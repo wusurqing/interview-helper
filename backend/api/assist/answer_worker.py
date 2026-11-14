@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from core.config import get_config
+from core.logger import get_logger
 from core.session import get_session, conversation_lock
 from services.stt import classify_followup, normalize_transcription_for_analysis
 from services.llm import (
@@ -679,6 +680,7 @@ def process_question_parallel(
     deps: AnswerWorkerDeps,
 ):
     question_text, image, manual_input, source, meta = task
+    mmpg_trace = meta.get("mmpg_trace")
     exam_preflight_id = str(meta.get("exam_preflight_id") or "") if meta.get("exam_preflight") else ""
     qa_id = f"qa-{seq}-{int(time.time() * 1000)}"
 
@@ -686,6 +688,10 @@ def process_question_parallel(
         if exam_preflight_id:
             data = {**data, "exam_preflight_id": exam_preflight_id}
         deps.broadcast(data)
+        if mmpg_trace and data["type"] in ("answer_done", "answer_error", "answer_cancelled"):
+            get_logger("mmpg.diagnostics").info(
+                "turn=%s event=%s seq=%s stage=%s", mmpg_trace, data["type"], seq, data.get("stage"),
+            )
         if exam_preflight_id:
             try:
                 from .exam_test import record_exam_preflight_answer_event
@@ -1003,6 +1009,8 @@ def process_question_parallel(
 
     exam_think_notified = False
     gen_start = time.monotonic()
+    if mmpg_trace:
+        get_logger("mmpg.diagnostics").info("turn=%s event=llm_start seq=%s", mmpg_trace, seq)
     # User-facing "首字" latency means the first answer token, not a hidden
     # reasoning token.  This matters for written-exam mode where Think output
     # may arrive seconds before any usable code/answer text.
@@ -1055,6 +1063,11 @@ def process_question_parallel(
             else:
                 if first_token_mono is None and chunk_text:
                     first_token_mono = time.monotonic()
+                    if mmpg_trace:
+                        get_logger("mmpg.diagnostics").info(
+                            "turn=%s event=llm_first_token seq=%s elapsed_ms=%.1f",
+                            mmpg_trace, seq, (first_token_mono - gen_start) * 1000,
+                        )
                 raw_full_answer += chunk_text
                 clean_chunk = stream_sanitizer.push(chunk_text)
                 if clean_chunk:

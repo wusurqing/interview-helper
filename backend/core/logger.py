@@ -4,6 +4,7 @@ Log files are written to <project_root>/log/ with daily rotation.
 - interview.log  — transcription, answer, pipeline events
 - error.log      — ERROR+ from all modules
 - app.log        — general application log (INFO+)
+- mmpg.log       — MMPG lifecycle and answer timing metadata
 
 Usage in any module:
     from core.logger import get_logger
@@ -62,6 +63,15 @@ def setup_logging():
     logging.getLogger("interview").addHandler(interview_handler)
     logging.getLogger("interview").setLevel(logging.DEBUG)
     logging.getLogger("interview").propagate = False
+
+    mmpg_handler = _make_file_handler("mmpg.log", logging.INFO, backup_count=7)
+    mmpg_handler.setFormatter(logging.Formatter(
+        "%(asctime)s.%(msecs)03d | %(message)s", datefmt=_LOG_DATE_FMT,
+    ))
+    mmpg_logger = logging.getLogger("mmpg.diagnostics")
+    mmpg_logger.addHandler(mmpg_handler)
+    mmpg_logger.setLevel(logging.INFO)
+    mmpg_logger.propagate = False
 
     # --- error.log: ERROR+ from all modules ---
     error_handler = _make_file_handler("error.log", logging.ERROR)

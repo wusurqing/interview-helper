@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import struct
 import time
 
@@ -111,7 +112,7 @@ def test_cloud_connector_signs_the_expected_rtc_path_without_wire_logging(monkey
     asyncio.run(check())
 
 
-def test_mmpg_gates_audio_on_both_transports_and_filters_conversations():
+def test_mmpg_gates_audio_on_both_transports_and_filters_conversations(caplog):
     from services.stt.mmpg import MmpgManager
 
     async def check():
@@ -130,7 +131,10 @@ def test_mmpg_gates_audio_on_both_transports_and_filters_conversations():
         async def stop(mode, reason):
             capture.append((mode, reason))
 
-        manager = MmpgManager(lambda: CONFIG, transcripts.append, on_capture_start=start,
+        def on_transcript(text, trace):
+            transcripts.append((text, trace))
+
+        manager = MmpgManager(lambda: CONFIG, on_transcript, on_capture_start=start,
                               on_capture_stop=stop, connector=connect)
         owner = object()
         manager.attach(owner, send)
@@ -164,7 +168,9 @@ def test_mmpg_gates_audio_on_both_transports_and_filters_conversations():
             cloud.push("user.audio.transcription.done", conv_id="private-cloud-id", transcript="duplicate")
             cloud.push("user.audio.transcription.done", conv_id="c", transcript="last")
             await wait_until(lambda: len(transcripts) >= 2)
-            assert transcripts == ["one-private-transcript", "last"]
+            assert [text for text, _ in transcripts] == ["one-private-transcript", "last"]
+            for _, trace in transcripts:
+                assert f"turn={trace} event=asr_done" in caplog.text
         finally:
             await manager.stop("paused")
         assert cloud.closed and cloud.sent[-1]["type"] == "session.close"
@@ -173,7 +179,18 @@ def test_mmpg_gates_audio_on_both_transports_and_filters_conversations():
         assert manager.status()["reason"] == "paused"
         assert not manager.offer_audio(np.array([0.25]))
 
-    asyncio.run(check())
+    with caplog.at_level("INFO", logger="mmpg.diagnostics"):
+        logger = logging.getLogger("mmpg.diagnostics")
+        attach_handler = not logger.propagate
+        if attach_handler:
+            logger.addHandler(caplog.handler)
+        try:
+            asyncio.run(check())
+        finally:
+            if attach_handler:
+                logger.removeHandler(caplog.handler)
+    for private in ("one-private-transcript", "private-cloud-id", CONFIG["doubao_api_key"], CONFIG["rtc_app_key"]):
+        assert private not in caplog.text
 
 
 def test_mmpg_retries_with_a_fresh_generation_and_rejects_stale_owner_events():

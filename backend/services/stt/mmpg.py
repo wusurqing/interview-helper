@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 
 import numpy as np
 
+from core.logger import get_logger
+
 
 MMPG_PATH = "/api/v2/mmpg"
 MMPG_URL = "wss://interactai.volcvideo.com" + MMPG_PATH
@@ -40,6 +42,7 @@ _RTC_FAULTS = {
     "rtc_error", "rtc_join_failed", "rtc_token_update_failed",
     "rtc_audio_unavailable", "rtc_token_expired", "rtc_token_invalid",
 }
+_RTC_STAGES = {"sdk_loading", "track_ready", "room_joining", "room_joined", "publishing", "token_updated"}
 _RETRYABLE = {
     "rtc_error", "rtc_join_failed", "rtc_token_update_failed", "rtc_token_expired",
     "rtc_join_timeout", "rtc_recovery_timeout", "audio_overrun", "audio_stalled", "audio_underrun",
@@ -64,6 +67,7 @@ _DEFAULTS = {
 # handshake headers and WebSocket payloads at that level.
 _WIRE_LOGGER = logging.Logger("mmpg.wire", logging.CRITICAL + 1)
 _WIRE_LOGGER.addHandler(logging.NullHandler())
+_log = get_logger("mmpg.diagnostics")
 
 
 class MmpgError(ValueError):
@@ -264,6 +268,7 @@ class _Run:
     mode: str
     device_ids: list[int]
     candidate_mic_id: int | None
+    trace_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     stop_reason: str | None = None
     started: bool = False
     deadline: asyncio.TimerHandle | None = None
@@ -291,6 +296,8 @@ class _Generation:
     seen_done: set[str] = field(default_factory=set)
     cancelled: set[str] = field(default_factory=set)
     open_conversations: set[str] = field(default_factory=set)
+    conversation_numbers: dict[str, int] = field(default_factory=dict)
+    pause_received_at: dict[str, float] = field(default_factory=dict)
     recent_underruns: deque = field(default_factory=lambda: deque(maxlen=BROWSER_UNDERRUN_LIMIT))
     token_issued_at: int | None = None
 
@@ -414,6 +421,11 @@ class MmpgManager:
     async def _publish(self, state, *, error=None, reason=None):
         self._state, self._error, self._reason = state, error, reason
         snapshot = self.status()
+        if self._run is not None:
+            _log.info(
+                "session=%s generation=%s state=%s mode=%s error=%s reason=%s",
+                self._run.trace_id, self._generation, state, self._mode, error, reason,
+            )
         if self._on_state is not None:
             self._on_state(snapshot.copy())
         with suppress(MmpgError):
@@ -545,6 +557,12 @@ class MmpgManager:
         kind = message["type"]
         if kind == "rtc_ready":
             generation.rtc_ready.set()
+            _log.info("session=%s generation=%s event=rtc_ready", self._run.trace_id, generation.number)
+        elif kind == "rtc_stage":
+            stage = message.get("stage")
+            if isinstance(stage, str) and stage in _RTC_STAGES:
+                _log.info("session=%s generation=%s event=rtc_stage stage=%s",
+                          self._run.trace_id, generation.number, stage)
         elif kind == "rtc_fault":
             code = message.get("code")
             self._fault(generation, code if isinstance(code, str) and code in _RTC_FAULTS else "rtc_error")
@@ -568,6 +586,7 @@ class MmpgManager:
         elif kind == "renew" and generation.config["token_mode"] == "auto" and generation.rtc_ready.is_set():
             if int(time.time()) - generation.token_issued_at >= 1:
                 token = self._issue_token(generation)
+                _log.info("session=%s generation=%s event=token_issued", self._run.trace_id, generation.number)
                 await self._emit({
                     "type": "rtc_token", "generation": generation.number,
                     "token": token, "expires_at": _display_expiry(generation.expires_at),
@@ -596,6 +615,11 @@ class MmpgManager:
             accepting_audio = self._audio_generation == generation.number
         if not accepting_audio:
             return
+        if underruns or overrun_samples:
+            _log.info(
+                "session=%s generation=%s event=audio_buffer underruns=%s overrun_samples=%s",
+                self._run.trace_id, generation.number, underruns, overrun_samples,
+            )
         if overrun_samples:
             self._fault(generation, "audio_overrun")
         elif underruns:
@@ -658,10 +682,17 @@ class MmpgManager:
                 "user.conversation.created", "user.audio.transcription.done",
             }:
                 continue
+            turn = generation.conversation_numbers.setdefault(conv_id, len(generation.conversation_numbers) + 1)
+            trace = f"{run.trace_id}/{generation.number}/{turn}"
             diagnostic = _DIAGNOSTIC_EVENTS.get(kind)
             if kind == "user.conversation.canceled":
                 generation.cancelled.add(conv_id)
                 generation.open_conversations.discard(conv_id)
+                generation.pause_received_at.pop(conv_id, None)
+            if kind == "user.audio.transcription.segment":
+                generation.pause_received_at[conv_id] = self._loop.time()
+            if diagnostic or kind == "user.conversation.created":
+                _log.info("turn=%s event=%s", trace, diagnostic or "speech_started")
             if run.mode == "test" and diagnostic:
                 await self._emit({
                     "type": "diagnostic", "generation": generation.number, "event": diagnostic,
@@ -674,6 +705,12 @@ class MmpgManager:
             generation.seen_done.add(conv_id)
             generation.open_conversations.discard(conv_id)
             text = event.get("transcript")
+            pause_at = generation.pause_received_at.pop(conv_id, None)
+            _log.info(
+                "turn=%s event=asr_done chars=%s since_last_pause_ms=%s",
+                trace, len(text.strip()) if isinstance(text, str) else 0,
+                round(1000 * (self._loop.time() - pause_at)) if pause_at is not None else None,
+            )
             if not isinstance(text, str) or not text.strip():
                 continue
             text = text.strip()
@@ -687,7 +724,7 @@ class MmpgManager:
                     "conv_id": conv_id, "transcript": text,
                 })
             else:
-                self._on_transcript(text)
+                self._on_transcript(text, trace)
 
     async def _run_transport(self, run, generation, cloud):
         try:
@@ -708,6 +745,7 @@ class MmpgManager:
         while True:
             event = await self._get_cloud_event(cloud[0], max(0, deadline - self._loop.time()))
             if event["type"] == "session.created":
+                _log.info("session=%s generation=%s event=cloud_ready", run.trace_id, generation.number)
                 break
         if self._capture_start is not None:
             generation.capture_entered = True
@@ -785,6 +823,11 @@ class MmpgManager:
                 and self._loop.time() - generation.ready_since >= RECOVERY_STABLE_SECONDS
             )
             reason = run.stop_reason or reason
+            _log.info(
+                "session=%s generation=%s event=closed reason=%s audio_dropped=%s underruns=%s overrun_samples=%s",
+                run.trace_id, generation.number, reason, self._audio_dropped,
+                self._browser_underruns, self._browser_overrun_samples,
+            )
             generation.cloud_ready = False
             self._interrupt_conversations(generation)
             if generation.recovery_timer is not None:
@@ -815,6 +858,12 @@ class MmpgManager:
             if preflight is not None:
                 await preflight(run.mode, run.device_ids, run.candidate_mic_id)
             config = validate_config(self._get_config())
+            _log.info(
+                "session=%s event=config device=%s token_mode=%s aivad=%s silence_ms=%s "
+                "twopass=%s prefetch=%s force_end=%s expire_ms=%s",
+                run.trace_id, run.device_ids[0], config["token_mode"], config["aivad"], config["silence_ms"],
+                config["twopass"], config["enable_prefetch"], config["force_end"], config["expire_time_ms"],
+            )
             retry_index = 0
             while not run.stop_reason:
                 if (expiry := config["rtc_token_expires_at"]) is not None and expiry <= time.time():
@@ -834,6 +883,8 @@ class MmpgManager:
                         retry_index = 0
                     if retry_index >= len(self._retry_delays):
                         break
+                    _log.info("session=%s generation=%s event=retry attempt=%s delay_s=%s error=%s",
+                              run.trace_id, self._generation, retry_index + 1, self._retry_delays[retry_index], error)
                     await self._publish("reconnecting", error=error)
                     await asyncio.sleep(self._retry_delays[retry_index])
                     retry_index += 1

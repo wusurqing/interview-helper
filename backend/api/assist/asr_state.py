@@ -61,15 +61,15 @@ class AssistAsrStateMachine:
     def reset_pending_group(self):
         self.pending_group = None
 
-    def accept_final_turn(self, cfg, session, text: str) -> None:
+    def accept_final_turn(self, cfg, session, text: str, mmpg_trace: str | None = None) -> str:
         """Publish a complete cloud turn and evaluate it without a local timer."""
         text = text.strip()
         if not text:
-            return
+            return "empty"
         session.add_transcription(text)
         self.broadcast({"type": "transcription", "text": text})
         if not cfg.auto_detect:
-            return
+            return "auto_answer_disabled"
         minimum = getattr(cfg, "transcription_min_sig_chars", 2)
         verdict, _ = classify_asr_question_candidate(text, minimum)
         # A complete question can end with an extra instruction. Check each
@@ -78,18 +78,20 @@ class AssistAsrStateMachine:
             classify_asr_question_candidate(part, minimum)[0] == "promote"
             for part in split_question_like_text(text)
         ):
-            return
+            return "filtered"
         now = self.clock()
         high_churn = self.is_high_churn_submission(cfg, now)
         turn = self.begin_asr_turn()
         self.record_asr_turn(now)
         source = "conversation_loopback" if session.capture_is_loopback else "conversation_mic"
-        self.submit_answer_task((text, None, False, source, {
+        queued = self.submit_answer_task((text, None, False, source, {
             "origin": "asr",
             "asr_turn_id": turn,
             "utterances": [text],
             "high_churn_short_answer": high_churn,
+            "mmpg_trace": mmpg_trace,
         }))
+        return "queued" if queued else "no_answer_model"
 
     def flush_question_group_now(self, cfg, session) -> None:
         group = self.pending_group
