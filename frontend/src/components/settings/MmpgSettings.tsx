@@ -142,6 +142,12 @@ export default function MmpgSettings({ form, stored, onChange, onImport, onSave,
             <Field label="判停静音时间（ms）" hint="允许 500–2999 毫秒。">
               <input aria-label="判停静音时间" className="input-field" type="number" min={500} max={2999} value={Number.isFinite(form.silence_ms) ? form.silence_ms : ''} onChange={(event) => set('silence_ms', event.target.valueAsNumber)} />
             </Field>
+            <Field label="答题前等待时长（毫秒）" hint="判停后等待续说。续说结束后合并文字并重新计时。设为 0 可立即提交。">
+              <input aria-label="答题前等待时长" className="input-field" type="number" min={0} step={1} value={Number.isFinite(form.answer_delay_ms) ? form.answer_delay_ms : ''} onChange={(event) => set('answer_delay_ms', event.target.valueAsNumber)} />
+            </Field>
+            <Field label="回答启动后的续说窗口（毫秒）" hint="从发起回答开始计时。窗口内续说会停止正在生成的回答，合并后重新回答。设为 0 可关闭。">
+              <input aria-label="回答启动后的续说窗口" className="input-field" type="number" min={0} step={1} value={Number.isFinite(form.followup_window_ms) ? form.followup_window_ms : ''} onChange={(event) => set('followup_window_ms', event.target.valueAsNumber)} />
+            </Field>
             <Field label="识别过期时间（ms，可选）">
               <input aria-label="识别过期时间" type="number" min={1} value={form.expire_time_ms ?? ''} className="input-field" onChange={(event) => set('expire_time_ms', event.target.value ? event.target.valueAsNumber : null)} />
             </Field>

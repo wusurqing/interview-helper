@@ -307,9 +307,10 @@ class MmpgManager:
 
     def __init__(self, config_getter, on_transcript, *, on_state=None,
                  on_capture_start=None, on_capture_stop=None, connector=connect_mmpg,
-                 retry_delays=(1, 2, 4), test_timeout=DIAGNOSTIC_TIMEOUT):
+                 retry_delays=(1, 2, 4), test_timeout=DIAGNOSTIC_TIMEOUT, on_turn=None):
         self._get_config = config_getter
         self._on_transcript = on_transcript
+        self._on_turn = on_turn
         self._on_state = on_state
         self._capture_start = on_capture_start
         self._capture_stop = on_capture_stop
@@ -397,7 +398,10 @@ class MmpgManager:
             return
         if run.stop_reason is None:
             run.stop_reason = reason
-            self._set_audio_gate(None)
+            if self._current is not None:
+                self._interrupt_conversations(self._current)
+            else:
+                self._set_audio_gate(None)
             # A start immediately followed by stop can precede the task's first
             # scheduling turn. Let it enter its cleanup block before cancelling.
             if run.started and (self._current is None or not self._current.cleaning):
@@ -508,6 +512,8 @@ class MmpgManager:
                 raise MmpgError("audio_stalled")
 
     def _interrupt_conversations(self, generation):
+        if self._on_turn and self._run and self._run.mode != "test":
+            self._on_turn("reset", "")
         generation.cancelled.update(generation.open_conversations)
         generation.open_conversations.clear()
         generation.recent_underruns.clear()
@@ -689,6 +695,8 @@ class MmpgManager:
                 generation.cancelled.add(conv_id)
                 generation.open_conversations.discard(conv_id)
                 generation.pause_received_at.pop(conv_id, None)
+                if self._on_turn and run.mode != "test":
+                    self._on_turn("cancelled", trace)
             if kind == "user.audio.transcription.segment":
                 generation.pause_received_at[conv_id] = self._loop.time()
             if diagnostic or kind == "user.conversation.created":
@@ -699,6 +707,8 @@ class MmpgManager:
                 })
             if kind in {"user.conversation.created", "user.audio.transcription.started",
                         "user.audio.transcription.segment"}:
+                if self._on_turn and run.mode != "test" and kind != "user.audio.transcription.segment":
+                    self._on_turn("started", trace)
                 generation.open_conversations.add(conv_id)
             if kind != "user.audio.transcription.done":
                 continue
@@ -712,6 +722,8 @@ class MmpgManager:
                 round(1000 * (self._loop.time() - pause_at)) if pause_at is not None else None,
             )
             if not isinstance(text, str) or not text.strip():
+                if self._on_turn and run.mode != "test":
+                    self._on_turn("cancelled", trace)
                 continue
             text = text.strip()
             for key in ("volc_access_key", "volc_secret_key", "rtc_app_key", "rtc_token", "doubao_api_key"):

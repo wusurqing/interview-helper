@@ -7,15 +7,66 @@ from fastapi.concurrency import run_in_threadpool
 
 from api.realtime.ws import broadcast
 from core.config import get_config
+from core.logger import get_logger
 from core.session import get_session
 from services.audio import AudioBusyError, audio_capture
 from services.stt.mmpg import MmpgError, MmpgManager
 from . import pipeline
+from .mmpg_turns import MmpgTurns
 
 PROVIDER = "doubao_mmpg"
 http_lifecycle_lock = asyncio.Lock()
 _session_settings = None
 _test_settings = None
+_turns = None
+_log = get_logger("mmpg.diagnostics")
+
+
+def _enabled():
+    session = get_session()
+    return pipeline.is_streaming_interview() and not session.is_paused and get_config().auto_detect
+
+
+def clear_turns():
+    if _turns is not None:
+        _turns.clear(cancel_running=True)
+
+
+def _turn_event(kind, trace):
+    if _turns is None:
+        return
+    if kind == "reset":
+        clear_turns()
+    elif kind == "started":
+        _turns.started(trace)
+    elif kind == "cancelled":
+        _turns.cancelled(trace)
+
+
+def _final_transcript(text, trace):
+    pipeline.publish_streaming_asr_turn(text)
+    if _turns is not None:
+        _turns.final(trace, text)
+
+
+def _new_turns():
+    loop = asyncio.get_running_loop()
+
+    def submit(request):
+        request.on_started = lambda at: loop.call_soon_threadsafe(turns.request_started, request, at)
+        return pipeline.submit_mmpg_question(request)
+
+    def log_event(event, **fields):
+        _log.info("event=%s %s", event, " ".join(f"{name}={value}" for name, value in fields.items()))
+
+    turns = MmpgTurns(
+        submit=submit, cancel=pipeline.cancel_mmpg_answer,
+        publish=lambda phase: broadcast({"type": "mmpg_answer_phase", "phase": phase}),
+        enabled=_enabled, clock=loop.time, call_later=loop.call_later, log=log_event,
+        answer_delay_ms=_session_settings.answer_delay_ms,
+        followup_window_ms=_session_settings.followup_window_ms,
+    )
+    return turns
 
 
 def _settings():
@@ -64,6 +115,7 @@ async def prepare(mode, device_ids, candidate_mic_id):
 
 
 async def start_capture(mode, device_ids, candidate_mic_id):
+    global _turns
     if get_session().is_recording and not pipeline.is_streaming_interview():
         raise MmpgError("interview_active")
     device = device_ids[0]
@@ -74,6 +126,7 @@ async def start_capture(mode, device_ids, candidate_mic_id):
                 owner="mmpg-test", queue_audio=False,
             )
         else:
+            _turns = _new_turns()
             action = pipeline.unpause_interview if pipeline.is_streaming_interview() else pipeline.start_nonblocking
             worker = run_in_threadpool(action, device, candidate_mic_id, stream_audio=manager.offer_audio)
         task = asyncio.create_task(worker)
@@ -120,7 +173,8 @@ def stt_status(status=None):
 
 manager = MmpgManager(
     _settings,
-    pipeline.accept_streaming_asr_turn,
+    _final_transcript,
+    on_turn=_turn_event,
     on_state=_broadcast_state,
     on_capture_start=start_capture,
     on_capture_stop=stop_capture,

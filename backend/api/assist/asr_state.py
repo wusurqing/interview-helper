@@ -68,6 +68,9 @@ class AssistAsrStateMachine:
             return "empty"
         session.add_transcription(text)
         self.broadcast({"type": "transcription", "text": text})
+        return self.submit_final_question(cfg, session, text, mmpg_trace)
+
+    def submit_final_question(self, cfg, session, text, mmpg_trace=None, request=None) -> str:
         if not cfg.auto_detect:
             return "auto_answer_disabled"
         minimum = getattr(cfg, "transcription_min_sig_chars", 2)
@@ -81,15 +84,16 @@ class AssistAsrStateMachine:
             return "filtered"
         now = self.clock()
         high_churn = self.is_high_churn_submission(cfg, now)
-        turn = self.begin_asr_turn()
+        turn = self.begin_asr_turn() if request is None else 0
         self.record_asr_turn(now)
         source = "conversation_loopback" if session.capture_is_loopback else "conversation_mic"
         queued = self.submit_answer_task((text, None, False, source, {
-            "origin": "asr",
+            "origin": "asr" if request is None else "mmpg",
             "asr_turn_id": turn,
-            "utterances": [text],
+            "utterances": text.splitlines() if request is not None else [text],
             "high_churn_short_answer": high_churn,
             "mmpg_trace": mmpg_trace,
+            **({"mmpg_request": request} if request is not None else {}),
         }))
         return "queued" if queued else "no_answer_model"
 

@@ -128,6 +128,8 @@ class Mmpg(BaseModel):
     doubao_resource_id: _MmpgText = "volc.seedasr.sauc.duration"
     aivad: StrictBool = True
     silence_ms: Annotated[int, Field(strict=True, ge=500, lt=3000)] = 800
+    answer_delay_ms: Annotated[int, Field(strict=True, ge=0)] = 1500
+    followup_window_ms: Annotated[int, Field(strict=True, ge=0)] = 1500
     twopass: StrictBool = True
     enable_prefetch: StrictBool = True
     expire_time_ms: _PositiveInt | None = None

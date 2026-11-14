@@ -34,11 +34,21 @@ def test_previous_config_uses_probe_tuning_defaults(client):
     response = client.get("/api/config").json()["mmpg"]
     assert response["aivad"] is True
     assert response["silence_ms"] == 800
+    assert response["answer_delay_ms"] == response["followup_window_ms"] == 1500
     assert response["twopass"] is True
     assert response["enable_prefetch"] is True
     assert response["expire_time_ms"] is None
     assert response["force_end"] is False
     assert response["token_mode"] == "auto"
+
+
+def test_answer_windows_allow_zero_and_require_nonnegative_integers(client):
+    result = client.post("/api/config", json={"mmpg": {"answer_delay_ms": 0, "followup_window_ms": 2000}})
+    assert result.status_code == 200
+    assert result.json()["mmpg"]["answer_delay_ms"] == 0
+    assert result.json()["mmpg"]["followup_window_ms"] == 2000
+    for bad in (-1, True, 1.5, "1500"):
+        assert client.post("/api/config", json={"mmpg": {"answer_delay_ms": bad}}).status_code == 422
 
 
 def test_mmpg_patch_keeps_replaces_and_clears_secrets(client, monkeypatch):

@@ -718,6 +718,22 @@ def submit_answer_task(task: TaskPayload) -> bool:
     return True
 
 
+def cancel_mmpg_answer(request):
+    if request.completed_qa_id:
+        return request.completed_qa_id
+    request.cancelled = True
+    with _dispatch_lock:
+        for index, (task, seq, _version) in enumerate(_pending):
+            if task_meta(task).get("mmpg_request") is request:
+                _pending.pop(index)
+                break
+        else:
+            return None
+    _mark_seq_skipped(seq)
+    _try_dispatch()
+    return None
+
+
 # ---------------------------------------------------------------------------
 # ASR question group handling
 # ---------------------------------------------------------------------------
@@ -1253,17 +1269,24 @@ def is_streaming_interview() -> bool:
     return _interviewer_streaming and get_session().is_recording
 
 
-def accept_streaming_asr_turn(text: str, trace: str) -> None:
+def publish_streaming_asr_turn(text: str) -> None:
     session = get_session()
-    outcome = "inactive"
-    started_at = time.monotonic()
-    if _interviewer_streaming and session.is_recording and not session.is_paused:
-        with _asr_state_lock:
-            outcome = _asr_state.accept_final_turn(get_config(), session, text, trace)
+    if text and is_streaming_interview() and not session.is_paused:
+        with conversation_lock:
+            session.add_transcription(text)
+        broadcast({"type": "transcription", "text": text})
+
+
+def submit_mmpg_question(request) -> bool:
+    session = get_session()
+    if not is_streaming_interview() or session.is_paused:
+        return False
+    trace = request.traces[-1]
+    outcome = _asr_state.submit_final_question(get_config(), session, request.text, trace, request)
     get_logger("mmpg.diagnostics").info(
-        "turn=%s event=answer_decision outcome=%s decision_ms=%.1f",
-        trace, outcome, (time.monotonic() - started_at) * 1000,
+        "turn=%s event=answer_decision outcome=%s", trace, outcome,
     )
+    return outcome == "queued"
 
 
 # H4: 独立 flush worker 线程，避免阻塞音频采集主循环
@@ -1939,12 +1962,13 @@ def _process_question_parallel(
     cfg = config_snapshot if config_snapshot is not None else get_config()
     my_gen = _capture_generation()
     my_asr_turn = int(_task_meta(task).get("asr_turn_id", 0)) if _is_asr_task(task) else 0
+    request = _task_meta(task).get("mmpg_request")
 
     def session_stale() -> bool:
         return sess_v != _task_session_version
 
     def aborted() -> bool:
-        if session_stale():
+        if session_stale() or (request and request.cancelled):
             return True
         if my_gen != _answer_generation:
             return True
@@ -1971,7 +1995,7 @@ def _process_question_parallel(
             broadcast=broadcast,
             logger=_ilog,
             error_logger=_elog,
-            start_abort_check=session_stale,
+            start_abort_check=aborted if request is not None else session_stale,
             model_cfg_snapshot=model_cfg_snapshot,
             config_snapshot=config_snapshot,
         ),

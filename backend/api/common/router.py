@@ -487,6 +487,10 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
             d["kb_asr_deadline_ms"] = max(20, min(1000, int(d["kb_asr_deadline_ms"])))
 
         await run_in_threadpool(update_config, d)
+        if d.get("auto_detect") is False:
+            from api.assist.mmpg_integration import clear_turns
+
+            clear_turns()
     except HTTPException:
         raise
     except OSError:

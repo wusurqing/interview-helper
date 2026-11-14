@@ -164,6 +164,7 @@ async def _api_resume_interview(body: Optional[dict] = None):
 @router.post("/clear")
 async def api_clear():
     from api.realtime.ws import broadcast
+    mmpg.clear_turns()
     cancel_answer_work(reset_session_data=True)
     broadcast({"type": "session_cleared"})
     return {"ok": True}
@@ -171,6 +172,7 @@ async def api_clear():
 
 @router.post("/ask/cancel")
 async def api_ask_cancel():
+    mmpg.clear_turns()
     _bump_generation()
     cancel_answer_work(reset_session_data=False)
     return {"ok": True}

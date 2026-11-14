@@ -681,6 +681,7 @@ def process_question_parallel(
 ):
     question_text, image, manual_input, source, meta = task
     mmpg_trace = meta.get("mmpg_trace")
+    mmpg_request = meta.get("mmpg_request")
     exam_preflight_id = str(meta.get("exam_preflight_id") or "") if meta.get("exam_preflight") else ""
     qa_id = f"qa-{seq}-{int(time.time() * 1000)}"
 
@@ -1009,6 +1010,8 @@ def process_question_parallel(
 
     exam_think_notified = False
     gen_start = time.monotonic()
+    if mmpg_request and mmpg_request.on_started:
+        mmpg_request.on_started(gen_start)
     if mmpg_trace:
         get_logger("mmpg.diagnostics").info("turn=%s event=llm_start seq=%s", mmpg_trace, seq)
     # User-facing "首字" latency means the first answer token, not a hidden
@@ -1146,7 +1149,7 @@ def process_question_parallel(
         return
 
     def _commit():
-        if not deps.is_session_current(sess_v):
+        if not deps.is_session_current(sess_v) or (mmpg_request and mmpg_request.cancelled):
             return
         session = get_session()
         if exam_preflight_id:
@@ -1198,6 +1201,8 @@ def process_question_parallel(
                     source=source,
                     model_name=model_cfg.name,
                 )
+                if mmpg_request:
+                    mmpg_request.completed_qa_id = qa_id
             stats = get_token_stats()
             deps.logger.info(
                 "ANSWER_DONE id=%s model=%s first_token=%.0fms total=%.0fms "

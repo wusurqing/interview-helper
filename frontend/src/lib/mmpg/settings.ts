@@ -11,6 +11,8 @@ export type MmpgPublicFields = {
   doubao_resource_id: string
   aivad: boolean
   silence_ms: number
+  answer_delay_ms: number
+  followup_window_ms: number
   twopass: boolean
   enable_prefetch: boolean
   expire_time_ms: number | null
@@ -31,6 +33,8 @@ export function mmpgFormFromConfig(config?: MmpgConfig): MmpgForm {
     doubao_resource_id: config?.doubao_resource_id ?? 'volc.seedasr.sauc.duration',
     aivad: config?.aivad ?? true,
     silence_ms: config?.silence_ms ?? 800,
+    answer_delay_ms: config?.answer_delay_ms ?? 1500,
+    followup_window_ms: config?.followup_window_ms ?? 1500,
     twopass: config?.twopass ?? true,
     enable_prefetch: config?.enable_prefetch ?? true,
     expire_time_ms: config?.expire_time_ms ?? null,

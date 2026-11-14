@@ -327,6 +327,11 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
       }
       const { mmpg, ...speechPayload } = savedForm
       const mmpgPatch = mmpgConfigPatch(mmpg, mmpgBaseline.current)
+      if ([mmpgPatch?.answer_delay_ms, mmpgPatch?.followup_window_ms].some(
+        (value) => value !== undefined && (!Number.isSafeInteger(value) || value < 0),
+      )) {
+        throw new Error('答题前等待时长和回答启动后的续说窗口须填写非负整数。')
+      }
       if (mmpgPatch?.silence_ms !== undefined && (!Number.isInteger(mmpgPatch.silence_ms) || mmpgPatch.silence_ms < 500 || mmpgPatch.silence_ms > 2999)) {
         throw new Error('MMPG 判停静音时间必须为 500–2999 毫秒内的整数。')
       }
