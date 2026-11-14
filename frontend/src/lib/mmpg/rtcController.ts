@@ -336,6 +336,7 @@ class MmpgController {
     let track: MediaStreamTrack | undefined
     let sdk: RtcSdk | undefined
     try {
+      this.send(owner, { type: 'rtc_stage', generation, stage: 'sdk_loading' })
       sdk = await import('@volcengine/rtc')
       if (!current()) return
       node = new AudioWorkletNode(owner.context, 'mmpg-pcm-source', {
@@ -345,6 +346,7 @@ class MmpgController {
       node.connect(destination)
       track = destination.stream.getAudioTracks()[0]
       if (!track || track.readyState !== 'live') throw new Error()
+      this.send(owner, { type: 'rtc_stage', generation, stage: 'track_ready' })
       fault = 'rtc_join_failed'
       sdk.default.setLogConfig({ logLevel: 'none' })
       const engine = sdk.default.createEngine(appId)
@@ -383,10 +385,13 @@ class MmpgController {
       if (!this.isCurrentRtc(owner, rtc)) return
       await engine.setExternalAudioTrack(mainStream, track)
       if (!this.isCurrentRtc(owner, rtc)) return
+      this.send(owner, { type: 'rtc_stage', generation, stage: 'room_joining' })
       await engine.joinRoom(token, roomId, { userId }, {
         isAutoPublish: false, isAutoSubscribeAudio: false, isAutoSubscribeVideo: false,
       })
       if (!this.isCurrentRtc(owner, rtc)) return
+      this.send(owner, { type: 'rtc_stage', generation, stage: 'room_joined' })
+      this.send(owner, { type: 'rtc_stage', generation, stage: 'publishing' })
       await engine.publishStream(sdk.MediaType.AUDIO)
       if (!this.isCurrentRtc(owner, rtc)) return
       rtc.published = true
@@ -439,6 +444,7 @@ class MmpgController {
     try {
       await rtc.engine.updateToken(token)
       if (!this.isCurrentRtc(owner, rtc)) return
+      this.send(owner, { type: 'rtc_stage', generation: rtc.generation, stage: 'token_updated' })
       rtc.renewing = false
       this.update({ tokenExpiresAt: typeof expiry === 'string' ? expiry : null, notice: null })
       this.testEvent(owner, 'RTC Token 已更新')

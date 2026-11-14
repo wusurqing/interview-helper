@@ -14,7 +14,7 @@ from services.stt.mmpg import MmpgError
 
 
 _START_COMMANDS = {"start", "resume", "test"}
-_RTC_MESSAGES = {"rtc_ready", "rtc_fault", "rtc_reconnecting", "rtc_recovered", "renew", "audio_status"}
+_RTC_MESSAGES = {"rtc_ready", "rtc_fault", "rtc_reconnecting", "rtc_recovered", "rtc_stage", "renew", "audio_status"}
 _MAX_CONTROL_BYTES = 2048
 
 

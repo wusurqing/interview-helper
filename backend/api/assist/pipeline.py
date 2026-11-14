@@ -708,6 +708,8 @@ def submit_answer_task(task: TaskPayload) -> bool:
         tv = _task_session_version
         _pending.append((task, seq, tv))
         delay = max(0.0, float(_task_meta(task).get("dispatch_after_mono", 0.0) or 0.0) - time.monotonic())
+    if trace := _task_meta(task).get("mmpg_trace"):
+        get_logger("mmpg.diagnostics").info("turn=%s event=answer_queued seq=%s", trace, seq)
     _try_dispatch()
     if delay > 0:
         timer = threading.Timer(delay, _try_dispatch)
@@ -1251,11 +1253,17 @@ def is_streaming_interview() -> bool:
     return _interviewer_streaming and get_session().is_recording
 
 
-def accept_streaming_asr_turn(text: str) -> None:
+def accept_streaming_asr_turn(text: str, trace: str) -> None:
     session = get_session()
+    outcome = "inactive"
+    started_at = time.monotonic()
     if _interviewer_streaming and session.is_recording and not session.is_paused:
         with _asr_state_lock:
-            _asr_state.accept_final_turn(get_config(), session, text)
+            outcome = _asr_state.accept_final_turn(get_config(), session, text, trace)
+    get_logger("mmpg.diagnostics").info(
+        "turn=%s event=answer_decision outcome=%s decision_ms=%.1f",
+        trace, outcome, (time.monotonic() - started_at) * 1000,
+    )
 
 
 # H4: 独立 flush worker 线程，避免阻塞音频采集主循环

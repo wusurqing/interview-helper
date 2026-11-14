@@ -111,6 +111,7 @@ test('MMPG settings test publishes PCM through the native AudioWorklet and stops
   })).toBeGreaterThan(0.25)
   expect(commands[0]).toEqual({ type: 'test', device_ids: [1001], candidate_mic_id: null })
   expect(commands.find(({ type }) => type === 'rtc_ready')).toEqual({ type: 'rtc_ready', generation: 2 })
+  expect(commands.filter(({ type }) => type === 'rtc_stage').map(({ stage }) => stage)).toContain('room_joined')
   expect(await page.evaluate(() => window.rtcSource)).toBe(1)
   await page.evaluate(() => window.rtcEvents.onTokenWillExpire())
   await expect.poll(() => page.evaluate(() => window.updatedTestToken)).toBe('renewed-test-token')
