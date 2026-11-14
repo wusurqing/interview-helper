@@ -131,11 +131,15 @@ export function useInterviewWS(active = true) {
       case 'session_cleared':
         s.clearSession()
         break
+      case 'mmpg_answer_phase':
+        s.setMmpgAnswerPhase(msg.phase)
+        break
       case 'answer_start':
         if (msg.exam_preflight_id) return
         s.startAnswer(msg.id as string, msg.question as string, {
           source: msg.source as string,
           modelName: msg.model_name as string,
+          updatesQaId: msg.updates_qa_id as string | undefined,
         })
         break
       case 'answer_think_chunk':
@@ -156,11 +160,12 @@ export function useInterviewWS(active = true) {
           msg.model_name as string,
           msg.first_token_ms as number | undefined,
           msg.total_ms as number | undefined,
+          msg.updates_qa_id as string | undefined,
         )
         break
       case 'answer_cancelled':
         if (msg.exam_preflight_id) return
-        s.cancelAnswer(msg.id as string)
+        s.cancelAnswer(msg.id as string, msg.reason as string | undefined)
         break
       case 'answer_error':
         if (msg.exam_preflight_id) return

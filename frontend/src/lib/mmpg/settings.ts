@@ -1,6 +1,17 @@
 export const mmpgSecrets = ['volc_access_key', 'volc_secret_key', 'rtc_app_key', 'rtc_token', 'doubao_api_key'] as const
 export type MmpgSecret = typeof mmpgSecrets[number]
 
+export const mmpgAnswerLabels = {
+  waiting: '等待续说',
+  continuing: '继续识别',
+  generating: '生成回答',
+} as const
+
+export function mmpgAnswerLabel(phase: unknown): string | null {
+  if (phase === 'waiting' || phase === 'continuing' || phase === 'generating') return mmpgAnswerLabels[phase]
+  return null
+}
+
 export type MmpgPublicFields = {
   token_mode: 'auto' | 'manual'
   rtc_app_id: string

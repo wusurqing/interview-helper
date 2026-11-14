@@ -31,6 +31,8 @@
     "doubao_resource_id": "volc.seedasr.sauc.duration",
     "aivad": true,
     "silence_ms": 800,
+    "answer_delay_ms": 1500,
+    "followup_window_ms": 1500,
     "twopass": true,
     "enable_prefetch": true,
     "expire_time_ms": null,

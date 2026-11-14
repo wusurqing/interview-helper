@@ -48,6 +48,7 @@ export default function InterviewOverlay() {
   const isPaused = useInterviewStore((s) => s.isPaused)
   const interviewerStreaming = useInterviewStore((s) => s.interviewerStreaming)
   const mmpgPhase = useInterviewStore((s) => s.mmpgPhase)
+  const mmpgAnswerLabel = useInterviewStore((s) => s.mmpgAnswerLabel)
   const clearSession = useInterviewStore((s) => s.clearSession)
   const setToastMessage = useInterviewStore((s) => s.setToastMessage)
   const config = useInterviewStore((s) => s.config)
@@ -56,7 +57,8 @@ export default function InterviewOverlay() {
   const setShortcuts = useShortcutsStore((s) => s.setShortcuts)
   const isExamMode = !interviewerStreaming && config?.written_exam_mode === true
   const standbyHint = interviewerStreaming
-    ? (isPaused && mmpgPhase === 'idle' ? '录音已暂停' : mmpgStateLabels[mmpgPhase ?? 'connecting'])
+    ? (isPaused && mmpgPhase === 'idle' ? '录音已暂停'
+        : mmpgPhase === 'listening' && mmpgAnswerLabel ? mmpgAnswerLabel : mmpgStateLabels[mmpgPhase ?? 'connecting'])
     : isRecording ? (isExamMode ? '笔试中…' : '正在聆听…') : (isExamMode ? '点击开始笔试' : '等待面试开始')
   const enabled = useUiPrefsStore((s) => s.interviewOverlayEnabled)
   const opacity = useUiPrefsStore((s) => s.interviewOverlayOpacity)
@@ -115,7 +117,9 @@ export default function InterviewOverlay() {
 
   const answerText =
     displayedQa?.status === 'cancelled'
-      ? '上一条回答已取消'
+      ? (displayedQa.cancelReason === 'continuation'
+          ? [displayedQa.answer, '已因续说停止'].filter(Boolean).join('\n\n')
+          : '上一条回答已取消')
       : displayedQa?.status === 'error'
         ? `保存失败: ${displayedQa.errorMessage || '未知原因'}`
         : displayedQa?.answer?.trim() || (displayedQa ? (displayedQa.isThinking ? '思考中…' : '正在组织回答…') : '')
@@ -414,7 +418,7 @@ export default function InterviewOverlay() {
     <div className="ov-answer-stack">
       {displayedQa && qaPairs.length > 1 && (
         <div className="ov-review-line">
-          {isReviewingHistory ? '回看' : '当前'} {displayedQaIndex + 1}/{qaPairs.length} · {displayedQa.question}
+          {displayedQa.updatesQaId ? '补充后的回答' : isReviewingHistory ? '回看' : '当前'} {displayedQaIndex + 1}/{qaPairs.length} · {displayedQa.question}
         </div>
       )}
       {activeVisionVerify && <OverlayVisionVerify verify={activeVisionVerify} />}
@@ -475,7 +479,7 @@ export default function InterviewOverlay() {
           {displayedQa && (
             <div className="ov-focus-question-strip" aria-label="题目导航">
               <span>{isReviewingHistory ? '回看' : '当前'} {displayedQaIndex + 1}/{qaPairs.length || 1}</span>
-              <strong>{displayedQa.question}</strong>
+              <strong>{displayedQa.updatesQaId ? '补充后的回答 · ' : ''}{displayedQa.question}</strong>
               {liveGeneratingQa && (
                 <span className="ov-focus-live-hint" title={liveGeneratingQa.question}>
                   新答案生成中

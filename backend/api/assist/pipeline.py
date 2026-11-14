@@ -740,6 +740,10 @@ def _cancel_mmpg_request(request, *, reason):
                 request.traces[-1], request.group_id, request.revision, reason,
             )
             if request.shown_qa_id:
+                with conversation_lock:
+                    session = get_session()
+                    if session.current_candidate_qa_id == request.shown_qa_id:
+                        session.close_candidate_answer_window()
                 broadcast({"type": "answer_cancelled", "id": request.shown_qa_id, "reason": reason})
             return True
     return False

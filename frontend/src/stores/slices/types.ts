@@ -156,6 +156,8 @@ export interface QAPair {
   totalMs?: number
   visionVerify?: { verdict: 'PASS' | 'FAIL' | 'UNKNOWN'; reason: string }
   status?: QAStatus
+  updatesQaId?: string
+  cancelReason?: string
   errorMessage?: string
 }
 

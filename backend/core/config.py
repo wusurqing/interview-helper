@@ -112,6 +112,7 @@ MMPG_SECRET_FIELDS = frozenset({
 })
 _MmpgText = Annotated[str, StringConstraints(strip_whitespace=True, strict=True)]
 _PositiveInt = Annotated[int, Field(strict=True, gt=0)]
+_AnswerWindowMs = Annotated[int, Field(strict=True, ge=0, le=2**53 - 1)]
 
 
 class Mmpg(BaseModel):
@@ -128,8 +129,8 @@ class Mmpg(BaseModel):
     doubao_resource_id: _MmpgText = "volc.seedasr.sauc.duration"
     aivad: StrictBool = True
     silence_ms: Annotated[int, Field(strict=True, ge=500, lt=3000)] = 800
-    answer_delay_ms: Annotated[int, Field(strict=True, ge=0)] = 1500
-    followup_window_ms: Annotated[int, Field(strict=True, ge=0)] = 1500
+    answer_delay_ms: _AnswerWindowMs = 1500
+    followup_window_ms: _AnswerWindowMs = 1500
     twopass: StrictBool = True
     enable_prefetch: StrictBool = True
     expire_time_ms: _PositiveInt | None = None

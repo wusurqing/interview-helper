@@ -444,6 +444,8 @@ def _parse_sse_data(line, api_type, parser):
         obj = json.loads(data)
     except ValueError:
         return None, False
+    if not isinstance(obj, dict):
+        return None, False
     chunk = parser(obj)
     event = obj.get("type")
     done = ((api_type == API_TYPE_ANTHROPIC and event == "message_stop")

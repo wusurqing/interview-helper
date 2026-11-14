@@ -98,6 +98,9 @@ test('MMPG settings test publishes PCM through the native AudioWorklet and stops
 
   await page.goto('/')
   await page.getByRole('button', { name: '打开豆包 MMPG 测试设置' }).click()
+  await page.getByText('豆包 MMPG 高级设置', { exact: true }).click()
+  await expect(page.getByLabel('答题前等待时长', { exact: true })).toHaveValue('1500')
+  await expect(page.getByLabel('回答启动后的续说窗口', { exact: true })).toHaveValue('1500')
   await page.getByLabel('MMPG 测试音频设备').selectOption('1001')
   await page.getByRole('button', { name: '保存并测试 MMPG' }).click()
   await expect(page.getByText('检测到停顿，等待本轮结束')).toBeVisible()
@@ -131,4 +134,39 @@ test('MMPG settings test publishes PCM through the native AudioWorklet and stops
   await expect(page.getByRole('button', { name: '开始面试', exact: true })).toBeEnabled()
   expect(apiPaths).not.toContain('/api/ask')
   expect(apiPaths).not.toContain('/api/start')
+})
+
+test('MMPG continuation stops a partial answer and adds an update alongside the completed answer', async ({ context, page }) => {
+  const config = { ...SAMPLE_CONFIG, stt_provider: 'doubao_mmpg' }
+  await context.route('**/api/**', (route) => {
+    const request = route.request()
+    const path = new URL(request.url()).pathname
+    return route.fulfill({ json: path === '/api/config' ? config : resolveApiPayload(path, request.method()) ?? {} })
+  })
+  const sockets = new Set()
+  const send = (data) => {
+    for (const socket of sockets) socket.send(JSON.stringify(data))
+  }
+  await context.routeWebSocket('**/ws', (socket) => {
+    sockets.add(socket)
+    socket.onClose(() => sockets.delete(socket))
+    socket.send(JSON.stringify({ type: 'init', is_recording: true, interviewer_streaming: true, stt_loaded: true,
+      mmpg_answer_phase: 'waiting', qa_pairs: [{ id: 'first', question: '熟悉 C++ 吗？', answer: '已有完整回答。' }] }))
+    socket.send(JSON.stringify({ type: 'stt_status', provider: 'doubao_mmpg', state: 'listening', loaded: true }))
+  })
+  await page.goto('/')
+  await expect(page.getByRole('status').filter({ hasText: '等待续说' })).toBeVisible()
+  send({ type: 'answer_start', id: 'partial', question: '讲讲编译。' })
+  await expect(page.getByText('讲讲编译。', { exact: true })).toBeVisible()
+  send({ type: 'answer_chunk', id: 'partial', chunk: '已经生成的部分。' })
+  send({ type: 'answer_cancelled', id: 'partial', reason: 'continuation' })
+  send({ type: 'answer_done', id: 'partial', question: '讲讲编译。', answer: '迟到的旧内容。' })
+  await expect(page.getByText('已因续说停止', { exact: true })).toBeVisible()
+  await expect(page.getByText('已经生成的部分。', { exact: true })).toBeVisible()
+  await expect(page.getByText('迟到的旧内容。', { exact: true })).toHaveCount(0)
+  send({ type: 'answer_start', id: 'updated', question: '熟悉 C++ 吗？\n讲讲编译。', updates_qa_id: 'first' })
+  send({ type: 'answer_done', id: 'updated', question: '熟悉 C++ 吗？\n讲讲编译。', answer: '新回答。', updates_qa_id: 'first' })
+  await expect(page.getByText('补充后的回答', { exact: true })).toBeVisible()
+  await expect(page.getByText('已有完整回答。', { exact: true })).toBeVisible()
+  await expect(page.getByText('新回答。', { exact: true })).toBeVisible()
 })

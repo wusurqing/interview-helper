@@ -694,6 +694,8 @@ def process_question_parallel(
                     return
                 if data["type"] == "answer_start":
                     mmpg_request.shown_qa_id = qa_id
+                if mmpg_request.updates_qa_id and data["type"] in ("answer_start", "answer_done"):
+                    data = {**data, "updates_qa_id": mmpg_request.updates_qa_id}
                 deps.broadcast(data)
         else:
             deps.broadcast(data)
@@ -983,9 +985,10 @@ def process_question_parallel(
             or bool(getattr(cfg, "candidate_asr_enabled", False))
         )
     )
-    if should_open_candidate_window:
+    if should_open_candidate_window and not deps.abort_check():
         with conversation_lock:
-            get_session().open_candidate_answer_window(qa_id)
+            if not deps.abort_check():
+                get_session().open_candidate_answer_window(qa_id)
 
     if kb_hits or kb_degraded:
         try:
@@ -1078,7 +1081,7 @@ def process_question_parallel(
                             get_logger("mmpg.diagnostics").info(
                                 "turn=%s group=%s revision=%s event=llm_first_token seq=%s elapsed_ms=%.1f since_final_ms=%.1f",
                                 mmpg_trace, mmpg_request.group_id, mmpg_request.revision, seq,
-                                (first_token_mono - mmpg_request.started_at) * 1000,
+                                (first_token_mono - (mmpg_request.started_at or gen_start)) * 1000,
                                 (first_token_mono - mmpg_request.final_at) * 1000,
                             )
                         else:
@@ -1220,6 +1223,7 @@ def process_question_parallel(
                     qa_id=qa_id,
                     source=source,
                     model_name=model_cfg.name,
+                    **({"updates_qa_id": mmpg_request.updates_qa_id} if mmpg_request and mmpg_request.updates_qa_id else {}),
                 )
                 if mmpg_request:
                     mmpg_request.completed_qa_id = qa_id
@@ -1289,6 +1293,8 @@ def process_question_parallel(
                         exc,
                     )
         except Exception as exc:
+            if mmpg_request:
+                mmpg_request.completed_qa_id = None
             with conversation_lock:
                 if len(session.qa_pairs) > pre_qa_len:
                     session.qa_pairs.pop()

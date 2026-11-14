@@ -22,6 +22,7 @@ class MmpgRequest:
     shown_qa_id: str | None = None
     seq: int | None = None
     started_at: float | None = None
+    finished: bool = False
     loop: asyncio.AbstractEventLoop | None = field(default=None, repr=False)
     lock: RLock = field(default_factory=RLock, repr=False, compare=False)
     stream_read: asyncio.Task | None = field(default=None, repr=False)
@@ -112,9 +113,11 @@ class MmpgTurns:
         self._set_phase("idle")
 
     def request_finished(self, request):
+        request.finished = True
         group = self._group
         if group and group.request is request:
-            if group.followup_until is None:
+            if group.followup_until is None or self._clock() > group.followup_until:
+                group.request = None
                 self.clear()
             else:
                 self._set_phase("idle")
@@ -206,6 +209,7 @@ class MmpgTurns:
         if self._submit(request):
             self._set_phase("generating")
         else:
+            group.request = None
             self.clear()
 
     def request_started(self, request, started_at):
@@ -222,7 +226,8 @@ class MmpgTurns:
 
         def expire():
             self._log("followup_window_elapsed", group=group.id, revision=request.revision)
-            self.clear()
+            if request.finished:
+                self.clear()
 
         self._schedule(max(0, group.followup_until - self._clock()), expire,
                        allow_opening_at_deadline=True)

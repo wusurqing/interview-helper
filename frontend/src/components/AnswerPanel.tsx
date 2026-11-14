@@ -118,11 +118,17 @@ function renderAnswerBody(
   const qaStatus = qa.status ?? (qa.answer ? 'done' : 'streaming')
   return (
     <>
+      {qa.updatesQaId && <p className="mb-1 text-xs text-text-secondary">补充后的回答</p>}
       {qa.thinkContent && <ThinkBlock content={qa.thinkContent} isThinking={qa.isThinking} streamLayout={stream} />}
       {qaStatus === 'cancelled' ? (
-        <div className="flex items-center gap-1.5 text-text-muted italic text-sm">
-          <Ban className="w-3.5 h-3.5 flex-shrink-0" />
-          <span>已取消</span>
+        <div className="space-y-2">
+          {qa.cancelReason === 'continuation' && qa.answer && (
+            <div className="whitespace-pre-wrap break-words text-sm text-text-secondary">{qa.answer}</div>
+          )}
+          <div className="flex items-center gap-1.5 text-sm italic text-text-muted">
+            <Ban className="w-3.5 h-3.5 flex-shrink-0" />
+            <span>{qa.cancelReason === 'continuation' ? '已因续说停止' : '已取消'}</span>
+          </div>
         </div>
       ) : qaStatus === 'error' ? (
         <div className="space-y-2">

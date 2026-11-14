@@ -53,6 +53,7 @@ export default function App() {
   const interviewerStreaming = useInterviewStore((s) => s.interviewerStreaming)
   const isPaused = useInterviewStore((s) => s.isPaused)
   const backendMmpgPhase = useInterviewStore((s) => s.mmpgPhase)
+  const mmpgAnswerLabel = useInterviewStore((s) => s.mmpgAnswerLabel)
   const backendMmpgError = useInterviewStore((s) => s.mmpgError)
   const mmpg = useMmpgStatus()
   const currentStreamingId = useInterviewStore((s) => s.currentStreamingId)
@@ -61,7 +62,8 @@ export default function App() {
   const localMmpgActive = mmpg.mode && mmpg.mode !== 'test' && !['idle', 'error'].includes(mmpg.state)
   const localMmpgError = mmpg.mode && mmpg.mode !== 'test' && !['connecting', 'reconnecting', 'listening', 'muted'].includes(backendMmpgPhase) ? mmpg.error : null
   const mmpgPhase = localMmpgActive ? mmpg.state : localMmpgError ? 'error' : backendMmpgPhase ?? 'idle'
-  const mmpgLabel = isPaused && mmpgPhase === 'idle' ? '已暂停' : mmpgStateLabels[mmpgPhase]
+  const mmpgLabel = isPaused && mmpgPhase === 'idle' ? '已暂停'
+    : mmpgPhase === 'listening' && mmpgAnswerLabel ? mmpgAnswerLabel : mmpgStateLabels[mmpgPhase]
   const mmpgError = (localMmpgActive ? mmpg.error : localMmpgError) ?? (backendMmpgError ? mmpgErrorMessage(backendMmpgError) : null)
   const mmpgNotice = localMmpgActive ? mmpg.notice : null
   const [mobileTab, setMobileTab] = useState<'transcript' | 'answer'>('transcript')

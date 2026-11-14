@@ -122,3 +122,42 @@ def test_closed_window_can_start_new_group_and_clear_drops_timer():
     turns.clear()
     clock.at(4)
     submit.assert_not_called()
+
+
+def test_window_includes_deadline_and_deduplicates_final_events():
+    turns, clock, submit, cancel = setup()
+    turns.final("1", "第一句")
+    clock.call_later(1.5, lambda: turns.started("2"))
+    clock.at(1.5)
+    submit.assert_not_called()
+    turns.final("2", "第二句")
+    turns.final("2", "重复最终事件")
+    clock.at(3)
+    request = submit.call_args.args[0]
+    turns.request_started(request, clock.now)
+    clock.call_later(1.5, lambda: turns.started("3"))
+    clock.at(4.5)
+    cancel.assert_called_once_with(request)
+    turns.final("3", "第三句")
+    clock.at(6)
+    assert submit.call_args.args[0].text == "第一句\n第二句\n第三句"
+
+
+def test_empty_followup_keeps_completed_answer_and_reset_rejects_late_final():
+    turns, clock, submit, cancel = setup()
+    turns.final("1", "第一问")
+    clock.at(1.5)
+    request = submit.call_args.args[0]
+    turns.request_started(request, clock.now)
+    request.completed_qa_id = "completed"
+    turns.request_finished(request)
+    clock.at(2)
+    turns.started("2")
+    turns.final("2", "")
+    clock.at(5)
+    assert submit.call_count == 1
+    turns.started("3")
+    turns.clear(cancel_running=True)
+    turns.final("3", "迟到结果")
+    clock.at(10)
+    assert submit.call_count == 1

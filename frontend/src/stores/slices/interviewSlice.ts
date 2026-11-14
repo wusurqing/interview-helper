@@ -1,6 +1,7 @@
 import type { StateCreator } from 'zustand'
 import type { RootState } from './rootState'
 import type { QAPair, QAStatus } from './types'
+import { mmpgAnswerLabel } from '@/lib/mmpg/settings'
 
 const CHUNK_THROTTLE_MS = 50
 const MAX_TRANSCRIPTIONS = 200
@@ -53,6 +54,7 @@ function _scheduleChunkFlush(set: (fn: (s: RootState) => Partial<RootState>) => 
 export interface InterviewSliceState {
   isRecording: boolean
   interviewerStreaming: boolean
+  mmpgAnswerLabel: string | null
   isPaused: boolean
   audioLevel: number
   isTranscribing: boolean
@@ -66,6 +68,7 @@ export interface InterviewSliceState {
 export interface InterviewSliceActions {
   setRecording: (v: boolean, interviewerStreaming?: boolean) => void
   setPaused: (v: boolean) => void
+  setMmpgAnswerPhase: (phase: unknown) => void
   setAudioLevel: (v: number) => void
   setTranscribing: (v: boolean) => void
   addTranscription: (text: string) => void
@@ -73,7 +76,7 @@ export interface InterviewSliceActions {
   startAnswer: (
     id: string,
     question: string,
-    meta?: { source?: string; modelName?: string },
+    meta?: { source?: string; modelName?: string; updatesQaId?: string },
   ) => void
   appendThinkChunk: (id: string, chunk: string) => void
   appendAnswerChunk: (id: string, chunk: string) => void
@@ -85,8 +88,9 @@ export interface InterviewSliceActions {
     modelName?: string,
     firstTokenMs?: number,
     totalMs?: number,
+    updatesQaId?: string,
   ) => void
-  cancelAnswer: (id: string) => void
+  cancelAnswer: (id: string, reason?: string) => void
   errorAnswer: (id: string, message: string) => void
   setVisionVerify: (id: string, verdict: 'PASS' | 'FAIL' | 'UNKNOWN', reason: string) => void
   setInitData: (data: any) => void
@@ -98,6 +102,7 @@ export type InterviewSlice = InterviewSliceState & InterviewSliceActions
 export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlice> = (set) => ({
   isRecording: false,
   interviewerStreaming: false,
+  mmpgAnswerLabel: null,
   isPaused: false,
   audioLevel: 0,
   isTranscribing: false,
@@ -107,7 +112,11 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
   streamingIds: [],
   currentStreamingId: null,
 
-  setRecording: (v, interviewerStreaming) => set({ isRecording: v, interviewerStreaming: v && interviewerStreaming === true }),
+  setRecording: (v, interviewerStreaming) => set({
+    isRecording: v, interviewerStreaming: v && interviewerStreaming === true,
+    ...(!v ? { mmpgAnswerLabel: null } : {}),
+  }),
+  setMmpgAnswerPhase: (phase) => set({ mmpgAnswerLabel: mmpgAnswerLabel(phase) }),
   setPaused: (v) => set({ isPaused: v }),
   setAudioLevel: (v) => set({ audioLevel: v }),
   setTranscribing: (v) => set({ isTranscribing: v }),
@@ -160,6 +169,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
                   question,
                   questionSource: meta?.source ?? qa.questionSource,
                   modelLabel: meta?.modelName ?? qa.modelLabel,
+                  updatesQaId: meta?.updatesQaId ?? qa.updatesQaId,
                 }
               : qa,
           ),
@@ -179,6 +189,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
             timestamp: Date.now() / 1000,
             questionSource: meta?.source,
             modelLabel: meta?.modelName,
+            updatesQaId: meta?.updatesQaId,
             status: 'streaming' as QAStatus,
           },
         ],
@@ -199,11 +210,14 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
     _scheduleChunkFlush(set)
   },
 
-  finalizeAnswer: (id, question, answer, thinkContent, modelName, firstTokenMs, totalMs) => {
+  finalizeAnswer: (id, question, answer, thinkContent, modelName, firstTokenMs, totalMs, updatesQaId) => {
     _chunkBuffer.delete(id)
     set((s) => {
       const next = s.streamingIds.filter((x) => x !== id)
       const existing = s.qaPairs.some((qa) => qa.id === id)
+      if (s.qaPairs.some((qa) => qa.id === id && qa.status === 'cancelled' && qa.cancelReason === 'continuation')) {
+        return s
+      }
       const qaPairs = existing
         ? s.qaPairs.map((qa) =>
             qa.id === id
@@ -216,6 +230,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
                   modelLabel: modelName ?? qa.modelLabel,
                   firstTokenMs: firstTokenMs ?? qa.firstTokenMs,
                   totalMs: totalMs ?? qa.totalMs,
+                  updatesQaId: updatesQaId ?? qa.updatesQaId,
                   status: 'done' as QAStatus,
                 }
               : qa,
@@ -232,6 +247,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
               modelLabel: modelName,
               firstTokenMs,
               totalMs,
+              updatesQaId,
               status: 'done' as QAStatus,
             },
           ]
@@ -243,7 +259,8 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
     })
   },
 
-  cancelAnswer: (id) => {
+  cancelAnswer: (id, reason) => {
+    const buffered = _chunkBuffer.get(id)
     _chunkBuffer.delete(id)
     set((s) => {
       const next = s.streamingIds.filter((x) => x !== id)
@@ -251,7 +268,15 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
         currentStreamingId: next.length ? next[next.length - 1] : null,
         streamingIds: next,
         qaPairs: s.qaPairs.map((qa) =>
-          qa.id === id ? { ...qa, isThinking: false, status: 'cancelled' as QAStatus } : qa,
+          qa.id === id && qa.status !== 'done'
+            ? {
+                ...qa,
+                answer: reason === 'continuation' ? qa.answer + (buffered?.answer ?? '') : qa.answer,
+                isThinking: false,
+                status: 'cancelled' as QAStatus,
+                cancelReason: reason,
+              }
+            : qa,
         ),
       }
     })
@@ -315,6 +340,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
             timestamp: qa.timestamp ?? Date.now() / 1000,
             questionSource: (qa as any).source ?? qa.questionSource,
             modelLabel: (qa as any).model_name ?? qa.modelLabel,
+            updatesQaId: (qa as any).updates_qa_id ?? qa.updatesQaId,
             status: qa.status ?? 'done' as QAStatus,
             ...(visionVerify ? { visionVerify } : {}),
           }
@@ -324,6 +350,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
       streamingIds: [],
       isRecording: data.is_recording ?? false,
       interviewerStreaming: data.is_recording === true && data.interviewer_streaming === true,
+      mmpgAnswerLabel: mmpgAnswerLabel(data.mmpg_answer_phase),
       isPaused: data.is_paused ?? false,
       sttLoaded: data.stt_loaded ?? false,
       candidateSttLoaded: false,
@@ -340,6 +367,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
       _chunkFlushTimer = null
     }
     set({
+      mmpgAnswerLabel: null,
       transcriptions: [],
       candidateTranscriptions: [],
       qaPairs: [],

@@ -32,6 +32,10 @@ def clear_turns():
         _turns.clear(cancel_running=True)
 
 
+def answer_phase():
+    return _turns.phase if _turns is not None else "idle"
+
+
 def _turn_event(kind, trace):
     if _turns is None:
         return
