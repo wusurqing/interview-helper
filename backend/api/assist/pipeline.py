@@ -523,6 +523,7 @@ def _reset_answer_state():
     global _pending, _in_flight_tasks, _commit_buffer, _skipped_commit_seqs, _next_commit_seq, _task_session_version, _latest_asr_turn_id, _recent_asr_turn_monos
     with _asr_state_lock:
         with _dispatch_lock:
+            tasks = [item[0] for item in _pending] + [item[1] for item in _in_flight_tasks.values()]
             _pending.clear()
             _in_flight_tasks.clear()
             _latest_asr_turn_id = 0
@@ -531,6 +532,9 @@ def _reset_answer_state():
             next_commit_seq = _next_submit_seq
         _reset_asr_merge_buffer_locked()
         _reset_pending_asr_group_locked()
+    for task in tasks:
+        if request := task_meta(task).get("mmpg_request"):
+            _cancel_mmpg_request(request, reason="stopped")
     # commit 相关操作单独处理
     with _commit_lock:
         _commit_buffer.clear()
@@ -632,6 +636,7 @@ def _mark_seq_skipped(seq: int):
     with _commit_lock:
         if seq < _next_commit_seq:
             return
+        _commit_buffer.pop(seq, None)
         _skipped_commit_seqs.add(seq)
         _drain_commit_queue_locked()
 
@@ -702,14 +707,23 @@ def submit_answer_task(task: TaskPayload) -> bool:
             }
         )
         return False
+    request = task_meta(task).get("mmpg_request")
     with _dispatch_lock:
         seq = _next_submit_seq
         _next_submit_seq += 1
         tv = _task_session_version
+        if request:
+            request.seq = seq
         _pending.append((task, seq, tv))
         delay = max(0.0, float(_task_meta(task).get("dispatch_after_mono", 0.0) or 0.0) - time.monotonic())
     if trace := _task_meta(task).get("mmpg_trace"):
-        get_logger("mmpg.diagnostics").info("turn=%s event=answer_queued seq=%s", trace, seq)
+        if request:
+            get_logger("mmpg.diagnostics").info(
+                "turn=%s group=%s revision=%s event=answer_queued seq=%s since_final_ms=%.1f",
+                trace, request.group_id, request.revision, seq, (time.monotonic() - request.final_at) * 1000,
+            )
+        else:
+            get_logger("mmpg.diagnostics").info("turn=%s event=answer_queued seq=%s", trace, seq)
     _try_dispatch()
     if delay > 0:
         timer = threading.Timer(delay, _try_dispatch)
@@ -718,18 +732,29 @@ def submit_answer_task(task: TaskPayload) -> bool:
     return True
 
 
-def cancel_mmpg_answer(request):
-    if request.completed_qa_id:
+def _cancel_mmpg_request(request, *, reason):
+    with request.lock:
+        if request.cancel():
+            get_logger("mmpg.diagnostics").info(
+                "turn=%s group=%s revision=%s event=request_cancelled reason=%s",
+                request.traces[-1], request.group_id, request.revision, reason,
+            )
+            if request.shown_qa_id:
+                broadcast({"type": "answer_cancelled", "id": request.shown_qa_id, "reason": reason})
+            return True
+    return False
+
+
+def cancel_mmpg_answer(request, *, reason="continuation"):
+    if not _cancel_mmpg_request(request, reason=reason):
         return request.completed_qa_id
-    request.cancelled = True
     with _dispatch_lock:
-        for index, (task, seq, _version) in enumerate(_pending):
+        for index, (task, _seq, _version) in enumerate(_pending):
             if task_meta(task).get("mmpg_request") is request:
                 _pending.pop(index)
                 break
-        else:
-            return None
-    _mark_seq_skipped(seq)
+    if request.seq is not None:
+        _mark_seq_skipped(request.seq)
     _try_dispatch()
     return None
 
@@ -894,12 +919,15 @@ def _run_answer_worker(
     finally:
         with _dispatch_lock:
             _in_flight_tasks.pop(seq, None)
+        request = task_meta(task).get("mmpg_request")
+        if request and request.on_finished:
+            request.on_finished()
         _try_dispatch()
 
 
 def _flush_commit(seq: int, apply_fn: Callable[[], None]):
     with _commit_lock:
-        if seq < _next_commit_seq:
+        if seq < _next_commit_seq or seq in _skipped_commit_seqs:
             return
         _commit_buffer[seq] = apply_fn
         _drain_commit_queue_locked()

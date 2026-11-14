@@ -13,6 +13,7 @@ if str(BACKEND_DIR) not in sys.path:
 
 from core.session import get_session, reset_session  # noqa: E402
 from api.assist import answer_worker  # noqa: E402
+from api.assist.mmpg_turns import MmpgRequest  # noqa: E402
 
 
 class _Logger:
@@ -123,13 +124,43 @@ def test_process_question_parallel_streams_and_commits_answer(monkeypatch: pytes
     assert broadcasts[3]["answer"] == "用 AOF 和 RDB 组合。"
     assert broadcasts[3]["think"] == "先判断场景"
     assert knowledge == [("Redis 怎么持久化？", "用 AOF 和 RDB 组合。", broadcasts[0]["id"], "")]
-
     session = get_session()
     assert len(session.qa_pairs) == 1
     assert session.qa_pairs[0].question == "Redis 怎么持久化？"
     assert session.qa_pairs[0].answer == "用 AOF 和 RDB 组合。"
     assert session.qa_pairs[0].model_name == "模型一"
 
+
+@pytest.mark.parametrize("cancel_first", [True, False])
+def test_mmpg_cancellation_and_commit_are_mutually_exclusive(monkeypatch, cancel_first):
+    broadcasts = []
+    knowledge = []
+    pending_commit = []
+    request = MmpgRequest("group", 1, "Redis 怎么持久化？", ("trace",), 0, None)
+
+    def stream(*args, **kwargs):
+        request.started_at = answer_worker.time.monotonic()
+        yield "text", "用 AOF 和 RDB 组合。"
+
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", stream)
+    answer_worker.process_question_parallel(
+        (request.text, None, False, "conversation_loopback", {"origin": "mmpg", "mmpg_request": request}),
+        seq=0, model_idx=0, sess_v=0,
+        deps=_deps(broadcasts=broadcasts, knowledge=knowledge,
+                   abort_check=lambda: request.cancelled, flush_commit=lambda _, fn: pending_commit.append(fn)),
+    )
+    assert len(pending_commit) == 1
+    if cancel_first:
+        assert request.cancel()
+        pending_commit[0]()
+        assert request.completed_qa_id is None and not knowledge
+        assert not get_session().qa_pairs
+        assert not any(event["type"] == "answer_done" for event in broadcasts)
+    else:
+        pending_commit[0]()
+        assert not request.cancel()
+        assert get_session().qa_pairs[0].id == request.completed_qa_id
+        assert len(knowledge) == 1
 
 def test_first_token_latency_starts_on_answer_not_hidden_think(
     monkeypatch: pytest.MonkeyPatch,

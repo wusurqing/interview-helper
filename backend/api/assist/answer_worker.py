@@ -688,7 +688,15 @@ def process_question_parallel(
     def _broadcast(data: dict) -> None:
         if exam_preflight_id:
             data = {**data, "exam_preflight_id": exam_preflight_id}
-        deps.broadcast(data)
+        if mmpg_request:
+            with mmpg_request.lock:
+                if mmpg_request.cancelled:
+                    return
+                if data["type"] == "answer_start":
+                    mmpg_request.shown_qa_id = qa_id
+                deps.broadcast(data)
+        else:
+            deps.broadcast(data)
         if mmpg_trace and data["type"] in ("answer_done", "answer_error", "answer_cancelled"):
             get_logger("mmpg.diagnostics").info(
                 "turn=%s event=%s seq=%s stage=%s", mmpg_trace, data["type"], seq, data.get("stage"),
@@ -1010,9 +1018,7 @@ def process_question_parallel(
 
     exam_think_notified = False
     gen_start = time.monotonic()
-    if mmpg_request and mmpg_request.on_started:
-        mmpg_request.on_started(gen_start)
-    if mmpg_trace:
+    if mmpg_trace and not mmpg_request:
         get_logger("mmpg.diagnostics").info("turn=%s event=llm_start seq=%s", mmpg_trace, seq)
     # User-facing "首字" latency means the first answer token, not a hidden
     # reasoning token.  This matters for written-exam mode where Think output
@@ -1040,6 +1046,7 @@ def process_question_parallel(
                 cfg,
                 high_churn_short_answer=high_churn_short_answer,
             ),
+            **({"mmpg_request": mmpg_request, "config_snapshot": cfg} if mmpg_request else {}),
         ):
             if deps.abort_check():
                 break
@@ -1067,10 +1074,18 @@ def process_question_parallel(
                 if first_token_mono is None and chunk_text:
                     first_token_mono = time.monotonic()
                     if mmpg_trace:
-                        get_logger("mmpg.diagnostics").info(
-                            "turn=%s event=llm_first_token seq=%s elapsed_ms=%.1f",
-                            mmpg_trace, seq, (first_token_mono - gen_start) * 1000,
-                        )
+                        if mmpg_request:
+                            get_logger("mmpg.diagnostics").info(
+                                "turn=%s group=%s revision=%s event=llm_first_token seq=%s elapsed_ms=%.1f since_final_ms=%.1f",
+                                mmpg_trace, mmpg_request.group_id, mmpg_request.revision, seq,
+                                (first_token_mono - mmpg_request.started_at) * 1000,
+                                (first_token_mono - mmpg_request.final_at) * 1000,
+                            )
+                        else:
+                            get_logger("mmpg.diagnostics").info(
+                                "turn=%s event=llm_first_token seq=%s elapsed_ms=%.1f",
+                                mmpg_trace, seq, (first_token_mono - gen_start) * 1000,
+                            )
                 raw_full_answer += chunk_text
                 clean_chunk = stream_sanitizer.push(chunk_text)
                 if clean_chunk:
@@ -1084,6 +1099,9 @@ def process_question_parallel(
             _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": "".join(chunk_buffer)})
             chunk_buffer.clear()
     except Exception as exc:
+        if mmpg_request and mmpg_request.cancelled:
+            deps.mark_seq_skipped(seq)
+            return
         deps.error_logger.error(
             "LLM stream error id=%s: %s",
             qa_id,
@@ -1112,6 +1130,8 @@ def process_question_parallel(
         deps.mark_seq_skipped(seq)
         return
 
+    if mmpg_request and mmpg_request.started_at is not None:
+        gen_start = mmpg_request.started_at
     gen_elapsed = (time.monotonic() - gen_start) * 1000
     first_token_ms = (
         (first_token_mono - gen_start) * 1000 if first_token_mono else gen_elapsed
@@ -1285,4 +1305,8 @@ def process_question_parallel(
                 "message": "答案保存失败",
             })
 
-    deps.flush_commit(seq, _commit)
+    def _commit_current_request():
+        with mmpg_request.lock:
+            _commit()
+
+    deps.flush_commit(seq, _commit_current_request if mmpg_request else _commit)

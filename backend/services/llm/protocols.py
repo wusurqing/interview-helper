@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from typing import Any, Generator, Optional
 
 import requests
+import httpx
 
 from core.logger import get_logger
 
@@ -432,6 +433,67 @@ _CHUNK_PARSERS = {
 }
 
 
+def _parse_sse_data(line, api_type, parser):
+    """Return a parsed delta and whether the stream has reached its end."""
+    if not line.startswith("data:"):
+        return None, False
+    data = line[5:].strip()
+    if data == "[DONE]":
+        return None, True
+    try:
+        obj = json.loads(data)
+    except ValueError:
+        return None, False
+    chunk = parser(obj)
+    event = obj.get("type")
+    done = ((api_type == API_TYPE_ANTHROPIC and event == "message_stop")
+            or (api_type == API_TYPE_RESPONSES and event == "response.completed"))
+    return chunk if chunk.choices or chunk.usage else None, done
+
+
+def _stream_targets(api_base_url, api_type, api_key):
+    candidates = chat_url_candidates(api_base_url, api_type)
+    if not candidates:
+        from services.llm.streaming import LLMError
+
+        raise LLMError("API Base URL 不能为空")
+    header_variants = [build_llm_headers(api_type, api_key)]
+    if api_type == API_TYPE_ANTHROPIC:
+        header_variants.append(build_llm_headers(api_type, api_key, bearer=True))
+    return candidates, header_variants
+
+
+async def post_cancellable_chat_stream(api_base_url, api_type, api_key, payload, *, on_started):
+    candidates, header_variants = _stream_targets(api_base_url, api_type, api_key)
+    parser = _CHUNK_PARSERS.get(api_type, _openai_chunk)
+    first = True
+    async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=10), follow_redirects=True) as client:
+        for url in candidates:
+            for headers in header_variants:
+                if first:
+                    on_started()
+                    first = False
+                async with client.stream("POST", url, headers=headers, json=payload) as response:
+                    status = response.status_code
+                    if status in (401, 403) and headers is not header_variants[-1]:
+                        continue
+                    if status in (404, 405):
+                        break
+                    if status >= 400:
+                        await response.aread()
+                        raise_for_llm_status(status, response.text)
+                    async for line in response.aiter_lines():
+                        chunk, done = _parse_sse_data(line, api_type, parser)
+                        if chunk is not None:
+                            yield chunk
+                        if done:
+                            break
+                    return
+    from services.llm.streaming import LLMError
+
+    raise LLMError("未找到可用的对话接口地址")
+
+
 def post_chat_stream(
     api_base_url: str,
     api_type: str,
@@ -441,15 +503,7 @@ def post_chat_stream(
     timeout: tuple[float, float] = (10, 90),
 ) -> Generator[SimpleNamespace, None, None]:
     """POST a streaming chat request, trying URL candidates on 404/405."""
-    candidates = chat_url_candidates(api_base_url, api_type)
-    if not candidates:
-        from services.llm.streaming import LLMError
-
-        raise LLMError("API Base URL 不能为空")
-    # anthropic：x-api-key 优先，401/403 时同 URL 换 Bearer 变体重试
-    header_variants = [build_llm_headers(api_type, api_key)]
-    if api_type == API_TYPE_ANTHROPIC:
-        header_variants.append(build_llm_headers(api_type, api_key, bearer=True))
+    candidates, header_variants = _stream_targets(api_base_url, api_type, api_key)
     parser = _CHUNK_PARSERS.get(api_type, _openai_chunk)
     last_not_found = ""
     for url in candidates:
@@ -467,23 +521,10 @@ def post_chat_stream(
                         body = resp.text
                     raise_for_llm_status(resp.status_code, str(body))
                 for line in _iter_sse_lines(resp):
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if not data or data == "[DONE]":
-                        if data == "[DONE]":
-                            break
-                        continue
-                    try:
-                        obj = json.loads(data)
-                    except Exception:
-                        continue
-                    chunk = parser(obj)
-                    if chunk.choices or chunk.usage:
+                    chunk, done = _parse_sse_data(line, api_type, parser)
+                    if chunk is not None:
                         yield chunk
-                    if api_type == API_TYPE_ANTHROPIC and obj.get("type") == "message_stop":
-                        break
-                    if api_type == API_TYPE_RESPONSES and obj.get("type") == "response.completed":
+                    if done:
                         break
                 return
     from services.llm.streaming import LLMError

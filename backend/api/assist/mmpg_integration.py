@@ -53,7 +53,9 @@ def _new_turns():
     loop = asyncio.get_running_loop()
 
     def submit(request):
-        request.on_started = lambda at: loop.call_soon_threadsafe(turns.request_started, request, at)
+        request.loop = loop
+        request.on_started = lambda at: turns.request_started(request, at)
+        request.on_finished = lambda: loop.call_soon_threadsafe(turns.request_finished, request)
         return pipeline.submit_mmpg_question(request)
 
     def log_event(event, **fields):
@@ -63,6 +65,7 @@ def _new_turns():
         submit=submit, cancel=pipeline.cancel_mmpg_answer,
         publish=lambda phase: broadcast({"type": "mmpg_answer_phase", "phase": phase}),
         enabled=_enabled, clock=loop.time, call_later=loop.call_later, log=log_event,
+        cancel_on_clear=lambda request: pipeline.cancel_mmpg_answer(request, reason="stopped"),
         answer_delay_ms=_session_settings.answer_delay_ms,
         followup_window_ms=_session_settings.followup_window_ms,
     )

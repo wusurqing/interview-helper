@@ -1,5 +1,7 @@
 """LLM client management, token tracking, and streaming generation."""
 
+import asyncio
+from concurrent.futures import CancelledError
 import threading
 import json
 import re
@@ -7,6 +9,7 @@ from types import SimpleNamespace
 from openai import OpenAI
 import openai
 import requests
+import httpx
 from typing import Callable, Generator, Optional
 from core.config import get_config
 from core.logger import get_logger
@@ -18,6 +21,7 @@ from services.llm.protocols import (
     normalize_api_base_url,
     post_chat_blocking,
     post_chat_stream,
+    post_cancellable_chat_stream,
 )
 
 _log = get_logger("llm.streaming")
@@ -103,6 +107,10 @@ def _classify_exception(e: BaseException) -> LLMError:
         return LLMConnectionError(_compact_error_detail(e), cause=e)
     if isinstance(e, requests.exceptions.Timeout):
         return LLMTimeout(_compact_error_detail(e), cause=e)
+    if isinstance(e, httpx.TimeoutException):
+        return LLMTimeout(_compact_error_detail(e), cause=e)
+    if isinstance(e, httpx.TransportError):
+        return LLMConnectionError(_compact_error_detail(e), cause=e)
     if isinstance(e, requests.exceptions.ConnectionError):
         return LLMConnectionError(_compact_error_detail(e), cause=e)
     if isinstance(e, requests.exceptions.RequestException):
@@ -716,6 +724,60 @@ def chat_stream(
         yield ("text", f"\n\n[{last_error.user_msg}]")
 
 
+def _mmpg_stream(model, messages, cfg, request, abort_check):
+    """Read an async HTTP stream from the existing answer worker thread."""
+    loop = request.loop
+    api_type = get_api_type(model)
+    payload = build_chat_payload(
+        api_type, model.model, messages, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
+        stream=True, think_params=_build_think_params(model, cfg),
+    )
+    if api_type == "openai":
+        payload.pop("max_tokens", None)
+        payload.pop("max_completion_tokens", None)
+        payload.update(_completion_token_kwargs(model, cfg.max_tokens))
+
+    def started():
+        request.started_at = loop.time()
+        get_logger("mmpg.diagnostics").info(
+            "turn=%s group=%s revision=%s event=llm_start seq=%s since_final_ms=%.1f",
+            request.traces[-1], request.group_id, request.revision, request.seq,
+            (request.started_at - request.final_at) * 1000,
+        )
+        if request.on_started:
+            request.on_started(request.started_at)
+
+    stream = post_cancellable_chat_stream(model.api_base_url, api_type, model.api_key, payload, on_started=started)
+
+    async def read():
+        with request.lock:
+            if request.cancelled:
+                return None
+            request.stream_read = asyncio.current_task()
+        try:
+            return await anext(stream, None)
+        finally:
+            with request.lock:
+                request.stream_read = None
+
+    try:
+        while not request.cancelled and not (abort_check and abort_check()):
+            chunk = asyncio.run_coroutine_threadsafe(read(), loop).result()
+            if chunk is None or request.cancelled:
+                break
+            yield chunk
+    except CancelledError:
+        if not request.cancelled:
+            raise
+    finally:
+        if loop.is_running():
+            asyncio.run_coroutine_threadsafe(stream.aclose(), loop).result()
+        get_logger("mmpg.diagnostics").info(
+            "group=%s revision=%s event=request_released cancelled=%s",
+            request.group_id, request.revision, request.cancelled,
+        )
+
+
 def chat_stream_single_model(
     model_cfg,
     messages: list[dict],
@@ -724,9 +786,11 @@ def chat_stream_single_model(
     override_think_mode: Optional[bool] = None,
     usage_callback: Optional[Callable[[int, int, str], None]] = None,
     override_max_tokens: Optional[int] = None,
+    mmpg_request=None,
+    config_snapshot=None,
 ) -> Generator[tuple[str, str], None, None]:
     """仅使用指定模型流式输出，不做跨模型降级（供并行答题）。"""
-    cfg = _config_with_think_override(get_config(), override_think_mode)
+    cfg = _config_with_think_override(config_snapshot if config_snapshot is not None else get_config(), override_think_mode)
     if override_max_tokens is not None:
         cfg = _copy_config_with_updates(cfg, {"max_tokens": max(1, int(override_max_tokens))})
     clean_messages = _sanitize_messages(messages, model_cfg.supports_vision)
@@ -737,7 +801,10 @@ def chat_stream_single_model(
     model_name = model_cfg.name
     try:
         emit_think = _should_emit_think(model_cfg, cfg)
-        response = _try_stream_with_model(model_cfg, full_messages, cfg)
+        if mmpg_request is not None:
+            response = _mmpg_stream(model_cfg, full_messages, cfg, mmpg_request, abort_check)
+        else:
+            response = _try_stream_with_model(model_cfg, full_messages, cfg)
         last_usage = (0, 0)
         for chunk in response:
             if abort_check and abort_check():
@@ -760,6 +827,8 @@ def chat_stream_single_model(
                     usage_callback(prompt_tokens, completion_tokens, model_name)
                 _broadcast_tokens()
     except Exception as e:
+        if mmpg_request is not None and mmpg_request.cancelled:
+            return
         err = _classify_exception(e)
         _log.error(
             "LLM single-model error model=%s kind=%s: %s",
@@ -771,3 +840,6 @@ def chat_stream_single_model(
         if err is e:
             raise
         raise err from None
+    finally:
+        if mmpg_request is not None and "response" in locals():
+            response.close()

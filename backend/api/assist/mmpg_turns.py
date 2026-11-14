@@ -1,6 +1,8 @@
 """Collect continuous MMPG utterances before and during answer generation."""
 
+import asyncio
 from dataclasses import dataclass, field
+from threading import RLock
 from typing import Callable
 from uuid import uuid4
 
@@ -16,6 +18,22 @@ class MmpgRequest:
     completed_qa_id: str | None = None
     cancelled: bool = False
     on_started: Callable[[float], None] | None = None
+    on_finished: Callable[[], None] | None = None
+    shown_qa_id: str | None = None
+    seq: int | None = None
+    started_at: float | None = None
+    loop: asyncio.AbstractEventLoop | None = field(default=None, repr=False)
+    lock: RLock = field(default_factory=RLock, repr=False, compare=False)
+    stream_read: asyncio.Task | None = field(default=None, repr=False)
+
+    def cancel(self) -> bool:
+        with self.lock:
+            if self.cancelled or self.completed_qa_id:
+                return False
+            self.cancelled = True
+            if self.stream_read is not None:
+                self.loop.call_soon_threadsafe(self.stream_read.cancel)
+            return True
 
 
 @dataclass
@@ -33,9 +51,10 @@ class _Question:
 
 class MmpgTurns:
     def __init__(self, *, submit, cancel, publish, enabled, clock, call_later,
-                 answer_delay_ms, followup_window_ms, log=None):
+                 answer_delay_ms, followup_window_ms, log=None, cancel_on_clear=None):
         self._submit = submit
         self._cancel = cancel
+        self._cancel_on_clear = cancel_on_clear or cancel
         self._publish = publish
         self._enabled = enabled
         self._clock = clock
@@ -88,7 +107,7 @@ class MmpgTurns:
         if group:
             self._seen.update(group.speaking)
             if group.request and (cancel_running or group.followup_until is None):
-                self._cancel(group.request)
+                self._cancel_on_clear(group.request)
             self._log("group_cleared", group=group.id)
         self._set_phase("idle")
 
@@ -111,6 +130,9 @@ class MmpgTurns:
         if group and trace in group.speaking:
             return
         now = self._clock()
+        if group and group.request and group.request.started_at is not None and group.followup_until is None:
+            self.request_started(group.request, group.request.started_at)
+            group = self._group
         if group and group.followup_until is not None and now > group.followup_until:
             self.clear()
             group = None
@@ -188,7 +210,7 @@ class MmpgTurns:
 
     def request_started(self, request, started_at):
         group = self._group
-        if not group or group.request is not request:
+        if not group or group.request is not request or group.followup_until is not None:
             return
         if self._followup == 0:
             group.followup_until = started_at
