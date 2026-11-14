@@ -1,0 +1,17 @@
+{
+  "name": "mmpg-probe",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local MMPG ASR and turn-detection probe; never calls an LLM",
+  "scripts": {
+    "build": "esbuild app.js --bundle --format=esm --platform=browser --target=chrome110 --outfile=dist/app.js",
+    "check": "node --check app.js"
+  },
+  "dependencies": {
+    "@volcengine/rtc": "4.69.5"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

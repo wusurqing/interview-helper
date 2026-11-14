@@ -173,6 +173,7 @@ export const api = {
   getConfig: () => request('/api/config'),
   updateConfig: (data: Record<string, any>) =>
     request('/api/config', { method: 'POST', body: JSON.stringify(data) }),
+  importMmpgProbe: () => request<{ ok: boolean }>('/api/stt/mmpg/import-probe', { method: 'POST' }),
   modelsLayout: (data: {
     order?: number[]
     enabled?: boolean[]

@@ -64,6 +64,8 @@ from api.assist.scheduler import (
 _interview_thread: Optional[threading.Thread] = None
 _interviewer_asr_thread: Optional[threading.Thread] = None
 _candidate_thread: Optional[threading.Thread] = None
+_interviewer_streaming = False
+_interviewer_config = None
 _candidate_audio_capture = AudioCapture()
 _stop_event = threading.Event()
 _pause_event = threading.Event()
@@ -442,7 +444,9 @@ def _start_interview_worker_thread_if_needed() -> None:
     global _interview_thread
     if _interview_thread and _interview_thread.is_alive():
         return
-    _interview_thread = threading.Thread(target=_interview_worker, daemon=True)
+    _interview_thread = threading.Thread(
+        target=_interview_worker, args=(_interviewer_config,), daemon=True,
+    )
     _interview_thread.start()
 
 
@@ -918,8 +922,15 @@ def _is_valid_device_id(value: Any) -> bool:
         return False
 
 
-def start_nonblocking(device_id: Optional[int] = None, candidate_mic_device_id: Optional[int] = None):
-    global _interview_thread, _candidate_thread
+def start_nonblocking(
+    device_id: Optional[int] = None,
+    candidate_mic_device_id: Optional[int] = None,
+    *,
+    stream_audio: Optional[Callable[[np.ndarray], None]] = None,
+    config_snapshot=None,
+):
+    global _interview_thread, _candidate_thread, _interviewer_streaming, _interviewer_config
+    start_cfg = config_snapshot if config_snapshot is not None else get_config()
     stop_interview_loop()
     _set_last_interviewer_runtime_snapshot(None)
     _stop_event.clear()
@@ -933,7 +944,10 @@ def start_nonblocking(device_id: Optional[int] = None, candidate_mic_device_id: 
     if device_id is not None:
         capture_is_loopback = _device_is_loopback(device_id)
 
-        audio_capture.start(device_id, owner="assist")
+        if stream_audio is None:
+            audio_capture.start(device_id, owner="assist")
+        else:
+            audio_capture.start(device_id, on_audio=stream_audio, owner="assist", queue_audio=False)
 
         with conversation_lock:
             session.last_device_id = int(device_id)
@@ -946,14 +960,19 @@ def start_nonblocking(device_id: Optional[int] = None, candidate_mic_device_id: 
             session.capture_is_loopback = False
         _ilog.info("INTERVIEW_START no_device (written_exam_mode)")
 
+    _interviewer_streaming = stream_audio is not None and device_id is not None
+    _interviewer_config = start_cfg if device_id is not None and not _interviewer_streaming else None
     with conversation_lock:
         session.is_recording = True
         session.is_paused = False
 
-    broadcast({"type": "recording", "value": True})
+    recording = {"type": "recording", "value": True}
+    if _interviewer_streaming:
+        recording["interviewer_streaming"] = True
+    broadcast(recording)
     broadcast({"type": "paused", "value": False})
 
-    if device_id is not None:
+    if device_id is not None and not _interviewer_streaming:
         _start_interview_worker_thread_if_needed()
 
     cfg = get_config()
@@ -999,12 +1018,13 @@ def start_nonblocking(device_id: Optional[int] = None, candidate_mic_device_id: 
         interviewer_device_id=device_id,
         candidate_device_id=review_candidate_device_id,
         candidate_asr_enabled=bool(getattr(cfg, "candidate_asr_enabled", False)),
-        written_exam_mode=bool(getattr(cfg, "written_exam_mode", False)),
+        written_exam_mode=not _interviewer_streaming and bool(getattr(cfg, "written_exam_mode", False)),
     )
 
 
 def stop_interview_loop():
-    global _interview_thread, _interviewer_asr_thread, _candidate_thread, _flush_thread
+    global _interview_thread, _interviewer_asr_thread, _candidate_thread, _flush_thread, _interviewer_streaming
+    global _interviewer_config
     _stop_event.set()
     _pause_event.clear()
     _candidate_flush_event.set()
@@ -1062,15 +1082,14 @@ def stop_interview_loop():
         _candidate_thread.join(timeout=5)
     _candidate_thread = None
 
-    try:
-        _try_flush_asr_merge_buffer(
-            get_config(), session, time.monotonic(), True
-        )
-        _try_flush_asr_question_group(
-            get_config(), session, time.monotonic(), True
-        )
-    except Exception:
-        _elog.debug("final ASR flush during stop skipped", exc_info=True)
+    if not _interviewer_streaming:
+        try:
+            _try_flush_asr_merge_buffer(get_config(), session, time.monotonic(), True)
+            _try_flush_asr_question_group(get_config(), session, time.monotonic(), True)
+        except Exception:
+            _elog.debug("final ASR flush during stop skipped", exc_info=True)
+    _interviewer_streaming = False
+    _interviewer_config = None
 
     wait_sec = float(getattr(get_config(), "assist_stop_answer_wait_sec", 3.0))
     if wait_sec > 0 and not _wait_for_answer_work_idle(min(wait_sec, 20.0)):
@@ -1109,11 +1128,16 @@ def pause_interview():
     broadcast({"type": "paused", "value": True})
 
 
-def unpause_interview(device_id: Optional[int] = None, candidate_mic_device_id: Optional[int] = None):
+def unpause_interview(
+    device_id: Optional[int] = None,
+    candidate_mic_device_id: Optional[int] = None,
+    *,
+    stream_audio: Optional[Callable[[np.ndarray], None]] = None,
+):
     global _interview_thread, _candidate_thread
     session = get_session()
     cfg = get_config()
-    written_exam = bool(getattr(cfg, "written_exam_mode", False))
+    written_exam = stream_audio is None and bool(getattr(cfg, "written_exam_mode", False))
     if written_exam:
         # A written exam has no audio workers. Ignore stale device IDs from a
         # previous interview and requests from older clients.
@@ -1142,8 +1166,11 @@ def unpause_interview(device_id: Optional[int] = None, candidate_mic_device_id: 
         )
     )
     if should_resume_interviewer:
-        audio_capture.start(next_device_id, owner="assist")
-        _start_interview_worker_thread_if_needed()
+        if stream_audio is None:
+            audio_capture.start(next_device_id, owner="assist")
+            _start_interview_worker_thread_if_needed()
+        else:
+            audio_capture.start(next_device_id, on_audio=stream_audio, owner="assist", queue_audio=False)
     last_candidate_id = (
         _UNSET_DEVICE_ID
         if written_exam
@@ -1220,6 +1247,17 @@ def is_paused() -> bool:
     return _pause_event.is_set()
 
 
+def is_streaming_interview() -> bool:
+    return _interviewer_streaming and get_session().is_recording
+
+
+def accept_streaming_asr_turn(text: str) -> None:
+    session = get_session()
+    if _interviewer_streaming and session.is_recording and not session.is_paused:
+        with _asr_state_lock:
+            _asr_state.accept_final_turn(get_config(), session, text)
+
+
 # H4: 独立 flush worker 线程，避免阻塞音频采集主循环
 def _flush_worker():
     """独立线程处理 ASR buffer flush，避免阻塞音频采集"""
@@ -1254,6 +1292,9 @@ def _interviewer_asr_worker(runtime: _InterviewerRuntime, session, cfg) -> None:
                 segment.sample_rate,
                 position=current_cfg.position,
                 language=current_cfg.language,
+                provider=getattr(cfg, "stt_provider", "whisper"),
+                whisper_model=getattr(cfg, "whisper_model", None),
+                whisper_language=getattr(cfg, "whisper_language", None),
                 scope="interviewer",
                 fallback_on_empty_remote=True,
             )
@@ -1284,9 +1325,13 @@ def _interviewer_asr_worker(runtime: _InterviewerRuntime, session, cfg) -> None:
             broadcast({"type": "transcribing", "value": False})
 
 
-def _interview_worker():
-    cfg = get_config()
-    engine = get_stt_engine()
+def _interview_worker(config_snapshot=None):
+    cfg = config_snapshot if config_snapshot is not None else get_config()
+    provider = getattr(cfg, "stt_provider", None)
+    engine = (get_stt_engine() if config_snapshot is None or not provider else get_stt_engine(
+        provider=provider, model_size=getattr(cfg, "whisper_model", None),
+        language=getattr(cfg, "whisper_language", None),
+    ))
     # 每次开新会话都用全新 runtime：上次异常退出遗留的 last_chunk_mono 会把
     # 跨会话的间隔当成音频空洞，打出 gap_ms=几千万 的假警报（日志已多次出现）。
     runtime = _new_interviewer_runtime()
@@ -1492,6 +1537,8 @@ def _interview_worker():
 def _candidate_provider_config(cfg) -> tuple[str, str, str, bool]:
     provider = (getattr(cfg, "candidate_stt_provider", "whisper") or "whisper").strip()
     allow_remote = bool(getattr(cfg, "candidate_remote_stt_enabled", False))
+    if provider == "doubao_mmpg":
+        provider = "whisper"
     if provider in ("doubao", "generic") and not allow_remote:
         provider = "whisper"
     # 本地引擎互斥：候选人链路跟随主链路的本地引擎，避免 funasr 与 whisper

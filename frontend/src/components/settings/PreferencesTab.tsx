@@ -151,7 +151,9 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
   ])
 
   const sttLabel =
-    config?.stt_provider === 'doubao'
+    config?.stt_provider === 'doubao_mmpg'
+      ? '豆包 MMPG'
+      : config?.stt_provider === 'doubao'
       ? '豆包'
       : config?.stt_provider === 'generic'
         ? '通用 ASR'

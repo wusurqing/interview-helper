@@ -10,9 +10,11 @@ from core.config import get_config
 from core.logger import get_logger
 from core.session import get_session, snapshot_session
 from services.audio import AudioBusyError
+from . import mmpg_integration as mmpg
 from .pipeline import (
     cancel_answer_work,
     is_paused,
+    is_streaming_interview,
     pause_interview,
     pick_model_index,
     prompt_server_screen_code,
@@ -44,13 +46,23 @@ class ServerScreenQuestion(BaseModel):
 
 @router.post("/start")
 async def api_start(body: dict):
+    async with mmpg.http_lifecycle_lock:
+        return await _api_start(body)
+
+
+async def _api_start(body: dict):
     from .exam_test import is_exam_preflight_running
 
     if is_exam_preflight_running():
         raise HTTPException(409, "笔试链路检测正在运行，请等待检测结束后再开始")
     cfg = get_config()
     written_exam = bool(getattr(cfg, "written_exam_mode", False))
-    device_id = body.get("device_id")
+    if mmpg.manager.active:
+        raise HTTPException(409, "豆包语义判停会话正在连接或运行")
+    uses_mmpg = getattr(cfg, "stt_provider", None) == mmpg.PROVIDER
+    if not written_exam and uses_mmpg:
+        raise HTTPException(409, "请从桌面主窗口或本机浏览器开始豆包语义判停")
+    device_id = None if written_exam and uses_mmpg else body.get("device_id")
     candidate_mic_device_id = body.get("candidate_mic_device_id")
     if not written_exam and device_id is None:
         raise HTTPException(400, "\u8bf7\u9009\u62e9\u97f3\u9891\u8bbe\u5907")
@@ -69,7 +81,9 @@ async def api_start(body: dict):
     else:
         candidate_dev = None
     try:
-        if candidate_dev is None:
+        if dev is not None and not written_exam:
+            await run_in_threadpool(start_nonblocking, dev, candidate_dev, config_snapshot=cfg)
+        elif candidate_dev is None:
             await run_in_threadpool(start_nonblocking, dev)
         else:
             await run_in_threadpool(start_nonblocking, dev, candidate_dev)
@@ -83,23 +97,36 @@ async def api_start(body: dict):
 
 @router.post("/stop")
 async def api_stop():
-    await run_in_threadpool(stop_interview_loop)
+    async with mmpg.http_lifecycle_lock:
+        await mmpg.manager.stop("stopped")
+        await run_in_threadpool(stop_interview_loop)
     return {"ok": True}
 
 
 @router.post("/pause")
 async def api_pause():
-    session = get_session()
-    if not session.is_recording:
-        raise HTTPException(400, "\u9762\u8bd5\u672a\u5728\u8fdb\u884c\u4e2d")
-    if is_paused():
-        raise HTTPException(400, "\u5df2\u7ecf\u5904\u4e8e\u6682\u505c\u72b6\u6001")
-    await run_in_threadpool(pause_interview)
+    async with mmpg.http_lifecycle_lock:
+        if is_streaming_interview() or mmpg.manager.active:
+            await mmpg.manager.stop("paused")
+            return {"ok": True}
+        session = get_session()
+        if not session.is_recording:
+            raise HTTPException(400, "面试未在进行中")
+        if is_paused():
+            raise HTTPException(400, "已经处于暂停状态")
+        await run_in_threadpool(pause_interview)
     return {"ok": True}
 
 
 @router.post("/unpause")
 async def api_resume_interview(body: Optional[dict] = None):
+    async with mmpg.http_lifecycle_lock:
+        return await _api_resume_interview(body)
+
+
+async def _api_resume_interview(body: Optional[dict] = None):
+    if is_streaming_interview():
+        raise HTTPException(409, "请从桌面主窗口或本机浏览器恢复豆包语义判停")
     session = get_session()
     if not session.is_recording:
         raise HTTPException(400, "\u9762\u8bd5\u672a\u5728\u8fdb\u884c\u4e2d")
@@ -240,6 +267,7 @@ async def api_preflight_scenarios():
 
 @router.post("/preflight/run")
 async def api_preflight_run(body: dict):
+    _check_segment_preflight()
     from .sound_test import start_preflight
     scenario_id = body.get("scenario_id", "self_intro")
     device_id = body.get("device_id")
@@ -265,6 +293,7 @@ async def api_preflight_status():
 
 @router.post("/preflight/replay")
 async def api_preflight_replay(body: dict):
+    _check_segment_preflight()
     session = get_session()
     if session.is_recording and not session.is_paused:
         raise HTTPException(409, "请先暂停或结束面试，再做高频回放检测")
@@ -309,7 +338,7 @@ async def api_exam_preflight_run():
     from .exam_test import start_exam_preflight
 
     session = get_session()
-    if session.is_recording:
+    if session.is_recording or mmpg.manager.active:
         raise HTTPException(409, "请先结束当前面试或笔试，再运行链路检测")
     preflight_id = start_exam_preflight()
     if not preflight_id:
@@ -317,6 +346,13 @@ async def api_exam_preflight_run():
             raise HTTPException(409, "请先结束当前面试或笔试，再运行链路检测")
         raise HTTPException(409, "笔试链路检测已在运行中")
     return {"ok": True, "preflight_id": preflight_id}
+
+
+def _check_segment_preflight():
+    if get_config().stt_provider == mmpg.PROVIDER:
+        raise HTTPException(409, "豆包语义判停请在语音设置中使用「保存并测试」")
+    if mmpg.manager.active:
+        raise HTTPException(409, "请先结束豆包语义判停会话或检测")
 
 
 @router.get("/exam-preflight/status")

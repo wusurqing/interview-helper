@@ -24,6 +24,8 @@ from core.env import env_int
 from core.logger import setup_logging, get_logger
 from services.stt import get_stt_engine
 from api.realtime import ws
+from api.realtime.mmpg import bind_mmpg_routes
+from api.assist import mmpg_integration
 from api import common, assist, analytics, resume, jobs, review
 from api import kb as kb_api
 
@@ -95,6 +97,7 @@ async def lifespan(app: FastAPI):
         _log.debug("Resume auto-restore skipped: %s", e)
     yield
     _log.info("SHUTDOWN cleaning up")
+    await mmpg_integration.manager.stop("shutdown")
     assist.stop_interview_loop()
     assist.shutdown_background_workers()
     dispatch_task.cancel()
@@ -104,6 +107,9 @@ async def lifespan(app: FastAPI):
 def _preload_stt():
     try:
         cfg = get_config()
+        if cfg.stt_provider == mmpg_integration.PROVIDER:
+            ws.broadcast({"type": "stt_status", **mmpg_integration.stt_status()})
+            return
         engine = get_stt_engine()
         _log.info("STT preload start provider=%s", cfg.stt_provider)
         is_remote = cfg.stt_provider in ("doubao", "generic")
@@ -236,6 +242,7 @@ async def api_auth_info(request: Request):
     return {"required": True, "token": get_token()}
 
 app.include_router(ws.router)
+bind_mmpg_routes(app, mmpg_integration.manager, on_control=mmpg_integration.prepare)
 app.include_router(common.router, prefix="/api")
 app.include_router(assist.router, prefix="/api")
 app.include_router(analytics.router, prefix="/api")

@@ -12,6 +12,7 @@ from services.stt import (
     is_asr_question_constraint_tail,
     is_viable_asr_question_group,
     join_transcription_fragments,
+    split_question_like_text,
     transcription_for_publish,
 )
 from api.assist.scheduler import TaskPayload
@@ -59,6 +60,36 @@ class AssistAsrStateMachine:
 
     def reset_pending_group(self):
         self.pending_group = None
+
+    def accept_final_turn(self, cfg, session, text: str) -> None:
+        """Publish a complete cloud turn and evaluate it without a local timer."""
+        text = text.strip()
+        if not text:
+            return
+        session.add_transcription(text)
+        self.broadcast({"type": "transcription", "text": text})
+        if not cfg.auto_detect:
+            return
+        minimum = getattr(cfg, "transcription_min_sig_chars", 2)
+        verdict, _ = classify_asr_question_candidate(text, minimum)
+        # A complete question can end with an extra instruction. Check each
+        # sentence for intent, while submitting the original turn verbatim.
+        if verdict != "promote" and not any(
+            classify_asr_question_candidate(part, minimum)[0] == "promote"
+            for part in split_question_like_text(text)
+        ):
+            return
+        now = self.clock()
+        high_churn = self.is_high_churn_submission(cfg, now)
+        turn = self.begin_asr_turn()
+        self.record_asr_turn(now)
+        source = "conversation_loopback" if session.capture_is_loopback else "conversation_mic"
+        self.submit_answer_task((text, None, False, source, {
+            "origin": "asr",
+            "asr_turn_id": turn,
+            "utterances": [text],
+            "high_churn_short_answer": high_churn,
+        }))
 
     def flush_question_group_now(self, cfg, session) -> None:
         group = self.pending_group

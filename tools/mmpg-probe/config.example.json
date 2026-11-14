@@ -1,0 +1,18 @@
+{
+  "volc_access_key": "",
+  "volc_secret_key": "",
+  "rtc_app_id": "",
+  "rtc_room_id": "mmpg-probe",
+  "rtc_user_id": "tester",
+  "rtc_bot_id": "mmpg-agent",
+  "rtc_token": "",
+  "doubao_api_key": "",
+  "doubao_resource_id": "volc.seedasr.sauc.duration",
+  "silence_ms": 800,
+  "aivad": true,
+  "twopass": true,
+  "enable_prefetch": true,
+  "expire_time_ms": null,
+  "force_end": false,
+  "max_session_seconds": 1800
+}

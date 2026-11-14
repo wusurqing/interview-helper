@@ -3,6 +3,7 @@ import { useInterviewStore } from '@/stores/configStore'
 import { useKbStore } from '@/stores/kbStore'
 import { buildWsUrl } from '@/lib/backendUrl'
 import { subscribeLeader } from '@/lib/wsLeader'
+import { isMmpgState } from '@/lib/mmpg/rtcController'
 
 // 指数退避重连步长（ms）。最后一档是稳态，不再翻倍。
 const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000]
@@ -107,7 +108,7 @@ export function useInterviewWS(active = true) {
         s.setInitData(msg as Parameters<typeof s.setInitData>[0])
         break
       case 'recording':
-        s.setRecording(msg.value as boolean)
+        s.setRecording(msg.value as boolean, msg.interviewer_streaming === true)
         break
       case 'paused':
         s.setPaused(msg.value as boolean)
@@ -187,6 +188,9 @@ export function useInterviewWS(active = true) {
         break
       case 'stt_status':
         s.setSttStatus((msg.loaded as boolean) ?? false, (msg.loading as boolean) ?? false, msg.provider as string | undefined)
+        if (msg.provider === 'doubao_mmpg' && isMmpgState(msg.state)) {
+          s.setMmpgStatus(msg.state, typeof msg.error === 'string' ? msg.error : null)
+        }
         break
       case 'candidate_asr_status':
         s.setCandidateSttStatus(

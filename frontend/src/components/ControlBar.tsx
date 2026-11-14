@@ -18,6 +18,8 @@ import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { api, getErrorMessage } from '@/lib/api'
+import { mmpgController, mmpgStateLabels } from '@/lib/mmpg/rtcController'
+import { useMmpgStatus } from '@/lib/mmpg/useMmpgStatus'
 import { showExamOverlayPrompt } from '@/lib/examOverlay'
 import { ResumeMountInline } from '@/components/resume/ResumeMount'
 import { AudioDevicePicker } from './control-bar/AudioDevicePicker'
@@ -47,6 +49,7 @@ export default function ControlBar() {
   // 精确订阅字段, 避免 store 任意字段(LLM token / audioLevel 等)变化触发 ControlBar 重渲染
   const {
     isRecording,
+    interviewerStreaming,
     isPaused,
     devices,
     setDevices,
@@ -65,12 +68,14 @@ export default function ControlBar() {
     sttLoaded,
     sttLoading,
     sttActiveProvider,
+    mmpgPhase,
     candidateSttLoaded,
     candidateSttLoading,
     candidateSttProvider,
   } = useInterviewStore(
     useShallow((s) => ({
       isRecording: s.isRecording,
+      interviewerStreaming: s.interviewerStreaming,
       isPaused: s.isPaused,
       devices: s.devices,
       setDevices: s.setDevices,
@@ -89,6 +94,7 @@ export default function ControlBar() {
       sttLoaded: s.sttLoaded ?? true,
       sttLoading: s.sttLoading ?? false,
       sttActiveProvider: s.sttActiveProvider ?? '',
+      mmpgPhase: s.mmpgPhase,
       candidateSttLoaded: s.candidateSttLoaded ?? false,
       candidateSttLoading: s.candidateSttLoading ?? false,
       candidateSttProvider: s.candidateSttProvider ?? '',
@@ -113,7 +119,11 @@ export default function ControlBar() {
     () => (config?.models ?? []).map((model, index) => ({ model, index })).filter(({ model }) => model.enabled !== false),
     [config?.models],
   )
-  const isExamMode = config?.written_exam_mode === true
+  const isExamMode = !interviewerStreaming && config?.written_exam_mode === true
+  const usesMmpg = !isExamMode && config?.stt_provider === 'doubao_mmpg'
+  const mmpg = useMmpgStatus()
+  const ownsMmpgConnection = mmpg.mode && mmpg.mode !== 'test' && ['connecting', 'reconnecting'].includes(mmpg.state)
+  const mmpgIsConnecting = interviewerStreaming && (ownsMmpgConnection || ['connecting', 'reconnecting'].includes(mmpgPhase))
   const noEnabledModels = (config?.models?.length ?? 0) > 0 && enabledModelEntries.length === 0
   const allModelsUnavailable = enabledModelEntries.length > 0 &&
     enabledModelEntries.every(({ index }) => modelHealth[index] === 'error')
@@ -287,10 +297,11 @@ export default function ControlBar() {
     lifecycleActionRef.current = true
     setLoading(true); setError(null)
     try {
-      await api.start(
-        isExamMode ? null : selectedDevice,
-        effectiveCandidateMic,
-      )
+      if (usesMmpg && selectedDevice !== null) {
+        await mmpgController.start('start', selectedDevice, effectiveCandidateMic, platformInfo?.platform)
+      } else {
+        await api.start(isExamMode ? null : selectedDevice, effectiveCandidateMic)
+      }
       if (isExamMode) {
         showExamOverlayPrompt()
         return
@@ -313,12 +324,16 @@ export default function ControlBar() {
         }).catch(() => {})
       }
     }
-    catch (e: unknown) { setError(getErrorMessage(e, isExamMode ? '开始失败' : '开始面试失败')) }
+    catch (e: unknown) {
+      if (!(usesMmpg && e instanceof Error && e.name === 'AbortError')) {
+        setError(getErrorMessage(e, isExamMode ? '开始失败' : '开始面试失败'))
+      }
+    }
     finally {
       lifecycleActionRef.current = false
       setLoading(false)
     }
-  }, [selectedDevice, effectiveCandidateMic, isExamMode])
+  }, [selectedDevice, effectiveCandidateMic, isExamMode, usesMmpg, platformInfo?.platform])
   const handleStop = useCallback(async () => {
     if (lifecycleActionRef.current) return
     if (isRecording && !window.confirm(isExamMode ? '结束本次笔试？当前答案会保留在页面上。' : '结束本次面试？将停止录音，当前转录与答案会保留在页面上。')) return
@@ -361,12 +376,18 @@ export default function ControlBar() {
     setLoading(true)
     try {
       if (isExamMode) await api.resume()
-      else await api.resume(selectedDevice ?? undefined, effectiveCandidateMic)
-    } catch (e: unknown) { setError(getErrorMessage(e, isExamMode ? '继续失败' : '继续录音失败')) } finally {
+      else if (interviewerStreaming && selectedDevice !== null) {
+        await mmpgController.start('resume', selectedDevice, effectiveCandidateMic, platformInfo?.platform)
+      } else await api.resume(selectedDevice ?? undefined, effectiveCandidateMic)
+    } catch (e: unknown) {
+      if (!(interviewerStreaming && e instanceof Error && e.name === 'AbortError')) {
+        setError(getErrorMessage(e, isExamMode ? '继续失败' : '继续录音失败'))
+      }
+    } finally {
       lifecycleActionRef.current = false
       setLoading(false)
     }
-  }, [selectedDevice, effectiveCandidateMic, isExamMode])
+  }, [selectedDevice, effectiveCandidateMic, isExamMode, interviewerStreaming, platformInfo?.platform])
   const handleClear = useCallback(async () => {
     if (clearingRef.current) return
     if (qaPairs.length > 0 || transcriptions.length > 0 || candidateTranscriptions.length > 0) {
@@ -730,10 +751,18 @@ export default function ControlBar() {
         )}
 
         <div className="flex h-full min-h-[56px] w-full min-w-0 flex-wrap items-center gap-1.5 lg:w-auto lg:max-w-[34rem] lg:border-l lg:border-bg-hover/60 lg:pl-2">
-        {isRecording ? (
+        {ownsMmpgConnection && (!isRecording || loading) ? (
+          <>
+            <span role="status" className="flex items-center gap-1.5 rounded-lg px-4 py-2 text-xs text-text-muted">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              {mmpgStateLabels[mmpg.state]}
+            </span>
+            <button type="button" className="rounded-lg px-3 py-2 text-xs text-text-secondary" onClick={mmpgController.cancelConnection}>取消连接</button>
+          </>
+        ) : isRecording ? (
           <>
             {isPaused ? (
-              <button onClick={handleResume} disabled={loading}
+              <button onClick={handleResume} disabled={loading || mmpgIsConnecting}
                 className="flex min-h-[38px] items-center gap-1.5 rounded-lg px-3.5 py-2 btn-primary text-xs font-semibold disabled:opacity-50 flex-shrink-0" style={{ background: 'linear-gradient(135deg, rgb(var(--c-accent-green)), rgb(var(--c-accent-green) / 0.85))' }}>
                 <PlayCircle className="w-3.5 h-3.5" />
                 <span>继续</span>
@@ -751,13 +780,13 @@ export default function ControlBar() {
               <span className="hidden sm:inline">{isExamMode ? '结束' : '结束面试'}</span>
             </button>
           </>
-        ) : !isExamMode && sttLoading ? (
+        ) : !isExamMode && !usesMmpg && sttLoading ? (
           <button disabled
             className="flex min-h-[38px] items-center gap-1.5 rounded-lg px-4 py-2 bg-bg-tertiary text-text-muted text-xs font-semibold cursor-not-allowed flex-shrink-0">
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
             <span>{sttActiveProvider === 'whisper' && config?.stt_provider && config.stt_provider !== 'whisper' ? '降级加载 Whisper…' : '语音加载中…'}</span>
           </button>
-        ) : !isExamMode && !sttLoaded ? (
+        ) : !isExamMode && !usesMmpg && !sttLoaded ? (
           <button onClick={handleStart} disabled={loading || selectedDevice === null}
             className="flex min-h-[38px] items-center gap-1.5 rounded-lg px-4 py-2 text-white text-xs font-semibold flex-shrink-0" style={{ background: 'linear-gradient(135deg, rgb(var(--c-accent-amber)), rgb(var(--c-accent-amber) / 0.85))' }}>
             <AlertTriangle className="w-3.5 h-3.5" />

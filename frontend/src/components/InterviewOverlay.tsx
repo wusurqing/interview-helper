@@ -4,6 +4,7 @@ import ReactMarkdown, { type Components } from 'react-markdown'
 import { useInterviewWS } from '@/hooks/useInterviewWS'
 import { applyStoredColorSchemeToDocument, COLOR_SCHEME_STORAGE_KEY } from '@/lib/colorScheme'
 import { api, getErrorMessage } from '@/lib/api'
+import { mmpgStateLabels } from '@/lib/mmpg/rtcController'
 import {
   isInterviewOverlayStorageKey,
   warnInterviewOverlaySyncIssue,
@@ -44,13 +45,19 @@ export default function InterviewOverlay() {
   const qaPairs = useInterviewStore((s) => s.qaPairs)
   const streamingIds = useInterviewStore((s) => s.streamingIds)
   const isRecording = useInterviewStore((s) => s.isRecording)
+  const isPaused = useInterviewStore((s) => s.isPaused)
+  const interviewerStreaming = useInterviewStore((s) => s.interviewerStreaming)
+  const mmpgPhase = useInterviewStore((s) => s.mmpgPhase)
   const clearSession = useInterviewStore((s) => s.clearSession)
   const setToastMessage = useInterviewStore((s) => s.setToastMessage)
   const config = useInterviewStore((s) => s.config)
   const setConfig = useInterviewStore((s) => s.setConfig)
   const shortcuts = useShortcutsStore((s) => s.shortcuts)
   const setShortcuts = useShortcutsStore((s) => s.setShortcuts)
-  const isExamMode = config?.written_exam_mode === true
+  const isExamMode = !interviewerStreaming && config?.written_exam_mode === true
+  const standbyHint = interviewerStreaming
+    ? (isPaused && mmpgPhase === 'idle' ? '录音已暂停' : mmpgStateLabels[mmpgPhase ?? 'connecting'])
+    : isRecording ? (isExamMode ? '笔试中…' : '正在聆听…') : (isExamMode ? '点击开始笔试' : '等待面试开始')
   const enabled = useUiPrefsStore((s) => s.interviewOverlayEnabled)
   const opacity = useUiPrefsStore((s) => s.interviewOverlayOpacity)
   const fontSize = useUiPrefsStore((s) => s.interviewOverlayFontSize)
@@ -416,7 +423,7 @@ export default function InterviewOverlay() {
     </div>
   ) : (
     <span className="ov-standby-hint" style={{ fontSize: `${answerFontSize}px` }}>
-      {isRecording ? (isExamMode ? '笔试中…' : '正在聆听…') : (isExamMode ? '点击开始笔试' : '等待面试开始')}
+      {standbyHint}
     </span>
   )
 
@@ -501,7 +508,7 @@ export default function InterviewOverlay() {
               </div>
             ) : (
               <span className="ov-standby-hint" style={{ fontSize: `${answerFontSize}px` }}>
-                {isRecording ? (isExamMode ? '笔试中…' : '正在聆听…') : (isExamMode ? '点击开始笔试' : '等待面试开始')}
+                {standbyHint}
               </span>
             )}
           </div>

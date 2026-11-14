@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MMPG 语音判停验证</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div><p class="eyebrow">独立验证工具 · 火山 RTC + MMPG</p><h1>听完整，再判停</h1></div>
+        <span class="badge" id="status" role="status">正在读取配置</span>
+      </header>
+      <p class="intro">用真实语音比较句中停顿和整轮结束。这里只显示识别与判停结果，不调用答题大模型。点击“开始验证”才会建立云端会话。</p>
+
+      <section class="panel settings" aria-labelledby="settings-title">
+        <h2 id="settings-title">本次会话</h2>
+        <p id="config-summary" class="muted">读取本机配置中……</p>
+        <div id="error" class="error" role="alert" hidden></div>
+        <fieldset id="controls">
+          <div class="form-grid">
+            <label>音频来源
+              <select id="audio-source">
+                <option value="microphone">麦克风 · 直接朗读测试句</option>
+                <option value="system">浏览器分享 · 系统或标签页声音</option>
+              </select>
+            </label>
+            <div>
+              <label for="silence-ms">静音观察窗（毫秒）</label>
+              <div class="range-row"><input id="silence-range" type="range" min="500" max="2900" step="100" value="800" /><input id="silence-ms" type="number" min="500" max="2900" step="100" value="800" /></div>
+            </div>
+            <label class="check"><input id="aivad" type="checkbox" checked /><span>开启 AIVAD 语义判停<br /><small>取消勾选，可与静音判停做对照</small></span></label>
+            <label class="check"><input id="twopass" type="checkbox" checked /><span>开启二遍识别修正<br /><small>所有参数仅在会话开始前可改</small></span></label>
+          </div>
+        </fieldset>
+        <p id="source-help" class="note">麦克风模式只采集麦克风。开始后等状态显示“可以讲话”再朗读。</p>
+        <div class="actions">
+          <button id="start" class="primary" disabled>开始验证</button>
+          <button id="mark-end" disabled>我说完了 · 标记时间</button>
+          <button id="stop" class="stop" disabled>停止会话</button>
+          <span class="muted" id="duration">尚未开始</span>
+        </div>
+        <p class="note">“我说完了”只向本机记录点击时间，不触发云端判停。下方时间是<strong>点击标记 → 收到 done</strong>，不是实际语音结束到响应的端到端延迟。</p>
+      </section>
+
+      <div class="results-grid">
+        <section class="panel" aria-labelledby="partial-title">
+          <div class="section-heading"><h2 id="partial-title">中间识别</h2><span class="muted">诊断用，不触发答题</span></div>
+          <p id="partial-text" class="transcript empty">等待讲话。试试在一句话中间停顿 1–2 秒，再继续补充条件。</p>
+          <p id="partial-state" class="muted">尚无识别事件</p>
+        </section>
+        <section class="panel" aria-labelledby="final-title">
+          <div class="section-heading"><h2 id="final-title">整轮最终文本</h2><span class="count" id="final-count">0 轮</span></div>
+          <p id="final-empty" class="empty">收到 user.audio.transcription.done 后显示。</p>
+          <div id="final-results" aria-live="polite"></div>
+        </section>
+      </div>
+
+      <section class="panel" aria-labelledby="timeline-title">
+        <div class="section-heading"><h2 id="timeline-title">事件时间线</h2><span class="muted">云端事件显示后端接收时间；本地操作另行标注</span></div>
+        <ol id="timeline"></ol>
+      </section>
+      <footer>本机页面只获得 RTC 临时 Token。AK/SK 留在 Python 服务端。停止或关闭页面会释放本地音轨并结束会话。</footer>
+    </main>
+    <script type="module" src="/dist/app.js"></script>
+  </body>
+</html>

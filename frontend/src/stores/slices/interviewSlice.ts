@@ -52,6 +52,7 @@ function _scheduleChunkFlush(set: (fn: (s: RootState) => Partial<RootState>) => 
 
 export interface InterviewSliceState {
   isRecording: boolean
+  interviewerStreaming: boolean
   isPaused: boolean
   audioLevel: number
   isTranscribing: boolean
@@ -63,7 +64,7 @@ export interface InterviewSliceState {
 }
 
 export interface InterviewSliceActions {
-  setRecording: (v: boolean) => void
+  setRecording: (v: boolean, interviewerStreaming?: boolean) => void
   setPaused: (v: boolean) => void
   setAudioLevel: (v: number) => void
   setTranscribing: (v: boolean) => void
@@ -96,6 +97,7 @@ export type InterviewSlice = InterviewSliceState & InterviewSliceActions
 
 export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlice> = (set) => ({
   isRecording: false,
+  interviewerStreaming: false,
   isPaused: false,
   audioLevel: 0,
   isTranscribing: false,
@@ -105,7 +107,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
   streamingIds: [],
   currentStreamingId: null,
 
-  setRecording: (v) => set({ isRecording: v }),
+  setRecording: (v, interviewerStreaming) => set({ isRecording: v, interviewerStreaming: v && interviewerStreaming === true }),
   setPaused: (v) => set({ isPaused: v }),
   setAudioLevel: (v) => set({ audioLevel: v }),
   setTranscribing: (v) => set({ isTranscribing: v }),
@@ -321,6 +323,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
       currentStreamingId: null,
       streamingIds: [],
       isRecording: data.is_recording ?? false,
+      interviewerStreaming: data.is_recording === true && data.interviewer_streaming === true,
       isPaused: data.is_paused ?? false,
       sttLoaded: data.stt_loaded ?? false,
       candidateSttLoaded: false,
