@@ -118,6 +118,9 @@ class AppConfig(BaseModel):
     # doubao=豆包语音识别 API，generic=OpenAI-compatible HTTP ASR
     stt_provider: str = "whisper"
     whisper_model: str = "base"
+    # 可选的本地模型缓存，以及旧 Windows 显卡驱动的 CUDA 11 隔离运行库。
+    stt_model_cache_root: str = ""
+    whisper_cuda11_compat: bool = False
     # "auto" is more robust for Chinese interview speech mixed with English terms.
     whisper_language: str = "auto"
     # 启动时预加载 whisper 降级模型（远程 ASR 为主引擎时，~300MB 内存换更快降级）
@@ -417,6 +420,6 @@ STT_FALLBACK_PROVIDER_OPTIONS = ["whisper", "funasr", "none"]
 # FunASR 本地模型（中文面试场景推荐 paraformer-zh：准确率高、CPU 快、支持热词）
 FUNASR_MODEL_OPTIONS = ["paraformer-zh", "sensevoice-small", "paraformer-zh-streaming"]
 # 语音识别引擎：whisper=本地，funasr=本地 FunASR，doubao=豆包 API，generic=OpenAI-compatible HTTP ASR
-STT_PROVIDER_OPTIONS = ["whisper", "funasr", "doubao", "generic"]
+STT_PROVIDER_OPTIONS = ["whisper", "funasr", "qwen3_asr", "doubao", "generic"]
 # 电脑截图区域
 SCREEN_CAPTURE_REGION_OPTIONS = ["full", "left_half", "right_half", "top_half", "bottom_half"]

@@ -2,12 +2,15 @@
 
 import time
 import threading
+import gc
+import sys
 from typing import Optional
 
 import numpy as np
 
 from core.logger import get_logger
 from .engines import STTEngine, DoubaoSTT, FunASRSTT, GenericHTTPSTT
+from .qwen_engine import QwenASRSTT
 
 _log = get_logger("stt.factory")
 
@@ -16,15 +19,19 @@ _whisper_engines: dict[tuple[str, str], STTEngine] = {}
 _doubao_engine: Optional[DoubaoSTT] = None
 _generic_engine: Optional[GenericHTTPSTT] = None
 _funasr_engines: dict[str, FunASRSTT] = {}
+_qwen_engine: Optional[QwenASRSTT] = None
 _engine_lock = threading.Lock()
 _whisper_infer_lock = threading.Lock()
 _funasr_infer_lock = threading.Lock()
+_qwen_infer_lock = threading.Lock()
 # 本地引擎推理非线程安全，同引擎串行；不同引擎（whisper vs funasr）互不阻塞，
 # 面试官链路（funasr）不会被候选人链路（whisper）的转写卡住。
-LOCAL_STT_PROVIDERS = ("whisper", "funasr")
+LOCAL_STT_PROVIDERS = ("whisper", "funasr", "qwen3_asr")
 
 
 def _local_infer_lock(provider: str) -> threading.Lock:
+    if provider == "qwen3_asr":
+        return _qwen_infer_lock
     return _funasr_infer_lock if provider == "funasr" else _whisper_infer_lock
 
 
@@ -45,6 +52,14 @@ def _candidate_local_provider(cfg) -> str:
     return provider if provider in LOCAL_STT_PROVIDERS else ""
 
 
+def _release_torch_cuda_cache() -> None:
+    """Return unused FunASR allocations before another runtime needs VRAM."""
+    gc.collect()
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _evict_other_local_engine_locked(
     primary_provider: str,
     fallback: str = "whisper",
@@ -56,7 +71,7 @@ def _evict_other_local_engine_locked(
     其余卸载引用，避免两个模型（合计 ~1GB+ 内存）同时驻留。
     keep 集由配置稳定决定：若只按「最后请求者」滚动，candidate 与
     fallback 会互相把对方正在使用的引擎清掉。"""
-    global _engine
+    global _engine, _qwen_engine
     keep: set[str] = set()
     if primary_provider in LOCAL_STT_PROVIDERS:
         keep.add(primary_provider)
@@ -74,7 +89,14 @@ def _evict_other_local_engine_locked(
         _engine = None
     if "funasr" not in keep and _funasr_engines:
         _log.info("Local STT mutex: evict funasr engines (primary=%s fallback=%s)", primary_provider, fallback)
-        _funasr_engines.clear()
+        with _funasr_infer_lock:
+            _funasr_engines.clear()
+            _release_torch_cuda_cache()
+    if "qwen3_asr" not in keep and _qwen_engine is not None:
+        # Lock ordering is factory -> inference -> model, also used below.
+        with _qwen_infer_lock:
+            _qwen_engine.unload()
+        _qwen_engine = None
 REMOTE_EMPTY_RETRY_PAD_MS = 240
 REMOTE_EMPTY_RETRY_MAX_AUDIO_SEC = 6.0
 
@@ -584,6 +606,16 @@ def get_stt_engine(
     from core.config import get_config
     cfg = get_config()
     effective_provider = provider or cfg.stt_provider
+    if effective_provider == "qwen3_asr":
+        global _qwen_engine
+        with _engine_lock:
+            _evict_other_local_engine_locked(
+                cfg.stt_provider, _fallback_target(cfg),
+                in_use=effective_provider, candidate=_candidate_local_provider(cfg),
+            )
+            if _qwen_engine is None:
+                _qwen_engine = QwenASRSTT()
+            return _qwen_engine
     if effective_provider == "iflytek":
         raise RuntimeError("讯飞 STT 已下线，请在设置中改为通用 ASR 或 Whisper")
     if effective_provider == "doubao":
@@ -638,7 +670,10 @@ def get_stt_engine(
             if engine is None or engine.model_name != model_name:
                 engine = FunASRSTT(model_name=model_name)
                 # 只保留新引擎：换模型时卸掉旧引用，避免两份 ~1GB 模型同时驻留
-                _funasr_engines.clear()
+                if _funasr_engines:
+                    with _funasr_infer_lock:
+                        _funasr_engines.clear()
+                        _release_torch_cuda_cache()
                 _funasr_engines[model_name] = engine
             return engine
     if effective_provider != "whisper":
@@ -655,6 +690,21 @@ def get_stt_engine(
             candidate=_candidate_local_provider(cfg),
         )
         default_key = (cfg.whisper_model or "base", cfg.whisper_language or "auto")
+        if (key == default_key and getattr(cfg, "stt_provider", "") == "whisper"
+                and _engine is not None
+                and (getattr(_engine, "model_size", None), getattr(_engine, "language", None)) != default_key):
+            # A settings change must not leave all previously selected Whisper
+            # sizes resident on a small GPU. Retain a separately configured
+            # candidate model, if any; in-flight callers keep their references.
+            keep_keys = {default_key}
+            if _candidate_local_provider(cfg) == "whisper":
+                keep_keys.add((getattr(cfg, "candidate_whisper_model", "") or default_key[0],
+                               getattr(cfg, "candidate_whisper_language", "") or default_key[1]))
+            for cached_key in list(_whisper_engines):
+                if cached_key not in keep_keys:
+                    _whisper_engines.pop(cached_key, None)
+            if (getattr(_engine, "model_size", None), getattr(_engine, "language", None)) not in keep_keys:
+                _engine = None
         if _engine is None and key == default_key:
             _whisper_engines.pop(key, None)
         engine = _whisper_engines.get(key)

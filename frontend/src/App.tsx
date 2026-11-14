@@ -52,6 +52,7 @@ export default function App() {
   const isPaused = useInterviewStore((s) => s.isPaused)
   const currentStreamingId = useInterviewStore((s) => s.currentStreamingId)
   const isExamMode = config?.written_exam_mode === true
+  const isWhisperFallback = sttActiveProvider === 'whisper' && !!config?.stt_provider && config.stt_provider !== 'whisper'
   const [mobileTab, setMobileTab] = useState<'transcript' | 'answer'>('transcript')
   const lastMobileStreamingIdRef = useRef<string | null>(null)
   const appMode = useUiPrefsStore((s) => s.appMode)
@@ -373,13 +374,13 @@ export default function App() {
                 isExamMode
                   ? '笔试模式 · 等待提问'
                   : sttLoaded
-                  ? sttActiveProvider === 'whisper' ? 'STT 已降级至 Whisper · 等待录音' : sttFallbackLoaded ? 'STT 就绪 · Whisper 降级已预加载' : 'STT 就绪 · 等待录音'
+                  ? isWhisperFallback ? 'STT 已降级至 Whisper · 等待录音' : sttFallbackLoaded ? 'STT 就绪 · Whisper 降级已预加载' : 'STT 就绪 · 等待录音'
                   : sttLoading
-                  ? sttActiveProvider === 'whisper' ? 'Whisper 降级加载中…' : 'STT 模型加载中…'
+                  ? isWhisperFallback ? 'Whisper 降级加载中…' : 'STT 模型加载中…'
                   : 'STT 模型尚未加载,首次录音时会自动加载'
               }
             >
-              <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${sttLoaded ? (sttActiveProvider === 'whisper' ? 'bg-accent-amber' : 'bg-accent-green') : sttLoading ? 'bg-accent-amber animate-pulse' : 'bg-accent-red'}`} />
+              <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${sttLoaded ? (isWhisperFallback ? 'bg-accent-amber' : 'bg-accent-green') : sttLoading ? 'bg-accent-amber animate-pulse' : 'bg-accent-red'}`} />
               <span className="text-[10px] text-text-muted hidden md:inline font-medium">
                 {sttLoaded ? (sttActiveProvider === 'whisper' ? 'Whisper' : sttFallbackLoaded ? 'STT ✓' : 'STT 就绪') : sttLoading ? '加载中' : '未加载'}
               </span>

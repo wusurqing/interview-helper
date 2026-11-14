@@ -616,8 +616,19 @@ async def api_resume_history_delete(entry_id: int):
 @router.get("/stt/status")
 async def api_stt_status():
     try:
-        engine = get_stt_engine()
-        return {"loaded": engine.is_loaded, "loading": engine.is_loading, "model": engine.model_size}
+        engine = await run_in_threadpool(get_stt_engine)
+        status = {"loaded": engine.is_loaded, "loading": engine.is_loading, "model": engine.model_size}
+        provider = get_config().stt_provider
+        if provider in ("whisper", "funasr", "qwen3_asr"):
+            status["provider"] = provider
+            if getattr(engine, "device", None):
+                status["device"] = engine.device
+            if getattr(engine, "compute_type", None):
+                status["compute_type"] = engine.compute_type
+        if provider == "qwen3_asr":
+            if engine.load_error:
+                status["detail"] = engine.load_error[:200]
+        return status
     except Exception as e:
         return {"loaded": False, "loading": False, "model": get_config().stt_provider, "detail": str(e)[:200]}
 
@@ -685,6 +696,8 @@ _funasr_download_state: dict = {"running": False, "error": "", "done_model": ""}
 
 def _funasr_installed() -> bool:
     try:
+        from services.stt.local_runtime import configure_funasr_cache
+        configure_funasr_cache(get_config())
         import funasr  # noqa: F401  首次 import 会加载 torch（数秒），勿在事件循环内直接执行
         return True
     except ImportError:
@@ -788,7 +801,7 @@ async def api_stt_test():
         if not getattr(cfg, "generic_stt_model", ""):
             return {"ok": False, "detail": "通用 ASR Model 未配置"}
     try:
-        engine = get_stt_engine()
+        engine = await run_in_threadpool(get_stt_engine)
         from services.audio import load_wav_file
         wav_path = Path(__file__).resolve().parents[2] / "assets" / "preflight_phrase.wav"
         if wav_path.exists():
@@ -797,7 +810,7 @@ async def api_stt_test():
             import numpy as _np
             sr = 16000
             audio = _np.zeros(int(sr * 1.5), dtype=_np.float32)
-        result = engine.transcribe(audio, sample_rate=sr)
+        result = await run_in_threadpool(engine.transcribe, audio, sample_rate=sr)
         if not (result or "").strip():
             return {"ok": False, "detail": "引擎返回空文本，请检查接口兼容性或模型配置"}
         return {"ok": True, "text": result}

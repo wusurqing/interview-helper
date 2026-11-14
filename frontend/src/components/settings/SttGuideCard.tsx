@@ -2,6 +2,18 @@ import { useState } from 'react'
 import { HelpCircle, ChevronDown, ChevronUp, ExternalLink } from 'lucide-react'
 
 const STT_GUIDES: Record<string, { color: string; borderColor: string; title: string; steps: string[]; link?: { url: string; label: string } }> = {
+  qwen3_asr: {
+    color: 'bg-accent-violet/10',
+    borderColor: 'border-accent-violet/25',
+    title: 'Qwen3-ASR 本地 GPU 引擎',
+    steps: [
+      '使用官方 Qwen3-ASR-0.6B 模型，自动识别语言',
+      'CUDA GPU 推理，首次加载会下载权重，之后使用本地缓存',
+      '无需 API 密钥，语音转写在本机完成',
+      '岗位热词可为技术术语识别提供上下文',
+    ],
+    link: { url: 'https://github.com/QwenLM/Qwen3-ASR', label: 'Qwen3-ASR 项目' },
+  },
   whisper: {
     color: 'bg-sky-500/10',
     borderColor: 'border-sky-500/20',
