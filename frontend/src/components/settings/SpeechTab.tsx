@@ -17,7 +17,8 @@ import {
 import { useInterviewStore } from '@/stores/configStore'
 import type { AppConfig } from '@/stores/slices/types'
 import { api } from '@/lib/api'
-import { updateConfigAndRefresh } from '@/lib/configSync'
+import { refreshConfig, updateConfigAndRefresh } from '@/lib/configSync'
+import { mmpgConfigPatch, mmpgCredentialsPresent, mmpgFormFromConfig, type MmpgForm } from '@/lib/mmpg/settings'
 import {
   Section,
   Field,
@@ -32,6 +33,7 @@ import {
   type SaveState,
 } from './shared'
 import SttGuideCard from './SttGuideCard'
+import MmpgSettings from './MmpgSettings'
 
 function clampNumberInput(value: unknown, min: number, max: number, fallback: number): number {
   const parsed = Number(value)
@@ -45,6 +47,7 @@ function clampIntegerInput(value: unknown, min: number, max: number, fallback: n
 
 type SpeechForm = {
   stt_provider: string
+  mmpg: MmpgForm
   whisper_model: string
   whisper_language: string
   whisper_preload: boolean
@@ -86,6 +89,7 @@ type SpeechForm = {
 
 const DEFAULT_SPEECH_FORM: SpeechForm = {
   stt_provider: 'whisper',
+  mmpg: mmpgFormFromConfig(),
   whisper_model: 'base',
   whisper_language: 'auto',
   whisper_preload: false,
@@ -166,6 +170,7 @@ steady: {
 function speechFormFromConfig(config: AppConfig): SpeechForm {
   return {
     stt_provider: config.stt_provider ?? DEFAULT_SPEECH_FORM.stt_provider,
+    mmpg: mmpgFormFromConfig(config.mmpg),
     whisper_model: config.whisper_model ?? DEFAULT_SPEECH_FORM.whisper_model,
     whisper_language: config.whisper_language ?? DEFAULT_SPEECH_FORM.whisper_language,
     whisper_preload: config.whisper_preload ?? DEFAULT_SPEECH_FORM.whisper_preload,
@@ -230,6 +235,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
   }>({ installed: true, model: 'paraformer-zh', loaded: false, loading: false, downloading: false, error: '' })
   const savingRef = useRef(false)
   const sttTestingRef = useRef(false)
+  const mmpgBaseline = useRef(mmpgFormFromConfig(config?.mmpg))
 
   const refreshFunasrStatus = async () => {
     try {
@@ -288,6 +294,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
   useEffect(() => {
     if (!config || dirtyRef.current) return
     const nextForm = speechFormFromConfig(config)
+    mmpgBaseline.current = nextForm.mmpg
     if (speechFormSnapshot(formRef.current) === speechFormSnapshot(nextForm)) return
     setForm(nextForm)
     resetBaseline(nextForm)
@@ -318,9 +325,19 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
         assist_transcription_merge_gap_sec: clampNumberInput(form.assist_transcription_merge_gap_sec, 0, 15, 2.0),
         assist_transcription_merge_max_sec: clampNumberInput(form.assist_transcription_merge_max_sec, 1, 120, 12.0),
       }
-      await updateConfigAndRefresh(savedForm)
-      setForm(savedForm)
-      markSaved(savedForm)
+      const { mmpg, ...speechPayload } = savedForm
+      const mmpgPatch = mmpgConfigPatch(mmpg, mmpgBaseline.current)
+      if (mmpgPatch?.silence_ms !== undefined && (!Number.isInteger(mmpgPatch.silence_ms) || mmpgPatch.silence_ms < 500 || mmpgPatch.silence_ms > 2999)) {
+        throw new Error('MMPG 判停静音时间必须为 500–2999 毫秒内的整数。')
+      }
+      if (mmpgPatch?.expire_time_ms != null && (!Number.isInteger(mmpgPatch.expire_time_ms) || mmpgPatch.expire_time_ms < 1)) {
+        throw new Error('MMPG 识别过期时间必须为正整数或留空。')
+      }
+      const savedConfig = await updateConfigAndRefresh({ ...speechPayload, ...(mmpgPatch ? { mmpg: mmpgPatch } : {}) })
+      const nextForm = { ...savedForm, mmpg: mmpgFormFromConfig(savedConfig?.mmpg ?? config?.mmpg) }
+      mmpgBaseline.current = nextForm.mmpg
+      setForm(nextForm)
+      markSaved(nextForm)
       setSaveState('saved')
       useInterviewStore.getState().setToastMessage('语音配置已保存')
       return true
@@ -333,6 +350,22 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
     } finally {
       savingRef.current = false
       setSaving(false)
+    }
+  }
+
+  const handleMmpgImport = async () => {
+    if (savingRef.current) return
+    savingRef.current = true
+    try {
+      await api.importMmpgProbe()
+      const next = await refreshConfig()
+      mmpgBaseline.current = mmpgFormFromConfig(next.mmpg)
+      const baseline = speechFormFromConfig(next)
+      setForm((current) => ({ ...current, mmpg: baseline.mmpg }))
+      resetBaseline(baseline)
+      useInterviewStore.getState().setToastMessage('探针配置已导入')
+    } finally {
+      savingRef.current = false
     }
   }
 
@@ -358,7 +391,8 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
     }
   }
 
-  const providers = options?.stt_providers ?? ['whisper', 'funasr', 'doubao', 'generic']
+  const providers = options?.stt_providers ?? ['whisper', 'funasr', 'doubao', 'doubao_mmpg', 'generic']
+  const candidateProviders = (options?.candidate_stt_providers ?? providers).filter((provider) => provider !== 'doubao_mmpg')
 
   const activeLatencyPreset = Object.entries(LATENCY_PRESETS).find(([, preset]) =>
     Object.entries(preset.values).every(([key, value]) => Number((form as any)[key]) === value),
@@ -369,6 +403,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
     whisper: { label: 'Whisper', desc: '本地运行，免费无限', icon: <Volume2 className="w-5 h-5" />, brandClass: 'sky' },
     funasr: { label: 'FunASR', desc: '本地·中文更强·支持热词', icon: <AudioWaveform className="w-5 h-5" />, brandClass: 'violet' },
     doubao: { label: '豆包', desc: '火山引擎云端 API', icon: <Zap className="w-5 h-5" />, brandClass: 'orange' },
+    doubao_mmpg: { label: '豆包 MMPG', desc: '火山 RTC · 智能判停', icon: <AudioWaveform className="w-5 h-5" />, brandClass: 'orange' },
     generic: { label: '通用 ASR', desc: 'OpenAI-compatible multipart', icon: <Sparkles className="w-5 h-5" />, brandClass: 'blue' },
   }
 
@@ -376,6 +411,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
     whisper: 'border-sky-400/40',
     funasr: 'border-accent-violet/40',
     doubao: 'border-orange-400/40',
+    doubao_mmpg: 'border-orange-400/40',
     generic: 'border-blue-400/40',
   }
 
@@ -383,6 +419,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
     if (provider === 'whisper') return true
     if (provider === 'funasr') return true
     if (provider === 'doubao') return !!(form.doubao_stt_api_key || (form.doubao_stt_app_id && form.doubao_stt_access_token))
+    if (provider === 'doubao_mmpg') return mmpgCredentialsPresent(form.mmpg, config?.mmpg)
     if (provider === 'generic') return !!(form.generic_stt_api_base_url && form.generic_stt_api_key && form.generic_stt_model)
     return false
   }
@@ -654,6 +691,17 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
           </>
         )}
 
+        {form.stt_provider === 'doubao_mmpg' && (
+          <MmpgSettings
+            form={form.mmpg}
+            stored={config?.mmpg}
+            onChange={(mmpg) => setForm((current) => ({ ...current, mmpg }))}
+            onImport={handleMmpgImport}
+            onSave={handleSave}
+            saving={saving}
+          />
+        )}
+
         {form.stt_provider === 'generic' && (
           <>
             <Field label="Base URL" hint="OpenAI-compatible 地址，例如 https://api.example.com/v1">
@@ -694,7 +742,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
           </Field>
         )}
 
-        <div className="flex items-center gap-3 pt-1">
+        {form.stt_provider !== 'doubao_mmpg' && <div className="flex items-center gap-3 pt-1">
           <button
             type="button"
             onClick={handleSttTest}
@@ -720,7 +768,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
               )}
             </div>
           )}
-        </div>
+        </div>}
       </GradientCard>
       </>)}
 
@@ -792,7 +840,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                 className="input-field"
                 disabled={!form.candidate_asr_enabled}
               >
-                {providers
+                {candidateProviders
                   .filter((provider) => !primaryLocalEngine || !['whisper', 'funasr'].includes(provider) || provider === primaryLocalEngine)
                   .map((provider) => (
                   <option key={provider} value={provider}>
@@ -985,7 +1033,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
         <div className="bg-bg-tertiary/30 rounded-lg p-3 text-xs text-text-muted space-y-1.5 mb-2">
           <div className="flex items-start gap-1.5">
             <HelpCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-accent-blue" />
-            <span>根据音量与静音时长判断一句是否说完。</span>
+            <span>{form.stt_provider === 'doubao_mmpg' ? 'MMPG 的主链路断句使用语音页的智能判停设置。此处的 VAD 参数适用于分段引擎与候选人链路。' : '根据音量与静音时长判断一句是否说完。'}</span>
           </div>
         </div>
         <div className="grid grid-cols-2 gap-3">

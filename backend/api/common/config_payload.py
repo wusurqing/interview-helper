@@ -1,10 +1,13 @@
-from core.config import model_health_fingerprint
+from core.config import MMPG_SECRET_FIELDS, Mmpg, model_health_fingerprint
 from services.storage.resume_history import get_filename_for_id
 
 
 def build_config_payload(cfg) -> dict:
     active_model = cfg.get_active_model()
     resume_active_history_id = getattr(cfg, "resume_active_history_id", None)
+    mmpg = (getattr(cfg, "mmpg", None) or Mmpg()).model_dump()
+    for field in MMPG_SECRET_FIELDS:
+        mmpg[f"{field}_configured"] = bool(mmpg.pop(field))
     return {
         "models": [
             {
@@ -25,6 +28,7 @@ def build_config_payload(cfg) -> dict:
         "think_mode": cfg.think_mode,
         "think_effort": cfg.think_effort,
         "stt_provider": cfg.stt_provider,
+        "mmpg": mmpg,
         "whisper_model": cfg.whisper_model,
         "whisper_language": cfg.whisper_language,
         "whisper_preload": cfg.whisper_preload,

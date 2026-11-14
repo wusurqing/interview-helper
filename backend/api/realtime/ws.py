@@ -4,6 +4,7 @@ import time
 from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
+from fastapi.concurrency import run_in_threadpool
 
 from core.auth import is_auth_disabled, loopback_bypass_allowed, verify_token
 from core.logger import get_logger
@@ -170,21 +171,45 @@ async def websocket_endpoint(ws: WebSocket):
     now = time.monotonic()
     ws._ia_connected_at = now  # type: ignore[attr-defined]
     ws._ia_last_pong = now  # type: ignore[attr-defined]
-    ws_clients.add(ws)
-    _log.info("WS connect clients=%d", len(ws_clients))
     try:
+        from core.config import get_config
+        from api.assist import mmpg_integration
+        cfg = get_config()
+        provider = cfg.stt_provider
+        streaming = mmpg_integration.pipeline.is_streaming_interview()
+        if provider == mmpg_integration.PROVIDER or streaming:
+            current_stt = mmpg_integration.stt_status()
+            loaded = current_stt["loaded"]
+        else:
+            current_stt = None
+            try:
+                loaded = (await run_in_threadpool(
+                    get_stt_engine, provider=provider,
+                    model_size=cfg.whisper_model, language=cfg.whisper_language,
+                )).is_loaded
+            except Exception:
+                _log.warning("Unable to inspect STT engine during WS initialization")
+                loaded = False
+        streaming = mmpg_integration.pipeline.is_streaming_interview()
+        if streaming or get_config().stt_provider == mmpg_integration.PROVIDER:
+            current_stt = mmpg_integration.stt_status()
+            loaded = current_stt["loaded"]
         snapshot = snapshot_session()
-        engine = get_stt_engine()
         await ws.send_json({
             "type": "init",
             "is_recording": snapshot["is_recording"],
             "is_paused": snapshot["is_paused"],
-            "stt_loaded": engine.is_loaded,
+            "interviewer_streaming": streaming,
+            "stt_loaded": loaded,
             "transcriptions": snapshot["transcriptions"],
             "candidate_transcriptions": snapshot.get("candidate_transcriptions", []),
             "candidate_answer_segments": snapshot.get("candidate_answer_segments", []),
             "qa_pairs": snapshot["qa_pairs"],
         })
+        if current_stt is not None:
+            await ws.send_json({"type": "stt_status", **current_stt})
+        ws_clients.add(ws)
+        _log.info("WS connect clients=%d", len(ws_clients))
         while True:
             data = await ws.receive_text()
             try:

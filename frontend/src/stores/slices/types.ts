@@ -45,6 +45,7 @@ export interface AppConfig {
   think_mode: boolean
   think_effort: string
   stt_provider: string
+  mmpg?: import('@/lib/mmpg/settings').MmpgConfig
   whisper_model: string
   whisper_language: string
   whisper_preload: boolean
@@ -177,6 +178,7 @@ export interface OptionsInfo {
   positions: string[]
   languages: string[]
   stt_providers?: string[]
+  candidate_stt_providers?: string[]
   whisper_models: string[]
   screen_capture_regions?: string[]
 }

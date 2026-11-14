@@ -1,16 +1,18 @@
+import json
 import socket
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, ValidationError
 
-from core.auth import get_token, is_auth_disabled, is_loopback_host
+from core.auth import get_token, is_auth_disabled, is_loopback_host, loopback_bypass_allowed
 from core.config import (
+    CANDIDATE_STT_PROVIDER_OPTIONS, MMPG_SECRET_FIELDS, MMPG_STT_PROVIDER, Mmpg,
     get_config, update_config,
     POSITION_OPTIONS, LANGUAGE_OPTIONS, WHISPER_MODEL_OPTIONS, STT_PROVIDER_OPTIONS,
     FUNASR_MODEL_OPTIONS,
@@ -59,6 +61,8 @@ class ConfigUpdate(BaseModel):
     think_mode: Optional[bool] = None
     think_effort: Optional[str] = None
     stt_provider: Optional[str] = None
+    # Validated inside the handler so malformed credential fields never appear in FastAPI's error body.
+    mmpg: Any = None
     whisper_model: Optional[str] = None
     whisper_language: Optional[str] = None
     whisper_preload: Optional[bool] = None
@@ -260,6 +264,32 @@ async def api_get_config():
 
 
 _LEGACY_STT_PROVIDER_MAP = {"iflytek": "generic"}
+_MMPG_PROBE_CONFIG_PATH = Path(__file__).resolve().parents[3] / "tools" / "mmpg-probe" / "config.local.json"
+_MMPG_PROBE_IMPORT_FIELDS = set(Mmpg.model_fields) - {"rtc_app_key", "token_mode"}
+_MMPG_PROBE_CONFIG_LIMIT = 64 * 1024
+
+
+def _require_local_mmpg_request(request: Request | None) -> None:
+    if request is None or not is_loopback_host(request.url.hostname) or not loopback_bypass_allowed(
+        request.client.host if request.client else None,
+        request.headers.get("origin"),
+        request.url.hostname,
+        request.url.scheme,
+        request.url.port,
+    ):
+        raise HTTPException(403, "请在运行后端的电脑上修改豆包 MMPG 设置")
+
+
+def _mmpg_validation_error(error: ValidationError) -> HTTPException:
+    fields = {
+        str(item["loc"][-1])
+        for item in error.errors(include_input=False, include_context=False, include_url=False)
+        if item["loc"] and item["loc"][-1] in Mmpg.model_fields
+    }
+    detail = "豆包 MMPG 设置格式无效"
+    if fields:
+        detail += "（" + "、".join(sorted(fields)) + "）"
+    return HTTPException(422, detail)
 
 
 @router.get("/config/models-full")
@@ -287,11 +317,17 @@ async def api_get_models_full():
 
 
 @router.post("/config")
-async def api_update_config(body: ConfigUpdate):
+async def api_update_config(body: ConfigUpdate, request: Request = None):
     from core.config import ModelConfig
 
     d = body.model_dump(exclude_none=True)
     try:
+        if body.mmpg is not None:
+            _require_local_mmpg_request(request)
+            if not isinstance(body.mmpg, dict) or body.mmpg.keys() - Mmpg.model_fields.keys():
+                raise HTTPException(422, "豆包 MMPG 设置格式无效或包含未知字段")
+            # Keep explicit nulls for clearing credentials and optional time limits.
+            d["mmpg"] = body.mmpg
         if "models" in d:
             raw_models = []
             current_models = list(get_config().models)
@@ -347,10 +383,10 @@ async def api_update_config(body: ConfigUpdate):
             )
         if d.get("candidate_stt_provider") == "":
             d.pop("candidate_stt_provider", None)
-        elif "candidate_stt_provider" in d and d["candidate_stt_provider"] not in STT_PROVIDER_OPTIONS:
+        elif "candidate_stt_provider" in d and d["candidate_stt_provider"] not in CANDIDATE_STT_PROVIDER_OPTIONS:
             raise HTTPException(
                 422,
-                f"candidate_stt_provider 必须是 {list(STT_PROVIDER_OPTIONS)} 之一",
+                f"candidate_stt_provider 必须是 {CANDIDATE_STT_PROVIDER_OPTIONS} 之一",
             )
         if d.get("candidate_stt_provider") in ("doubao", "generic") and not bool(d.get("candidate_remote_stt_enabled", get_config().candidate_remote_stt_enabled)):
             d["candidate_stt_provider"] = "whisper"
@@ -453,12 +489,18 @@ async def api_update_config(body: ConfigUpdate):
         await run_in_threadpool(update_config, d)
     except HTTPException:
         raise
-    except (TypeError, ValueError, ValidationError) as e:
+    except OSError:
+        raise HTTPException(500, "无法保存设置，请检查配置文件目录的写入权限") from None
+    except ValidationError as e:
+        if "mmpg" in d:
+            raise _mmpg_validation_error(e) from None
+        raise HTTPException(400, str(e)) from e
+    except (TypeError, ValueError) as e:
         raise HTTPException(400, str(e)) from e
     if body.whisper_language is not None:
         set_whisper_language(body.whisper_language)
-    if body.whisper_model is not None:
-        engine = get_stt_engine()
+    if body.whisper_model is not None and get_config().stt_provider == "whisper":
+        engine = await run_in_threadpool(get_stt_engine)
         new_model = body.whisper_model
         if hasattr(engine, "change_model"):
             threading.Thread(target=lambda: engine.change_model(new_model), daemon=True).start()
@@ -504,6 +546,7 @@ async def api_options():
         "positions": POSITION_OPTIONS,
         "languages": LANGUAGE_OPTIONS,
         "stt_providers": STT_PROVIDER_OPTIONS,
+        "candidate_stt_providers": CANDIDATE_STT_PROVIDER_OPTIONS,
         "whisper_models": WHISPER_MODEL_OPTIONS,
         "funasr_models": FUNASR_MODEL_OPTIONS,
         "stt_fallback_providers": STT_FALLBACK_PROVIDER_OPTIONS,
@@ -615,11 +658,62 @@ async def api_resume_history_delete(entry_id: int):
 
 @router.get("/stt/status")
 async def api_stt_status():
+    from api.assist import mmpg_integration
+
+    cfg = get_config()
+    if cfg.stt_provider == MMPG_STT_PROVIDER or mmpg_integration.pipeline.is_streaming_interview():
+        from services.stt.mmpg import MmpgError, validate_config
+
+        try:
+            validate_config(cfg.mmpg)
+            configured, missing = True, []
+        except MmpgError as e:
+            configured, missing = False, e.fields
+        return {
+            **mmpg_integration.stt_status(),
+            "configured": configured,
+            "missing": missing,
+        }
     try:
         engine = get_stt_engine()
         return {"loaded": engine.is_loaded, "loading": engine.is_loading, "model": engine.model_size}
     except Exception as e:
         return {"loaded": False, "loading": False, "model": get_config().stt_provider, "detail": str(e)[:200]}
+
+
+def _import_mmpg_probe_config() -> None:
+    try:
+        with _MMPG_PROBE_CONFIG_PATH.open("rb") as probe_file:
+            content = probe_file.read(_MMPG_PROBE_CONFIG_LIMIT + 1)
+        if len(content) > _MMPG_PROBE_CONFIG_LIMIT:
+            raise ValueError
+        probe = json.loads(content.decode("utf-8-sig"))
+        if not isinstance(probe, dict):
+            raise ValueError
+    except FileNotFoundError:
+        raise HTTPException(404, "本机没有找到 tools/mmpg-probe/config.local.json") from None
+    except (OSError, ValueError):
+        raise HTTPException(422, "无法读取探针配置，请检查 config.local.json 格式") from None
+    patch = {
+        field: value
+        for field, value in probe.items()
+        if field in _MMPG_PROBE_IMPORT_FIELDS and (value is not None or field not in MMPG_SECRET_FIELDS)
+    }
+    if not patch:
+        raise HTTPException(422, "探针配置没有可导入的豆包 MMPG 设置")
+    update_config({"mmpg": patch})
+
+
+@router.post("/stt/mmpg/import-probe")
+async def api_import_mmpg_probe(request: Request):
+    _require_local_mmpg_request(request)
+    try:
+        await run_in_threadpool(_import_mmpg_probe_config)
+    except OSError:
+        raise HTTPException(500, "无法保存设置，请检查配置文件目录的写入权限") from None
+    except ValidationError as e:
+        raise _mmpg_validation_error(e) from None
+    return {"ok": True}
 
 
 @router.post("/models/health")
@@ -770,6 +864,8 @@ async def api_funasr_download(body: dict = None):
 async def api_stt_test():
     """Test current STT engine connectivity with credential pre-checks."""
     cfg = get_config()
+    if cfg.stt_provider == MMPG_STT_PROVIDER:
+        return {"ok": False, "detail": "请在语音设置中使用豆包 MMPG 的会话诊断"}
     if cfg.stt_provider == "iflytek":
         return {"ok": False, "detail": "讯飞 STT 已下线，请改为通用 ASR 或 Whisper"}
     if cfg.stt_provider == "doubao":

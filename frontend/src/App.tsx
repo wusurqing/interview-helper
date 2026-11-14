@@ -10,6 +10,8 @@ import { useOverlayWindowSync } from '@/hooks/useOverlayWindowSync'
 import { useAssistSplit } from '@/hooks/useAssistSplit'
 import { api } from '@/lib/api'
 import { updateConfigAndRefresh } from '@/lib/configSync'
+import { mmpgErrorMessage, mmpgStateLabels } from '@/lib/mmpg/rtcController'
+import { useMmpgStatus } from '@/lib/mmpg/useMmpgStatus'
 import TranscriptionPanel from '@/components/TranscriptionPanel'
 import AnswerPanel from '@/components/AnswerPanel'
 import ControlBar from '@/components/ControlBar'
@@ -48,9 +50,20 @@ export default function App() {
   const sttActiveProvider = useInterviewStore((s) => s.sttActiveProvider)
   const sttFallbackLoaded = useInterviewStore((s) => s.sttFallbackLoaded)
   const isRecording = useInterviewStore((s) => s.isRecording)
+  const interviewerStreaming = useInterviewStore((s) => s.interviewerStreaming)
   const isPaused = useInterviewStore((s) => s.isPaused)
+  const backendMmpgPhase = useInterviewStore((s) => s.mmpgPhase)
+  const backendMmpgError = useInterviewStore((s) => s.mmpgError)
+  const mmpg = useMmpgStatus()
   const currentStreamingId = useInterviewStore((s) => s.currentStreamingId)
-  const isExamMode = config?.written_exam_mode === true
+  const isExamMode = !interviewerStreaming && config?.written_exam_mode === true
+  const usesMmpg = !isExamMode && (isRecording ? interviewerStreaming : config?.stt_provider === 'doubao_mmpg')
+  const localMmpgActive = mmpg.mode && mmpg.mode !== 'test' && !['idle', 'error'].includes(mmpg.state)
+  const localMmpgError = mmpg.mode && mmpg.mode !== 'test' && !['connecting', 'reconnecting', 'listening', 'muted'].includes(backendMmpgPhase) ? mmpg.error : null
+  const mmpgPhase = localMmpgActive ? mmpg.state : localMmpgError ? 'error' : backendMmpgPhase ?? 'idle'
+  const mmpgLabel = isPaused && mmpgPhase === 'idle' ? '已暂停' : mmpgStateLabels[mmpgPhase]
+  const mmpgError = (localMmpgActive ? mmpg.error : localMmpgError) ?? (backendMmpgError ? mmpgErrorMessage(backendMmpgError) : null)
+  const mmpgNotice = localMmpgActive ? mmpg.notice : null
   const [mobileTab, setMobileTab] = useState<'transcript' | 'answer'>('transcript')
   const lastMobileStreamingIdRef = useRef<string | null>(null)
   const appMode = useUiPrefsStore((s) => s.appMode)
@@ -335,7 +348,11 @@ export default function App() {
           </div>
 
           {/* 状态 chip:合并 STT + REC,录音中优先显示 REC,平时显示 STT 状态 */}
-          {isRecording ? (
+          {usesMmpg ? (
+            <div role="status" title={mmpgError ?? mmpgNotice ?? `豆包 MMPG · ${mmpgLabel}`} className={`ml-1.5 flex items-center gap-1.5 rounded-lg border border-bg-hover/30 px-2 py-1 text-[10px] font-medium ${mmpgPhase === 'error' ? 'text-accent-red' : mmpgPhase === 'listening' ? 'text-accent-green' : 'text-text-muted'}`}>
+              <span>{`MMPG ${mmpgLabel}`}</span>
+            </div>
+          ) : isRecording ? (
             <div
               className={`flex items-center gap-1.5 ml-1.5 flex-shrink-0 rounded-lg px-2 py-1 border animate-fade-up ${
                 isPaused
@@ -622,6 +639,7 @@ export default function App() {
         dismissToast={dismissToast}
       />
 
+      {usesMmpg && (mmpgError || mmpgNotice) && <div role="status" className="px-4 py-1.5 text-xs text-accent-amber">{mmpgError ?? mmpgNotice}</div>}
       <SettingsDrawer />
       <KnowledgeDrawer />
     </div>

@@ -1,0 +1,9 @@
+config.local.json
+logs/
+.venv/
+node_modules/
+dist/
+__pycache__/
+.python-deps.sha256
+.node-deps.sha256
+*.png

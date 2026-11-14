@@ -7,7 +7,20 @@
 | `whisper` | 本地 faster-whisper（多语种） | 通用、已有模型缓存 |
 | `funasr` | 本地 FunASR（paraformer / SenseVoice） | **中文/中英混说面试推荐** |
 | `doubao` | 火山引擎流式 ASR（云端） | 高准确率、接受音频上云 |
+| `doubao_mmpg` | 豆包流式 ASR 2.0 与 AIVAD（云端） | Windows 桌面和本机浏览器中的面试官主链路 |
 | `generic` | OpenAI-compatible `/audio/transcriptions` | 自建/第三方云端 ASR |
+
+## 豆包语义判停（MMPG）
+
+在设置 → 语音 → 主链路 ASR 选择 **豆包语义判停（MMPG）**。已完成独立验证的用户可用 **导入本机探针配置** 填入原有项目参数和凭证。
+
+- 自动模式填入 RTC AppId、RTC AppKey、火山 AK/SK 和豆包 ASR API Key。后台会签发并续期本次会话的 RTC Token。
+- 手动模式使用与 AppId、房间 ID 和真人用户 ID 一致的临时 RTC Token。过期后请更新 Token。
+- 选择系统音频或麦克风，点击 **保存并测试 MMPG**。在时间线上查看停顿和判停完成事件，检查最终转写是否保留整道问题。可用同一句话复测 1–2 秒的句中停顿。
+
+默认开启 AIVAD、二遍识别和 Prefetch，静音阈值为 800ms，ForceEnd 关闭，ExpireTime 留空。录音中途调整设置会在下一次面试开始时生效。云端连接中断时会暂停自动提交，按 1、2、4 秒间隔重试，恢复稳定后会为下一次故障重新计数。结束面试会关闭云端会话。
+
+没有开通服务的用户可按[独立验证工具的开通说明](../../tools/mmpg-probe/README.md)准备 RTC、AI 音视频互动和豆包流式 ASR 2.0。
 
 ## FunASR（本地中文推荐）
 

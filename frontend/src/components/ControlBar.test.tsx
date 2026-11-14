@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import ControlBar from './ControlBar'
 import { useInterviewStore } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
+import { mmpgController } from '@/lib/mmpg/rtcController'
 
 
 const apiMock = vi.hoisted(() => ({
@@ -139,6 +140,8 @@ describe('ControlBar', () => {
       sttActiveProvider: '',
       sttFallbackLoaded: false,
       isRecording: false,
+      interviewerStreaming: false,
+      mmpgPhase: null,
       isPaused: false,
       lastWSError: null,
       toastMessage: null,
@@ -251,6 +254,24 @@ describe('ControlBar', () => {
     fireEvent.click(screen.getByRole('button', { name: '继续' }))
 
     await waitFor(() => expect(apiMock.resume).toHaveBeenCalledWith())
+  })
+
+  it('resumes a paused MMPG owner after the next session is configured for written exam', async () => {
+    const start = vi.spyOn(mmpgController, 'start').mockResolvedValue(undefined)
+    try {
+      useInterviewStore.setState((state) => ({
+        config: { ...state.config, written_exam_mode: true, stt_provider: 'whisper' },
+        isRecording: true,
+        isPaused: true,
+        interviewerStreaming: true,
+      }))
+      render(<ControlBar />)
+      fireEvent.click(screen.getByRole('button', { name: '继续' }))
+      await waitFor(() => expect(start).toHaveBeenCalledWith('resume', 1, null, undefined))
+      expect(apiMock.resume).not.toHaveBeenCalled()
+    } finally {
+      start.mockRestore()
+    }
   })
 
   it('blocks interview resume when no audio device is selected', async () => {

@@ -1,5 +1,7 @@
-from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Literal, Optional, Any
+from pydantic import BaseModel, Field, StrictBool, StringConstraints, ValidationError, field_validator, model_validator
+from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Annotated, Literal, Optional, Any
 import hashlib
 import hmac
 import json
@@ -104,6 +106,35 @@ def _default_model_config() -> ModelConfig:
     )
 
 
+MMPG_STT_PROVIDER = "doubao_mmpg"
+MMPG_SECRET_FIELDS = frozenset({
+    "volc_access_key", "volc_secret_key", "rtc_app_key", "rtc_token", "doubao_api_key",
+})
+_MmpgText = Annotated[str, StringConstraints(strip_whitespace=True, strict=True)]
+_PositiveInt = Annotated[int, Field(strict=True, gt=0)]
+
+
+class Mmpg(BaseModel):
+    volc_access_key: _MmpgText = Field(default="", repr=False)
+    volc_secret_key: _MmpgText = Field(default="", repr=False)
+    rtc_app_id: _MmpgText = ""
+    rtc_app_key: _MmpgText = Field(default="", repr=False)
+    rtc_room_id: _MmpgText = ""
+    rtc_user_id: _MmpgText = ""
+    rtc_bot_id: _MmpgText = ""
+    rtc_token: _MmpgText = Field(default="", repr=False)
+    rtc_token_expires_at: _PositiveInt | None = None
+    doubao_api_key: _MmpgText = Field(default="", repr=False)
+    doubao_resource_id: _MmpgText = "volc.seedasr.sauc.duration"
+    aivad: StrictBool = True
+    silence_ms: Annotated[int, Field(strict=True, ge=500, lt=3000)] = 800
+    twopass: StrictBool = True
+    enable_prefetch: StrictBool = True
+    expire_time_ms: _PositiveInt | None = None
+    force_end: StrictBool = False
+    token_mode: Literal["auto", "manual"] = "auto"
+
+
 class AppConfig(BaseModel):
     models: list[ModelConfig] = Field(default_factory=lambda: [_default_model_config()])
     active_model: int = 0
@@ -115,8 +146,9 @@ class AppConfig(BaseModel):
     think_effort: Literal["off", "low", "medium", "high", "xhigh"] = "off"
 
     # 语音识别：whisper=本地 faster-whisper，funasr=本地 FunASR（paraformer/SenseVoice），
-    # doubao=豆包语音识别 API，generic=OpenAI-compatible HTTP ASR
+    # doubao=豆包语音识别 API，doubao_mmpg=豆包会话式 ASR，generic=OpenAI-compatible HTTP ASR
     stt_provider: str = "whisper"
+    mmpg: Mmpg = Field(default_factory=Mmpg)
     whisper_model: str = "base"
     # "auto" is more robust for Chinese interview speech mixed with English terms.
     whisper_language: str = "auto"
@@ -267,7 +299,7 @@ class AppConfig(BaseModel):
                 "检测到已废弃的 candidate_stt_provider=iflytek；已重置为 whisper"
             )
             self.candidate_stt_provider = "whisper"
-        if self.candidate_stt_provider not in STT_PROVIDER_OPTIONS:
+        if self.candidate_stt_provider not in CANDIDATE_STT_PROVIDER_OPTIONS:
             logger.warning(
                 "candidate_stt_provider=%r 不支持，已重置为 whisper",
                 self.candidate_stt_provider,
@@ -365,12 +397,29 @@ def update_config(updates: dict) -> AppConfig:
     with _config_lock:
         cfg = get_config()
         data = cfg.model_dump()
-        for k, v in updates.items():
-            if hasattr(cfg, k):
-                data[k] = v
-        _config = AppConfig(**data)
-        _save_config(_config)
-        return _config
+        for key, value in updates.items():
+            if key == "mmpg":
+                # Merge under the same lock used to persist settings so concurrent
+                # patches preserve fields and credentials they don't edit.
+                current = data["mmpg"]
+                previous_token = current["rtc_token"]
+                for field, setting in value.items():
+                    if field in MMPG_SECRET_FIELDS:
+                        if isinstance(setting, str):
+                            setting = setting.strip()
+                            if not setting:
+                                continue
+                        if setting is None:
+                            setting = ""
+                    current[field] = setting
+                if current["rtc_token"] != previous_token and "rtc_token_expires_at" not in value:
+                    current["rtc_token_expires_at"] = None
+            elif hasattr(cfg, key):
+                data[key] = value
+        updated = AppConfig(**data)
+        _save_config(updated)
+        _config = updated
+        return updated
 
 
 def _load_config() -> AppConfig:
@@ -386,21 +435,32 @@ def _load_config() -> AppConfig:
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 return AppConfig(**json.load(f))
+        except ValidationError as e:
+            logger.warning("配置包含 %s 项无效设置，使用默认配置", e.error_count())
         except Exception as e:
             print(f"[Config] 配置文件解析失败: {e}，使用默认配置")
     return AppConfig()
 
 
-def _save_config(cfg: AppConfig) -> bool:
+def _save_config(cfg: AppConfig) -> None:
+    target = Path(CONFIG_FILE)
+    data = cfg.model_dump()
+    data.pop("resume_text", None)
+    temp_path = None
     try:
-        data = cfg.model_dump()
-        data.pop("resume_text", None)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as f:
+            temp_path = Path(f.name)
             json.dump(data, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception as e:
-        logger.warning("保存配置失败: %s", e, exc_info=True)
-        return False
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, target)
+        temp_path = None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("无法清理配置临时文件")
 
 
 POSITION_OPTIONS = [
@@ -417,6 +477,7 @@ STT_FALLBACK_PROVIDER_OPTIONS = ["whisper", "funasr", "none"]
 # FunASR 本地模型（中文面试场景推荐 paraformer-zh：准确率高、CPU 快、支持热词）
 FUNASR_MODEL_OPTIONS = ["paraformer-zh", "sensevoice-small", "paraformer-zh-streaming"]
 # 语音识别引擎：whisper=本地，funasr=本地 FunASR，doubao=豆包 API，generic=OpenAI-compatible HTTP ASR
-STT_PROVIDER_OPTIONS = ["whisper", "funasr", "doubao", "generic"]
+CANDIDATE_STT_PROVIDER_OPTIONS = ["whisper", "funasr", "doubao", "generic"]
+STT_PROVIDER_OPTIONS = [*CANDIDATE_STT_PROVIDER_OPTIONS, MMPG_STT_PROVIDER]
 # 电脑截图区域
 SCREEN_CAPTURE_REGION_OPTIONS = ["full", "left_half", "right_half", "top_half", "bottom_half"]

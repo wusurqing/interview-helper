@@ -191,6 +191,7 @@ class AudioCapture:
         self._running = False
         self._audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=940)
         self._callback: Optional[Callable[[np.ndarray], None]] = None
+        self._queue_audio = True
         self._lock = threading.Lock()
         # soundcard thread
         self._sc_stop = threading.Event()
@@ -312,6 +313,8 @@ class AudioCapture:
         on_audio: Optional[Callable[[np.ndarray], None]] = None,
         owner: Optional[str] = None,
         mic_compatibility_mode: bool = False,
+        *,
+        queue_audio: bool = True,
     ):
         """Start audio capture on the requested device.
 
@@ -328,12 +331,13 @@ class AudioCapture:
                     self._owner = owner
                 return
             self._callback = on_audio
+            self._queue_audio = queue_audio
             self._running = True
             self._owner = owner
             self._audio_queue = queue.Queue(maxsize=940)
             self._resample_state = [None]
             self._agc_peak = 0.0
-            self._sc_stop.clear()
+            self._sc_stop = threading.Event()
             self._dropped_chunks_count = 0
             self._loopback_discontinuity_count = 0
             self._max_queue_chunk_samples = 0
@@ -378,8 +382,9 @@ class AudioCapture:
             audio = audio.astype(np.float32)
         if self._use_agc:
             audio = self._apply_agc(audio)
-        for chunk in self._iter_queueable_chunks(audio):
-            self._enqueue_chunk(chunk)
+        if self._queue_audio:
+            for chunk in self._iter_queueable_chunks(audio):
+                self._enqueue_chunk(chunk)
         if self._callback:
             self._callback(audio)
 
@@ -430,6 +435,10 @@ class AudioCapture:
                             # noticeably smaller than blocksize on WASAPI to reduce
                             # latency spikes and backend-sized chunk jitter.
                             data = rec.record(numframes=self.LOOPBACK_RECORD_NUMFRAMES)
+                        if self._sc_stop is not stop_event:
+                            return
+                        if stop_event.is_set() and not self._queue_audio:
+                            return
                         if caught:
                             for warning in caught:
                                 warning_text = str(getattr(warning, "message", "") or "")
@@ -454,11 +463,12 @@ class AudioCapture:
                         self._push(np.concatenate(pending_chunks))
                         pending_chunks = []
                         pending_samples = 0
-                if pending_chunks:
+                if pending_chunks and self._sc_stop is stop_event and self._queue_audio:
                     self._push(np.concatenate(pending_chunks))
             except Exception as e:
                 _alog.error("soundcard error: %s", e, exc_info=True)
-                self._running = False
+                if self._sc_stop is stop_event:
+                    self._running = False
             finally:
                 try:
                     ctypes.windll.ole32.CoUninitialize()
@@ -535,7 +545,11 @@ class AudioCapture:
         return attempts
 
     def _start_sounddevice(self, device_id: int, mic_compatibility_mode: bool = False):
+        stop_event = self._sc_stop
+
         def audio_cb(indata, frames, time_info, status):
+            if self._sc_stop is not stop_event or stop_event.is_set():
+                return
             audio = indata[:, 0].copy() if indata.ndim > 1 else indata.copy().flatten()
             native_sr = getattr(self, '_native_sr', self.SAMPLE_RATE)
             audio = _resample_chunk(audio, native_sr, self.SAMPLE_RATE, self._resample_state)

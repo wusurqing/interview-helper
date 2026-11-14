@@ -1,12 +1,15 @@
 import type { StateCreator } from 'zustand'
 import type { RootState } from './rootState'
 import type { ModelHealthStatus, TokenUsage } from './types'
+import type { MmpgState } from '@/lib/mmpg/rtcController'
 
 export interface SttSliceState {
   sttLoaded: boolean
   sttLoading: boolean
   sttActiveProvider: string
   sttFallbackLoaded: boolean
+  mmpgPhase: MmpgState | null
+  mmpgError: string | null
   candidateSttLoaded: boolean
   candidateSttLoading: boolean
   candidateSttProvider: string
@@ -18,6 +21,7 @@ export interface SttSliceState {
 
 export interface SttSliceActions {
   setSttStatus: (loaded: boolean, loading: boolean, provider?: string) => void
+  setMmpgStatus: (phase: MmpgState | null, error: string | null) => void
   setCandidateSttStatus: (loaded: boolean, loading: boolean, provider?: string) => void
   setModelHealth: (
     index: number,
@@ -36,6 +40,8 @@ export const createSttSlice: StateCreator<RootState, [], [], SttSlice> = (set) =
   sttLoading: false,
   sttActiveProvider: '',
   sttFallbackLoaded: false,
+  mmpgPhase: null,
+  mmpgError: null,
   candidateSttLoaded: false,
   candidateSttLoading: false,
   candidateSttProvider: '',
@@ -59,6 +65,7 @@ export const createSttSlice: StateCreator<RootState, [], [], SttSlice> = (set) =
     candidateSttLoading: loading,
     ...(provider != null ? { candidateSttProvider: provider } : {}),
   })),
+  setMmpgStatus: (mmpgPhase, mmpgError) => set({ mmpgPhase, mmpgError }),
   setModelHealth: (index, status, detail, latencyMs, modelFingerprint) => set((s) => {
     const currentFingerprint = s.config?.models?.[index]?.health_fingerprint
     if (modelFingerprint && currentFingerprint && modelFingerprint !== currentFingerprint) return {}

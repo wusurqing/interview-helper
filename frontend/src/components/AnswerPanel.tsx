@@ -286,8 +286,11 @@ export default function AnswerPanel() {
   const streamingIds = useInterviewStore((s) => s.streamingIds)
   const config = useInterviewStore((s) => s.config)
   const isRecording = useInterviewStore((s) => s.isRecording)
-  const isExamMode = config?.written_exam_mode === true
+  const interviewerStreaming = useInterviewStore((s) => s.interviewerStreaming)
+  const isExamMode = !interviewerStreaming && config?.written_exam_mode === true
+  const usesMmpg = config?.stt_provider === 'doubao_mmpg'
   const toggleSettings = useInterviewStore((s) => s.toggleSettings)
+  const openSpeechSettings = useInterviewStore((s) => s.openConfigDrawer)
   const answerPanelLayout = useUiPrefsStore((s) => s.answerPanelLayout)
   const colorScheme = useUiPrefsStore((s) => s.colorScheme)
   const stream = answerPanelLayout === 'stream'
@@ -419,7 +422,12 @@ export default function AnswerPanel() {
         </div>
 
         {/* Sound Test - only show when idle (not recording) */}
-        {isIdle && !isExamMode && (
+        {isIdle && !isExamMode && usesMmpg && (
+          <button type="button" onClick={openSpeechSettings} className="rounded-lg border border-accent-blue/30 bg-accent-blue/10 px-3 py-2 text-xs text-accent-blue">
+            打开豆包 MMPG 测试设置
+          </button>
+        )}
+        {isIdle && !isExamMode && !usesMmpg && (
           <Suspense fallback={<div className="text-xs text-text-muted">加载链路检测中…</div>}>
             <SoundTest />
           </Suspense>

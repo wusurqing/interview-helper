@@ -357,6 +357,8 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
+      // 主窗口隐藏到悬浮窗或托盘时，仍需持续向 RTC 提供会议音频。
+      backgroundThrottling: false,
     },
   });
 

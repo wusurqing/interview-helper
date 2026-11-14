@@ -129,7 +129,8 @@ def ensure_python_deps():
        using *sys.executable* (same Python that is running this script).
     3. After installing, re-check; exit with helpful message if still missing.
     """
-    probe_packages = ["fastapi", "uvicorn", "openai", "numpy", "sounddevice"]
+    probe_packages = ["fastapi", "uvicorn", "openai", "numpy", "sounddevice",
+                      "volcenginesdkcore.signv4", "websockets.asyncio.client"]
     missing = []
     for pkg in probe_packages:
         try:
@@ -236,7 +237,7 @@ def build_frontend(force: bool = False):
         shutil.rmtree(FRONTEND_DIST, ignore_errors=True)
 
     print("[...] 构建前端...")
-    if not os.path.isdir(os.path.join(FRONTEND_DIR, "node_modules")):
+    if not os.path.isfile(os.path.join(FRONTEND_DIR, "node_modules", "@volcengine", "rtc", "package.json")):
         print("  安装前端 npm 依赖...")
         r = subprocess.run([npm, "install"], cwd=FRONTEND_DIR, **_hidden_process_kwargs())
         if r.returncode != 0:
