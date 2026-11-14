@@ -48,6 +48,11 @@ code, pre, .font-mono {
   -webkit-app-region: no-drag;
 }
 
+.app-no-drag,
+.app-no-drag * {
+  -webkit-app-region: no-drag;
+}
+
 /* ========== 主题变量（与 tailwind.config 中 rgb(var(--c-*) / <alpha>) 对应）========== */
 
 :root,

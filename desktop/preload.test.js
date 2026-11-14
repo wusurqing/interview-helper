@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const invoked = [];
 const fakeIpcRenderer = {
   invoke(channel, ...args) {
-    invoked.push(channel);
+    invoked.push({ channel, args });
     return Promise.resolve();
   },
   send() {},
@@ -38,13 +38,19 @@ const api = fakeContextBridge.exposed.api;
 test('preload exposes minimizeWindow that invokes minimize-window channel', async () => {
   invoked.length = 0;
   await api.minimizeWindow();
-  assert.equal(invoked[0], 'minimize-window');
+  assert.equal(invoked[0].channel, 'minimize-window');
 });
 
 test('preload exposes quitApp that invokes quit-app channel', async () => {
   invoked.length = 0;
   await api.quitApp();
-  assert.equal(invoked[0], 'quit-app');
+  assert.equal(invoked[0].channel, 'quit-app');
+});
+
+test('preload sends main window opacity to the dedicated IPC channel', async () => {
+  invoked.length = 0;
+  await api.setWindowOpacity(0.42);
+  assert.deepEqual(invoked[0], { channel: 'set-window-opacity', args: [0.42] });
 });
 
 test('preload exposes all required window control methods', () => {

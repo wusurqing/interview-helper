@@ -52,6 +52,7 @@ const {
   relayChildOutput,
 } = require('./windowOptions');
 const { createMultiScreenBatch } = require('./multiScreenBatch');
+const { normalizeOpacity, readMainWindowOpacity, writeMainWindowOpacity } = require('./mainWindowOpacity');
 
 const pkg = require('./package.json');
 
@@ -83,6 +84,8 @@ const PORT = parseInt(process.env.PORT || '18080', 10);
 const SERVER_URL = `http://127.0.0.1:${PORT}`;
 
 let mainWindow = null;
+let mainWindowOpacity = 1;
+let mainWindowOpacitySaveTimer = null;
 let overlayWindow = null;
 let tray = null;
 let pythonProcess = null;
@@ -122,22 +125,33 @@ const VISIBLE_OVERLAY_SHORTCUT_ACTIONS = new Set(['cancelAnswer', 'overlayPrevQu
 const FRONT_REASSERT_DURATION = 5000;
 const FRONT_REASSERT_INTERVAL = 500;
 
+function stopFrontReassert() {
+  if (_frontReassertTimer === null) return;
+  clearInterval(_frontReassertTimer);
+  _frontReassertTimer = null;
+}
+
+function canReassertOverlayTopMost(win) {
+  return win && win === overlayWindow && !win.isDestroyed()
+    && lastOverlayState.visible && win.isVisible();
+}
+
 function applyTopMost(win) {
-  if (!win || win.isDestroyed()) return;
+  // On Windows, Electron's moveTop() also shows a hidden window.
+  if (!canReassertOverlayTopMost(win)) return;
   win.setAlwaysOnTop(true, 'screen-saver', FRONT_REASSERT_LEVEL);
   win.setContentProtection(true);
   win.moveTop();
 }
 
 function keepWindowInFront(win) {
-  if (_frontReassertTimer) { clearInterval(_frontReassertTimer); _frontReassertTimer = null; }
-  if (!win || win.isDestroyed()) return;
+  stopFrontReassert();
+  if (!canReassertOverlayTopMost(win)) return;
   const start = Date.now();
   applyTopMost(win);
   _frontReassertTimer = setInterval(() => {
-    if (!win || win.isDestroyed() || Date.now() - start > FRONT_REASSERT_DURATION) {
-      clearInterval(_frontReassertTimer);
-      _frontReassertTimer = null;
+    if (!canReassertOverlayTopMost(win) || Date.now() - start > FRONT_REASSERT_DURATION) {
+      stopFrontReassert();
       return;
     }
     applyTopMost(win);
@@ -343,6 +357,10 @@ function startPythonBackend() {
 
 function createWindow() {
   const isWindows = process.platform === 'win32';
+  const opacitySupported = isWindows || process.platform === 'darwin';
+  mainWindowOpacity = opacitySupported
+    ? readMainWindowOpacity(path.join(app.getPath('userData'), 'main-window.json'))
+    : 1;
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -351,6 +369,7 @@ function createWindow() {
     title: APP_DISPLAY_NAME,
     frame: false,
     show: false,
+    ...(opacitySupported ? { opacity: mainWindowOpacity } : {}),
     // Windows 下不在任务栏显示，只在托盘
     skipTaskbar: isWindows,
     webPreferences: {
@@ -475,12 +494,13 @@ function createOverlayWindow() {
     overlayWindow.setBackgroundColor('#00000000');
     overlayWindow.setFocusable(false);
   });
+  overlayWindow.on('hide', stopFrontReassert);
 
   overlayWindow.on('closed', () => {
     overlayWindow = null;
     _overlayDragging = false;
     if (_blurTimer) { clearTimeout(_blurTimer); _blurTimer = null; }
-    if (_frontReassertTimer) { clearInterval(_frontReassertTimer); _frontReassertTimer = null; }
+    stopFrontReassert();
   });
   overlayWindow.on('moved', () => schedulePersistOverlayPosition());
   overlayWindow.on('resize', () => schedulePersistOverlayPosition());
@@ -512,11 +532,17 @@ function sendShortcutsState() {
   });
 }
 
+function hideOverlayWindow() {
+  stopFrontReassert();
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  overlayWindow._pendingShow = false;
+  overlayWindow.hide();
+}
+
 function showOverlayWindow() {
   if (!overlayWindow || overlayWindow.isDestroyed()) return;
   if (!lastOverlayState?.visible) {
-    overlayWindow._pendingShow = false;
-    overlayWindow.hide();
+    hideOverlayWindow();
     return;
   }
   if (!overlayWindow._overlayReady) {
@@ -897,10 +923,7 @@ const shortcutCallbacks = {
     } else {
       // 快捷键仅切换 overlay 可见性, 主窗口保持原状 (用户可通过 Cmd+B 或托盘唤回).
       // 只有 ControlBar 的 "结束面试" 按钮会走 sync-overlay-window IPC 恢复主窗口.
-      if (overlayWindow && !overlayWindow.isDestroyed()) {
-        overlayWindow._pendingShow = false;
-        overlayWindow.hide();
-      }
+      hideOverlayWindow();
     }
   },
   moveOverlayToMouse: () => {
@@ -972,7 +995,28 @@ ipcMain.handle('get-window-state', () => ({
   alwaysOnTop: mainWindow?.isAlwaysOnTop() ?? false,
   contentProtection: mainWindow?._contentProtection !== false,
   visible: mainWindow?.isVisible() ?? false,
+  opacity: mainWindow && !mainWindow.isDestroyed() ? mainWindow.getOpacity() : mainWindowOpacity,
+  opacitySupported: process.platform === 'win32' || process.platform === 'darwin',
 }));
+ipcMain.handle('set-window-opacity', (_event, requestedOpacity) => {
+  if (!mainWindow || mainWindow.isDestroyed()) throw new Error('Main window is unavailable');
+  if (process.platform !== 'win32' && process.platform !== 'darwin') {
+    throw new Error('Window opacity is not supported on this platform');
+  }
+  const opacity = normalizeOpacity(requestedOpacity);
+  mainWindow.setOpacity(opacity);
+  mainWindowOpacity = opacity;
+  if (mainWindowOpacitySaveTimer) clearTimeout(mainWindowOpacitySaveTimer);
+  mainWindowOpacitySaveTimer = setTimeout(() => {
+    mainWindowOpacitySaveTimer = null;
+    try {
+      writeMainWindowOpacity(path.join(app.getPath('userData'), 'main-window.json'), mainWindowOpacity);
+    } catch (error) {
+      console.warn('saveMainWindowOpacity failed:', error);
+    }
+  }, 250);
+  return mainWindow.getOpacity();
+});
 ipcMain.handle('sync-overlay-window', (_event, payload = {}) => {
   const style = {};
   if ('opacity' in payload) {
@@ -1046,10 +1090,7 @@ ipcMain.handle('sync-overlay-window', (_event, payload = {}) => {
   }
 
   if (!state.visible) {
-    if (overlayWindow && !overlayWindow.isDestroyed()) {
-      overlayWindow._pendingShow = false;
-      overlayWindow.hide();
-    }
+    hideOverlayWindow();
     return { ok: true, visible: false };
   }
 
@@ -1171,7 +1212,7 @@ function requestAssistStop(timeoutMs = 12000) {
       settled = true;
       resolve();
     };
-    const req = http.request(`${SERVER_URL}/api/assist/stop`, {
+    const req = http.request(`${SERVER_URL}/api/stop`, {
       method: 'POST',
       timeout: timeoutMs,
     }, (res) => {
@@ -1188,8 +1229,7 @@ function requestAssistStop(timeoutMs = 12000) {
   });
 }
 
-// 优雅停止后端：先主动请求 assist stop，让复盘归档和 SQLite 刷盘完成；
-// 再发 SIGTERM，超时后兜底 SIGKILL。
+// 先等 /api/stop 释放 MMPG 音频和云端会话，并完成复盘归档，再停止后端进程。
 let pythonStopPromise = null;
 function gracefulStopPython(timeoutMs = 20000) {
   if (pythonStopPromise) return pythonStopPromise;
@@ -1199,14 +1239,14 @@ function gracefulStopPython(timeoutMs = 20000) {
     let settled = false;
     const finish = () => { if (settled) return; settled = true; resolve(); };
     proc.once('exit', finish);
-    const stopTimeoutMs = Math.max(1000, Math.min(15000, timeoutMs - 5000));
+    const stopTimeoutMs = Math.max(1000, timeoutMs - 5000);
     requestAssistStop(stopTimeoutMs).then(() => {
       if (settled) return;
       try { proc.kill('SIGTERM'); } catch (err) { console.warn('[py] SIGTERM failed:', err.message); }
       setTimeout(() => {
         if (settled) return;
         try {
-          if (!proc.killed) {
+          if (proc.exitCode === null && proc.signalCode === null) {
             console.warn('[py] graceful timeout, escalating to SIGKILL');
             proc.kill('SIGKILL');
           }
@@ -1222,8 +1262,9 @@ function gracefulStopPython(timeoutMs = 20000) {
 
 app.on('before-quit', (event) => {
   isQuitting = true;
-  if (!pythonProcess || pythonStopPromise) return;
+  if (!pythonProcess) return;
   event.preventDefault();
+  if (pythonStopPromise) return;
   gracefulStopPython().then(() => {
     pythonProcess = null;
     app.quit();
@@ -1274,6 +1315,16 @@ app.on('activate', () => {
 
 app.on('will-quit', () => {
   globalShortcut.unregisterAll();
+  stopFrontReassert();
+  if (mainWindowOpacitySaveTimer) {
+    clearTimeout(mainWindowOpacitySaveTimer);
+    mainWindowOpacitySaveTimer = null;
+    try {
+      writeMainWindowOpacity(path.join(app.getPath('userData'), 'main-window.json'), mainWindowOpacity);
+    } catch (error) {
+      console.warn('saveMainWindowOpacity failed:', error);
+    }
+  }
   if (overlayPositionSaveTimer) {
     clearTimeout(overlayPositionSaveTimer);
     overlayPositionSaveTimer = null;
