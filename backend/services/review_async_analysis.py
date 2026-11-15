@@ -3,6 +3,7 @@
 """
 import threading
 import re
+from collections.abc import Mapping
 from typing import Any, Optional
 
 from core.config import get_config
@@ -40,17 +41,19 @@ def analyze_session_async(session_id: int):
     异步分析 session
     在后台线程中执行，不阻塞主流程
     """
+    configured = getattr(get_config(), "system_prompts", None)
+    system_prompts = dict(configured) if isinstance(configured, Mapping) else {}
     review.update_session_status(session_id, "analyzing")
     thread = threading.Thread(
         target=_analyze_session_worker,
-        args=(session_id,),
+        args=(session_id, system_prompts),
         daemon=True,
     )
     thread.start()
     logger.info("Started background analysis for session_id=%d", session_id)
 
 
-def _analyze_session_worker(session_id: int):
+def _analyze_session_worker(session_id: int, system_prompts: Mapping[str, str] | None = None):
     """
     分析 worker
     1. 逐题分析
@@ -68,23 +71,15 @@ def _analyze_session_worker(session_id: int):
 
         turns = detail.get("turns", [])
         review_source = str(detail.get("source") or "assist")
-        if not turns:
-            logger.info("Session %d has no turns, mark as completed", session_id)
-            review.update_session_summary(
-                session_id=session_id,
-                summary_markdown="本场面试未录制到有效问答",
-                strong_points=[],
-                weak_points=[],
-                avg_score=None,
-            )
-            review.update_session_status(session_id, "completed")
-            return
-
         # 逐题分析
         analyzed_turns = []
+        turn_failed = False
         for turn in turns:
             if turn["is_partial"]:
                 logger.info("Skip partial turn: session_id=%d, turn_id=%d", session_id, turn["id"])
+                continue
+            if turn["analysis_status"] == "completed":
+                analyzed_turns.append(turn)
                 continue
 
             try:
@@ -94,6 +89,7 @@ def _analyze_session_worker(session_id: int):
                     reference_answer=turn.get("reference_answer_text", ""),
                     code_text=turn.get("code_text", ""),
                     review_source=review_source,
+                    system_prompts=system_prompts,
                 )
 
                 # 更新 turn（包括纠正后的候选人回答）
@@ -119,6 +115,7 @@ def _analyze_session_worker(session_id: int):
                 logger.info("Analyzed turn: session_id=%d, turn_id=%d", session_id, turn["id"])
 
             except Exception as e:
+                turn_failed = True
                 logger.error(
                     "Failed to analyze turn: session_id=%d, turn_id=%d, error=%s",
                     session_id,
@@ -131,36 +128,27 @@ def _analyze_session_worker(session_id: int):
                     analysis_status="failed",
                 )
 
-        try:
-            summary_result = review_analysis.generate_summary(
-                turns=analyzed_turns,
-                review_source=review_source,
-            )
+        if turn_failed:
+            review.update_session_status(session_id, "analysis_failed")
+            return
 
-            # 计算平均分
-            all_scores = []
-            for t in analyzed_turns:
-                all_scores.extend(_score_values(t.get("scorecard", {})))
-            avg_score = sum(all_scores) / len(all_scores) if all_scores else None
+        summary_result = review_analysis.generate_summary(
+            turns=analyzed_turns,
+            review_source=review_source,
+            system_prompts=system_prompts,
+        )
+        all_scores = []
+        for turn in analyzed_turns:
+            all_scores.extend(_score_values(turn.get("scorecard", {})))
+        avg_score = sum(all_scores) / len(all_scores) if all_scores else None
 
-            # 更新 session
-            review.update_session_summary(
-                session_id=session_id,
-                summary_markdown=summary_result.get("summary_markdown", ""),
-                strong_points=summary_result.get("strong_points", []),
-                weak_points=summary_result.get("weak_points", []),
-                avg_score=avg_score,
-            )
-
-            logger.info("Generated summary for session_id=%d", session_id)
-
-        except Exception as e:
-            logger.error(
-                "Failed to generate summary: session_id=%d, error=%s",
-                session_id,
-                e,
-                exc_info=True,
-            )
+        review.update_session_summary(
+            session_id=session_id,
+            summary_markdown=summary_result["summary_markdown"],
+            strong_points=summary_result["strong_points"],
+            weak_points=summary_result["weak_points"],
+            avg_score=avg_score,
+        )
 
         # 标记为完成
         review.update_session_status(session_id, "completed")

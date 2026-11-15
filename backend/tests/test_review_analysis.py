@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 import sys
 from unittest.mock import patch, MagicMock
+import json
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
@@ -25,28 +26,75 @@ def _mock_review_config():
     return mock_config
 
 
+@pytest.mark.parametrize(("scene", "source", "summary"), [
+    ("review_turn", "assist", False),
+    ("review_summary", "assist", True),
+    ("exam_review_turn", "written_exam", False),
+    ("exam_review_summary", "written_exam", True),
+])
+def test_review_scene_uses_custom_system_prompt_and_preserves_output_contract(scene, source, summary):
+    model_config = _mock_review_config()
+    custom = "我的复盘规则：使用 {自定义维度}。"
+    model_config.system_prompts = {scene: custom}
+    if summary:
+        result = {"summary_markdown": "## 概述", "strong_points": [], "weak_points": []}
+        contract_field = "summary_markdown"
+    else:
+        result = {
+            "strengths": [],
+            "risks": [],
+            "scorecard": {"自定义维度": 8.5},
+            "evidence": {"improvement_advice": "", "follow_up_questions": [], "tags": []},
+        }
+        contract_field = "scorecard"
+
+    response = MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps(result)))])
+    with patch("services.review_analysis.get_config", return_value=model_config), \
+         patch("services.llm.streaming.chat_completion_create", return_value=response) as completion:
+        if summary:
+            actual = review_analysis.generate_summary(
+                [{"question_text": "输入问题 XYZ", "reference_answer_text": "参考答案"}],
+                review_source=source,
+            )
+        else:
+            actual = review_analysis.analyze_turn(
+                "输入问题 XYZ", "口述回答", "参考答案", apply_asr_correction=False,
+                review_source=source,
+            )
+
+    system, user = completion.call_args.args[1]
+    assert system["role"] == "system"
+    assert system["content"].startswith(custom)
+    assert contract_field in system["content"]
+    assert "输入问题 XYZ" not in system["content"]
+    assert user["role"] == "user"
+    assert "输入问题 XYZ" in user["content"]
+    assert contract_field not in user["content"]
+    assert actual[contract_field] == result[contract_field]
+
+
 def test_analyze_turn_no_active_model():
-    """测试没有有效模型配置时返回空结果"""
+    """模型配置错误需要由后台任务处理。"""
     with patch('services.review_analysis.get_review_model_cfg') as mock_model:
         mock_model.side_effect = ValueError("No API key")
 
-        result = review_analysis.analyze_turn(
-            question="什么是 Python GIL？",
-            candidate_answer="GIL 是全局解释器锁",
-            reference_answer="参考答案",
-        )
-
-        assert result["strengths"] == []
-        assert result["risks"] == []
-        assert result["scorecard"] == {}
-        assert result["evidence"] == {}
+        with pytest.raises(ValueError, match="No API key"):
+            review_analysis.analyze_turn(
+                question="什么是 Python GIL？",
+                candidate_answer="GIL 是全局解释器锁",
+                reference_answer="参考答案",
+                apply_asr_correction=False,
+            )
 
 
 def test_analyze_turn_returns_asr_correction_evidence():
+    response = MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps({
+        "strengths": [], "risks": [], "scorecard": {}, "evidence": {},
+    })))])
     with patch('services.review_analysis.correct_asr_errors') as mock_correct, \
-         patch('services.review_analysis.get_active_llm_client') as mock_client:
+         patch('services.review_analysis.get_config', return_value=_mock_review_config()), \
+         patch('services.llm.streaming.chat_completion_create', return_value=response):
         mock_correct.return_value = "Redis 有字符串和哈希"
-        mock_client.side_effect = ValueError("No API key")
 
         result = review_analysis.analyze_turn(
             question="Redis 有哪些数据结构？",
@@ -132,17 +180,14 @@ def test_analyze_written_exam_turn_reviews_generated_answer():
 
 
 def test_generate_summary_no_active_model():
-    """测试没有有效模型配置时返回提示信息"""
+    """模型配置错误需要由后台任务处理。"""
     with patch('services.review_analysis.get_review_model_cfg') as mock_model:
         mock_model.side_effect = ValueError("No API key")
 
-        result = review_analysis.generate_summary(
-            turns=[{"question_text": "Q1", "candidate_answer_text": "A1"}],
-        )
-
-        assert "未配置" in result["summary_markdown"]
-        assert result["strong_points"] == []
-        assert result["weak_points"] == []
+        with pytest.raises(ValueError, match="No API key"):
+            review_analysis.generate_summary(
+                turns=[{"question_text": "Q1", "candidate_answer_text": "A1"}],
+            )
 
 
 def test_generate_summary_empty_turns():
@@ -152,6 +197,17 @@ def test_generate_summary_empty_turns():
     assert "未录制" in result["summary_markdown"]
     assert result["strong_points"] == []
     assert result["weak_points"] == []
+
+
+def test_summary_markdown_can_contain_code_fences():
+    summary = "## 代码改进例子\n\n```python\nprint(1)\n```"
+    content = json.dumps({"summary_markdown": summary, "strong_points": [], "weak_points": []})
+    response = MagicMock(choices=[MagicMock(message=MagicMock(content=content))])
+    with patch('services.review_analysis.get_config', return_value=_mock_review_config()), \
+         patch('services.llm.streaming.chat_completion_create', return_value=response):
+        result = review_analysis.generate_summary([{"question_text": "题目"}])
+
+    assert result["summary_markdown"] == summary
 
 
 def test_generate_summary_for_written_exam_uses_generated_answers():

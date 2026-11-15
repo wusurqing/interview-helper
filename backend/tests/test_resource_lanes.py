@@ -687,11 +687,18 @@ def test_resume_optimize_is_submitted_to_low_priority_lane(monkeypatch):
         return True
 
     monkeypatch.setattr(resume_router, "submit_low_priority_background", fake_submit)
+    prompts = {"resume_match": "Use a comparison table."}
+    monkeypatch.setattr(
+        resume_router, "get_config", lambda: type("Settings", (), {"system_prompts": prompts})(),
+    )
     monkeypatch.setattr(resume_router.uuid, "uuid4", lambda: type("U", (), {"hex": "job-1"})())
     monkeypatch.setattr(resume_router, "_resume_opt_current_job_id", None)
 
     result = asyncio.run(resume_router.api_resume_optimize(resume_router.OptimizeRequest(jd="需要 Redis 经验")))
 
     assert result == {"ok": True, "job_id": "job-1"}
-    assert submitted == [(resume_router._run_optimize, ("需要 Redis 经验", "job-1"))]
+    prompts["resume_match"] = "Write a paragraph."
+    assert submitted == [
+        (resume_router._run_optimize, ("需要 Redis 经验", "job-1", {"resume_match": "Use a comparison table."})),
+    ]
     assert resume_router._resume_opt_current_job_id == "job-1"

@@ -1,7 +1,9 @@
 import threading
 import uuid
+from collections.abc import Mapping
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+from core.config import get_config
 from core.logger import get_logger
 from core.resource_lanes import submit_low_priority_background
 from services.resume_optimizer import optimize_resume_stream
@@ -24,9 +26,11 @@ async def api_resume_optimize(body: OptimizeRequest):
     global _resume_opt_current_job_id
     job_id = uuid.uuid4().hex
     with _resume_opt_lock:
+        configured = getattr(get_config(), "system_prompts", None)
+        system_prompts = dict(configured) if isinstance(configured, Mapping) else {}
         previous_job_id = _resume_opt_current_job_id
         _resume_opt_current_job_id = job_id
-        accepted = submit_low_priority_background(_run_optimize, body.jd, job_id)
+        accepted = submit_low_priority_background(_run_optimize, body.jd, job_id, system_prompts)
         if not accepted:
             _resume_opt_current_job_id = previous_job_id
             raise HTTPException(429, "后台低优先级队列繁忙，请稍后重试")
@@ -42,13 +46,13 @@ def _resume_opt_payload(event_type: str, job_id: str, **extra):
     return {"type": event_type, "scope": "resume-opt", "job_id": job_id, **extra}
 
 
-def _run_optimize(jd: str, job_id: str):
+def _run_optimize(jd: str, job_id: str, system_prompts: Mapping[str, str]):
     if not _is_current_resume_opt_job(job_id):
         return
     broadcast(_resume_opt_payload("resume_opt_start", job_id))
     full_text = ""
     try:
-        for chunk in optimize_resume_stream(jd):
+        for chunk in optimize_resume_stream(jd, system_prompts=system_prompts):
             if not _is_current_resume_opt_job(job_id):
                 return
             full_text += chunk

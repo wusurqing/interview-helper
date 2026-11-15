@@ -6,7 +6,7 @@
 2) 命中 / 缺失分析(逐条引用简历行号 L<n>,流式 Markdown)
 3) 改写建议(必须引用对应 L<n> 的原文,禁止编造经历)
 
-简历正文在送入步骤 2、3 前预先打编号,模型必须用 L<n> 引用。
+简历正文在送入步骤 2、3 前预先打编号，默认提示词要求用 L<n> 引用。
 失败回退策略:
 - 步骤 1 失败 → 直接走 `_legacy_pass`(单次综合分析),保证用户至少拿到基础结果。
 - 步骤 2 失败 → 在已输出步骤 1 的基础上追加提示,再走 `_legacy_pass` 续输出,
@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+from collections.abc import Mapping
 from typing import Any, Dict, Generator, List, Tuple
 
 
@@ -27,6 +28,7 @@ def _new_eid() -> str:
 
 from core.config import get_config
 from core.logger import get_logger
+from core.prompt_settings import resolve_system_prompt
 from services.llm import _add_tokens, get_client
 
 _log = get_logger("resume_optimizer")
@@ -36,86 +38,46 @@ _log = get_logger("resume_optimizer")
 # Prompts
 # ---------------------------------------------------------------------------
 
-_JD_EXTRACT_PROMPT = """你是资深技术招聘顾问。请从下面 JD 中抽取候选人需要具备的关键能力,
-按 must_have(硬性必需)、nice_to_have(加分项)、soft_skills(软实力) 三类分组。
-每条尽量是简洁的能力词或场景短语,不要照抄整段 JD。
-仅输出 JSON,不要任何其他文字、不要 ```json 围栏。
+_JD_EXTRACT_PROMPT = """你是资深技术招聘顾问。请从 JD 中抽取候选人需要具备的关键能力，按硬性必需、加分项和软实力分组。
+每条写成简洁的能力词或场景短语，避免照抄整段 JD。"""
 
-JD:
-{jd}
+_MATCH_PROMPT = """你是简历审核员。根据 JD 关键能力清单和已编号的简历，逐条判断能力是否在简历中有体现。
 
-输出格式:
-{{
-  "must_have": ["..."],
-  "nice_to_have": ["..."],
-  "soft_skills": ["..."]
-}}
-"""
+用 Markdown 输出“命中能力”和“缺失能力”两个小节。
+- 命中：用粗体写出能力名称，给出简历行号并附简短原文片段。
+- 缺失：用粗体写出能力名称，简短建议在哪个段落补充。
+只引用简历中实际存在的行号，使用 L<n> 格式，如 L12。优先说明硬性要求的匹配情况。"""
 
-_MATCH_PROMPT = """你是简历审核员。下面给出 JD 关键能力清单和已编号的简历正文。
-请逐条判断每条能力是否在简历中有体现:
-- 命中:用粗体写出能力名,然后给出对应简历行号(必须是 L<n> 形式,可多个),并附极简引用片段。
-- 缺失:用粗体写出能力名,简短建议在简历哪个段落补充。
+_REWRITE_PROMPT = """你是资深简历教练。根据 JD、命中与缺失分析以及简历，给出 3-6 条针对性的改写建议。
 
-仅输出 Markdown,不要 JSON,不要重复输出能力清单本身。
-不要编造行号,只能用清单里出现过的 L<n>。
+用 Markdown 列出建议，每条给出一句话标题、简历引用、改写后的版本、对应的 JD 能力和改写理由。引用的原文直接摘自简历。
+每条建议用 L<n> 引用要修改的原文行号；涉及插入时注明“在 L<n> 之后插入”。只使用简历中实际存在的行号。
+只能基于现有内容加强表达、重排或量化，避免编造候选人的经历或技术栈。"""
 
-JD 关键能力:
-{requirements}
+_FALLBACK_PROMPT = """你是资深技术招聘顾问。用 Markdown 简略对比 JD 和简历并给出优化建议，包含匹配度评分、命中亮点、缺失关键词和面试重点。"""
 
-简历(每行已加编号):
-{resume}
+_JD_OUTPUT_CONTRACT = """只返回一个 JSON 对象。must_have、nice_to_have、soft_skills 三个字段均为字符串数组，可为空。"""
 
-按下面结构输出:
-### ✅ 命中能力
-- **<能力>** — L12, L18 / "原文极简引用"
-- ...
+_RESUME_PROMPT_SPECS = {
+    "resume_jd": (_JD_EXTRACT_PROMPT, _JD_OUTPUT_CONTRACT, 700),
+    "resume_match": (_MATCH_PROMPT, "", 1600),
+    "resume_rewrite": (_REWRITE_PROMPT, "", 1800),
+    "resume_fallback": (_FALLBACK_PROMPT, "", 2400),
+}
 
-### ⚠️ 缺失能力
-- **<能力>** — 建议在 <段落> 增加 ...
-- ...
-"""
 
-_REWRITE_PROMPT = """你是资深简历教练。基于上一步的命中/缺失分析,
-给出 3-6 条针对性的简历改写建议。
+def resume_prompt_specs() -> dict[str, tuple[str, str, int]]:
+    return _RESUME_PROMPT_SPECS.copy()
 
-硬性要求:
-1. 每条建议必须用 L<n> 引用要修改的具体行;若涉及新增内容,标注 "在 L<n> 之后插入"。
-2. 引用的"原文"必须直接抄自简历(不可改写),"改写"在原文基础上加强表达。
-3. 严禁编造候选人没有的经历或技术栈,只能基于现有内容做加强、重排、量化。
-4. 每条说明对应 JD 哪条要求(从命中/缺失分析里挑)。
 
-JD:
-{jd}
-
-命中/缺失分析:
-{analysis}
-
-简历(每行已加编号):
-{resume}
-
-输出 Markdown:
-### 📝 改写建议
-
-#### 建议 1 — <一句话标题>
-- 引用: **L<n>** / "原文片段"
-- 改写: <改写后的版本>
-- 对应 JD 要求: <来自上一步的能力名>
-- 理由: <为什么这样改>
-
-#### 建议 2 — ...
-"""
-
-_FALLBACK_PROMPT = """你是资深技术招聘顾问。简略对比下方 JD 与简历并给出 Markdown 形式的优化建议。
-
-## JD
-{jd}
-
-## 简历
-{resume}
-
-输出包括:匹配度评分、命中亮点、缺失关键词、面试重点。
-"""
+def _resume_request(
+    overrides: Mapping[str, str], scene: str, user_text: str,
+) -> tuple[list[dict], int]:
+    default, contract, max_tokens = _RESUME_PROMPT_SPECS[scene]
+    return [
+        {"role": "system", "content": resolve_system_prompt(overrides, scene, default, contract)},
+        {"role": "user", "content": user_text},
+    ], max_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -163,48 +125,32 @@ def _try_parse_json(raw: str) -> Dict[str, Any]:
     return {}
 
 
-def _format_requirements(parsed: Dict[str, Any], raw_fallback: str) -> str:
-    if not parsed:
-        return f"```\n{raw_fallback.strip()}\n```"
-
-    def _bullets(items: Any) -> str:
-        if not isinstance(items, list) or not items:
-            return "- (无)"
-        return "\n".join(f"- {str(x).strip()}" for x in items if str(x).strip())
-
-    parts: List[str] = []
-    parts.append("**必需技能 / 经验**")
-    parts.append(_bullets(parsed.get("must_have")))
-    nice = parsed.get("nice_to_have")
-    if isinstance(nice, list) and nice:
-        parts.append("")
-        parts.append("**加分项**")
-        parts.append(_bullets(nice))
-    soft = parsed.get("soft_skills")
-    if isinstance(soft, list) and soft:
-        parts.append("")
-        parts.append("**软实力**")
-        parts.append(_bullets(soft))
-    return "\n".join(parts)
+_REQUIREMENT_SECTIONS = {
+    "must_have": "必需技能 / 经验",
+    "nice_to_have": "加分项",
+    "soft_skills": "软实力",
+}
 
 
-def _requirements_for_prompt(parsed: Dict[str, Any], raw_fallback: str) -> str:
-    """给后续步骤模型用,纯文本紧凑版本。"""
-    if not parsed:
-        return raw_fallback.strip()
+def _parse_requirements(raw: str) -> dict[str, list[str]]:
+    parsed = _try_parse_json(raw)
+    requirements = {}
+    for key in _REQUIREMENT_SECTIONS:
+        items = parsed.get(key)
+        if not isinstance(items, list) or not all(isinstance(item, str) for item in items):
+            raise ValueError(f"JD 抽取模型字段 {key} 必须是字符串数组")
+        requirements[key] = [item.strip() for item in items if item.strip()]
+    return requirements
 
-    def _list(label: str, items: Any) -> str:
-        if not isinstance(items, list) or not items:
-            return ""
-        joined = "; ".join(str(x).strip() for x in items if str(x).strip())
-        return f"{label}: {joined}" if joined else ""
 
-    chunks = [
-        _list("must_have", parsed.get("must_have")),
-        _list("nice_to_have", parsed.get("nice_to_have")),
-        _list("soft_skills", parsed.get("soft_skills")),
-    ]
-    return "\n".join(c for c in chunks if c) or raw_fallback.strip()
+def _format_requirements(requirements: dict[str, list[str]]) -> str:
+    sections = []
+    for key, label in _REQUIREMENT_SECTIONS.items():
+        items = requirements[key]
+        if items or key == "must_have":
+            bullets = "\n".join(f"- {item}" for item in items) if items else "- (无)"
+            sections.append(f"**{label}**\n{bullets}")
+    return "\n\n".join(sections)
 
 
 _LINE_REF_RE = re.compile(r"\bL\d+\b")
@@ -221,7 +167,7 @@ def _rewrite_needs_line_reference_warning(text: str) -> bool:
 def _stream_chat(
     client,
     model_cfg,
-    prompt: str,
+    messages: list[dict],
     *,
     temperature: float,
     max_tokens: int,
@@ -229,7 +175,6 @@ def _stream_chat(
     """流式调用,逐 chunk yield 文本。usage 自动累加。api_type 任意协议可用。"""
     from services.llm.protocols import build_chat_payload, get_api_type, post_chat_stream
 
-    messages = [{"role": "user", "content": prompt}]
     api_type = get_api_type(model_cfg)
     if api_type != "openai":
         payload = build_chat_payload(
@@ -262,7 +207,7 @@ def _stream_chat(
 def _non_stream_chat(
     client,
     model_cfg,
-    prompt: str,
+    messages: list[dict],
     *,
     temperature: float,
     max_tokens: int,
@@ -271,7 +216,7 @@ def _non_stream_chat(
 
     response = chat_completion_create(
         model_cfg,
-        [{"role": "user", "content": prompt}],
+        messages,
         temperature=temperature,
         max_tokens=max_tokens,
     )
@@ -287,34 +232,42 @@ def _non_stream_chat(
 # Public API
 # ---------------------------------------------------------------------------
 
-def optimize_resume_stream(jd_text: str) -> Generator[str, None, None]:
+def optimize_resume_stream(
+    jd_text: str,
+    *,
+    system_prompts: Mapping[str, str] | None = None,
+) -> Generator[str, None, None]:
     """三步式 grounded 流式输出。任一步失败自动降级到单次分析。"""
     cfg = get_config()
-    if not cfg.resume_text:
+    resume_text = cfg.resume_text
+    if not resume_text:
         yield "[错误: 请先上传简历]"
         return
 
     model_cfg = cfg.get_active_model()
     client = get_client()
 
-    numbered_resume, line_map = _number_resume(cfg.resume_text)
+    configured = getattr(cfg, "system_prompts", None) if system_prompts is None else system_prompts
+    overrides = dict(configured) if isinstance(configured, Mapping) else {}
+    numbered_resume, line_map = _number_resume(resume_text)
     if not line_map:
         yield "[错误: 简历内容为空,无法进行行号引用]"
         return
 
     # ----- Step 1: 抽取 JD 关键能力 -----
     yield "## 📊 JD 关键能力抽取\n\n"
-    parsed: Dict[str, Any] = {}
-    raw_extract = ""
+    jd_input = f"JD：\n{jd_text}"
+    fallback_input = f"{jd_input}\n\n简历：\n{resume_text}"
     try:
+        messages, max_tokens = _resume_request(overrides, "resume_jd", jd_input)
         raw_extract = _non_stream_chat(
             client,
             model_cfg,
-            _JD_EXTRACT_PROMPT.format(jd=jd_text),
+            messages,
             temperature=0.2,
-            max_tokens=700,
+            max_tokens=max_tokens,
         )
-        parsed = _try_parse_json(raw_extract)
+        requirements = _parse_requirements(raw_extract)
     except Exception as e:  # noqa: BLE001
         eid = _new_eid()
         _log.warning("resume agent step1 failed [%s]: %s", eid, e)
@@ -322,26 +275,24 @@ def optimize_resume_stream(jd_text: str) -> Generator[str, None, None]:
             f"\n> 抽取步骤失败,已自动降级到单次综合分析。"
             f"(错误编号 `{eid}`,详情见服务端日志)\n\n---\n\n"
         )
-        yield from _legacy_pass(client, model_cfg, jd_text, cfg.resume_text)
+        yield from _legacy_pass(client, model_cfg, overrides, fallback_input)
         return
 
-    yield _format_requirements(parsed, raw_extract) + "\n\n---\n\n"
-
-    requirements_for_match = _requirements_for_prompt(parsed, raw_extract)
+    yield _format_requirements(requirements) + "\n\n---\n\n"
 
     # ----- Step 2: 命中 / 缺失分析 -----
     yield "## 🎯 命中 / 缺失分析\n\n"
     analysis_chunks: List[str] = []
     try:
+        requirements_text = json.dumps(requirements, ensure_ascii=False)
+        match_input = f"JD 关键能力：\n{requirements_text}\n\n简历（每行已编号）：\n{numbered_resume}"
+        messages, max_tokens = _resume_request(overrides, "resume_match", match_input)
         for piece in _stream_chat(
             client,
             model_cfg,
-            _MATCH_PROMPT.format(
-                requirements=requirements_for_match,
-                resume=numbered_resume,
-            ),
+            messages,
             temperature=0.3,
-            max_tokens=1600,
+            max_tokens=max_tokens,
         ):
             analysis_chunks.append(piece)
             yield piece
@@ -353,7 +304,7 @@ def optimize_resume_stream(jd_text: str) -> Generator[str, None, None]:
             f"(错误编号 `{eid}`)\n\n"
             "---\n\n## 🛟 兜底综合分析(降级)\n\n"
         )
-        yield from _legacy_pass(client, model_cfg, jd_text, cfg.resume_text)
+        yield from _legacy_pass(client, model_cfg, overrides, fallback_input)
         return
 
     analysis_text = "".join(analysis_chunks).strip()
@@ -362,7 +313,7 @@ def optimize_resume_stream(jd_text: str) -> Generator[str, None, None]:
             "\n\n> 模型返回空匹配结果,使用兜底综合分析。\n\n"
             "---\n\n## 🛟 兜底综合分析(降级)\n\n"
         )
-        yield from _legacy_pass(client, model_cfg, jd_text, cfg.resume_text)
+        yield from _legacy_pass(client, model_cfg, overrides, fallback_input)
         return
     yield "\n\n---\n\n"
 
@@ -370,21 +321,22 @@ def optimize_resume_stream(jd_text: str) -> Generator[str, None, None]:
     yield "## ✏️ 简历改写建议\n\n"
     rewrite_chunks: List[str] = []
     try:
+        rewrite_input = (
+            f"{jd_input}\n\n命中 / 缺失分析：\n{analysis_text}"
+            f"\n\n简历（每行已编号）：\n{numbered_resume}"
+        )
+        messages, max_tokens = _resume_request(overrides, "resume_rewrite", rewrite_input)
         for piece in _stream_chat(
             client,
             model_cfg,
-            _REWRITE_PROMPT.format(
-                jd=jd_text,
-                analysis=analysis_text,
-                resume=numbered_resume,
-            ),
+            messages,
             temperature=0.45,
-            max_tokens=1800,
+            max_tokens=max_tokens,
         ):
             rewrite_chunks.append(piece)
             yield piece
         rewrite_text = "".join(rewrite_chunks)
-        if _rewrite_needs_line_reference_warning(rewrite_text):
+        if "resume_rewrite" not in overrides and _rewrite_needs_line_reference_warning(rewrite_text):
             yield (
                 "\n\n> 需人工确认：部分改写建议缺少行号引用，"
                 "请回到原简历逐条核对后再采用。"
@@ -397,18 +349,24 @@ def optimize_resume_stream(jd_text: str) -> Generator[str, None, None]:
             f"(错误编号 `{eid}`)\n\n"
             "---\n\n## 🛟 兜底改写建议(降级)\n\n"
         )
-        yield from _legacy_pass(client, model_cfg, jd_text, cfg.resume_text)
+        yield from _legacy_pass(client, model_cfg, overrides, fallback_input)
 
 
-def _legacy_pass(client, model_cfg, jd_text: str, resume_text: str) -> Generator[str, None, None]:
+def _legacy_pass(
+    client,
+    model_cfg,
+    overrides: Mapping[str, str],
+    user_text: str,
+) -> Generator[str, None, None]:
     """三步链路完全不可用时的兜底:旧的一次性 prompt。"""
     try:
+        messages, max_tokens = _resume_request(overrides, "resume_fallback", user_text)
         yield from _stream_chat(
             client,
             model_cfg,
-            _FALLBACK_PROMPT.format(jd=jd_text, resume=resume_text),
+            messages,
             temperature=0.6,
-            max_tokens=2400,
+            max_tokens=max_tokens,
         )
     except Exception as e:  # noqa: BLE001
         eid = _new_eid()

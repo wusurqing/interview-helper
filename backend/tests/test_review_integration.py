@@ -3,8 +3,11 @@
 """
 import pytest
 from pathlib import Path
+import asyncio
 import sys
 from unittest.mock import MagicMock
+import json
+from types import SimpleNamespace
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
@@ -350,7 +353,7 @@ def test_written_exam_analysis_worker_uses_written_exam_source(monkeypatch):
             "corrected_answer": None,
         }
 
-    def fake_generate_summary(*, turns, review_source):
+    def fake_generate_summary(*, turns, review_source, system_prompts):
         calls["summary"] = {"turns": turns, "review_source": review_source}
         return {
             "summary_markdown": "## 笔试答题质量\n\n整体可提交。",
@@ -411,7 +414,7 @@ def test_analysis_worker_averages_string_scorecards(monkeypatch):
             "corrected_answer": None,
         }
 
-    def fake_generate_summary(*, turns, review_source):
+    def fake_generate_summary(*, turns, review_source, system_prompts):
         return {
             "summary_markdown": "## 总结\n\n评分可用。",
             "strong_points": [],
@@ -427,6 +430,90 @@ def test_analysis_worker_averages_string_scorecards(monkeypatch):
     assert detail is not None
     assert detail["status"] == "completed"
     assert detail["avg_score"] == pytest.approx(7.75)
+
+
+def test_review_job_snapshots_prompts_and_retry_preserves_valid_stages(monkeypatch):
+    from api.review.router import trigger_review_analysis
+    from core.config import ModelConfig
+
+    session_id = review.create_session(
+        started_at=1000.0,
+        interviewer_enabled=False,
+        candidate_enabled=False,
+        source="written_exam",
+    )
+    for seq in (1, 2):
+        review.add_turn(session_id, f"id-{seq}", seq, f"题目 {seq}", reference_answer_text=f"参考答案 {seq}")
+
+    model = ModelConfig(name="review", api_key="test-key", model="test-model")
+    config = SimpleNamespace(
+        get_review_model=lambda: model,
+        system_prompts={"exam_review_turn": "旧逐题规则", "exam_review_summary": "旧总结规则"},
+    )
+    monkeypatch.setattr(review_async_analysis, "get_config", lambda: config)
+    monkeypatch.setattr(review_async_analysis.review_analysis, "get_config", lambda: config)
+    workers = []
+    monkeypatch.setattr(
+        review_async_analysis.threading, "Thread",
+        lambda *, target, args, daemon: SimpleNamespace(start=lambda: workers.append(lambda: target(*args))),
+    )
+    valid_turn = {
+        "strengths": ["复杂度清晰"], "risks": [],
+        "scorecard": {"自定义维度": 8},
+        "evidence": {"improvement_advice": "", "follow_up_questions": [], "tags": []},
+    }
+    calls = []
+    fail_turn = True
+    fail_summary = True
+
+    def completion(model, messages, **kwargs):
+        system, user = (message["content"] for message in messages)
+        calls.append((system, user))
+        if "summary_markdown" in system:
+            data = {"summary_markdown": "## 总结", "strong_points": [], "weak_points": []}
+            if fail_summary:
+                data["summary_markdown"] = ["格式错误"]
+        elif "题目 2" in user and fail_turn:
+            data = {**valid_turn, "strengths": [42]}
+        else:
+            data = valid_turn
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(data)))])
+
+    monkeypatch.setattr("services.llm.streaming.chat_completion_create", completion)
+    assert asyncio.run(trigger_review_analysis(session_id))["status"] == "started"
+    config.system_prompts.update(exam_review_turn="新逐题规则", exam_review_summary="新总结规则")
+    workers.pop()()
+
+    detail = review.get_session_detail(session_id)
+    assert detail["status"] == "analysis_failed"
+    assert [turn["analysis_status"] for turn in detail["turns"]] == ["completed", "failed"]
+    assert detail["turns"][0]["scorecard"] == {"自定义维度": 8}
+    assert all(system.startswith("旧逐题规则") for system, _ in calls)
+
+    fail_turn = False
+    assert asyncio.run(trigger_review_analysis(session_id))["status"] == "started"
+    workers.pop()()
+
+    detail = review.get_session_detail(session_id)
+    assert detail["status"] == "analysis_failed"
+    assert [turn["analysis_status"] for turn in detail["turns"]] == ["completed", "completed"]
+    assert len(calls) == 4
+    assert calls[2][0].startswith("新逐题规则")
+    assert "题目 2" in calls[2][1]
+    assert calls[3][0].startswith("新总结规则")
+    assert "题目 1" in calls[3][1]
+
+    fail_summary = False
+    assert asyncio.run(trigger_review_analysis(session_id))["status"] == "started"
+    workers.pop()()
+
+    detail = review.get_session_detail(session_id)
+    assert detail["status"] == "completed"
+    assert detail["summary_markdown"] == "## 总结"
+    assert len(calls) == 5
+    assert calls[4][0].startswith("新总结规则")
+    assert asyncio.run(trigger_review_analysis(session_id))["status"] == "done"
+    assert workers == []
 
 
 def test_on_assist_stop_no_session():

@@ -3,16 +3,18 @@ Review 模块 LLM 分析服务（含 ASR 纠错功能）
 使用当前激活的 LLM 模型进行逐题分析和整场总结
 """
 import json
+import re
+from collections.abc import Mapping
 from difflib import SequenceMatcher
 from types import SimpleNamespace
-from typing import Optional, Any
+from typing import Any
 from openai import OpenAI
 
 from core.logger import get_logger
 from core.config import get_config
+from core.prompt_settings import resolve_system_prompt
 from services.llm.streaming import (
     _build_think_params,
-    _completion_token_kwargs,
     get_client_for_model,
 )
 
@@ -193,6 +195,125 @@ def correct_asr_errors(
     return candidate_answer
 
 
+_INTERVIEW_TURN_PROMPT = """你是一位资深技术面试官。结合面试问题、候选人回答、参考答案和代码（如有），客观评估候选人的回答。
+
+列出亮点（例如准确性、深度、实战经验、代码质量）和可改进的风险。默认按准确性、深度、表达评分，每条亮点或风险控制在 30 字以内。
+给出下次回答可以直接采用的改进动作、1-2 个可能的面试追问，以及 1-3 个相关技术标签。
+如果候选人未回答或回答为空，亮点留空，风险注明“未回答”，各项评分给 0。
+根据参考答案和实际回答质量评价，避免编造候选人未提到的项目经历。"""
+
+_EXAM_TURN_PROMPT = """你是一位资深算法与笔试辅导教练，对截图题及本次生成答案进行客观复盘。
+
+关注题意理解、算法正确性、复杂度、代码可提交性和边界用例；分析是否漏读截图条件、复杂度不达标、代码不可运行或缺少假设说明。
+默认按正确性、完整性、可提交性评分，每条亮点或风险控制在 30 字以内。
+给出下一次答题可采用的改进动作、1-2 个自测变体或边界用例问题，以及 1-3 个算法或工程标签。
+如果未生成答案，亮点留空，风险注明“未生成答案”，各项评分给 0。
+仅依据题面条件判断。如果答案使用了假设，请评价这些假设是否充分。"""
+
+_INTERVIEW_SUMMARY_PROMPT = """你是一位资深技术面试官。根据本场问答和逐题复盘，对候选人的整场面试表现作出评价。
+
+用 2-3 句话概述整体表现，列出 3-5 条主要亮点和 2-4 条改进方向。
+提取 3-5 个高频亮点和 2-4 个高频短板作为关键词。"""
+
+_EXAM_SUMMARY_PROMPT = """你是一位资深算法与笔试辅导教练。根据截图题、生成答案和逐题复盘，总结本次笔试练习。
+
+用 2-3 句话概述答题质量，列出 3-5 条主要亮点和 2-4 条下次截图答题的改进方向。
+提取 3-5 个高频亮点和 2-4 个高频风险作为关键词。"""
+
+_TURN_OUTPUT_CONTRACT = """只返回一个 JSON 对象，包含以下字段：
+- strengths、risks：字符串数组，可为空。
+- scorecard：对象，键是评分维度名称，可自定义维度；值为 0 至 10 的数字。
+- evidence：对象，可包含 improvement_advice（改进动作字符串）、follow_up_questions（追问字符串数组）和 tags（标签字符串数组）。"""
+
+_SUMMARY_OUTPUT_CONTRACT = """只返回一个 JSON 对象，包含以下字段：
+- summary_markdown：非空 Markdown 字符串，包含整体评价。
+- strong_points、weak_points：字符串数组，分别包含亮点和短板关键词，可为空。"""
+
+_REVIEW_PROMPT_SPECS = {
+    "review_turn": (_INTERVIEW_TURN_PROMPT, _TURN_OUTPUT_CONTRACT, 1000),
+    "review_summary": (_INTERVIEW_SUMMARY_PROMPT, _SUMMARY_OUTPUT_CONTRACT, 1500),
+    "exam_review_turn": (_EXAM_TURN_PROMPT, _TURN_OUTPUT_CONTRACT, 1000),
+    "exam_review_summary": (_EXAM_SUMMARY_PROMPT, _SUMMARY_OUTPUT_CONTRACT, 1500),
+}
+_JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+
+
+def review_prompt_specs() -> dict[str, tuple[str, str, int]]:
+    return _REVIEW_PROMPT_SPECS.copy()
+
+
+def _request_review_json(scene: str, user_text: str, overrides: Mapping[str, str] | None) -> dict[str, Any]:
+    model = get_review_model_cfg()
+    if overrides is None:
+        configured = getattr(get_config(), "system_prompts", None)
+        overrides = configured if isinstance(configured, Mapping) else {}
+    default, contract, max_tokens = _REVIEW_PROMPT_SPECS[scene]
+    response = _review_chat(
+        model,
+        [
+            {"role": "system", "content": resolve_system_prompt(overrides, scene, default, contract)},
+            {"role": "user", "content": user_text},
+        ],
+        temperature=0.3,
+        max_tokens=max_tokens,
+    )
+
+    content = response.choices[0].message.content if response.choices else ""
+    if not content:
+        raise ValueError("复盘模型返回为空")
+
+    try:
+        result = json.loads(content)
+    except json.JSONDecodeError as exc:
+        # 兼容外层 Markdown 围栏，同时保留 JSON 字符串内部的代码块。
+        match = _JSON_FENCE.fullmatch(content.strip())
+        if not match:
+            raise ValueError("复盘模型未返回有效 JSON") from exc
+        try:
+            result = json.loads(match.group(1))
+        except json.JSONDecodeError as fenced_exc:
+            raise ValueError("复盘模型未返回有效 JSON") from fenced_exc
+    if not isinstance(result, dict):
+        raise ValueError("复盘模型未返回 JSON 对象")
+    return result
+
+
+def _string_list(result: dict, field: str) -> list[str]:
+    value = result.get(field)
+    if not isinstance(value, list) or not all(isinstance(text, str) for text in value):
+        raise ValueError(f"复盘模型字段 {field} 必须是字符串数组")
+    return value
+
+
+def _turn_result(result: dict[str, Any]) -> dict[str, Any]:
+    scorecard = result.get("scorecard")
+    if not isinstance(scorecard, dict) or not all(
+        dimension.strip() and type(score) in (int, float) and 0 <= score <= 10
+        for dimension, score in scorecard.items()
+    ):
+        raise ValueError("复盘模型字段 scorecard 必须是维度名称到 0 至 10 分的映射")
+
+    evidence = result.get("evidence")
+    if not isinstance(evidence, dict):
+        raise ValueError("复盘模型字段 evidence 必须是对象")
+    action_evidence: dict[str, Any] = {}
+    if "improvement_advice" in evidence:
+        advice = evidence["improvement_advice"]
+        if not isinstance(advice, str):
+            raise ValueError("复盘模型字段 improvement_advice 必须是字符串")
+        action_evidence["improvement_advice"] = advice
+    for field in ("follow_up_questions", "tags"):
+        if field in evidence:
+            action_evidence[field] = _string_list(evidence, field)
+
+    return {
+        "strengths": _string_list(result, "strengths"),
+        "risks": _string_list(result, "risks"),
+        "scorecard": scorecard,
+        "evidence": action_evidence,
+    }
+
+
 def analyze_turn(
     question: str,
     candidate_answer: str,
@@ -200,225 +321,46 @@ def analyze_turn(
     code_text: str = "",
     apply_asr_correction: bool = True,
     review_source: str = "assist",
+    *,
+    system_prompts: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """
-    分析单个 turn
-    返回：
-    {
-        "strengths": ["亮点1", "亮点2"],
-        "risks": ["风险1", "风险2"],
-        "scorecard": {"准确性": 8, "深度": 7, "表达": 8},
-        "evidence": {"key": "value"},
-        "corrected_answer": "纠正后的回答（如有变化）"
-    }
-    """
+    """分析单题并验证模型返回的复盘数据。"""
     is_written_exam = (review_source or "").strip() == "written_exam"
-    # 语音识别纠错
     corrected_answer = candidate_answer
     if not is_written_exam and apply_asr_correction and candidate_answer:
         corrected_answer = correct_asr_errors(question, candidate_answer)
-    correction_evidence = {}
-    if corrected_answer != candidate_answer:
-        correction_evidence = {
-            "asr_correction": {
-                "original": candidate_answer,
-                "corrected": corrected_answer,
-            }
-        }
-
-    try:
-        review_model = get_review_model_cfg()
-    except ValueError as e:
-        logger.warning("Failed to get active LLM client: %s", e)
-        return {
-            "strengths": [],
-            "risks": [],
-            "scorecard": {},
-            "evidence": {
-                **({"review_mode": "written_exam"} if is_written_exam else {}),
-                **correction_evidence,
-            },
-            "corrected_answer": corrected_answer if corrected_answer != candidate_answer else None,
-        }
 
     if is_written_exam:
-        prompt = f"""你是一位资深算法与笔试辅导教练，请对一次截图笔试答题结果进行客观复盘。
-
-截图题目/题面：
-{question}
-
-本次生成答案：
-{reference_answer if reference_answer else "(未生成答案)"}
-"""
+        scene = "exam_review_turn"
+        user_text = f"截图题目/题面：\n{question}\n\n本次生成答案：\n{reference_answer or '(未生成答案)'}"
     else:
-        prompt = f"""你是一位资深的技术面试官，请对候选人的回答进行客观评价。
-
-问题：
-{question}
-
-候选人回答：
-{corrected_answer if corrected_answer else "(未录制到回答)"}
-
-参考答案：
-{reference_answer}
-"""
-
-    if code_text:
-        prompt += f"""
-
-代码：
-{code_text}
-"""
-
-    if is_written_exam:
-        prompt += """
-
-请从以下维度分析：
-1. **亮点（strengths）**：列出本次生成答案中的优点，例如：题意理解、算法正确性、代码可提交性、复杂度分析、边界用例覆盖等
-2. **风险（risks）**：列出可能导致笔试不过的不足，例如：漏读截图条件、边界条件缺失、复杂度不达标、代码不可运行、没有说明假设等
-3. **评分（scorecard）**：给出 1-10 分的评分，包含：正确性、完整性、可提交性三个维度
-4. **补强建议（evidence.improvement_advice）**：给出 1 条下一次截图答题可直接采用的改进动作
-5. **追问练习（evidence.follow_up_questions）**：给出 1-2 个可用于自测的变体或边界用例问题
-6. **知识标签（evidence.tags）**：提取 1-3 个算法/工程主题标签
-
-请以 JSON 格式返回，格式如下：
-```json
-{
-  "strengths": ["亮点1", "亮点2", "亮点3"],
-  "risks": ["风险1", "风险2"],
-  "scorecard": {
-    "正确性": 8,
-    "完整性": 7,
-    "可提交性": 8
-  },
-  "evidence": {
-    "improvement_advice": "先列出截图里的输入输出约束和边界用例",
-    "follow_up_questions": ["如果输入为空或只有一个元素会怎样？"],
-    "tags": ["哈希表", "边界条件"]
-  }
-}
-```
-
-注意：
-- 如果本次生成答案为空，strengths 为空，risks 包含"未生成答案"，scorecard 全部为 0
-- 评分要客观，重点看这份答案能否在笔试平台直接通过
-- 每条亮点/风险限制在 30 字以内
-- 不要假设截图里没有出现的条件；如果答案基于合理假设，请把假设是否充分列为风险或亮点
-"""
-    else:
-        prompt += """
-
-请从以下维度分析：
-1. **亮点（strengths）**：列出候选人回答中的优点，例如：准确性、深度、实战经验、代码质量等
-2. **风险（risks）**：列出候选人回答中的不足或可改进点
-3. **评分（scorecard）**：给出 1-10 分的评分，包含：准确性、深度、表达三个维度
-4. **补强建议（evidence.improvement_advice）**：给出 1 条下一次回答可直接采用的改进动作
-5. **追问练习（evidence.follow_up_questions）**：给出 1-2 个面试官可能继续追问的问题
-6. **知识标签（evidence.tags）**：提取 1-3 个技术主题标签
-
-请以 JSON 格式返回，格式如下：
-```json
-{
-  "strengths": ["亮点1", "亮点2", "亮点3"],
-  "risks": ["风险1", "风险2"],
-  "scorecard": {
-    "准确性": 8,
-    "深度": 7,
-    "表达": 8
-  },
-  "evidence": {
-    "improvement_advice": "补充一个真实项目中的取舍或踩坑",
-    "follow_up_questions": ["如果数据量扩大 10 倍，你会怎么改？"],
-    "tags": ["Redis", "缓存穿透"]
-  }
-}
-```
-
-注意：
-- 如果候选人未回答或回答为空，strengths 为空，risks 包含"未回答"，scorecard 全部为 0
-- 评分要客观，结合参考答案和实际回答质量
-- 每条亮点/风险限制在 30 字以内
-- 不要编造候选人没有表达过的项目经历；补强建议和追问可以基于问题主题提出
-"""
-
-    try:
-        response = _review_chat(
-            review_model,
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是一位专业的算法与笔试辅导教练，擅长评估截图题解答质量。"
-                        if is_written_exam
-                        else "你是一位专业的技术面试官，擅长客观评价候选人的回答。"
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=1000,
+        scene = "review_turn"
+        user_text = (
+            f"问题：\n{question}\n\n候选人回答：\n{corrected_answer or '(未录制到回答)'}"
+            f"\n\n参考答案：\n{reference_answer}"
         )
+    if code_text:
+        user_text += f"\n\n代码：\n{code_text}"
 
-        content = response.choices[0].message.content
-        if not content:
-            raise ValueError("Empty response from LLM")
-
-        # 提取 JSON
-        if "```json" in content:
-            start = content.index("```json") + 7
-            end = content.index("```", start)
-            json_str = content[start:end].strip()
-        elif "```" in content:
-            start = content.index("```") + 3
-            end = content.index("```", start)
-            json_str = content[start:end].strip()
-        else:
-            json_str = content.strip()
-
-        result = json.loads(json_str)
-        llm_evidence = result.get("evidence", {})
-        if not isinstance(llm_evidence, dict):
-            llm_evidence = {}
-
-        return {
-            "strengths": result.get("strengths", []),
-            "risks": result.get("risks", []),
-            "scorecard": result.get("scorecard", {}),
-            "evidence": {
-                **llm_evidence,
-                **({"review_mode": "written_exam"} if is_written_exam else {}),
-                **correction_evidence,
-            },
-            "corrected_answer": corrected_answer if corrected_answer != candidate_answer else None,
+    result = _turn_result(_request_review_json(scene, user_text, system_prompts))
+    if is_written_exam:
+        result["evidence"]["review_mode"] = "written_exam"
+    if corrected_answer != candidate_answer:
+        result["evidence"]["asr_correction"] = {
+            "original": candidate_answer,
+            "corrected": corrected_answer,
         }
-
-    except Exception as e:
-        logger.error("Failed to analyze turn: %s", e, exc_info=True)
-        return {
-            "strengths": [],
-            "risks": [f"分析失败: {str(e)[:50]}"],
-            "scorecard": {},
-            "evidence": {
-                **({"review_mode": "written_exam"} if is_written_exam else {}),
-                **correction_evidence,
-            },
-            "corrected_answer": corrected_answer if corrected_answer != candidate_answer else None,
-        }
+    result["corrected_answer"] = corrected_answer if corrected_answer != candidate_answer else None
+    return result
 
 
 def generate_summary(
     turns: list[dict[str, Any]],
     review_source: str = "assist",
+    *,
+    system_prompts: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
-    """
-    生成整场面试的总结
-    返回：
-    {
-        "summary_markdown": "## 整体表现\n...",
-        "strong_points": ["基础扎实", "表达清晰"],
-        "weak_points": ["深度不够", "缺少实战案例"]
-    }
-    """
+    """根据已经分析的逐题数据生成整体评价。"""
     is_written_exam = (review_source or "").strip() == "written_exam"
     if not turns:
         return {
@@ -427,133 +369,34 @@ def generate_summary(
             "weak_points": [],
         }
 
-    try:
-        review_model = get_review_model_cfg()
-    except ValueError as e:
-        logger.warning("Failed to get active LLM client: %s", e)
-        return {
-            "summary_markdown": "未配置有效的模型 API Key，无法生成总结",
-            "strong_points": [],
-            "weak_points": [],
-        }
-
-    # 构建输入
-    turns_text = ""
-    for idx, turn in enumerate(turns, start=1):
-        if is_written_exam:
-            turns_text += f"""
-### 第 {idx} 题
-截图题目/题面：{turn.get('question_text', '')}
-生成答案：{turn.get('reference_answer_text', '(未生成)')}
-"""
-        else:
-            turns_text += f"""
-### 第 {idx} 题
-问题：{turn.get('question_text', '')}
-回答：{turn.get('candidate_answer_text', '(未录制)')}
-"""
-        strengths = turn.get("strengths", [])
-        risks = turn.get("risks", [])
-        if strengths:
-            turns_text += f"亮点：{', '.join(strengths)}\n"
-        if risks:
-            turns_text += f"风险：{', '.join(risks)}\n"
-
     if is_written_exam:
-        prompt = f"""你是一位资深算法与笔试辅导教练，请对本次截图笔试练习进行总结。
-
-本次笔试练习共 {len(turns)} 道截图题：
-{turns_text}
-
-请生成一份 Markdown 格式的整体评价，包含：
-1. 答题质量概述（2-3 句话）
-2. 主要亮点（3-5 条，用列表形式）
-3. 下次截图答题改进方向（2-4 条，用列表形式）
-
-同时，请提取：
-- strong_points：高频亮点关键词（数组，3-5 个词）
-- weak_points：高频风险关键词（数组，2-4 个词）
-
-返回 JSON 格式：
-```json
-{{
-  "summary_markdown": "## 笔试答题质量\n\n...\n\n**亮点：**\n- ...\n\n**改进方向：**\n- ...",
-  "strong_points": ["题意提取准确", "复杂度清晰", "代码可提交"],
-  "weak_points": ["边界用例不足", "截图条件遗漏"]
-}}
-```
-"""
+        scene = "exam_review_summary"
+        user_parts = [f"本次笔试练习共 {len(turns)} 道截图题："]
     else:
-        prompt = f"""你是一位资深技术面试官，请对候选人的整场面试表现进行总结。
+        scene = "review_summary"
+        user_parts = [f"本场面试共 {len(turns)} 轮问答："]
 
-本场面试共 {len(turns)} 轮问答：
-{turns_text}
-
-请生成一份 Markdown 格式的整体评价，包含：
-1. 整体表现概述（2-3 句话）
-2. 主要亮点（3-5 条，用列表形式）
-3. 改进方向（2-4 条，用列表形式）
-
-同时，请提取：
-- strong_points：高频亮点关键词（数组，3-5 个词）
-- weak_points：高频短板关键词（数组，2-4 个词）
-
-返回 JSON 格式：
-```json
-{{
-  "summary_markdown": "## 整体表现\n\n...\n\n**亮点：**\n- ...\n\n**改进方向：**\n- ...",
-  "strong_points": ["基础扎实", "表达清晰", "有实战经验"],
-  "weak_points": ["深度不够", "缺少踩坑案例"]
-}}
-```
-"""
-
-    try:
-        response = _review_chat(
-            review_model,
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "你是一位专业的算法与笔试辅导教练，擅长总结截图笔试练习表现。"
-                        if is_written_exam
-                        else "你是一位专业的技术面试官，擅长总结候选人的整体表现。"
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_tokens=1500,
-        )
-
-        content = response.choices[0].message.content
-        if not content:
-            raise ValueError("Empty response from LLM")
-
-        # 提取 JSON
-        if "```json" in content:
-            start = content.index("```json") + 7
-            end = content.index("```", start)
-            json_str = content[start:end].strip()
-        elif "```" in content:
-            start = content.index("```") + 3
-            end = content.index("```", start)
-            json_str = content[start:end].strip()
+    for idx, turn in enumerate(turns, start=1):
+        user_parts.append(f"\n### 第 {idx} 题")
+        if is_written_exam:
+            user_parts.append(f"截图题目/题面：{turn.get('question_text', '')}")
+            user_parts.append(f"生成答案：{turn.get('reference_answer_text', '(未生成)')}")
         else:
-            json_str = content.strip()
+            user_parts.append(f"问题：{turn.get('question_text', '')}")
+            user_parts.append(f"回答：{turn.get('candidate_answer_text', '(未录制)')}")
+        for field, label in (("strengths", "亮点"), ("risks", "风险")):
+            values = turn.get(field)
+            if isinstance(values, list):
+                texts = [text for text in values if isinstance(text, str)]
+                if texts:
+                    user_parts.append(f"{label}：{', '.join(texts)}")
 
-        result = json.loads(json_str)
-
-        return {
-            "summary_markdown": result.get("summary_markdown", ""),
-            "strong_points": result.get("strong_points", []),
-            "weak_points": result.get("weak_points", []),
-        }
-
-    except Exception as e:
-        logger.error("Failed to generate summary: %s", e, exc_info=True)
-        return {
-            "summary_markdown": f"## 总结生成失败\n\n{str(e)}",
-            "strong_points": [],
-            "weak_points": [],
-        }
+    result = _request_review_json(scene, "\n".join(user_parts), system_prompts)
+    summary = result.get("summary_markdown")
+    if not isinstance(summary, str) or not summary.strip():
+        raise ValueError("复盘模型字段 summary_markdown 必须是非空字符串")
+    return {
+        "summary_markdown": summary,
+        "strong_points": _string_list(result, "strong_points"),
+        "weak_points": _string_list(result, "weak_points"),
+    }
