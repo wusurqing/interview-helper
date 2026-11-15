@@ -97,6 +97,7 @@ def extract_tags(question: str, answer: str = "", candidate_answer: str = "") ->
             [{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=200,
+            trace_context={"scene": "knowledge_tags"},
         )
         text = resp.choices[0].message.content or "[]"
         start = text.find("[")

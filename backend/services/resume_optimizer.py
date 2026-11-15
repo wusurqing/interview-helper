@@ -30,6 +30,7 @@ from core.config import get_config
 from core.logger import get_logger
 from core.prompt_settings import resolve_system_prompt
 from services.llm import _add_tokens, get_client
+from services.llm import trace
 
 _log = get_logger("resume_optimizer")
 
@@ -164,6 +165,7 @@ def _rewrite_needs_line_reference_warning(text: str) -> bool:
     return _LINE_REF_RE.search(cleaned) is None
 
 
+@trace.traced("resume_optimization")
 def _stream_chat(
     client,
     model_cfg,
@@ -211,6 +213,7 @@ def _non_stream_chat(
     *,
     temperature: float,
     max_tokens: int,
+    trace_context: dict | None = None,
 ) -> str:
     from services.llm.streaming import chat_completion_create
 
@@ -219,6 +222,7 @@ def _non_stream_chat(
         messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        trace_context=trace_context,
     )
     usage = getattr(response, "usage", None)
     if usage:
@@ -266,6 +270,7 @@ def optimize_resume_stream(
             messages,
             temperature=0.2,
             max_tokens=max_tokens,
+            trace_context={"scene": "resume_jd"},
         )
         requirements = _parse_requirements(raw_extract)
     except Exception as e:  # noqa: BLE001
@@ -293,6 +298,7 @@ def optimize_resume_stream(
             messages,
             temperature=0.3,
             max_tokens=max_tokens,
+            trace_context={"scene": "resume_match"},
         ):
             analysis_chunks.append(piece)
             yield piece
@@ -332,6 +338,7 @@ def optimize_resume_stream(
             messages,
             temperature=0.45,
             max_tokens=max_tokens,
+            trace_context={"scene": "resume_rewrite"},
         ):
             rewrite_chunks.append(piece)
             yield piece
@@ -367,6 +374,7 @@ def _legacy_pass(
             messages,
             temperature=0.6,
             max_tokens=max_tokens,
+            trace_context={"scene": "resume_fallback"},
         )
     except Exception as e:  # noqa: BLE001
         eid = _new_eid()

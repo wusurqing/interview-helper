@@ -56,7 +56,7 @@ def _review_think_params(max_tokens: int) -> dict[str, Any]:
     return _build_think_params(review_model, request_cfg)
 
 
-def _review_chat(model_cfg, messages: list, *, temperature: float, max_tokens: int):
+def _review_chat(model_cfg, messages: list, *, temperature: float, max_tokens: int, trace_context=None):
     """统一非流式调用：api_type=anthropic/responses 的模型也能用。"""
     from services.llm.streaming import chat_completion_create
 
@@ -66,6 +66,7 @@ def _review_chat(model_cfg, messages: list, *, temperature: float, max_tokens: i
         temperature=temperature,
         max_tokens=max_tokens,
         think_params=_review_think_params(max_tokens),
+        trace_context=trace_context,
     )
 
 
@@ -141,6 +142,7 @@ def run_asr_correction_check(
             ],
             temperature=0.1,
             max_tokens=800,
+            trace_context={"scene": "asr_correction"},
         )
 
         content = response.choices[0].message.content
@@ -256,6 +258,7 @@ def _request_review_json(scene: str, user_text: str, overrides: Mapping[str, str
         ],
         temperature=0.3,
         max_tokens=max_tokens,
+        trace_context={"scene": scene},
     )
 
     content = response.choices[0].message.content if response.choices else ""

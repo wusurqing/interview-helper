@@ -23,6 +23,7 @@ from services.llm.streaming import (
     _disabled_think_params_for_model,
     _openai_compat_headers,
 )
+from services.llm import trace
 
 _model_health: dict[int, str] = {}
 _model_health_detail: dict[int, str] = {}
@@ -278,6 +279,7 @@ def _chat_payload(model, messages: list, max_tokens: int, extra: Optional[dict] 
     return payload
 
 
+@trace.traced("model_health")
 def _post_chat(model, payload: dict, timeout: int = 12) -> tuple[dict, int]:
     import time as _time
 
@@ -290,7 +292,18 @@ def _post_chat(model, payload: dict, timeout: int = 12) -> tuple[dict, int]:
     last_not_found = ""
     response = None
     for url in candidates:
-        response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        attempt = trace.begin(url, api_type, payload, api_key=model.api_key)
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        except Exception as exc:
+            attempt.finish("failed", exc)
+            raise
+        attempt.headers(response.status_code)
+        try:
+            attempt.response(response.json())
+        except ValueError:
+            attempt.response({"unparsed_body": response.text})
+        attempt.finish("failed" if response.status_code >= 400 else "completed")
         if response.status_code in (404, 405) and len(candidates) > 1:
             last_not_found = f"HTTP {response.status_code}: {response.text[:160]}"
             continue

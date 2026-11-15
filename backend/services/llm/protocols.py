@@ -10,6 +10,7 @@ Base URL 的处理参考 cc-switch 的宽松策略：带不带 /v1、结尾多�
 SDK 路径会先规范化，裸 HTTP 路径按候选列表依次探测（404 自动换下一个）。
 """
 
+import asyncio
 import json
 import re
 from types import SimpleNamespace
@@ -19,6 +20,7 @@ import requests
 import httpx
 
 from core.logger import get_logger
+from services.llm import trace
 
 _log = get_logger("llm.protocols")
 
@@ -453,6 +455,25 @@ def _parse_sse_data(line, api_type, parser):
     return chunk if chunk.choices or chunk.usage else None, done
 
 
+def _trace_sse_line(attempt, line):
+    if not line.startswith("data:"):
+        return
+    data = line[5:].strip()
+    if data == "[DONE]":
+        return
+    try:
+        attempt.stream_event(json.loads(data))
+    except ValueError:
+        attempt.stream_event({"unparsed_data": data})
+
+
+def _trace_http_error_body(response):
+    try:
+        return response.json()
+    except (ValueError, TypeError):
+        return {"unparsed_body": response.text}
+
+
 def _stream_targets(api_base_url, api_type, api_key):
     candidates = chat_url_candidates(api_base_url, api_type)
     if not candidates:
@@ -465,7 +486,7 @@ def _stream_targets(api_base_url, api_type, api_key):
     return candidates, header_variants
 
 
-async def post_cancellable_chat_stream(api_base_url, api_type, api_key, payload, *, on_started):
+async def post_cancellable_chat_stream(api_base_url, api_type, api_key, payload, *, on_started, trace_context=None):
     candidates, header_variants = _stream_targets(api_base_url, api_type, api_key)
     parser = _CHUNK_PARSERS.get(api_type, _openai_chunk)
     first = True
@@ -475,22 +496,44 @@ async def post_cancellable_chat_stream(api_base_url, api_type, api_key, payload,
                 if first:
                     on_started()
                     first = False
-                async with client.stream("POST", url, headers=headers, json=payload) as response:
-                    status = response.status_code
-                    if status in (401, 403) and headers is not header_variants[-1]:
-                        continue
-                    if status in (404, 405):
-                        break
-                    if status >= 400:
-                        await response.aread()
-                        raise_for_llm_status(status, response.text)
-                    async for line in response.aiter_lines():
-                        chunk, done = _parse_sse_data(line, api_type, parser)
-                        if chunk is not None:
-                            yield chunk
-                        if done:
+                attempt = trace.begin(url, api_type, payload, api_key=api_key, context=trace_context)
+                complete = False
+                try:
+                    async with client.stream("POST", url, headers=headers, json=payload) as response:
+                        status = response.status_code
+                        attempt.headers(status)
+                        if status in (401, 403) and headers is not header_variants[-1]:
+                            await response.aread()
+                            attempt.response(_trace_http_error_body(response))
+                            continue
+                        if status in (404, 405):
+                            await response.aread()
+                            attempt.response(_trace_http_error_body(response))
                             break
-                    return
+                        if status >= 400:
+                            await response.aread()
+                            attempt.response(_trace_http_error_body(response))
+                            raise_for_llm_status(status, response.text)
+                        async for line in response.aiter_lines():
+                            _trace_sse_line(attempt, line)
+                            chunk, done = _parse_sse_data(line, api_type, parser)
+                            if chunk is not None:
+                                yield chunk
+                            if done:
+                                complete = True
+                                break
+                        else:
+                            complete = True
+                        return
+                except (GeneratorExit, asyncio.CancelledError):
+                    attempt.finish("cancelled")
+                    raise
+                except Exception as exc:
+                    attempt.finish("failed", exc)
+                    raise
+                finally:
+                    attempt.finish("failed" if (attempt.status_code or 0) >= 400 else
+                                   "completed" if complete else "incomplete")
     from services.llm.streaming import LLMError
 
     raise LLMError("未找到可用的对话接口地址")
@@ -510,25 +553,43 @@ def post_chat_stream(
     last_not_found = ""
     for url in candidates:
         for headers in header_variants:
-            with _http.post(url, headers=headers, json=payload, stream=True, timeout=timeout) as resp:
-                if resp.status_code in (401, 403) and headers is not header_variants[-1]:
-                    continue
-                if resp.status_code in (404, 405):
-                    last_not_found = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                    break
-                if resp.status_code >= 400:
-                    try:
-                        body = resp.json()
-                    except Exception:
-                        body = resp.text
-                    raise_for_llm_status(resp.status_code, str(body))
-                for line in _iter_sse_lines(resp):
-                    chunk, done = _parse_sse_data(line, api_type, parser)
-                    if chunk is not None:
-                        yield chunk
-                    if done:
+            attempt = trace.begin(url, api_type, payload, api_key=api_key)
+            complete = False
+            try:
+                with _http.post(url, headers=headers, json=payload, stream=True, timeout=timeout) as resp:
+                    attempt.headers(resp.status_code)
+                    if resp.status_code in (401, 403) and headers is not header_variants[-1]:
+                        attempt.response(_trace_http_error_body(resp))
+                        continue
+                    if resp.status_code in (404, 405):
+                        last_not_found = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                        attempt.response(_trace_http_error_body(resp))
                         break
-                return
+                    if resp.status_code >= 400:
+                        try:
+                            body = resp.json()
+                        except Exception:
+                            body = resp.text
+                        attempt.response(body)
+                        raise_for_llm_status(resp.status_code, str(body))
+                    for line in _iter_sse_lines(resp):
+                        _trace_sse_line(attempt, line)
+                        chunk, done = _parse_sse_data(line, api_type, parser)
+                        if chunk is not None:
+                            yield chunk
+                        if done:
+                            break
+                    complete = True
+                    return
+            except GeneratorExit:
+                attempt.finish("cancelled")
+                raise
+            except Exception as exc:
+                attempt.finish("failed", exc)
+                raise
+            finally:
+                attempt.finish("failed" if (attempt.status_code or 0) >= 400 else
+                               "completed" if complete else "incomplete")
     from services.llm.streaming import LLMError
 
     raise LLMError(last_not_found or "未找到可用的对话接口地址")
@@ -554,24 +615,39 @@ def post_chat_blocking(
     last_not_found = ""
     for url in candidates:
         for headers in header_variants:
-            response = _http.post(url, headers=headers, json=payload, timeout=timeout)
+            attempt = trace.begin(url, api_type, payload, api_key=api_key)
+            try:
+                response = _http.post(url, headers=headers, json=payload, timeout=timeout)
+            except Exception as exc:
+                attempt.finish("failed", exc)
+                raise
+            attempt.headers(response.status_code)
             if response.status_code in (401, 403) and headers is not header_variants[-1]:
+                attempt.response(_trace_http_error_body(response))
+                attempt.finish("failed")
                 continue
             if response.status_code in (404, 405):
                 last_not_found = f"HTTP {response.status_code}: {response.text[:200]}"
+                attempt.response(_trace_http_error_body(response))
+                attempt.finish("failed")
                 break
             if response.status_code >= 400:
                 try:
                     body = response.json()
                 except Exception:
                     body = response.text
+                attempt.response(body)
+                attempt.finish("failed")
                 raise_for_llm_status(response.status_code, str(body))
             try:
                 data = response.json()
             except Exception:
                 from services.llm.streaming import LLMProtocolError
 
+                attempt.finish("failed", "response is not JSON")
                 raise LLMProtocolError(f"响应不是 JSON: {response.text[:200]}")
+            attempt.response(data)
+            attempt.finish()
             text, reasoning = extract_reply_text(data, api_type)
             message = SimpleNamespace(content=text, reasoning_content=reasoning or None)
             usage_obj = _extract_usage(data)
