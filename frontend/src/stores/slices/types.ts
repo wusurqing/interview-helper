@@ -42,6 +42,7 @@ export interface AppConfig {
   model_name: string
   temperature: number
   max_tokens: number
+  system_prompts?: Record<string, string>
   think_mode: boolean
   think_effort: string
   stt_provider: string
@@ -192,5 +193,5 @@ export interface TokenUsage {
   byModel?: Record<string, { prompt: number; completion: number }>
 }
 
-export type SettingsDrawerTab = 'general' | 'mode' | 'kb' | 'config' | 'timing' | 'hotwords' | 'models' | 'appearance'
+export type SettingsDrawerTab = 'general' | 'mode' | 'kb' | 'config' | 'timing' | 'hotwords' | 'models' | 'prompts' | 'appearance'
 export type ModelHealthStatus = 'checking' | 'ok' | 'error'

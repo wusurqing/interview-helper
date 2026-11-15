@@ -278,3 +278,40 @@ def test_api_start_rejects_while_exam_preflight_is_running(
     assert exc_info.value.status_code == 409
     assert "链路检测正在运行" in str(exc_info.value.detail)
     assert started == []
+
+
+def test_prompt_catalog_and_settings_api_keep_runtime_data_out(monkeypatch, tmp_path):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from api.common.router import router
+    from core import config
+
+    config_path = tmp_path / "config.json"
+    cfg = config.AppConfig(resume_text="private-resume-sentinel", position="private-role-sentinel", max_tokens=640)
+    monkeypatch.setattr(config, "CONFIG_FILE", config_path)
+    monkeypatch.setattr(config, "_config", cfg)
+    app = FastAPI()
+    app.include_router(router, prefix="/api")
+
+    with TestClient(app) as client:
+        catalog = client.get("/api/prompts")
+        assert catalog.status_code == 200
+        assert "private-" not in catalog.text
+        scenes = {row["id"]: row for row in catalog.json()["scenes"]}
+        assert len(scenes) == 13
+        assert scenes["assist_manual"]["max_output_tokens"] == 640
+        assert "summary_markdown" in scenes["review_summary"]["output_contract"]
+        assert scenes["assist_manual"]["default_prompt"]
+
+        body = {"system_prompts": {"assist_manual": "Use {literal} and bold text."}}
+        saved = client.post("/api/config", json=body)
+        assert saved.status_code == 200
+        assert saved.json()["system_prompts"] == body["system_prompts"]
+        assert "private-resume-sentinel" not in config_path.read_text(encoding="utf-8")
+
+        bad = client.post("/api/config", json={"system_prompts": {"unknown": "rules"}})
+        assert 400 <= bad.status_code < 500
+        assert client.get("/api/config").json()["system_prompts"] == body["system_prompts"]
+        reset = client.post("/api/config", json={"system_prompts": {"assist_manual": None}})
+        assert reset.json()["system_prompts"] == {}

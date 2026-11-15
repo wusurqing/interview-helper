@@ -169,10 +169,21 @@ export interface ResumeUploadResult {
   parse_error?: string | null
 }
 
+export interface SystemPromptScene {
+  id: string
+  group: string
+  label: string
+  entry: string
+  default_prompt: string
+  output_contract: string
+  max_output_tokens: number
+}
+
 export const api = {
   getConfig: () => request('/api/config'),
   updateConfig: (data: Record<string, any>) =>
     request('/api/config', { method: 'POST', body: JSON.stringify(data) }),
+  getSystemPromptScenes: () => request<{ scenes: SystemPromptScene[] }>('/api/prompts'),
   importMmpgProbe: () => request<{ ok: boolean }>('/api/stt/mmpg/import-probe', { method: 'POST' }),
   modelsLayout: (data: {
     order?: number[]

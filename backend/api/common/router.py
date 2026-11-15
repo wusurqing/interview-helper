@@ -8,7 +8,7 @@ from typing import Any, Optional
 import requests
 from fastapi import APIRouter, UploadFile, File, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, StrictStr, ValidationError
 
 from core.auth import get_token, is_auth_disabled, is_loopback_host, loopback_bypass_allowed
 from core.config import (
@@ -21,6 +21,7 @@ from core.config import (
     normalize_llm_max_tokens, normalize_llm_temperature,
 )
 from core.env import env_int
+from core.prompt_settings import PROMPT_SCENES
 from services.audio import AudioCapture
 from services.stt import get_stt_engine, set_whisper_language
 from api.common.config_payload import build_config_payload
@@ -53,6 +54,7 @@ def _has_enabled_model(models: list) -> bool:
 
 
 class ConfigUpdate(BaseModel):
+    system_prompts: Optional[dict[str, StrictStr | None]] = None
     models: Optional[list] = None
     max_parallel_answers: Optional[int] = None
     active_model: Optional[int] = None
@@ -261,6 +263,32 @@ def _list_remote_models(api_base_url: str, api_key: str, api_type: str = "openai
 @router.get("/config")
 async def api_get_config():
     return build_config_payload(get_config())
+
+
+@router.get("/prompts")
+async def api_get_prompts():
+    from services.llm.prompts import assist_prompt_specs
+    from services.resume_optimizer import resume_prompt_specs
+    from services.review_analysis import review_prompt_specs
+
+    specs = {
+        **assist_prompt_specs(get_config()),
+        **review_prompt_specs(),
+        **resume_prompt_specs(),
+    }
+    scenes = []
+    for scene, (group, label, entry) in PROMPT_SCENES.items():
+        default_prompt, output_contract, max_output_tokens = specs[scene]
+        scenes.append({
+            "id": scene,
+            "group": group,
+            "label": label,
+            "entry": entry,
+            "default_prompt": default_prompt,
+            "output_contract": output_contract,
+            "max_output_tokens": max_output_tokens,
+        })
+    return {"scenes": scenes}
 
 
 _LEGACY_STT_PROVIDER_MAP = {"iflytek": "generic"}

@@ -9,6 +9,7 @@ import {
   Timer,
   AudioWaveform,
   BrainCircuit,
+  FileText,
   Settings2,
   Search,
 } from 'lucide-react'
@@ -20,6 +21,7 @@ const SpeechTab = lazy(() => import('./SpeechTab'))
 const TimingTab = lazy(() => import('./SpeechTab'))
 const HotwordsTab = lazy(() => import('./HotwordsTab'))
 const ModelsTab = lazy(() => import('./ModelsTab'))
+const SystemPromptsTab = lazy(() => import('./SystemPromptsTab'))
 
 export default function SettingsDrawer() {
   const { settingsOpen, toggleSettings, settingsDrawerTab, setSettingsDrawerTab } = useUiSettings()
@@ -28,14 +30,17 @@ export default function SettingsDrawer() {
   const contentRef = useRef<HTMLDivElement>(null)
   const previousActiveRef = useRef<HTMLElement | null>(null)
   const wasOpenRef = useRef(false)
-  const dirtyExplicitCountRef = useRef(0)
+  const navigationGuardRef = useRef({ dirtyExplicitCount: 0, promptSaving: false })
   const [searchQuery, setSearchQuery] = useState('')
   const [noResults, setNoResults] = useState(false)
+  const [promptSaving, setPromptSaving] = useState(false)
   const [dirtyExplicitSections, setDirtyExplicitSections] = useState<Record<string, boolean>>({})
   const dirtyExplicitCount = Object.values(dirtyExplicitSections).filter(Boolean).length
+  const searchEnabled = settingsDrawerTab !== 'models' && settingsDrawerTab !== 'prompts'
   const dirtyExplicitLabels = [
     dirtyExplicitSections.speech ? '语音配置' : null,
     dirtyExplicitSections.models ? '模型配置' : null,
+    dirtyExplicitSections.prompts ? '系统提示词' : null,
   ].filter(Boolean)
 
   useEffect(() => {
@@ -49,11 +54,12 @@ export default function SettingsDrawer() {
   }, [])
 
   useEffect(() => {
-    dirtyExplicitCountRef.current = dirtyExplicitCount
-  }, [dirtyExplicitCount])
+    navigationGuardRef.current = { dirtyExplicitCount, promptSaving }
+  }, [dirtyExplicitCount, promptSaving])
 
   const closeSettings = useCallback(() => {
-    if (dirtyExplicitCountRef.current > 0 && !window.confirm('有未保存更改，关闭后会丢失。')) {
+    const guard = navigationGuardRef.current
+    if (guard.promptSaving || (guard.dirtyExplicitCount > 0 && !window.confirm('有未保存更改，关闭后会丢失。'))) {
       return false
     }
     toggleSettings()
@@ -62,7 +68,8 @@ export default function SettingsDrawer() {
 
   const changeTab = useCallback((tab: typeof settingsDrawerTab) => {
     if (tab === settingsDrawerTab) return
-    if (dirtyExplicitCountRef.current > 0 && !window.confirm('有未保存更改，切换后会丢失。')) {
+    const guard = navigationGuardRef.current
+    if (guard.promptSaving || (guard.dirtyExplicitCount > 0 && !window.confirm('有未保存更改，切换后会丢失。'))) {
       return
     }
     setSettingsDrawerTab(tab)
@@ -71,7 +78,7 @@ export default function SettingsDrawer() {
   // 检查搜索是否有命中 (仅 general/config tab 判断, 兼容 lazy tab 的挂载时序)
   useEffect(() => {
     if (!settingsOpen) return
-    if (!searchQuery.trim() || settingsDrawerTab === 'models') {
+    if (!searchQuery.trim() || !searchEnabled) {
       setNoResults(false)
       return
     }
@@ -96,7 +103,7 @@ export default function SettingsDrawer() {
       timers.forEach((t) => clearTimeout(t))
       observer?.disconnect()
     }
-  }, [searchQuery, settingsDrawerTab, settingsOpen])
+  }, [searchQuery, searchEnabled, settingsDrawerTab, settingsOpen])
 
   useEffect(() => {
     if (!settingsOpen) {
@@ -185,6 +192,7 @@ export default function SettingsDrawer() {
     { key: 'timing', label: '节奏', icon: <Timer className="w-4 h-4" />, desc: '延迟与断句' },
     { key: 'hotwords', label: '热词', icon: <AudioWaveform className="w-4 h-4" />, desc: '岗位术语偏置' },
     { key: 'models', label: '模型', icon: <BrainCircuit className="w-4 h-4" />, desc: '队列与协议' },
+    { key: 'prompts', label: '系统提示词', icon: <FileText className="w-4 h-4" />, desc: '按场景编辑' },
     { key: 'appearance', label: '外观', icon: <Palette className="w-4 h-4" />, desc: '主题与快捷操作' },
   ]
 
@@ -193,6 +201,7 @@ export default function SettingsDrawer() {
     config: speechDirty,
     timing: speechDirty,
     models: !!dirtyExplicitSections.models,
+    prompts: !!dirtyExplicitSections.prompts,
   }
 
   return (
@@ -207,7 +216,7 @@ export default function SettingsDrawer() {
           className="pointer-events-auto relative flex w-full max-w-5xl h-full max-h-[94vh] bg-bg-secondary rounded-2xl border border-bg-tertiary shadow-2xl overflow-hidden flex-col md:flex-row"
         >
           {/* ── 左侧导航栏（md 及以上）── */}
-          <nav className="hidden md:flex w-52 flex-shrink-0 flex-col bg-bg-primary/50 border-r border-bg-tertiary/70 py-4" aria-label="设置分区">
+          <nav className="hidden md:flex w-52 flex-shrink-0 flex-col overflow-y-auto bg-bg-primary/50 border-r border-bg-tertiary/70 py-4" aria-label="设置分区">
             <div className="px-4 pb-4">
               <h2 id="settings-title" className="text-sm font-semibold text-text-primary flex items-center gap-2">
                 <Settings2 className="w-4 h-4 text-accent-blue" />
@@ -224,8 +233,9 @@ export default function SettingsDrawer() {
                     key={t.key}
                     type="button"
                     onClick={() => changeTab(t.key)}
+                    aria-disabled={promptSaving || undefined}
                     aria-current={active ? 'page' : undefined}
-                    className={`group flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-left transition-colors ${
+                    className={`group flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-left transition-colors aria-disabled:opacity-50 ${
                       active
                         ? 'bg-accent-blue/12 text-accent-blue'
                         : 'text-text-secondary hover:text-text-primary hover:bg-bg-tertiary/60'
@@ -260,8 +270,8 @@ export default function SettingsDrawer() {
                   <Settings2 className="w-4 h-4 text-accent-blue" />
                   设置
                 </h2>
-                {/* 搜索框: 快速过滤 Section/Collapsible (模型页直接在队列中编辑) */}
-                <div className="relative flex-1 min-w-0">
+                {/* 搜索框快速过滤支持搜索的设置分区 */}
+                <div className={settingsDrawerTab === 'prompts' ? 'hidden' : 'relative flex-1 min-w-0'}>
                   <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-text-muted pointer-events-none" />
                   <input
                     type="search"
@@ -276,7 +286,7 @@ export default function SettingsDrawer() {
                     placeholder={settingsDrawerTab === 'models' ? '模型页直接在队列中编辑' : '搜索设置项，如 VAD / 知识库 / 截图 / 主题'}
                     aria-label="搜索设置项"
                     className="w-full text-xs pl-8 pr-8 py-2 rounded-lg bg-bg-tertiary/60 border border-bg-hover/60 text-text-primary placeholder-text-muted focus:outline-none focus:border-accent-blue/60 focus:ring-2 focus:ring-accent-blue/20 transition"
-                    disabled={settingsDrawerTab === 'models'}
+                    disabled={!searchEnabled}
                   />
                   {searchQuery && (
                     <button
@@ -290,7 +300,7 @@ export default function SettingsDrawer() {
                     </button>
                   )}
                 </div>
-                <button type="button" onClick={closeSettings} className="p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary flex-shrink-0" aria-label="关闭">
+                <button type="button" onClick={closeSettings} aria-disabled={promptSaving || undefined} className="ml-auto p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary flex-shrink-0 aria-disabled:opacity-50" aria-label="关闭">
                   <X className="w-5 h-5" />
                 </button>
               </div>
@@ -300,22 +310,23 @@ export default function SettingsDrawer() {
                 </p>
               )}
 
-              {/* 移动端 tab（md 起由左侧导航取代）：分区多于 4 个时两行网格 */}
+              {/* 移动端 tab（md 起由左侧导航取代） */}
               <div className="md:hidden mt-2.5">
-                <div className="grid grid-cols-4 rounded-xl bg-bg-tertiary/80 p-1 gap-1">
+                <div className="grid grid-cols-3 rounded-xl bg-bg-tertiary/80 p-1 gap-1">
                   {tabs.map((t) => (
                     <button
                       key={t.key}
                       type="button"
                       onClick={() => changeTab(t.key)}
+                      aria-disabled={promptSaving || undefined}
                       aria-current={settingsDrawerTab === t.key ? 'page' : undefined}
-                      className={`flex items-center justify-center gap-1.5 py-2 px-2 rounded-lg text-xs font-medium transition-all ${
+                      className={`flex items-center justify-center gap-1.5 whitespace-nowrap py-2 px-1.5 rounded-lg text-xs font-medium transition-all aria-disabled:opacity-50 ${
                         settingsDrawerTab === t.key
                           ? 'bg-bg-secondary text-accent-blue shadow-sm'
                           : 'text-text-muted hover:text-text-primary'
                       }`}
                     >
-                      {t.icon}
+                      <span className="hidden min-[380px]:inline-flex" aria-hidden="true">{t.icon}</span>
                       {t.label}
                     </button>
                   ))}
@@ -325,7 +336,7 @@ export default function SettingsDrawer() {
 
             {/* 内容区：整宽展示，不再被侧栏挤压 */}
             <div ref={contentRef} className="flex-1 overflow-y-auto min-h-0">
-              <SettingsSearchContext.Provider value={settingsDrawerTab === 'models' ? '' : searchQuery}>
+              <SettingsSearchContext.Provider value={searchEnabled ? searchQuery : ''}>
                 <Suspense fallback={<div className="flex items-center justify-center py-12 text-text-muted text-sm">加载中…</div>}>
                   {settingsDrawerTab === 'general' && <PreferencesTab variant="main" />}
                   {settingsDrawerTab === 'mode' && <PreferencesTab variant="mode" />}
@@ -335,6 +346,7 @@ export default function SettingsDrawer() {
                   {settingsDrawerTab === 'timing' && <TimingTab variant="timing" />}
                   {settingsDrawerTab === 'hotwords' && <HotwordsTab />}
                   {settingsDrawerTab === 'models' && <ModelsTab />}
+                  {settingsDrawerTab === 'prompts' && <SystemPromptsTab onSavingChange={setPromptSaving} />}
                 </Suspense>
                 {noResults && (
                   <div className="flex flex-col items-center justify-center py-12 gap-3 text-center">
