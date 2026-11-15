@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, StrictBool, StringConstraints, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, StrictBool, StrictStr, StringConstraints, ValidationError, field_validator, model_validator
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Annotated, Literal, Optional, Any
@@ -10,6 +10,7 @@ import os
 import secrets
 
 from core.logger import get_logger
+from core.prompt_settings import patch_system_prompts
 
 logger = get_logger(__name__)
 import shutil
@@ -139,6 +140,7 @@ class Mmpg(BaseModel):
 
 
 class AppConfig(BaseModel):
+    system_prompts: dict[str, StrictStr] = Field(default_factory=dict)
     models: list[ModelConfig] = Field(default_factory=lambda: [_default_model_config()])
     active_model: int = 0
 
@@ -417,6 +419,8 @@ def update_config(updates: dict) -> AppConfig:
                     current[field] = setting
                 if current["rtc_token"] != previous_token and "rtc_token_expires_at" not in value:
                     current["rtc_token_expires_at"] = None
+            elif key == "system_prompts":
+                data[key] = patch_system_prompts(data[key], value)
             elif hasattr(cfg, key):
                 data[key] = value
         updated = AppConfig(**data)

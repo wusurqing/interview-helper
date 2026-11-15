@@ -9,6 +9,7 @@ def build_config_payload(cfg) -> dict:
     for field in MMPG_SECRET_FIELDS:
         mmpg[f"{field}_configured"] = bool(mmpg.pop(field))
     return {
+        "system_prompts": dict(getattr(cfg, "system_prompts", {})),
         "models": [
             {
                 "name": model.name,

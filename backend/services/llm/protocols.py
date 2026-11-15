@@ -234,7 +234,7 @@ def build_chat_payload(
             payload["stream"] = True
             payload["stream_options"] = {"include_usage": True}
         # 网关风格各异：think 参数整体平铺合并（thinking/think_mode/enable_thinking 等）
-        payload.update(think_params)
+        payload.update({key: value for key, value in think_params.items() if key != "messages"})
     if extra:
         payload.update(extra)
     return payload

@@ -194,7 +194,7 @@ def chat_completion_create(
         client = get_client_for_model(model_cfg)
         extra_kwargs: dict = {}
         if think_params:
-            extra_kwargs["extra_body"] = think_params
+            extra_kwargs["extra_body"] = {key: value for key, value in think_params.items() if key != "messages"}
         # gpt-5/o1/o3/o4 只认 max_completion_tokens；timeout 必须显式传给 SDK，
         # 否则用 SDK 默认（600s 带重试），慢供应商会拖死调用方。
         extra_kwargs["timeout"] = float(timeout[1] if isinstance(timeout, tuple) else timeout)
@@ -589,7 +589,7 @@ def _try_stream_with_model(model_cfg, full_messages, cfg):
     client = get_client_for_model(model_cfg)
     extra_kwargs: dict = {}
     if think_params:
-        extra_kwargs["extra_body"] = think_params
+        extra_kwargs["extra_body"] = {key: value for key, value in think_params.items() if key != "messages"}
     extra_kwargs["stream_options"] = {"include_usage": True}
     token_kwargs = _completion_token_kwargs(model_cfg, cfg.max_tokens)
     try:
