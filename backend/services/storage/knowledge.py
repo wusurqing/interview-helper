@@ -1,18 +1,15 @@
 import json
-import os
 import sqlite3
 import threading
 import time
+from contextlib import closing
+from dataclasses import dataclass
 from typing import Optional
 
-from core.config import get_config
-from core.logger import get_logger
-from services.llm import get_client
 from services.storage.paths import sqlite_path
 
 DB_PATH = sqlite_path("knowledge.db")
 _db_lock = threading.Lock()
-_tag_log = get_logger("knowledge.tags")
 
 
 def _get_conn() -> sqlite3.Connection:
@@ -64,49 +61,14 @@ def _session_type_where(session_types: Optional[tuple[str, ...]]) -> tuple[str, 
     return f" WHERE session_type IN ({placeholders})", list(session_types)
 
 
-def _analysis_answer_text(answer: str = "", candidate_answer: str = "") -> str:
-    candidate_clean = (candidate_answer or "").strip()
-    answer_clean = (answer or "").strip()
-    if candidate_clean:
-        return (
-            "候选人实际口述：\n"
-            f"{candidate_clean}\n\n"
-            "助手参考答案：\n"
-            f"{answer_clean or '(无助手答案)'}"
-        )
-    return answer_clean
-
-
-def extract_tags(question: str, answer: str = "", candidate_answer: str = "") -> list[str]:
-    """Use LLM to extract 3-5 knowledge tags from a Q&A pair."""
-    cfg = get_config()
-    m = cfg.get_active_model()
-    answer_for_tags = _analysis_answer_text(answer, candidate_answer)
+def _stored_tags(value: str | None) -> list[str]:
     try:
-        from services.llm.streaming import chat_completion_create
-        prompt = f"""从以下面试问答中提取 3-5 个知识点标签（技术关键词），直接返回 JSON 数组，不要其他内容。
-如果存在“候选人实际口述”，优先依据候选人实际回答暴露出的知识点和能力点；助手参考答案只作为题目语境补充。
-
-问题：{question[:300]}
-回答：{answer_for_tags[:800] if answer_for_tags else '(无回答)'}
-
-示例输出：["Redis", "缓存穿透", "布隆过滤器"]"""
-
-        resp = chat_completion_create(
-            m,
-            [{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=200,
-            trace_context={"scene": "knowledge_tags"},
-        )
-        text = resp.choices[0].message.content or "[]"
-        start = text.find("[")
-        end = text.rfind("]") + 1
-        if start >= 0 and end > start:
-            return json.loads(text[start:end])
-    except Exception as e:
-        _tag_log.warning("extract_tags failed: %s", e, exc_info=True)
-    return []
+        tags = json.loads(value) if value else []
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(tags, list):
+        return []
+    return list(dict.fromkeys(tag.strip() for tag in tags if isinstance(tag, str) and tag.strip()))
 
 
 def save_record(
@@ -118,8 +80,6 @@ def save_record(
     candidate_answer: str = "",
     qa_id: str = "",
 ):
-    if tags is None:
-        tags = extract_tags(question, answer, candidate_answer)
     with _db_lock:
         conn = _get_conn()
         conn.execute(
@@ -131,7 +91,7 @@ def save_record(
                 answer,
                 candidate_answer or "",
                 score,
-                json.dumps(tags, ensure_ascii=False),
+                json.dumps(tags or [], ensure_ascii=False),
                 time.time(),
             ),
         )
@@ -142,47 +102,57 @@ def save_record(
 def update_candidate_answer_for_qa(
     qa_id: str,
     candidate_answer: str,
-    *,
-    refresh_tags: bool = True,
 ) -> bool:
     qa_key = (qa_id or "").strip()
     answer_text = (candidate_answer or "").strip()
     if not qa_key or not answer_text:
         return False
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, closing(_get_conn()) as conn, conn:
+        result = conn.execute(
+            """UPDATE question_records SET candidate_answer = ?
+               WHERE id = (SELECT id FROM question_records WHERE qa_id = ?
+                           ORDER BY created_at DESC, id DESC LIMIT 1)""",
+            (answer_text, qa_key),
+        )
+        return result.rowcount == 1
+
+
+@dataclass(frozen=True)
+class AnalysisRecord:
+    id: int
+    question: str | None
+    answer: str | None
+    candidate_answer: str | None
+    tags: str | None
+
+
+def pending_assist_ids() -> list[int]:
+    with _db_lock, closing(_get_conn()) as conn:
+        rows = conn.execute("SELECT id, tags FROM question_records WHERE session_type = 'assist' ORDER BY id")
+        return [row["id"] for row in rows if not _stored_tags(row["tags"])]
+
+
+def get_pending_assist_record(record_id: int) -> AnalysisRecord | None:
+    with _db_lock, closing(_get_conn()) as conn:
         row = conn.execute(
-            "SELECT id, question, answer FROM question_records WHERE qa_id = ? ORDER BY created_at DESC LIMIT 1",
-            (qa_key,),
+            """SELECT id, question, answer, candidate_answer, tags FROM question_records
+               WHERE id = ? AND session_type = 'assist'""",
+            (record_id,),
         ).fetchone()
-        conn.close()
-        if not row:
-            return False
+    if row is None or _stored_tags(row["tags"]):
+        return None
+    return AnalysisRecord(**row)
 
-    tags_json = None
-    if refresh_tags:
-        try:
-            tags = extract_tags(row["question"] or "", row["answer"] or "", answer_text)
-            if tags:
-                tags_json = json.dumps(tags, ensure_ascii=False)
-        except Exception:
-            tags_json = None
 
-    with _db_lock:
-        conn = _get_conn()
-        if tags_json is not None:
-            conn.execute(
-                "UPDATE question_records SET candidate_answer = ?, tags = ? WHERE id = ?",
-                (answer_text, tags_json, row["id"]),
-            )
-        else:
-            conn.execute(
-                "UPDATE question_records SET candidate_answer = ? WHERE id = ?",
-                (answer_text, row["id"]),
-            )
-        conn.commit()
-        conn.close()
-        return True
+def write_analysis_tags(record: AnalysisRecord, tags: list[str]) -> bool:
+    with _db_lock, closing(_get_conn()) as conn, conn:
+        result = conn.execute(
+            """UPDATE question_records SET tags = ? WHERE id = ? AND session_type = 'assist'
+               AND question IS ? AND answer IS ? AND candidate_answer IS ? AND tags IS ?""",
+            (json.dumps(tags, ensure_ascii=False), record.id, record.question, record.answer,
+             record.candidate_answer, record.tags),
+        )
+        return result.rowcount == 1
 
 
 def get_summary(session_types: Optional[tuple[str, ...]] = None) -> list[dict]:
@@ -198,11 +168,7 @@ def get_summary(session_types: Optional[tuple[str, ...]] = None) -> list[dict]:
 
     tag_data: dict[str, list[dict]] = {}
     for row in rows:
-        try:
-            tags = json.loads(row["tags"]) if row["tags"] else []
-        except Exception:
-            tags = []
-        for tag in tags:
+        for tag in _stored_tags(row["tags"]):
             if tag not in tag_data:
                 tag_data[tag] = []
             tag_data[tag].append({"score": row["score"], "created_at": row["created_at"]})
@@ -254,10 +220,6 @@ def get_history(
 
     records = []
     for row in rows:
-        try:
-            tags = json.loads(row["tags"]) if row["tags"] else []
-        except Exception:
-            tags = []
         records.append({
             "id": row["id"],
             "qa_id": row["qa_id"] if "qa_id" in row.keys() else "",
@@ -266,7 +228,7 @@ def get_history(
             "answer": row["answer"],
             "candidate_answer": row["candidate_answer"] if "candidate_answer" in row.keys() else "",
             "score": row["score"],
-            "tags": tags,
+            "tags": _stored_tags(row["tags"]),
             "created_at": row["created_at"],
         })
 

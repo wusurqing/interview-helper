@@ -792,6 +792,16 @@ export function resolveApiPayload(pathname, method) {
 
   if (pathname === '/api/knowledge/summary') return SAMPLE_KNOWLEDGE_SUMMARY
   if (pathname === '/api/knowledge/history') return SAMPLE_KNOWLEDGE_HISTORY
+  if (pathname === '/api/knowledge/settings' && method === 'GET') {
+    const model = SAMPLE_CONFIG.models[0]
+    return {
+      settings: { model_index: null, system_prompt: null, temperature: 0.3, max_tokens: 1024, think_effort: 'off' },
+      default_system_prompt: '提取面试问答中的知识点。',
+      output_contract: '仅返回含 3–5 个标签的 JSON 数组。',
+      models: [{ index: 0, name: model.name, model: model.model, fingerprint: 'sample-model', available: true, supports_think: false }],
+    }
+  }
+  if (pathname === '/api/knowledge/analysis' && method === 'GET') return { pending_count: 0, job: null }
   if (pathname === '/api/knowledge/reset') return { ok: true }
 
   if (pathname === '/api/review/sessions') return SAMPLE_REVIEW_SESSIONS

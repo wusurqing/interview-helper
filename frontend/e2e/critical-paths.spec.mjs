@@ -41,6 +41,8 @@ test.describe('app shell', () => {
     await knowledgeTab.click()
     await expect(knowledgeTab).toHaveAttribute('aria-selected', 'true')
     await expect(page.getByText('薄弱点排名')).toBeVisible({ timeout: 8000 })
+    await expect(page.getByRole('button', { name: '分析设置' })).toBeEnabled()
+    await expect(page.getByText('待分析 0 条问答')).toBeVisible()
 
     await resumeTab.click()
     await expect(resumeTab).toHaveAttribute('aria-selected', 'true')

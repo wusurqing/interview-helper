@@ -619,7 +619,7 @@ def test_models_full_does_not_return_plain_api_key(monkeypatch):
 def test_update_config_keep_existing_api_key_placeholder(monkeypatch):
     captured: dict[str, dict] = {}
 
-    def fake_update_config(d):
+    def fake_update_config(d, **_model_update):
         captured["d"] = dict(d)
 
     async def fake_run_in_threadpool(fn, *args, **kwargs):
@@ -657,7 +657,7 @@ def test_update_config_keep_existing_api_key_placeholder(monkeypatch):
 def test_update_config_keep_existing_api_key_uses_original_index_after_reorder(monkeypatch):
     captured: dict[str, dict] = {}
 
-    def fake_update_config(d):
+    def fake_update_config(d, **_model_update):
         captured["d"] = dict(d)
 
     async def fake_run_in_threadpool(fn, *args, **kwargs):
