@@ -213,23 +213,6 @@ def test_pick_model_index_prefers_non_physical_busy_model_for_asr(
     assert picked == 0
 
 
-def test_is_high_churn_asr_submission_respects_toggle_and_recent_activity():
-    cfg = _cfg(assist_high_churn_short_answer=False)
-    assist_router._recent_asr_turn_monos = [8.2]
-    assert assist_router._is_high_churn_asr_submission(cfg, 10.0) is False
-
-    cfg = _cfg(assist_high_churn_short_answer=True)
-    assist_router._recent_asr_turn_monos = [8.2]
-    assert assist_router._is_high_churn_asr_submission(cfg, 10.0) is True
-
-    assist_router._recent_asr_turn_monos = []
-    assist_router._in_flight_tasks[1] = (
-        2,
-        ("旧问题", None, False, "conversation_mic", {"origin": "asr", "asr_turn_id": 1}),
-    )
-    assert assist_router._is_high_churn_asr_submission(cfg, 10.0) is True
-
-
 def test_cancel_answer_work_clears_everything_and_optionally_session_history():
     session = reset_session()
     session.add_transcription("旧转写")
@@ -249,7 +232,6 @@ def test_cancel_answer_work_clears_everything_and_optionally_session_history():
         2,
         ("生成中", None, False, "conversation_mic", {"origin": "asr", "asr_turn_id": 1}),
     )
-    assist_router._recent_asr_turn_monos = [1.0, 2.0]
     assist_router._answer_generation = 7
 
     assist_router.cancel_answer_work(reset_session_data=False)
@@ -257,7 +239,6 @@ def test_cancel_answer_work_clears_everything_and_optionally_session_history():
     with assist_router._asr_state_lock:
         assert assist_router._asr_state.pending_group is None
     assert assist_router._in_flight_tasks == {}
-    assert assist_router._recent_asr_turn_monos == []
     assert assist_router._answer_generation == 8
     assert get_session().transcription_history == ["旧转写"]
     assert len(get_session().qa_pairs) == 1
@@ -267,7 +248,7 @@ def test_cancel_answer_work_clears_everything_and_optionally_session_history():
     assert get_session().qa_pairs == []
 
 
-def test_build_system_prompt_includes_high_churn_short_answer_instructions():
+def test_build_system_prompt_includes_voice_short_answer_instructions():
     normal = build_system_prompt(
         manual_input=False,
         mode="asr_realtime",
@@ -279,8 +260,8 @@ def test_build_system_prompt_includes_high_churn_short_answer_instructions():
         high_churn_short_answer=True,
     )
 
-    assert "高 churn 模式" not in normal
-    assert "高 churn 模式" in short
+    assert "简短回答模式" not in normal
+    assert "简短回答模式" in short
     assert "80-180" in short
     assert "输入判定三档 ladder" in normal
     assert "输入判定三档 ladder" in short

@@ -98,14 +98,11 @@ _next_commit_seq = 0
 _next_submit_seq = 0
 _commit_lock = threading.Lock()
 
-_recent_asr_turn_monos: list[float] = []
 _knowledge_worker: Optional[BoundedTaskWorker] = None
 _asr_state = AssistAsrStateMachine(
     broadcast=lambda data: broadcast(data),
     submit_answer_task=lambda task: submit_answer_task(task),
     begin_asr_turn=lambda: _begin_asr_turn(),
-    record_asr_turn=lambda now_mono: _record_asr_turn(now_mono),
-    is_high_churn_submission=lambda cfg, now_mono: _is_high_churn_asr_submission(cfg, now_mono),
     append_late_constraint_tail=lambda text, source, now_mono: _append_late_asr_constraint_tail(text, source, now_mono),
     logger=_ilog,
 )
@@ -162,33 +159,6 @@ def _reset_pending_asr_group_locked():
 def _reset_pending_asr_group():
     with _asr_state_lock:
         _reset_pending_asr_group_locked()
-
-
-def _prune_recent_asr_turns_locked(now_mono: float, window_sec: float = 6.0):
-    global _recent_asr_turn_monos
-    _recent_asr_turn_monos = [
-        ts for ts in _recent_asr_turn_monos
-        if now_mono - ts <= window_sec
-    ]
-
-
-def _is_high_churn_asr_submission(cfg, now_mono: float) -> bool:
-    if not bool(getattr(cfg, "assist_high_churn_short_answer", False)):
-        return False
-    with _dispatch_lock:
-        _prune_recent_asr_turns_locked(now_mono)
-        has_active_asr = any(
-            _is_asr_task(task) and not _is_stale_inflight_asr_task(task)
-            for _model_idx, task in _in_flight_tasks.values()
-        )
-        has_recent_turn = bool(_recent_asr_turn_monos)
-    return has_active_asr or has_recent_turn
-
-
-def _record_asr_turn(now_mono: float):
-    with _dispatch_lock:
-        _prune_recent_asr_turns_locked(now_mono)
-        _recent_asr_turn_monos.append(now_mono)
 
 
 def _asr_confirm_window_sec(cfg) -> float:
@@ -519,14 +489,13 @@ def _capture_generation() -> int:
 
 
 def _reset_answer_state():
-    global _pending, _in_flight_tasks, _commit_buffer, _skipped_commit_seqs, _next_commit_seq, _task_session_version, _latest_asr_turn_id, _recent_asr_turn_monos
+    global _pending, _in_flight_tasks, _commit_buffer, _skipped_commit_seqs, _next_commit_seq, _task_session_version, _latest_asr_turn_id
     with _asr_state_lock:
         with _dispatch_lock:
             tasks = [item[0] for item in _pending] + [item[1] for item in _in_flight_tasks.values()]
             _pending.clear()
             _in_flight_tasks.clear()
             _latest_asr_turn_id = 0
-            _recent_asr_turn_monos = []
             _task_session_version += 1
             next_commit_seq = _next_submit_seq
         _reset_asr_merge_buffer_locked()

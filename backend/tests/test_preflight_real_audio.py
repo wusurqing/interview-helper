@@ -183,43 +183,43 @@ def test_run_preflight_updates_status_and_completes(monkeypatch: pytest.MonkeyPa
     assert any(e.get('type') == 'preflight_step' for e in events)
 
 
-def test_generate_preflight_answer_uses_real_answer_pipeline(monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize(
+    ("short", "expected_prompt", "expected_limit"),
+    [(True, "简短语音规则", 320), (False, "标准语音规则", 720)],
+)
+def test_generate_preflight_answer_uses_selected_voice_prompt(
+    monkeypatch: pytest.MonkeyPatch, short: bool, expected_prompt: str, expected_limit: int,
+):
     calls: dict = {}
-    cfg = SimpleNamespace(screen_capture_region='left_half')
+    cfg = SimpleNamespace(
+        assist_high_churn_short_answer=short,
+        assist_realtime_max_tokens=720,
+        assist_realtime_high_churn_max_tokens=320,
+        system_prompts={
+            'assist_realtime': '标准语音规则',
+            'assist_realtime_short': '简短语音规则',
+            'assist_manual': '手动提问规则',
+        },
+    )
     model_cfg = SimpleNamespace(name='demo', model='demo-model', supports_vision=False)
 
-    def fake_build_system_prompt(**kwargs):
-        calls['prompt_kwargs'] = kwargs
-        return 'system-prompt'
-
-    def fake_stream(model, messages, system_prompt=None, **kwargs):
-        calls['model'] = model
-        calls['messages'] = messages
-        calls['system_prompt'] = system_prompt
+    def fake_stream(model, messages, **kwargs):
+        calls.update(model=model, messages=messages, **kwargs)
         yield ('think', 'internal reasoning')
-        yield ('text', '真实')
+        yield ('text', '# 真实')
         yield ('text', '回答')
 
-    def fake_postprocess(text, mode, *, preserve_format):
-        calls['postprocess'] = (text, mode, preserve_format)
-        return text
-
-    monkeypatch.setattr(sound_test, 'build_system_prompt', fake_build_system_prompt)
     monkeypatch.setattr(sound_test, 'chat_stream_single_model', fake_stream)
-    monkeypatch.setattr(sound_test, 'postprocess_answer_for_mode', fake_postprocess)
     ticks = iter([10.0, 10.4, 10.9])
     monkeypatch.setattr(sound_test.time, 'monotonic', lambda: next(ticks))
 
     result = sound_test.generate_preflight_answer(cfg, model_cfg, '请做一下自我介绍')
 
-    assert result == {'answer': '真实回答', 'first_token_ms': 400, 'total_ms': 900}
-    assert calls['prompt_kwargs']['manual_input'] is True
-    assert calls['prompt_kwargs']['mode'] == sound_test.PROMPT_MODE_MANUAL_TEXT
-    assert calls['prompt_kwargs']['cfg'] is cfg
+    assert result == {'answer': '# 真实回答', 'first_token_ms': 400, 'total_ms': 900}
     assert calls['model'] is model_cfg
     assert calls['messages'] == [{'role': 'user', 'content': '请做一下自我介绍'}]
-    assert calls['system_prompt'] == 'system-prompt'
-    assert calls['postprocess'] == ('真实回答', sound_test.PROMPT_MODE_MANUAL_TEXT, False)
+    assert calls['system_prompt'] == expected_prompt
+    assert calls['override_max_tokens'] == expected_limit
 
 
 def test_replay_preflight_capture_stt_collects_round_stats(monkeypatch: pytest.MonkeyPatch):

@@ -724,7 +724,7 @@ def process_question_parallel(
     written_exam = bool(meta.get("exam_preflight") or getattr(cfg, "written_exam_mode", False))
     written_exam_think = bool(getattr(cfg, "written_exam_think", False))
     prompt_mode = prompt_mode_for_task(source, manual_input, written_exam=written_exam)
-    high_churn_short_answer = bool(meta.get("high_churn_short_answer", False))
+    high_churn_short_answer = bool(getattr(cfg, "assist_high_churn_short_answer", False))
     scene = assist_prompt_scene(prompt_mode, high_churn_short_answer=high_churn_short_answer)
     customized_prompt = scene in getattr(cfg, "system_prompts", {})
 

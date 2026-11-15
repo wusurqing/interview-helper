@@ -1079,8 +1079,8 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
         <Field label="回答长度" hint="和常用页的回答长度设置一致，保存语音配置后生效">
           <div className="grid grid-cols-2 gap-2">
             {([
-              { value: false, label: '详细回答', hint: '解释更完整' },
-              { value: true, label: '简短回答', hint: '更快跟住问题' },
+              { value: false, label: '详细回答', hint: '每轮语音答题使用标准提示词' },
+              { value: true, label: '简短回答', hint: '每轮语音答题使用简短提示词' },
             ]).map((item) => {
               const selected = form.assist_high_churn_short_answer === item.value
               return (

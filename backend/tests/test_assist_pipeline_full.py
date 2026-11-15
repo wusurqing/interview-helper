@@ -86,7 +86,6 @@ def reset_pipeline_state(monkeypatch: pytest.MonkeyPatch):
     pipeline._latest_asr_turn_id = 0
     pipeline._reset_asr_merge_buffer()
     pipeline._reset_pending_asr_group()
-    pipeline._recent_asr_turn_monos = []
     pipeline._commit_buffer.clear()
     pipeline._skipped_commit_seqs.clear()
     pipeline._next_commit_seq = 0

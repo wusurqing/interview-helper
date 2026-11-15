@@ -86,7 +86,7 @@ _FEWSHOT_EXAM = (
 
 
 def _intent_ladder_block(short_answer_budget: str) -> str:
-    """Three-tier intent ladder injected at the top of asr / high_churn bodies.
+    """Three-tier intent ladder injected at the top of the standard and short voice prompts.
 
     short_answer_budget: 描述 B 档最小可用回答的字数窗口（如 "~150 字" / "~80 字"）。
     """
@@ -227,7 +227,7 @@ def _asr_realtime_prompt_body(
 ) -> str:
     if high_churn_short_answer:
         return (
-            "\n场景：当前处于实时面试高 churn 模式，面试官切题或追问很快。\n\n"
+            "\n场景：本轮输入来自实时语音转写，当前使用简短回答模式。\n\n"
             + _intent_ladder_block("~80 字")
             + _FIRST_SENTENCE_CONSTRAINT
             + "\n回答规则：\n"

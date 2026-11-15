@@ -33,14 +33,11 @@ def _cfg(**overrides):
 
 def test_question_group_flush_submits_asr_task_with_turn_metadata():
     submitted: list[tuple] = []
-    recorded: list[float] = []
     turn_ids = iter([7])
     state = AssistAsrStateMachine(
         broadcast=lambda _data: None,
         submit_answer_task=lambda task: submitted.append(task) or True,
         begin_asr_turn=lambda: next(turn_ids),
-        record_asr_turn=recorded.append,
-        is_high_churn_submission=lambda _cfg, _now: False,
         logger=_Logger(),
         clock=lambda: 10.0,
     )
@@ -64,8 +61,6 @@ def test_question_group_flush_submits_asr_task_with_turn_metadata():
     assert meta["origin"] == "asr"
     assert meta["asr_turn_id"] == 7
     assert meta["utterances"] == ["Redis 持久化讲一下"]
-    assert meta["high_churn_short_answer"] is False
-    assert recorded == [10.0]
     assert state.pending_group is None
 
 
@@ -75,8 +70,6 @@ def test_append_transcription_fragment_broadcasts_and_feeds_auto_detect_when_unm
         broadcast=broadcasts.append,
         submit_answer_task=lambda _task: True,
         begin_asr_turn=lambda: 1,
-        record_asr_turn=lambda _now: None,
-        is_high_churn_submission=lambda _cfg, _now: False,
         logger=_Logger(),
         clock=lambda: 10.0,
     )
@@ -103,8 +96,6 @@ def test_constraint_tail_is_merged_with_previous_question_before_fast_confirm():
         broadcast=lambda _data: None,
         submit_answer_task=lambda task: submitted.append(task) or True,
         begin_asr_turn=lambda: 8,
-        record_asr_turn=lambda _now: None,
-        is_high_churn_submission=lambda _cfg, _now: False,
         logger=_Logger(),
         clock=lambda: 2.0,
     )
@@ -146,8 +137,6 @@ def test_late_constraint_tail_is_merged_before_question_flush():
         broadcast=lambda _data: None,
         submit_answer_task=lambda task: submitted.append(task) or True,
         begin_asr_turn=lambda: len(submitted) + 1,
-        record_asr_turn=lambda _now: None,
-        is_high_churn_submission=lambda _cfg, _now: False,
         logger=_Logger(),
         clock=lambda: 5.0,
     )

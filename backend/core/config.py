@@ -232,11 +232,11 @@ class AppConfig(BaseModel):
     assist_asr_group_max_wait_sec: float = 1.2
     # 实时辅助：确认新问句组后是否中断仍在生成的旧 ASR 回答
     assist_asr_interrupt_running: bool = True
-    # 实时辅助：高 churn 场景下自动切短答，优先跟住最新问题
+    # 实时辅助：为每轮语音回答使用简短提示词
     assist_high_churn_short_answer: bool = False
     # 实时语音问答默认输出 token 上限，避免首题展开过长拖慢后续题。
     assist_realtime_max_tokens: int = 720
-    # 高 churn 短答模式的更严格 token 上限。
+    # 语音简短回答的 token 上限。
     assist_realtime_high_churn_max_tokens: int = 320
     # stop 时等待 answer worker 收尾的最长时间；压测 interviewer 转写链路时可设为 0。
     assist_stop_answer_wait_sec: float = 3.0

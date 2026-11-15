@@ -99,10 +99,12 @@ def reset_worker_state(monkeypatch: pytest.MonkeyPatch):
     "scene, source, manual, exam, short, image_count, limit",
     [
         ("assist_realtime", "conversation_loopback", False, False, False, 0, 720),
-        ("assist_realtime_short", "asr", False, False, True, 0, 320),
-        ("assist_manual", "manual_text", True, False, False, 0, 850),
+        ("assist_realtime_short", "conversation_loopback", False, False, True, 0, 320),
+        ("assist_realtime", "conversation_mic", False, False, False, 0, 720),
+        ("assist_realtime_short", "conversation_mic", False, False, True, 0, 320),
+        ("assist_manual", "manual_text", True, False, True, 0, 850),
         ("assist_manual", "manual_image", True, False, False, 1, 850),
-        ("assist_screen", "server_screen_left", True, False, False, 1, 850),
+        ("assist_screen", "server_screen_left", True, False, True, 1, 850),
         ("assist_screen", "server_screen_multi", True, False, False, 2, 850),
         ("assist_exam", "server_screen_exam_preflight", True, False, False, 1, 850),
         ("assist_exam", "manual_image", True, True, True, 1, 850),
@@ -115,6 +117,7 @@ def test_custom_prompt_uses_dispatch_snapshot_and_preserves_answer(
 
     cfg = _cfg()
     cfg.written_exam_mode = exam
+    cfg.assist_high_churn_short_answer = short
     cfg.position = "快照里的岗位"
     cfg.language = "Rust"
     cfg.max_tokens = 850
@@ -139,7 +142,14 @@ def test_custom_prompt_uses_dispatch_snapshot_and_preserves_answer(
     monkeypatch.setattr(answer_worker, "build_system_prompt", build_system_prompt)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", stream)
     monkeypatch.setattr("services.vision_verify.schedule_self_verify", lambda **_kw: None)
-    meta = {"high_churn_short_answer": short}
+    meta = {}
+    if source == "conversation_loopback":
+        meta["origin"] = "asr"
+    elif source == "conversation_mic":
+        meta.update(
+            origin="mmpg",
+            mmpg_request=MmpgRequest("group", 1, "本轮题目", ("trace",), 0, None),
+        )
     if source.endswith("exam_preflight"):
         meta.update(exam_preflight=True, exam_preflight_id="preflight-test")
     answer_worker.process_question_parallel(
@@ -422,33 +432,6 @@ def test_process_question_parallel_uses_global_max_tokens_for_manual_text(monkey
     )
 
     assert captured["override_max_tokens"] == 4096
-
-
-def test_process_question_parallel_uses_high_churn_token_cap(monkeypatch: pytest.MonkeyPatch):
-    broadcasts: list[dict] = []
-    captured: dict[str, object] = {}
-
-    def fake_stream(*_args, **kwargs):
-        captured["override_max_tokens"] = kwargs.get("override_max_tokens")
-        yield ("text", "回答")
-
-    monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
-
-    answer_worker.process_question_parallel(
-        (
-            "那这个怎么验证？",
-            None,
-            False,
-            "conversation_loopback",
-            {"origin": "asr", "asr_turn_id": 2, "high_churn_short_answer": True},
-        ),
-        seq=0,
-        model_idx=0,
-        sess_v=0,
-        deps=_deps(broadcasts=broadcasts),
-    )
-
-    assert captured["override_max_tokens"] == 320
 
 
 def test_process_question_parallel_marks_seq_skipped_when_aborted(

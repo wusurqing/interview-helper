@@ -15,7 +15,7 @@ from core.config import get_config
 from core.logger import get_logger
 from services.audio import AudioCapture, play_audio_file
 from services.llm import (
-    PROMPT_MODE_MANUAL_TEXT,
+    PROMPT_MODE_ASR_REALTIME,
     build_system_prompt,
     chat_stream_single_model,
     postprocess_answer_for_mode,
@@ -476,11 +476,13 @@ def resolve_preflight_scenario(scenario_id: str) -> dict:
 
 
 def generate_preflight_answer(cfg, model_cfg, question: str) -> dict:
-    prompt_mode = PROMPT_MODE_MANUAL_TEXT
-    customized_prompt = assist_prompt_scene(prompt_mode) in getattr(cfg, "system_prompts", {})
+    prompt_mode = PROMPT_MODE_ASR_REALTIME
+    short_answer = bool(getattr(cfg, "assist_high_churn_short_answer", False))
+    scene = assist_prompt_scene(prompt_mode, high_churn_short_answer=short_answer)
+    customized_prompt = scene in getattr(cfg, "system_prompts", {})
     system_prompt = build_system_prompt(
-        manual_input=True,
         mode=prompt_mode,
+        high_churn_short_answer=short_answer,
         cfg=cfg,
     )
     user_context = build_assist_user_context(cfg, mode=prompt_mode)
@@ -492,7 +494,8 @@ def generate_preflight_answer(cfg, model_cfg, question: str) -> dict:
         model_cfg,
         [{"role": "user", "content": user_text}],
         system_prompt=system_prompt,
-        override_max_tokens=max_tokens_for_assist_prompt(prompt_mode, cfg),
+        override_max_tokens=max_tokens_for_assist_prompt(prompt_mode, cfg, high_churn_short_answer=short_answer),
+        config_snapshot=cfg,
     ):
         if chunk_type != "text":
             continue

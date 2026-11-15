@@ -7,7 +7,6 @@ from api.assist.asr_state import AssistAsrStateMachine
 def make_state():
     return AssistAsrStateMachine(
         broadcast=Mock(), submit_answer_task=Mock(), begin_asr_turn=lambda: 7,
-        record_asr_turn=Mock(), is_high_churn_submission=lambda *_: False,
         logger=Mock(),
     )
 

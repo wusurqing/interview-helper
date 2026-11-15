@@ -2,8 +2,8 @@ from collections.abc import Mapping
 
 # Display order also defines the order in the settings scene selector.
 PROMPT_SCENES = {
-    "assist_realtime": ("实时辅助", "语音回答·标准", "开始面试后，未触发简短回答的语音答题。"),
-    "assist_realtime_short": ("实时辅助", "语音回答·简短", "开启简短回答后，连续提问触发的语音答题。"),
+    "assist_realtime": ("实时辅助", "语音回答·标准", "选择「详细回答」后，用于每轮语音答题。"),
+    "assist_realtime_short": ("实时辅助", "语音回答·简短", "选择「简短回答」后，用于每轮语音答题。"),
     "assist_manual": ("实时辅助", "手动提问", "在实时辅助底部输入问题，或粘贴图片后发送。"),
     "assist_screen": ("实时辅助", "电脑截图答题", "通过悬浮窗的截图审题、截图快捷键或连续截图提交。"),
     "assist_exam": ("实时辅助", "笔试答题", "设置 → 模式 → 开启笔试模式后，适用于手动提问及截图。"),

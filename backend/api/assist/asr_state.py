@@ -34,8 +34,6 @@ class AssistAsrStateMachine:
         broadcast: Callable[[dict], None],
         submit_answer_task: Callable[[TaskPayload], bool],
         begin_asr_turn: Callable[[], int],
-        record_asr_turn: Callable[[float], None],
-        is_high_churn_submission: Callable[[Any, float], bool],
         logger,
         append_late_constraint_tail: Callable[[str, str, float], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -43,8 +41,6 @@ class AssistAsrStateMachine:
         self.broadcast = broadcast
         self.submit_answer_task = submit_answer_task
         self.begin_asr_turn = begin_asr_turn
-        self.record_asr_turn = record_asr_turn
-        self.is_high_churn_submission = is_high_churn_submission
         self.append_late_constraint_tail = append_late_constraint_tail or (lambda _text, _source, _now: False)
         self.logger = logger
         self.clock = clock
@@ -82,16 +78,12 @@ class AssistAsrStateMachine:
             for part in split_question_like_text(text)
         ):
             return "filtered"
-        now = self.clock()
-        high_churn = self.is_high_churn_submission(cfg, now)
         turn = self.begin_asr_turn() if request is None else 0
-        self.record_asr_turn(now)
         source = "conversation_loopback" if session.capture_is_loopback else "conversation_mic"
         queued = self.submit_answer_task((text, None, False, source, {
             "origin": "asr" if request is None else "mmpg",
             "asr_turn_id": turn,
             "utterances": text.splitlines() if request is not None else [text],
-            "high_churn_short_answer": high_churn,
             "mmpg_trace": mmpg_trace,
             **({"mmpg_request": request} if request is not None else {}),
         }))
@@ -111,12 +103,10 @@ class AssistAsrStateMachine:
         if not question_text:
             return
         now_mono = self.clock()
-        high_churn_short = self.is_high_churn_submission(cfg, now_mono)
         turn_id = self.begin_asr_turn()
-        self.record_asr_turn(now_mono)
         self.logger.info(
-            "ASR_QUESTION turn=%d utterances=%d churn=%s text=%r",
-            turn_id, len(group.utterances), high_churn_short,
+            "ASR_QUESTION turn=%d utterances=%d text=%r",
+            turn_id, len(group.utterances),
             question_text[:150],
         )
         self.submit_answer_task(
@@ -129,7 +119,6 @@ class AssistAsrStateMachine:
                     "origin": "asr",
                     "asr_turn_id": turn_id,
                     "utterances": list(group.utterances),
-                    "high_churn_short_answer": high_churn_short,
                     "dispatch_after_mono": now_mono + _asr_late_constraint_grace_sec(cfg),
                     "asr_tail_grace_until_mono": now_mono + _asr_late_constraint_grace_sec(cfg),
                 },

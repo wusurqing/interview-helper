@@ -244,8 +244,8 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
         <Field label="回答长度">
           <div className="grid grid-cols-2 gap-2">
             {([
-              { value: false, label: '详细回答', hint: '解释更完整' },
-              { value: true, label: '简短回答', hint: '更快跟住问题' },
+              { value: false, label: '详细回答', hint: '每轮语音答题使用标准提示词' },
+              { value: true, label: '简短回答', hint: '每轮语音答题使用简短提示词' },
             ]).map((item) => {
               const selected = (config?.assist_high_churn_short_answer ?? false) === item.value
               return (
