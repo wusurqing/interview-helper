@@ -10,7 +10,9 @@ from services.llm.streaming import chat_stream_single_model
 
 @pytest.mark.parametrize("stage", ["headers", "first_token", "streaming"])
 @pytest.mark.asyncio
-async def test_cancellation_closes_the_actual_http_connection(stage):
+async def test_cancellation_closes_the_actual_http_connection(stage, tmp_path, monkeypatch):
+    from services.llm import trace
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
     received = asyncio.Event()
     closed = asyncio.Event()
     chunks = []
@@ -68,6 +70,11 @@ async def test_cancellation_closes_the_actual_http_connection(stage):
             request.cancel()
             await asyncio.gather(consumer, return_exceptions=True)
         assert chunks == ([("text", "first")] if stage == "streaming" else [])
+        results = [json.loads(line) for line in (tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()]
+        terminal = [row for row in results if row["event"] == "result"]
+        assert len(terminal) == 1
+        assert terminal[0]["status"] == "cancelled"
+        assert terminal[0]["output_text"] == ("first" if stage == "streaming" else "")
 
 
 @pytest.mark.parametrize(("api_type", "suffix", "event"), [

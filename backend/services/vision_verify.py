@@ -139,6 +139,7 @@ def _verify_blocking(answer: str, image_data_url: str | Sequence[str]) -> dict:
             [{"role": "user", "content": user_content}],
             temperature=0.1,
             max_tokens=300,
+            trace_context={"scene": "vision_verify"},
         )
     except Exception as e:  # noqa: BLE001
         _log.warning("vision self-verify call failed: %s", e)
@@ -176,7 +177,9 @@ def schedule_self_verify(
 
     def _worker() -> None:
         try:
-            result = _verify_blocking(answer, images)
+            from services.llm import trace
+            with trace.scope("vision_verify", qa_id=qa_id):
+                result = _verify_blocking(answer, images)
         except Exception as e:  # noqa: BLE001
             _log.warning("vision self-verify worker crashed: %s", e)
             result = {"verdict": "UNKNOWN", "reason": f"自检异常: {e}"}

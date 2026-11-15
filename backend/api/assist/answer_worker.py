@@ -724,8 +724,8 @@ def process_question_parallel(
     written_exam = bool(meta.get("exam_preflight") or getattr(cfg, "written_exam_mode", False))
     written_exam_think = bool(getattr(cfg, "written_exam_think", False))
     prompt_mode = prompt_mode_for_task(source, manual_input, written_exam=written_exam)
-    high_churn_short_answer = bool(getattr(cfg, "assist_high_churn_short_answer", False))
-    scene = assist_prompt_scene(prompt_mode, high_churn_short_answer=high_churn_short_answer)
+    short_answer = bool(getattr(cfg, "assist_high_churn_short_answer", False))
+    scene = assist_prompt_scene(prompt_mode, high_churn_short_answer=short_answer)
     customized_prompt = scene in getattr(cfg, "system_prompts", {})
 
     kb_hits: list = []
@@ -896,7 +896,7 @@ def process_question_parallel(
     system_prompt = build_system_prompt(
         manual_input=manual_input,
         mode=prompt_mode,
-        high_churn_short_answer=high_churn_short_answer,
+        high_churn_short_answer=short_answer,
         cfg=cfg,
     )
     user_context = build_assist_user_context(
@@ -924,7 +924,7 @@ def process_question_parallel(
         "image_payload_chars=%d history_used=%s history_profile=%s history_messages=%d "
         "historical_images_stripped=%d history_text_raw_chars=%d "
         "history_text_trimmed_chars=%d candidate_context_chars=%d "
-        "message_count=%d text_chars=%d",
+        "message_count=%d text_chars=%d prompt_scene=%s customized_prompt=%s",
         source,
         prompt_mode,
         written_exam,
@@ -939,6 +939,8 @@ def process_question_parallel(
         candidate_context_chars,
         len(messages_for_llm),
         _message_text_chars(messages_for_llm),
+        scene,
+        customized_prompt,
     )
 
     if len(images) > 1:
@@ -1033,8 +1035,12 @@ def process_question_parallel(
             override_max_tokens=max_tokens_for_assist_prompt(
                 prompt_mode,
                 cfg,
-                high_churn_short_answer=high_churn_short_answer,
+                high_churn_short_answer=short_answer,
             ),
+            trace_context={"scene": scene, "qa_id": qa_id, "source": source,
+                           "mmpg_group_id": getattr(mmpg_request, "group_id", None),
+                           "mmpg_revision": getattr(mmpg_request, "revision", None),
+                           "mmpg_seq": getattr(mmpg_request, "seq", None)},
             **({"mmpg_request": mmpg_request, "config_snapshot": cfg} if mmpg_request else {}),
         ):
             if deps.abort_check():

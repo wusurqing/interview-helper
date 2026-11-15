@@ -84,6 +84,7 @@ def summarize_messages(messages: Sequence[dict], prior_summary: str = "") -> str
         [{"role": "user", "content": prompt}],
         temperature=0.2,
         max_tokens=600,
+        trace_context={"scene": "memory_compaction"},
     )
     usage = getattr(response, "usage", None)
     if usage:

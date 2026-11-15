@@ -83,14 +83,16 @@ def _analyze_session_worker(session_id: int, system_prompts: Mapping[str, str] |
                 continue
 
             try:
-                result = review_analysis.analyze_turn(
-                    question=turn["question_text"],
-                    candidate_answer=turn["candidate_answer_text"],
-                    reference_answer=turn.get("reference_answer_text", ""),
-                    code_text=turn.get("code_text", ""),
-                    review_source=review_source,
-                    system_prompts=system_prompts,
-                )
+                from services.llm import trace
+                with trace.scope("review_turn", session_id=session_id, turn_id=turn["id"]):
+                    result = review_analysis.analyze_turn(
+                        question=turn["question_text"],
+                        candidate_answer=turn["candidate_answer_text"],
+                        reference_answer=turn.get("reference_answer_text", ""),
+                        code_text=turn.get("code_text", ""),
+                        review_source=review_source,
+                        system_prompts=system_prompts,
+                    )
 
                 # 更新 turn（包括纠正后的候选人回答）
                 review.update_turn_analysis(
@@ -132,11 +134,13 @@ def _analyze_session_worker(session_id: int, system_prompts: Mapping[str, str] |
             review.update_session_status(session_id, "analysis_failed")
             return
 
-        summary_result = review_analysis.generate_summary(
-            turns=analyzed_turns,
-            review_source=review_source,
-            system_prompts=system_prompts,
-        )
+        from services.llm import trace
+        with trace.scope("review_summary", session_id=session_id):
+            summary_result = review_analysis.generate_summary(
+                turns=analyzed_turns,
+                review_source=review_source,
+                system_prompts=system_prompts,
+            )
         all_scores = []
         for turn in analyzed_turns:
             all_scores.extend(_score_values(turn.get("scorecard", {})))

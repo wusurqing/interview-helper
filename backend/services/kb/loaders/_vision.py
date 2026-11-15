@@ -71,6 +71,7 @@ def vision_caption(png_path: Path, *, deadline_s: float = 20.0) -> Optional[str]
             ],
             temperature=0.0,
             max_tokens=400,
+            trace_context={"scene": "kb_vision_caption", "image_path": str(png_path)},
             timeout=(10, max(5.0, deadline_s)),
         )
     except Exception as e:  # pragma: no cover

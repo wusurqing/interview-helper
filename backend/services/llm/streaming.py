@@ -13,6 +13,7 @@ import httpx
 from typing import Callable, Generator, Optional
 from core.config import get_config
 from core.logger import get_logger
+from services.llm import trace
 from services.llm.protocols import (
     API_TYPE_ANTHROPIC,
     API_TYPE_RESPONSES,
@@ -152,6 +153,7 @@ def get_client_for_model(model_cfg) -> OpenAI:
                 api_key=model_cfg.api_key,
                 base_url=base,
                 default_headers=_openai_compat_headers(),
+                http_client=trace.TracingHttpxClient(),
             )
             _client_cache[key] = client
         return client
@@ -175,6 +177,7 @@ RESUME_VISION_PROMPT = """以下是一份简历的页面图片（可能为扫描
 - 若某页无文字或无法识别，可输出空行或省略该页，不要编造内容。"""
 
 
+@trace.traced("chat_completion")
 def chat_completion_create(
     model_cfg,
     messages: list[dict],
@@ -231,6 +234,7 @@ def chat_completion_create(
     )
 
 
+@trace.traced("resume_vision_ocr_http_fallback")
 def _vision_via_http(model_cfg, messages: list[dict]) -> str:
     """Raw HTTP fallback for vision calls when SDK has pydantic issues."""
     api_type = get_api_type(model_cfg)
@@ -269,7 +273,8 @@ def vision_extract_text(image_base64_list: list[str]) -> str:
         parts.append({"type": "image_url", "image_url": {"url": img_url}})
     vision_messages = [{"role": "user", "content": parts}]
     try:
-        r = chat_completion_create(model, vision_messages, temperature=0, max_tokens=4096)
+        r = chat_completion_create(model, vision_messages, temperature=0, max_tokens=4096,
+                                   trace_context={"scene": "resume_vision_ocr"})
         return (r.choices[0].message.content or "").strip()
     except TypeError as e:
         if "by_alias" not in str(e):
@@ -639,6 +644,7 @@ def _config_with_think_override(cfg, override_think_mode: Optional[bool]):
     return _copy_config_with_updates(cfg, updates)
 
 
+@trace.traced("chat_stream")
 def chat_stream(
     messages: list[dict],
     system_prompt: Optional[str] = None,
@@ -747,7 +753,10 @@ def _mmpg_stream(model, messages, cfg, request, abort_check):
         if request.on_started:
             request.on_started(request.started_at)
 
-    stream = post_cancellable_chat_stream(model.api_base_url, api_type, model.api_key, payload, on_started=started)
+    stream = post_cancellable_chat_stream(
+        model.api_base_url, api_type, model.api_key, payload,
+        on_started=started, trace_context=trace.current_context(),
+    )
 
     async def read():
         with request.lock:
@@ -778,6 +787,7 @@ def _mmpg_stream(model, messages, cfg, request, abort_check):
         )
 
 
+@trace.traced("answer")
 def chat_stream_single_model(
     model_cfg,
     messages: list[dict],
