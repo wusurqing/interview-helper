@@ -62,8 +62,8 @@ def _devices(message):
     return ids, mic
 
 
-def bind_mmpg_routes(app, manager, *, on_control):
-    @app.websocket("/ws/stt/mmpg")
+def bind_mmpg_routes(app, manager, *, on_control, path="/ws/stt/mmpg"):
+    @app.websocket(path)
     async def publisher_endpoint(ws: WebSocket):
         if not _local_owner(ws):
             await ws.close(code=1008)

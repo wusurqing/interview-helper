@@ -25,7 +25,7 @@ from core.logger import setup_logging, get_logger
 from services.stt import get_stt_engine
 from api.realtime import ws
 from api.realtime.mmpg import bind_mmpg_routes
-from api.assist import mmpg_integration
+from api.assist import candidate_mmpg, mmpg_integration
 from api import common, assist, analytics, resume, jobs, review
 from api import kb as kb_api
 
@@ -97,7 +97,7 @@ async def lifespan(app: FastAPI):
         _log.debug("Resume auto-restore skipped: %s", e)
     yield
     _log.info("SHUTDOWN cleaning up")
-    await mmpg_integration.manager.stop("shutdown")
+    await asyncio.gather(mmpg_integration.manager.stop("shutdown"), candidate_mmpg.stop("shutdown", drain=True))
     assist.stop_interview_loop()
     assist.shutdown_background_workers()
     dispatch_task.cancel()
@@ -243,6 +243,7 @@ async def api_auth_info(request: Request):
 
 app.include_router(ws.router)
 bind_mmpg_routes(app, mmpg_integration.manager, on_control=mmpg_integration.prepare)
+bind_mmpg_routes(app, candidate_mmpg.manager, on_control=candidate_mmpg.prepare, path="/ws/stt/mmpg/candidate")
 app.include_router(common.router, prefix="/api")
 app.include_router(assist.router, prefix="/api")
 app.include_router(analytics.router, prefix="/api")

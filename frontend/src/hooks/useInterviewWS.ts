@@ -3,7 +3,7 @@ import { useInterviewStore } from '@/stores/configStore'
 import { useKbStore } from '@/stores/kbStore'
 import { buildWsUrl } from '@/lib/backendUrl'
 import { subscribeLeader } from '@/lib/wsLeader'
-import { isMmpgState } from '@/lib/mmpg/rtcController'
+import { isMmpgState, mmpgErrorMessage } from '@/lib/mmpg/rtcController'
 
 // 指数退避重连步长（ms）。最后一档是稳态，不再翻倍。
 const RECONNECT_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000]
@@ -203,7 +203,9 @@ export function useInterviewWS(active = true) {
           (msg.loading as boolean) ?? false,
           msg.provider as string | undefined,
         )
-        if (msg.error) {
+        if (msg.error && msg.provider === 'doubao_mmpg') {
+          if (msg.state === 'error') s.pushToast(`我的麦克风 MMPG · ${mmpgErrorMessage(String(msg.error))}`, 'warn')
+        } else if (msg.error) {
           s.pushToast(`会议软件可能独占麦克风，候选人口述记录已关闭，不影响面试录音: ${msg.error as string}`, 'warn')
         }
         break

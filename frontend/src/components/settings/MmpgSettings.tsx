@@ -12,6 +12,7 @@ type Props = {
   onImport: () => Promise<void>
   onSave: () => Promise<boolean>
   saving: boolean
+  testEnabled: boolean
 }
 
 const secretLabels: Record<MmpgSecret, string> = {
@@ -39,7 +40,7 @@ function dateTimeLocal(seconds: number | null) {
   return Number.isFinite(calendar.valueOf()) ? calendar.toISOString().slice(0, 19) : ''
 }
 
-export default function MmpgSettings({ form, stored, onChange, onImport, onSave, saving }: Props) {
+export default function MmpgSettings({ form, stored, onChange, onImport, onSave, saving, testEnabled }: Props) {
   const devices = useInterviewStore((state) => state.devices)
   const platform = useInterviewStore((state) => state.platformInfo?.platform)
   const recording = useInterviewStore((state) => state.isRecording)
@@ -109,7 +110,7 @@ export default function MmpgSettings({ form, stored, onChange, onImport, onSave,
   const importLocal = window.isSecureContext && ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname)
   return (
     <div className="space-y-3 rounded-xl border border-bg-hover/60 p-3">
-      <p className="text-xs text-text-secondary">豆包 MMPG 通过火山 RTC 识别主链路音频并自动判停。开始面试或运行测试会将所选设备音频发送到火山引擎，可能产生费用。</p>
+      <p className="text-xs text-text-secondary">豆包 MMPG 通过火山 RTC 识别所选音源并自动判停。开始面试或运行测试会将所选设备音频发送到火山引擎，可能产生费用。</p>
       <button type="button" className="text-xs text-accent-blue disabled:opacity-50" onClick={importProbe} disabled={!importLocal || importing || saving || testRunning}>
         {importing ? '正在导入…' : '导入本机探针配置'}
       </button>
@@ -161,6 +162,7 @@ export default function MmpgSettings({ form, stored, onChange, onImport, onSave,
         </details>
       </fieldset>
 
+      {testEnabled && (
       <div className="space-y-2 rounded-lg bg-bg-primary/40 p-3 text-xs text-text-secondary">
         <Field label="MMPG 测试音频设备">
           <select aria-label="MMPG 测试音频设备" className="input-field" value={device} disabled={testRunning} onChange={(event) => setDevice(event.target.value)}>
@@ -192,8 +194,9 @@ export default function MmpgSettings({ form, stored, onChange, onImport, onSave,
             </ol>
           </div>
         )}
-        {(error || (test && status.error)) && <p role="alert" className="text-accent-red">{error || status.error}</p>}
       </div>
+      )}
+      {(error || (test && status.error)) && <p role="alert" className="text-xs text-accent-red">{error || status.error}</p>}
     </div>
   )
 }

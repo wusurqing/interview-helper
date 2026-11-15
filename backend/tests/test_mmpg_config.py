@@ -1,5 +1,6 @@
 import json
 from importlib import import_module
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import FastAPI
@@ -19,15 +20,38 @@ def client(monkeypatch, tmp_path):
     return TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 40000))
 
 
-def test_mmpg_settings_are_main_only(client):
+def test_mmpg_can_be_saved_for_both_audio_sources(client):
     options = client.get("/api/options").json()
     assert "doubao_mmpg" in options["stt_providers"]
-    assert "doubao_mmpg" not in options["candidate_stt_providers"]
+    assert "doubao_mmpg" in options["candidate_stt_providers"]
     assert client.post("/api/config", json={"stt_provider": "doubao_mmpg"}).status_code == 200
-    assert client.post(
-        "/api/config", json={"candidate_stt_provider": "doubao_mmpg", "candidate_remote_stt_enabled": True}
-    ).status_code == 422
-    assert config.AppConfig(candidate_stt_provider="doubao_mmpg").candidate_stt_provider == "whisper"
+    candidate = client.post("/api/config", json={"candidate_stt_provider": "doubao_mmpg", "candidate_asr_enabled": True})
+    assert candidate.status_code == 200
+    assert candidate.json()["candidate_stt_provider"] == "doubao_mmpg"
+    assert config._load_config().candidate_stt_provider == "doubao_mmpg"
+
+
+def test_candidate_mmpg_never_preloads_whisper(monkeypatch):
+    from api.assist import pipeline
+
+    settings = config.AppConfig(candidate_stt_provider="doubao_mmpg", candidate_asr_enabled=True)
+    monkeypatch.setattr(pipeline, "get_config", lambda: settings)
+    monkeypatch.setattr(pipeline, "_preload_candidate_whisper_async", lambda *_: pytest.fail("Whisper was preloaded"))
+
+    pipeline.preload_candidate_asr_if_enabled()
+
+
+def test_disabling_candidate_asr_ends_its_mmpg_session(client, monkeypatch):
+    from api.assist import candidate_mmpg
+
+    stop = AsyncMock()
+    monkeypatch.setattr(candidate_mmpg, "stop", stop)
+    result = client.post("/api/config", json={"candidate_stt_provider": "doubao_mmpg", "candidate_asr_enabled": True})
+    assert result.status_code == 200
+    stop.assert_not_awaited()
+
+    assert client.post("/api/config", json={"candidate_asr_enabled": False}).status_code == 200
+    stop.assert_awaited_once_with("settings_changed")
 
 
 def test_previous_config_uses_probe_tuning_defaults(client):

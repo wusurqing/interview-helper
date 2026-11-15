@@ -64,6 +64,10 @@ const errorMessages: Record<string, string> = {
   capture_busy: '音频设备正在被其他操作使用，请结束该操作后重试。',
   device_required: '请选择一个后端音频设备。',
   device_unavailable: '所选音频设备不可用，请刷新设备后重新选择。',
+  candidate_provider_not_selected: '请启用我的回答记录，并将语音识别引擎设为豆包 MMPG。',
+  candidate_interview_inactive: '请先开始或继续面试。',
+  candidate_mic_required: '请为我的回答选择独立的麦克风输入设备。',
+  candidate_mmpg_auto_token_required: '两路同时使用豆包 MMPG 时，请设置 RTC App Key 并选择自动签发 Token。',
   cannot_resume: '当前没有已暂停的 MMPG 面试可继续。',
   interview_active: '请结束当前面试后再运行 MMPG 测试。',
   provider_not_selected: '请将主链路语音引擎选为豆包 MMPG 并保存。',
@@ -127,6 +131,8 @@ class MmpgController {
   private readonly subscribers = new Set<() => void>()
   private owner?: Owner
   private cleanup = Promise.resolve()
+
+  constructor(private readonly path = '/ws/stt/mmpg') {}
 
   getSnapshot = () => this.snapshot
 
@@ -192,12 +198,10 @@ class MmpgController {
 
   private async connect(owner: Owner, ready: Promise<void>, deviceId: number, candidateMicId: number | null, prepare?: () => Promise<boolean>) {
     try {
-      const [prepared] = await Promise.all([
-        prepare?.() ?? true,
-        ready,
-        owner.context.audioWorklet.addModule(pcmWorkletUrl),
-        owner.cleanup,
-      ])
+      const audioReady = Promise.all([
+        ready, owner.context.audioWorklet.addModule(pcmWorkletUrl), owner.cleanup,
+      ]).then(() => window.clearTimeout(owner.connectTimer))
+      const [prepared] = await Promise.all([prepare?.() ?? true, audioReady])
       if (this.owner !== owner) return
       if (!prepared) {
         this.finish(owner, 'invalid_command')
@@ -209,7 +213,8 @@ class MmpgController {
       return
     }
     try {
-      const socket = new WebSocket(buildWsUrl('/ws/stt/mmpg'))
+      owner.connectTimer = window.setTimeout(() => this.finish(owner, 'connect_timeout'), 15_000)
+      const socket = new WebSocket(buildWsUrl(this.path))
       owner.socket = socket
       socket.binaryType = 'arraybuffer'
       socket.onopen = () => {
@@ -525,3 +530,4 @@ async function quietRtcCleanup(action: () => Promise<unknown>) {
 }
 
 export const mmpgController = new MmpgController()
+export const candidateMmpgController = new MmpgController('/ws/stt/mmpg/candidate')

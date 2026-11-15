@@ -11,7 +11,7 @@ from difflib import SequenceMatcher
 from typing import Any, Callable, Literal, Optional
 
 from core.background import BoundedTaskWorker
-from core.config import get_config
+from core.config import MMPG_STT_PROVIDER, get_config
 from core.logger import get_interview_logger, get_logger
 from core.session import get_session, reset_session, conversation_lock
 from services import review_integration
@@ -940,6 +940,21 @@ def _is_valid_device_id(value: Any) -> bool:
         return False
 
 
+def _start_candidate_capture(device_id: int, cfg) -> None:
+    global _candidate_thread
+    if getattr(cfg, "candidate_stt_provider", None) == MMPG_STT_PROVIDER:
+        # The independent RTC publisher owns this capture once its transport is ready.
+        return
+    _candidate_audio_capture.start(
+        device_id,
+        owner="assist-candidate",
+        mic_compatibility_mode=bool(getattr(cfg, "candidate_mic_compatibility_mode", True)),
+    )
+    if not _candidate_thread or not _candidate_thread.is_alive():
+        _candidate_thread = threading.Thread(target=_candidate_worker, daemon=True)
+        _candidate_thread.start()
+
+
 def start_nonblocking(
     device_id: Optional[int] = None,
     candidate_mic_device_id: Optional[int] = None,
@@ -947,7 +962,7 @@ def start_nonblocking(
     stream_audio: Optional[Callable[[np.ndarray], None]] = None,
     config_snapshot=None,
 ):
-    global _interview_thread, _candidate_thread, _interviewer_streaming, _interviewer_config
+    global _interview_thread, _interviewer_streaming, _interviewer_config
     start_cfg = config_snapshot if config_snapshot is not None else get_config()
     stop_interview_loop()
     _set_last_interviewer_runtime_snapshot(None)
@@ -1001,15 +1016,9 @@ def start_nonblocking(
         and int(candidate_mic_device_id) != int(device_id)
     ):
         try:
-            _candidate_audio_capture.start(
-                int(candidate_mic_device_id),
-                owner="assist-candidate",
-                mic_compatibility_mode=bool(getattr(cfg, "candidate_mic_compatibility_mode", True)),
-            )
             with conversation_lock:
                 session.last_candidate_mic_device_id = int(candidate_mic_device_id)
-            _candidate_thread = threading.Thread(target=_candidate_worker, daemon=True)
-            _candidate_thread.start()
+            _start_candidate_capture(int(candidate_mic_device_id), cfg)
             review_candidate_device_id = int(candidate_mic_device_id)
             _ilog.info("CANDIDATE_ASR_START device=%s", candidate_mic_device_id)
         except Exception as exc:
@@ -1152,7 +1161,6 @@ def unpause_interview(
     *,
     stream_audio: Optional[Callable[[np.ndarray], None]] = None,
 ):
-    global _interview_thread, _candidate_thread
     session = get_session()
     cfg = get_config()
     written_exam = stream_audio is None and bool(getattr(cfg, "written_exam_mode", False))
@@ -1216,14 +1224,7 @@ def unpause_interview(
         and candidate_device_valid
     ):
         try:
-            _candidate_audio_capture.start(
-                next_candidate_id,
-                owner="assist-candidate",
-                mic_compatibility_mode=bool(getattr(cfg, "candidate_mic_compatibility_mode", True)),
-            )
-            if not _candidate_thread or not _candidate_thread.is_alive():
-                _candidate_thread = threading.Thread(target=_candidate_worker, daemon=True)
-                _candidate_thread.start()
+            _start_candidate_capture(next_candidate_id, cfg)
         except Exception as exc:
             next_candidate_id = _UNSET_DEVICE_ID
             _elog.warning("CANDIDATE_ASR_RESUME_FAIL err=%s", exc)
@@ -1568,8 +1569,6 @@ def _interview_worker(config_snapshot=None):
 def _candidate_provider_config(cfg) -> tuple[str, str, str, bool]:
     provider = (getattr(cfg, "candidate_stt_provider", "whisper") or "whisper").strip()
     allow_remote = bool(getattr(cfg, "candidate_remote_stt_enabled", False))
-    if provider == "doubao_mmpg":
-        provider = "whisper"
     if provider in ("doubao", "generic") and not allow_remote:
         provider = "whisper"
     # 本地引擎互斥：候选人链路跟随主链路的本地引擎，避免 funasr 与 whisper
@@ -1715,6 +1714,9 @@ def _publish_candidate_transcription(
 def _candidate_worker():
     cfg = get_config()
     provider, model, language, allow_remote = _candidate_provider_config(cfg)
+    if provider == MMPG_STT_PROVIDER:
+        _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=True)
+        return
     streaming_enabled, streaming_interval_ms = _candidate_streaming_config(cfg, provider)
     _ilog.info(
         "CANDIDATE_ASR_WORKER_START provider=%s model=%s language=%s remote=%s streaming=%s interval_ms=%d",
@@ -1750,6 +1752,8 @@ def _candidate_worker():
             return
         local_cfg = get_config()
         final_provider, final_model, final_language, final_allow_remote = _candidate_provider_config(local_cfg)
+        if final_provider == MMPG_STT_PROVIDER:
+            return
         try:
             with conversation_lock:
                 target_qa_id = (
@@ -1812,6 +1816,9 @@ def _candidate_worker():
 
     try:
         while not _stop_event.is_set():
+            cfg = get_config()
+            if getattr(cfg, "candidate_stt_provider", None) == MMPG_STT_PROVIDER:
+                break
             if _pause_event.is_set():
                 if _candidate_flush_event.is_set():
                     _candidate_flush_event.clear()
@@ -1823,7 +1830,6 @@ def _candidate_worker():
                 time.sleep(0.05)
                 continue
 
-            cfg = get_config()
             if not bool(getattr(cfg, "candidate_asr_enabled", False)):
                 with conversation_lock:
                     if hasattr(session, "mark_candidate_asr_idle"):

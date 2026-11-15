@@ -1,5 +1,6 @@
 """Interview assist HTTP routes."""
 
+import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -10,6 +11,7 @@ from core.config import get_config
 from core.logger import get_logger
 from core.session import get_session, snapshot_session
 from services.audio import AudioBusyError
+from . import candidate_mmpg
 from . import mmpg_integration as mmpg
 from .answer_worker import prompt_server_screen_code
 from .pipeline import (
@@ -81,6 +83,7 @@ async def _api_start(body: dict):
     else:
         candidate_dev = None
     try:
+        await candidate_mmpg.stop("stopped")
         if dev is not None and not written_exam:
             await run_in_threadpool(start_nonblocking, dev, candidate_dev, config_snapshot=cfg)
         elif candidate_dev is None:
@@ -98,7 +101,7 @@ async def _api_start(body: dict):
 @router.post("/stop")
 async def api_stop():
     async with mmpg.http_lifecycle_lock:
-        await mmpg.manager.stop("stopped")
+        await asyncio.gather(mmpg.manager.stop("stopped"), candidate_mmpg.stop("stopped", drain=True))
         await run_in_threadpool(stop_interview_loop)
     return {"ok": True}
 
@@ -107,14 +110,14 @@ async def api_stop():
 async def api_pause():
     async with mmpg.http_lifecycle_lock:
         if is_streaming_interview() or mmpg.manager.active:
-            await mmpg.manager.stop("paused")
+            await asyncio.gather(mmpg.manager.stop("paused"), candidate_mmpg.stop("paused", drain=True))
             return {"ok": True}
         session = get_session()
         if not session.is_recording:
             raise HTTPException(400, "面试未在进行中")
         if is_paused():
             raise HTTPException(400, "已经处于暂停状态")
-        await run_in_threadpool(pause_interview)
+        await asyncio.gather(run_in_threadpool(pause_interview), candidate_mmpg.stop("paused", drain=True))
     return {"ok": True}
 
 
@@ -165,6 +168,7 @@ async def _api_resume_interview(body: Optional[dict] = None):
 async def api_clear():
     from api.realtime.ws import broadcast
     mmpg.clear_turns()
+    candidate_mmpg.manager.discard_turns()
     cancel_answer_work(reset_session_data=True)
     broadcast({"type": "session_cleared"})
     return {"ok": True}
