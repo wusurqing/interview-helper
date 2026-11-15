@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   toggleAlwaysOnTop: () => ipcRenderer.invoke('toggle-always-on-top'),
   toggleContentProtection: () => ipcRenderer.invoke('toggle-content-protection'),
   getWindowState: () => ipcRenderer.invoke('get-window-state'),
+  setWindowOpacity: (opacity) => ipcRenderer.invoke('set-window-opacity', opacity),
   syncOverlayWindow: (payload) => ipcRenderer.invoke('sync-overlay-window', payload),
   resizeOverlayWindow: (payload) => ipcRenderer.invoke('resize-overlay-window', payload),
   setShortcutsSuspended: (on) => ipcRenderer.invoke('set-shortcuts-suspended', on),

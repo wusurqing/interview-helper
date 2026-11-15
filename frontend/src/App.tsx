@@ -22,6 +22,7 @@ import KnowledgeDrawer from '@/components/kb/KnowledgeDrawer'
 import { AppToastStack } from '@/components/app/AppToastStack'
 import { InitErrorScreen } from '@/components/app/InitErrorScreen'
 import { ModelPriorityDropdown } from '@/components/app/ModelPriorityDropdown'
+import { WindowOpacitySlider } from '@/components/app/WindowOpacitySlider'
 const ReviewMode = lazy(() => import('@/components/ReviewMode'))
 const KnowledgeMap = lazy(() => import('@/components/KnowledgeMap'))
 const ResumeOptimizer = lazy(() => import('@/components/ResumeOptimizer'))
@@ -406,6 +407,7 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-1.5 md:gap-2 flex-shrink-0 flex-nowrap justify-end">
+          <WindowOpacitySlider />
           {config?.models && config.models.length > 0 && (
             <ModelPriorityDropdown
               config={config}
