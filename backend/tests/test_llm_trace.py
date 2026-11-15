@@ -150,6 +150,43 @@ def test_raw_http_stream_logs_retry_and_partial_cancel(tmp_path, monkeypatch):
     assert records[3]["output_text"] == "partial"
 
 
+@pytest.mark.parametrize("error_status", [401, 403, 404, 405])
+@pytest.mark.parametrize(("error_content", "expected_body"), [
+    (
+        b'{"error":{"message":"rejected fixture-dummy-token","api_key":"fixture-dummy-token"}}',
+        {"error": {"message": "rejected [REDACTED]", "api_key": "[REDACTED]"}},
+    ),
+    (
+        b"rejected fixture-dummy-token",
+        {"unparsed_body": "rejected [REDACTED]"},
+    ),
+])
+def test_non_stream_retry_logs_redacted_error_body(tmp_path, monkeypatch, error_status, error_content, expected_body):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    failed = httpx.Response(error_status, content=error_content)
+    accepted = httpx.Response(200, json={"content": [{"type": "text", "text": "ok"}]})
+    with patch.object(protocols._http, "post", side_effect=[failed, accepted]), trace.scope("blocking_retry"):
+        reply = protocols.post_chat_blocking(
+            "https://example.com", "anthropic", "fixture-dummy-token",
+            {"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert reply.choices[0].message.content == "ok"
+    logged = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    request, failure, retry, success = map(json.loads, logged.splitlines())
+    assert [row["event"] for row in (request, failure, retry, success)] == ["request", "result", "request", "result"]
+    assert failure["http_status"] == error_status
+    assert failure["status"] == "failed"
+    assert success["status"] == "completed"
+    assert request["call_id"] == failure["call_id"] == retry["call_id"] == success["call_id"]
+    assert request["attempt_id"] == failure["attempt_id"]
+    assert retry["attempt_id"] == success["attempt_id"]
+    assert failure["attempt_id"] != success["attempt_id"]
+    assert (request["url"] == retry["url"]) == (error_status in (401, 403))
+    assert failure["response"] == expected_body
+    assert "fixture-dummy-token" not in logged
+
+
 def test_openai_sdk_retry_has_two_attempts_with_one_call_id(tmp_path, monkeypatch):
     monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
     count = 0

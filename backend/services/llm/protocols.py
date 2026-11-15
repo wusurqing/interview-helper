@@ -623,10 +623,12 @@ def post_chat_blocking(
                 raise
             attempt.headers(response.status_code)
             if response.status_code in (401, 403) and headers is not header_variants[-1]:
+                attempt.response(_trace_http_error_body(response))
                 attempt.finish("failed")
                 continue
             if response.status_code in (404, 405):
                 last_not_found = f"HTTP {response.status_code}: {response.text[:200]}"
+                attempt.response(_trace_http_error_body(response))
                 attempt.finish("failed")
                 break
             if response.status_code >= 400:
