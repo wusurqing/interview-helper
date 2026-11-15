@@ -24,6 +24,11 @@ from services.llm import (
     LLMError,
     postprocess_answer_for_mode,
 )
+from services.llm.prompts import (
+    assist_prompt_scene,
+    build_assist_user_context,
+    max_tokens_for_assist_prompt,
+)
 from api.assist.scheduler import TaskPayload
 
 
@@ -57,14 +62,11 @@ def _screen_region_label(region: str) -> str:
     return labels.get(region, "主显示器左半屏")
 
 
-def prompt_server_screen_code(language: str, region: str) -> str:
+def prompt_server_screen_code(region: str, *, image_count: int = 1) -> str:
     where = _screen_region_label(region)
-    return (
-        f"下图来自运行本后端的电脑「{where}」的实时画面，可能包含题目描述、输入输出约束或代码片段。\n\n"
-        f"请基于图中可见信息作答。若是编程题，代码请优先使用 {language}（SQL 题使用 sql）。\n\n"
-        "请尽量按以下顺序组织：题目理解、主方案代码、备选方案代码（1-2 个）、方案对比、思路与复杂度、测试用例设计。\n"
-        "如果关键信息看不清，请明确说明缺失项，不要编造；可在合理假设下给出最小可执行方案。"
-    )
+    if image_count > 1:
+        return f"电脑截图（{where}，共 {image_count} 张连续截图，按页序排列）"
+    return f"电脑截图（{where}）"
 
 
 def _normalize_task_images(image: Any) -> list[str]:
@@ -114,12 +116,12 @@ def _context_excerpt(text: str, max_chars: int) -> str:
 def _written_exam_question_context_label(question: str, source: str) -> str:
     cleaned = " ".join(str(question or "").split())
     if (
-        cleaned.startswith("下图来自运行本后端")
+        cleaned.startswith(("下图来自运行本后端", "电脑截图（"))
         or "请基于图中可见信息作答" in cleaned
     ):
         if source == "server_screen_multi":
-            return "上一批连续截图题面（无 OCR 文本，以上一版答案和当前截图为准）"
-        return "上一张截图题面（无 OCR 文本，以上一版答案和当前截图为准）"
+            return "上一批连续截图题面（无 OCR 文本）"
+        return "上一张截图题面（无 OCR 文本）"
     return _clip_text(cleaned, 260)
 
 
@@ -138,9 +140,6 @@ def _written_exam_followup_context(session_ref, *, source: str, image_count: int
 
     lines = [
         "[笔试连续截图上下文]",
-        "当前截图优先级最高: 若截图里出现新增规则、隐藏/边界条件、失败用例、编译/运行报错、预期输出和实际输出, 必须据此修正上一版答案。",
-        "不要因为上一版代码已存在就忽略当前截图; 若当前截图显示上一版未通过, 直接输出修正后的完整可提交代码。",
-        "如果当前截图明显是新题或与上一题无关, 忽略下面旧答案, 按新题作答。",
         "最近上一版答案参考:",
     ]
     for idx, qa in enumerate(recent_qas, start=1):
@@ -623,23 +622,6 @@ def _history_context_options(prompt_mode: PromptMode, written_exam: bool) -> dic
     }
 
 
-def _max_tokens_for_prompt(
-    prompt_mode: PromptMode,
-    cfg,
-    *,
-    high_churn_short_answer: bool = False,
-) -> int:
-    base_limit = max(1, int(getattr(cfg, "max_tokens", 4096) or 4096))
-    if prompt_mode == PROMPT_MODE_ASR_REALTIME:
-        cap = (
-            int(getattr(cfg, "assist_realtime_high_churn_max_tokens", 420) or 420)
-            if high_churn_short_answer
-            else int(getattr(cfg, "assist_realtime_max_tokens", 900) or 900)
-        )
-        return max(1, min(base_limit, cap))
-    return base_limit
-
-
 def _wait_for_candidate_context_if_pending(session_ref, qa_id: str, wait_ms: int) -> None:
     if wait_ms <= 0 or not qa_id:
         return
@@ -739,10 +721,12 @@ def process_question_parallel(
         deps.mark_seq_skipped(seq)
         return
 
-    written_exam = bool(getattr(cfg, "written_exam_mode", False))
+    written_exam = bool(meta.get("exam_preflight") or getattr(cfg, "written_exam_mode", False))
     written_exam_think = bool(getattr(cfg, "written_exam_think", False))
     prompt_mode = prompt_mode_for_task(source, manual_input, written_exam=written_exam)
     high_churn_short_answer = bool(meta.get("high_churn_short_answer", False))
+    scene = assist_prompt_scene(prompt_mode, high_churn_short_answer=high_churn_short_answer)
+    customized_prompt = scene in getattr(cfg, "system_prompts", {})
 
     kb_hits: list = []
     kb_latency_ms = 0
@@ -849,30 +833,25 @@ def process_question_parallel(
             prev_answer_summary = _context_excerpt(last_qa.answer, prev_answer_budget)
         if not followup_needs_bridge:
             user_for_llm = (
-                f"[追问上下文] 上一个问题：{last_qa.question}\n"
-                "当前追问已经自带比较完整的对象、条件和要问点。只把上一轮当作主题锚点，"
-                "不要重复上一轮助手建议答案，也不要硬套候选人上一轮项目细节、示例或量化结果。\n\n"
+                f"[追问上下文] 上一个问题（主题锚点）：{last_qa.question}\n\n"
                 f"现在面试官追问：{question_text}"
             )
         elif not candidate_context_enabled:
             user_for_llm = (
                 f"[追问上下文] 上一个问题：{last_qa.question}\n"
-                f"你上次回答的要点：{prev_answer_summary}\n\n"
+                f"助手上一轮建议答案：{prev_answer_summary}\n\n"
                 f"现在面试官追问：{question_text}"
             )
         else:
             actual_block = (
                 f"候选人麦克风转写（辅助参考，可能有识别误差）：{actual_spoken_answer[:candidate_max_chars]}\n"
                 if actual_spoken_answer
-                else "候选人麦克风转写：未启用或未捕获到；本轮按旧逻辑仅参考助手建议答案。\n"
+                else "候选人麦克风转写：未捕获到。"
             )
             user_for_llm = (
                 f"[追问上下文] 上一个问题：{last_qa.question}\n"
-                f"{actual_block}"
-                f"助手上一轮建议答案（参考候选人可能听到过的答题方向，不代表候选人照读）：{prev_answer_summary}\n"
-                "追问回答规则：以当前面试官追问和会议音频识别出的题意为主；"
-                "候选人麦克风转写用于理解上一轮回答大意，但不要当作逐字稿。"
-                "如果转写内容明显识别错、与当前追问冲突或不自然，请降权使用，不要强行套入。\n\n"
+                f"{actual_block}\n"
+                f"助手上一轮建议答案：{prev_answer_summary}\n\n"
                 f"现在面试官追问：{question_text}"
             )
     elif (
@@ -883,10 +862,7 @@ def process_question_parallel(
     ):
         user_for_llm = (
             f"[候选人回答辅助背景] 上一个问题：{last_qa.question}\n"
-            f"候选人上一轮麦克风转写（可能有识别误差）：{actual_spoken_answer[:candidate_max_chars]}\n"
-            "使用规则：这段转写可帮助延续候选人上一轮回答的大意、项目线索和技术关键词；"
-            "以当前面试官问题为主，如果当前问题与上一轮无关，或转写明显不准，请忽略或弱化它。"
-            "不得假设候选人照读了助手上一轮建议答案，也不要把转写当成逐字事实。\n\n"
+            f"候选人上一轮麦克风转写（可能有识别误差）：{actual_spoken_answer[:candidate_max_chars]}\n\n"
             f"现在面试官问题：{question_text}"
         )
 
@@ -920,9 +896,13 @@ def process_question_parallel(
     system_prompt = build_system_prompt(
         manual_input=manual_input,
         mode=prompt_mode,
-        screen_region=getattr(cfg, "screen_capture_region", "left_half"),
         high_churn_short_answer=high_churn_short_answer,
-        kb_hits=kb_hits or None,
+        cfg=cfg,
+    )
+    user_context = build_assist_user_context(
+        cfg,
+        mode=prompt_mode,
+        kb_hits=kb_hits,
         include_resume=_should_include_resume_context(
             prompt_mode,
             question_text,
@@ -931,6 +911,12 @@ def process_question_parallel(
             followup_needs_bridge=followup_needs_bridge,
         ),
     )
+    if user_context:
+        context_prefix = f"[本轮任务资料]\n{user_context}\n\n[当前输入]\n"
+        if isinstance(user_for_llm, list):
+            user_for_llm[0]["text"] = context_prefix + user_for_llm[0]["text"]
+        else:
+            user_for_llm = context_prefix + user_for_llm
 
     messages_for_llm = base_messages + [{"role": "user", "content": user_for_llm}]
     deps.logger.info(
@@ -1009,7 +995,7 @@ def process_question_parallel(
             deps.error_logger.warning("broadcast kb_hits failed: %s", exc)
 
     raw_full_answer = ""
-    stream_sanitizer = create_answer_stream_sanitizer(prompt_mode)
+    stream_sanitizer = create_answer_stream_sanitizer(prompt_mode, preserve_format=customized_prompt)
     full_think = ""
     token_prompt_delta = 0
     token_completion_delta = 0
@@ -1044,7 +1030,7 @@ def process_question_parallel(
             abort_check=deps.abort_check,
             override_think_mode=think_override,
             usage_callback=_record_usage,
-            override_max_tokens=_max_tokens_for_prompt(
+            override_max_tokens=max_tokens_for_assist_prompt(
                 prompt_mode,
                 cfg,
                 high_churn_short_answer=high_churn_short_answer,
@@ -1150,7 +1136,7 @@ def process_question_parallel(
     if tail:
         _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": tail})
 
-    full_answer = postprocess_answer_for_mode(raw_full_answer, prompt_mode)
+    full_answer = postprocess_answer_for_mode(raw_full_answer, prompt_mode, preserve_format=customized_prompt)
     if not full_answer.strip():
         deps.error_logger.warning(
             "ANSWER_EMPTY id=%s model=%s source=%s think_len=%d raw_len=%d",

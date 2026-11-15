@@ -11,13 +11,13 @@ from core.logger import get_logger
 from core.session import get_session, snapshot_session
 from services.audio import AudioBusyError
 from . import mmpg_integration as mmpg
+from .answer_worker import prompt_server_screen_code
 from .pipeline import (
     cancel_answer_work,
     is_paused,
     is_streaming_interview,
     pause_interview,
     pick_model_index,
-    prompt_server_screen_code,
     start_nonblocking,
     stop_interview_loop,
     submit_answer_task,
@@ -182,7 +182,7 @@ async def api_ask_cancel():
 async def api_ask(body: ManualQuestion):
     if not body.text.strip() and not body.image:
         raise HTTPException(400, "问题不能为空")
-    text = body.text.strip() or "请分析这张图片中的题目，并给出面试回答"
+    text = body.text.strip() or "粘贴的图片"
     src = "manual_image" if body.image else "manual_text"
     meta = {"origin": "manual"}
     if body.override_think_mode is not None:
@@ -206,7 +206,7 @@ async def api_ask_from_server_screen(body: Optional[ServerScreenQuestion] = None
         raise HTTPException(503, str(e))
     cfg = get_config()
     region = getattr(cfg, "screen_capture_region", "left_half") or "left_half"
-    text = prompt_server_screen_code(cfg.language, region)
+    text = prompt_server_screen_code(region)
     meta = {"origin": "server_screen"}
     if body is not None and body.override_think_mode is not None:
         meta["override_think_mode"] = bool(body.override_think_mode)
@@ -246,7 +246,7 @@ async def api_ask_from_server_screens(body: MultiServerScreenQuestion):
 
     cfg = get_config()
     region = getattr(cfg, "screen_capture_region", "left_half") or "left_half"
-    text = f"{prompt_server_screen_code(cfg.language, region)}\n\n本次包含 {len(images)} 张连续截图，请按页序合并理解题目。"
+    text = prompt_server_screen_code(region, image_count=len(images))
     meta = {"origin": "server_screen", "image_count": len(images)}
     if body.override_think_mode is not None:
         meta["override_think_mode"] = bool(body.override_think_mode)

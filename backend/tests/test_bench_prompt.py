@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 
 from scripts.bench_prompt import (
     BENCH_CASES,
@@ -13,6 +14,7 @@ from scripts.bench_prompt import (
     resume_keyword_hits,
     ngram_overlap_3,
     word_count_cn,
+    _run_one_case,
 )
 
 
@@ -33,6 +35,28 @@ def test_bench_cases_have_required_fields():
 def test_resume_fixture_present():
     assert "Kafka" in RESUME_FIXTURE
     assert "字节" in RESUME_FIXTURE
+
+
+def test_resume_benchmark_supplies_fixture_as_task_data(monkeypatch):
+    from core.config import AppConfig
+
+    monkeypatch.setattr("core.config.get_config", lambda: AppConfig(resume_text=RESUME_FIXTURE))
+    case = next(case for case in BENCH_CASES if case["category"] == "resume_deepdive")
+    captured = {}
+
+    def stream(_model, *, messages, system_prompt):
+        captured.update(messages=messages, system_prompt=system_prompt)
+        yield "text", "Kafka"
+
+    monkeypatch.setattr("services.llm.chat_stream_single_model", stream)
+    result = _run_one_case(SimpleNamespace(name="mock"), case, "NEW", {"NEW": lambda _case: "prompt"})
+
+    assert result.error is None
+    assert result.text == "Kafka"
+    assert captured["system_prompt"] == "prompt"
+    user_text = captured["messages"][0]["content"]
+    assert "<resume_context>" in user_text and "Kafka" in user_text
+    assert case["input"] in user_text
 
 
 def test_has_info_insufficient_phrase():

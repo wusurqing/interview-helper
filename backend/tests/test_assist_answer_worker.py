@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 from types import SimpleNamespace
 import sys
 from typing import Any
@@ -92,6 +93,109 @@ def reset_worker_state(monkeypatch: pytest.MonkeyPatch):
         "get_token_stats",
         lambda: {"prompt": 3, "completion": 5, "total": 8, "by_model": {}},
     )
+
+
+@pytest.mark.parametrize(
+    "scene, source, manual, exam, short, image_count, limit",
+    [
+        ("assist_realtime", "conversation_loopback", False, False, False, 0, 720),
+        ("assist_realtime_short", "asr", False, False, True, 0, 320),
+        ("assist_manual", "manual_text", True, False, False, 0, 850),
+        ("assist_manual", "manual_image", True, False, False, 1, 850),
+        ("assist_screen", "server_screen_left", True, False, False, 1, 850),
+        ("assist_screen", "server_screen_multi", True, False, False, 2, 850),
+        ("assist_exam", "server_screen_exam_preflight", True, False, False, 1, 850),
+        ("assist_exam", "manual_image", True, True, True, 1, 850),
+    ],
+)
+def test_custom_prompt_uses_dispatch_snapshot_and_preserves_answer(
+    monkeypatch, scene, source, manual, exam, short, image_count, limit,
+):
+    from services.llm import build_system_prompt
+
+    cfg = _cfg()
+    cfg.written_exam_mode = exam
+    cfg.position = "快照里的岗位"
+    cfg.language = "Rust"
+    cfg.max_tokens = 850
+    cfg.system_prompts = {
+        "assist_realtime": "实时回答",
+        "assist_realtime_short": "实时简答",
+        "assist_manual": "",
+        "assist_screen": "识别截图后给出要点",
+        "assist_exam": "展示笔试推导过程",
+    }
+    images = [f"data:image/png;base64,image-{n}" for n in range(image_count)]
+    expected = "这是一个经典问题。\n# 回答\n\n---\n\n**核心**是先止血。\n不对，这一行要保留。"
+    captured = {}
+    broadcasts = []
+
+    def stream(_model, messages, **kwargs):
+        captured.update(messages=messages, **kwargs)
+        yield "text", "<thi"
+        yield "text", "nk>隐藏内容</think>" + expected[:25]
+        yield "text", expected[25:]
+
+    monkeypatch.setattr(answer_worker, "build_system_prompt", build_system_prompt)
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", stream)
+    monkeypatch.setattr("services.vision_verify.schedule_self_verify", lambda **_kw: None)
+    meta = {"high_churn_short_answer": short}
+    if source.endswith("exam_preflight"):
+        meta.update(exam_preflight=True, exam_preflight_id="preflight-test")
+    answer_worker.process_question_parallel(
+        ("本轮题目", images or None, manual, source, meta),
+        seq=0,
+        model_idx=0,
+        sess_v=0,
+        deps=replace(_deps(broadcasts=broadcasts), config_snapshot=cfg),
+    )
+
+    assert captured["system_prompt"] == cfg.system_prompts[scene]
+    assert captured["override_max_tokens"] == limit
+    text = str(captured["messages"])
+    for value in ["本轮题目", "Rust", *images]:
+        assert value in text
+    if scene != "assist_exam":
+        assert "快照里的岗位" in text
+    assert "".join(event["chunk"] for event in broadcasts if event["type"] == "answer_chunk") == expected
+    assert next(event["answer"] for event in broadcasts if event["type"] == "answer_done") == expected
+
+
+def test_manual_prompt_keeps_references_in_user_context(monkeypatch):
+    from services.kb.types import KBHit
+    from services.llm import build_system_prompt
+
+    cfg = _cfg()
+    cfg.system_prompts = {"assist_manual": "以第二人称回答。"}
+    cfg.resume_text = "履历中的项目专名"
+    cfg.kb_enabled = True
+    cfg.kb_trigger_modes = ["manual_text"]
+    get_session().system_summary = "既往面试摘要"
+    monkeypatch.setattr(
+        "services.kb.retriever.retrieve",
+        lambda *_a, **_kw: [KBHit(path="notes.md", section_path="笔记", text="本地笔记内容", score=1.0)],
+    )
+    monkeypatch.setattr(answer_worker, "build_system_prompt", build_system_prompt)
+    captured = {}
+
+    def stream(_model, messages, **kwargs):
+        captured.update(messages=messages, **kwargs)
+        yield "text", "你可以先排查日志。"
+
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", stream)
+    answer_worker.process_question_parallel(
+        ("怎么排查你简历里那个项目的问题？", None, True, "manual_text", {}),
+        seq=0,
+        model_idx=0,
+        sess_v=0,
+        deps=replace(_deps(broadcasts=[]), config_snapshot=cfg),
+    )
+
+    assert captured["system_prompt"] == "以第二人称回答。"
+    assert all(message["role"] != "system" for message in captured["messages"])
+    user_text = "\n".join(message["content"] for message in captured["messages"] if message["role"] == "user")
+    for value in ["<resume_context>", "履历中的项目专名", "<kb_context>", "本地笔记内容", "既往面试摘要"]:
+        assert value in user_text
 
 
 def test_process_question_parallel_streams_and_commits_answer(monkeypatch: pytest.MonkeyPatch):
@@ -418,6 +522,8 @@ def test_process_question_parallel_sanitizes_streamed_answer_chunks(
 
 
 def test_followup_prompt_uses_candidate_spoken_answer_as_auxiliary_context(monkeypatch: pytest.MonkeyPatch):
+    from services.llm import build_system_prompt
+
     broadcasts: list[dict] = []
     seen: dict[str, str] = {}
     session = get_session()
@@ -436,10 +542,13 @@ def test_followup_prompt_uses_candidate_spoken_answer_as_auxiliary_context(monke
     cfg = _cfg()
     cfg.candidate_asr_enabled = True
     cfg.candidate_context_enabled = True
+    cfg.system_prompts = {"assist_realtime": "交流时保留自然开场。"}
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
+    monkeypatch.setattr(answer_worker, "build_system_prompt", build_system_prompt)
 
-    def fake_stream(_model_cfg, messages, **_kwargs):
+    def fake_stream(_model_cfg, messages, *, system_prompt, **_kwargs):
         seen["user"] = messages[-1]["content"]
+        seen["system_prompt"] = system_prompt
         yield ("text", "围绕当前追问回答。")
 
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
@@ -453,12 +562,12 @@ def test_followup_prompt_uses_candidate_spoken_answer_as_auxiliary_context(monke
     )
 
     prompt = seen["user"]
+    assert seen["system_prompt"] == "交流时保留自然开场。"
     assert "候选人麦克风转写（辅助参考，可能有识别误差）" in prompt
-    assert "以当前面试官追问和会议音频识别出的题意为主" in prompt
-    assert "不要当作逐字稿" in prompt
+    assert "追问回答规则" not in prompt
     assert "风控规则引擎" in prompt
     assert "误杀率下降了三成" in prompt
-    assert "助手上一轮建议答案（参考候选人可能听到过的答题方向" in prompt
+    assert "助手上一轮建议答案：" in prompt
     assert "通用缓存项目" in prompt
 
 
@@ -478,14 +587,14 @@ def test_self_contained_concept_followup_disables_resume_context(monkeypatch: py
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
     monkeypatch.setattr(answer_worker, "classify_followup", lambda *_args, **_kwargs: True)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "只讲概念。")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -512,14 +621,14 @@ def test_resume_question_keeps_resume_context_enabled(monkeypatch: pytest.Monkey
     cfg.resume_text = "项目A: 多租户权限系统。"
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "讲项目。")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -540,14 +649,14 @@ def test_chinese_project_context_keeps_resume_context_enabled(monkeypatch: pytes
     cfg.resume_text = "项目A: 多租户权限系统。"
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "结合项目中权限模型回答。")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -568,14 +677,14 @@ def test_chinese_self_intro_keeps_resume_context_enabled(monkeypatch: pytest.Mon
     cfg.resume_text = "项目A: 多租户权限系统。"
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "结合简历做自我介绍。")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -596,14 +705,14 @@ def test_chinese_background_experience_keeps_resume_context_enabled(monkeypatch:
     cfg.resume_text = "项目A: 多租户权限系统。"
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "结合过往经历回答。")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -624,14 +733,14 @@ def test_generic_experience_verb_does_not_force_resume_context(monkeypatch: pyte
     cfg.resume_text = "项目A: 多租户权限系统。"
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "按网络流程回答。")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -652,14 +761,14 @@ def test_generic_project_noun_does_not_force_resume_context(monkeypatch: pytest.
     cfg.resume_text = "项目A: 多租户权限系统。"
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "按依赖管理最佳实践回答。")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -696,14 +805,14 @@ def test_manual_question_negating_project_context_disables_resume(
     cfg.resume_text = "项目A: 多租户权限系统。"
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "只讲概念。")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -730,14 +839,14 @@ def test_realtime_resume_negation_overrides_project_context_cue(monkeypatch: pyt
     cfg.resume_text = "项目A: 多租户权限系统。"
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "只讲核心概念。")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -764,14 +873,14 @@ def test_english_resume_question_keeps_resume_context_enabled(monkeypatch: pytes
     cfg.resume_text = "Project A: RBAC platform with audit logs."
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "Use the RBAC project.")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -798,14 +907,14 @@ def test_english_self_intro_keeps_resume_context_enabled(monkeypatch: pytest.Mon
     cfg.resume_text = "Project A: RBAC platform with audit logs."
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "Use the resume for a concise introduction.")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -832,14 +941,14 @@ def test_english_project_negation_disables_resume_context(monkeypatch: pytest.Mo
     cfg.resume_text = "Project A: RBAC platform with audit logs."
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, _messages, **_kwargs):
         yield ("text", "Only the concept.")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -874,15 +983,15 @@ def test_english_short_followup_inherits_previous_resume_context(monkeypatch: py
     cfg.resume_text = "Project A: RBAC platform with audit logs."
     monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
 
-    def fake_prompt(**kwargs):
+    def fake_context(_cfg, **kwargs):
         captured["include_resume"] = kwargs.get("include_resume")
-        return "system"
+        return ""
 
     def fake_stream(_model_cfg, messages, **_kwargs):
         captured["user"] = messages[-1]["content"]
         yield ("text", "Validate with audit-log tests.")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_assist_user_context", fake_context)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -947,7 +1056,7 @@ def test_realtime_asr_source_uses_candidate_context_and_opens_next_window(monkey
     )
 
     assert "候选人麦克风转写（辅助参考，可能有识别误差）" in seen["user"]
-    assert "以当前面试官追问和会议音频识别出的题意为主" in seen["user"]
+    assert "追问回答规则" not in seen["user"]
     assert "风控规则引擎" in seen["user"]
     answer_start = next(event for event in broadcasts if event["type"] == "answer_start")
     assert session.current_candidate_qa_id == answer_start["id"]
@@ -1061,7 +1170,7 @@ def test_followup_prompt_uses_anchor_only_when_question_is_self_contained(monkey
     )
 
     prompt = seen["user"]
-    assert "只把上一轮当作主题锚点" in prompt
+    assert "上一个问题（主题锚点）" in prompt
     assert "助手上一轮建议答案" not in prompt
     assert "候选人麦克风转写（辅助参考" not in prompt
     assert "风控规则引擎" not in prompt
@@ -1157,8 +1266,7 @@ def test_non_followup_prompt_can_include_candidate_spoken_background(monkeypatch
     assert "[候选人回答辅助背景]" in prompt
     assert "候选人上一轮麦克风转写（可能有识别误差）" in prompt
     assert "风控规则引擎" in prompt
-    assert "以当前面试官问题为主" in prompt
-    assert "不要把转写当成逐字事实" in prompt
+    assert "使用规则" not in prompt
     assert "现在面试官问题：风控规则冲突怎么处理？" in prompt
 
 
@@ -1240,7 +1348,7 @@ def test_followup_prompt_uses_legacy_context_when_candidate_context_disabled(mon
     )
 
     prompt = seen["user"]
-    assert "你上次回答的要点：助手建议答案：缓存项目。" in prompt
+    assert "助手上一轮建议答案：助手建议答案：缓存项目。" in prompt
     assert "候选人麦克风转写" not in prompt
     assert "风控规则引擎" not in prompt
     assert session.current_candidate_qa_id == ""
@@ -1282,7 +1390,7 @@ def test_short_followup_keeps_tail_of_long_previous_answer(monkeypatch: pytest.M
     )
 
     prompt = seen["user"]
-    assert "你上次回答的要点：开头结论" in prompt
+    assert "助手上一轮建议答案：开头结论" in prompt
     assert "最终验证：用 trace_id 串联灰度命中、回滚开关和误杀率看板" in prompt
     assert len(prompt) < len(long_answer) + 160
 
@@ -1324,7 +1432,7 @@ def test_followup_prompt_uses_legacy_context_when_candidate_asr_disabled(monkeyp
     )
 
     prompt = seen["user"]
-    assert "你上次回答的要点：助手建议答案：缓存项目。" in prompt
+    assert "助手上一轮建议答案：助手建议答案：缓存项目。" in prompt
     assert "候选人麦克风转写" not in prompt
     assert "风控规则引擎" not in prompt
 
@@ -1413,7 +1521,7 @@ def test_process_question_parallel_flushes_batched_chunks_before_error(
         yield ("text", "chunk-2")
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(answer_worker, "create_answer_stream_sanitizer", lambda _mode: PassthroughSanitizer())
+    monkeypatch.setattr(answer_worker, "create_answer_stream_sanitizer", lambda _mode, **_kw: PassthroughSanitizer())
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
@@ -1701,9 +1809,7 @@ def test_written_exam_screenshot_injects_recent_qa_as_revision_context(monkeypat
     text = content[0]["text"]
     assert len(captured["messages"]) == 1
     assert "[笔试连续截图上下文]" in text
-    assert "当前截图优先级最高" in text
-    assert "失败用例" in text
-    assert "修正后的完整可提交代码" in text
+    assert "修正后的完整可提交代码" not in text
     assert "代码题：输出最短路径" in text
     assert "print(0)" in text
     assert "expected=1 actual=0" in text
@@ -1757,7 +1863,7 @@ def test_written_exam_revision_context_compacts_previous_screen_prompt(monkeypat
     broadcasts: list[dict] = []
     captured = {}
     session = get_session()
-    previous_prompt = answer_worker.prompt_server_screen_code("Python", "left_half")
+    previous_prompt = answer_worker.prompt_server_screen_code("left_half")
     session.add_qa(
         previous_prompt + " [📷 附图]",
         "```python\ndef solve():\n    print('old')\n```",
@@ -1789,7 +1895,7 @@ def test_written_exam_revision_context_compacts_previous_screen_prompt(monkeypat
     )
 
     text = captured["messages"][0]["content"][0]["text"]
-    assert "上一张截图题面（无 OCR 文本，以上一版答案和当前截图为准）" in text
+    assert "上一张截图题面（无 OCR 文本）" in text
     assert "下图来自运行本后端" not in text
     assert "请基于图中可见信息作答" not in text
     assert "print('old')" in text

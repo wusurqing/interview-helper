@@ -230,11 +230,8 @@ class Session:
         )
         if include_summary and self.system_summary:
             out.append({
-                "role": "system",
-                "content": (
-                    "以下是之前面试中已经发生的问答的滚动摘要(由系统压缩,仅供你了解上下文,"
-                    "不要复读它):\n" + self.system_summary
-                ),
+                "role": "user",
+                "content": "[之前的面试问答摘要，仅供参考]\n" + self.system_summary,
             })
         for msg in recent:
             content, msg_stripped = self._strip_images_from_content(msg.get("content"))

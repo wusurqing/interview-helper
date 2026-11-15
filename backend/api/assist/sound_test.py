@@ -18,8 +18,12 @@ from services.llm import (
     PROMPT_MODE_MANUAL_TEXT,
     build_system_prompt,
     chat_stream_single_model,
-    create_answer_stream_sanitizer,
     postprocess_answer_for_mode,
+)
+from services.llm.prompts import (
+    assist_prompt_scene,
+    build_assist_user_context,
+    max_tokens_for_assist_prompt,
 )
 from services.stt import transcribe_with_fallback
 
@@ -473,31 +477,32 @@ def resolve_preflight_scenario(scenario_id: str) -> dict:
 
 def generate_preflight_answer(cfg, model_cfg, question: str) -> dict:
     prompt_mode = PROMPT_MODE_MANUAL_TEXT
+    customized_prompt = assist_prompt_scene(prompt_mode) in getattr(cfg, "system_prompts", {})
     system_prompt = build_system_prompt(
         manual_input=True,
         mode=prompt_mode,
-        screen_region=getattr(cfg, "screen_capture_region", "left_half"),
+        cfg=cfg,
     )
-    sanitizer = create_answer_stream_sanitizer(prompt_mode)
+    user_context = build_assist_user_context(cfg, mode=prompt_mode)
+    user_text = f"[本轮任务资料]\n{user_context}\n\n[当前输入]\n{question}" if user_context else question
     raw_answer = ""
     started = time.monotonic()
     first_token_mono: Optional[float] = None
     for chunk_type, chunk_text in chat_stream_single_model(
         model_cfg,
-        [{"role": "user", "content": question}],
+        [{"role": "user", "content": user_text}],
         system_prompt=system_prompt,
+        override_max_tokens=max_tokens_for_assist_prompt(prompt_mode, cfg),
     ):
         if chunk_type != "text":
             continue
         if first_token_mono is None and chunk_text:
             first_token_mono = time.monotonic()
         raw_answer += chunk_text
-        sanitizer.push(chunk_text)
-    sanitizer.finish()
     total_ms = int((time.monotonic() - started) * 1000)
     first_token_ms = int((first_token_mono - started) * 1000) if first_token_mono is not None else total_ms
     return {
-        "answer": postprocess_answer_for_mode(raw_answer, prompt_mode).strip(),
+        "answer": postprocess_answer_for_mode(raw_answer, prompt_mode, preserve_format=customized_prompt),
         "first_token_ms": first_token_ms,
         "total_ms": total_ms,
     }

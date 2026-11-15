@@ -32,20 +32,15 @@ def test_select_exam_preflight_model_requires_vision(monkeypatch: pytest.MonkeyP
 
 
 def test_exam_preflight_task_uses_real_server_screen_worker_shape():
-    cfg = SimpleNamespace(
-        screen_capture_region="left_half",
-        language="Python",
-    )
-
     task = exam_test._exam_preflight_task(
-        cfg,
         "data:image/png;base64,fake",
         "preflight-1",
     )
 
     text, image, manual_input, source, meta = task
-    assert "实时画面" in text
     assert "固定链路检测用截图代码题" in text
+    assert "主方案代码" not in text
+    assert "请按笔试模式直接给出可提交代码" not in text
     assert image == "data:image/png;base64,fake"
     assert manual_input is True
     assert source == "server_screen_exam_preflight"

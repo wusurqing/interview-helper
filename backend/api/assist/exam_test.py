@@ -15,7 +15,6 @@ from api.realtime.ws import broadcast
 from core.config import get_config
 from core.logger import get_logger
 from core.session import get_session
-from .answer_worker import prompt_server_screen_code
 
 
 EXAM_PREFLIGHT_QUESTION = "代码题：给定整数数组 nums 和目标值 target，返回两数之和的下标。"
@@ -212,14 +211,9 @@ def select_exam_preflight_model(cfg):
     raise RuntimeError("没有可用的识图模型，请在设置中启用一个支持视觉且已填写 API Key 的模型")
 
 
-def _exam_preflight_task(cfg, image_data_url: str, preflight_id: str):
-    region = getattr(cfg, "screen_capture_region", "left_half")
-    text = (
-        f"{prompt_server_screen_code(getattr(cfg, 'language', 'Python'), region)}\n\n"
-        "这是固定链路检测用截图代码题，请按笔试模式直接给出可提交代码。"
-    )
+def _exam_preflight_task(image_data_url: str, preflight_id: str):
     return (
-        text,
+        "固定链路检测用截图代码题",
         image_data_url,
         True,
         "server_screen_exam_preflight",
@@ -396,7 +390,7 @@ def _run_exam_preflight(preflight_id: Optional[str] = None) -> None:
         _set_step("submit", "running", "正在按截图审题链路提交…", {"question": EXAM_PREFLIGHT_QUESTION})
         _model_idx, model_cfg = select_exam_preflight_model(cfg)
         _set_status(model_name=getattr(model_cfg, "name", None))
-        task = _exam_preflight_task(cfg, image_data_url, preflight_id)
+        task = _exam_preflight_task(image_data_url, preflight_id)
         from .pipeline import pick_model_index, submit_answer_task
 
         if pick_model_index(task, set()) is None:

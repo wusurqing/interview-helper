@@ -32,7 +32,6 @@ from api.assist.answer_worker import (
     AnswerWorkerDeps,
     process_question_parallel,
     prompt_mode_for_task as answer_prompt_mode_for_task,
-    prompt_server_screen_code,
 )
 from api.assist.asr_state import (
     AssistAsrStateMachine,

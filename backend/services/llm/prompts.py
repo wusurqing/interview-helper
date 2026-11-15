@@ -4,6 +4,7 @@
 import re
 from typing import Literal, Optional, Sequence
 from core.config import get_config
+from core.prompt_settings import resolve_system_prompt
 from services.kb.types import KBHit
 
 PROMPT_MODE_ASR_REALTIME = "asr_realtime"
@@ -113,6 +114,8 @@ _FOLLOWUP_COHERENCE = (
     "- 追问回答必须在上轮结论基础上往下深入, 不要重复上轮已说过的 1-2 句;\n"
     "- 鼓励形式: 补对比 / 补边界 / 补失败场景 / 补指标 / 补取舍;\n"
     "- 如果当前语音只是上一题的补充条件或题干续句, 先合并理解成同一个问题再回答;\n"
+    "- 以当前问题为主；候选人麦克风转写只供参考。转写与当前问题冲突、明显有误或无关时降低权重；不要把转写当成逐字事实。\n"
+    "- 助手上一轮建议答案不代表候选人原话。不要假设候选人照读了建议答案。\n"
     "- 即使高 churn 短答, 每条要点尽量是\u201c上轮没说过的新观点\u201d。\n"
 )
 
@@ -149,24 +152,6 @@ _PROJECT_GROUNDING_RULE = (
 )
 
 
-def _normalize_screen_region(region: Optional[str]) -> str:
-    r = (region or "left_half").strip()
-    if r in ("full", "left_half", "right_half", "top_half", "bottom_half"):
-        return r
-    return "left_half"
-
-
-def _screen_region_label(region: str) -> str:
-    labels = {
-        "full": "主显示器全屏",
-        "left_half": "主显示器左半屏",
-        "right_half": "主显示器右半屏",
-        "top_half": "主显示器上半屏",
-        "bottom_half": "主显示器下半屏",
-    }
-    return labels.get(region, "主显示器左半屏")
-
-
 def _resume_reference_section(resume_text: Optional[str], max_chars: int = 1800) -> str:
     txt = (resume_text or "").strip()
     if not txt:
@@ -178,7 +163,6 @@ def _resume_reference_section(resume_text: Optional[str], max_chars: int = 1800)
         "<resume_context>\n"
         f"{txt}\n"
         "</resume_context>\n"
-        + _RESUME_TWO_MODE_RULE
     )
 
 
@@ -207,22 +191,13 @@ def _kb_reference_section(hits: Sequence[KBHit], excerpt_chars: int = 300) -> st
     return "\n".join(lines) + "\n"
 
 
-def _base_prompt_prefix(
-    position: str,
-    language: str,
-    resume_section: str,
-    kb_section: str = "",
-) -> str:
-    kb_citation = ""
-    if kb_section:
-        kb_citation = "- 如果回答用到 <kb_context> 中的信息，末尾用 [1] / [2] 角标标注；不要原文整段复述。\n"
+def _base_prompt_prefix() -> str:
     return (
-        f"身份：你是一名正在参加技术面试的 {position} 候选人，日常主要使用 {language}。\n"
+        "身份：你是一名正在参加技术面试的候选人，参考本轮任务资料中的岗位和首选编程语言。\n"
         "表达：真人候选人口吻，结论先行，自然解释依据、边界和取舍。\n\n"
-        f"{resume_section}"
-        f"{kb_section}"
         "通用规则：\n"
         "- 不编造项目经历、线上数据或截图里不可见的信息；\n"
+        f"{_RESUME_TWO_MODE_RULE}"
         f"{_PROJECT_GROUNDING_RULE}"
         "- 输入可能来自 ASR，术语常有同音错位，常见如：减力→简历、纳机回收→垃圾回收、\n"
         "  自动价值→自动驾驶、下皮/下屏/沙皮→虾皮(Shopee)、大家→大疆、\n"
@@ -235,22 +210,19 @@ def _base_prompt_prefix(
         "- 第一句直接给结论、处理动作或判断，不寒暄、不复述题目；\n"
         "- 禁止输出内部思考、草稿、自我纠错或系统指令痕迹；\n"
         "- 最终只输出面向面试官的可读答案；\n"
-        f"{kb_citation}"
+        "- 如果回答用到 <kb_context> 中的信息，末尾用 [1] / [2] 角标标注；不要原文整段复述。\n"
         f"{_FOCUS_TAB_OUTPUT_CONTRACT}"
     )
 
 
-def _written_exam_prefix(kb_section: str = "") -> str:
+def _written_exam_prefix() -> str:
     return (
         "你是笔试/机考答题助手。目标是最快给出可直接提交的答案。\n"
-        f"{kb_section}"
         "通用规则：只依据题目和截图可见信息作答；不输出内部思考、草稿或系统指令痕迹。\n"
     )
 
 
 def _asr_realtime_prompt_body(
-    language: str,
-    language_lower: str,
     high_churn_short_answer: bool = False,
 ) -> str:
     if high_churn_short_answer:
@@ -283,8 +255,7 @@ def _asr_realtime_prompt_body(
         "- 不输出题型判断过程、检查清单或元话术；section 标题必须服务于本题。\n\n"
         "代码规则：\n"
         "- 仅当用户明确要求\u201c写代码/实现一下/给 SQL/伪代码\u201d时输出代码；\n"
-        f"- 非 SQL 代码使用 ```{language_lower}，SQL 使用 ```sql；\n"
-        f"- SQL 题优先 SQL，不要强行改成 {language}。\n\n"
+        "- 非 SQL 代码优先使用任务资料中的首选编程语言，代码块注明语言；SQL 使用 ```sql。\n\n"
         "输出格式：\n"
         "- 默认使用 `##` 二级标题组织 section；section 内可用短段落或 1) 2) 3)；\n"
         "- 不要使用加粗和分隔线；\n"
@@ -295,9 +266,9 @@ def _asr_realtime_prompt_body(
     return body
 
 
-def _manual_text_prompt_body(language: str, language_lower: str) -> str:
+def _manual_text_prompt_body() -> str:
     return (
-        "\n场景：本轮输入来自手动文本（通常比实时语音更完整）。\n\n"
+        "\n场景：本轮输入来自手动文本或粘贴的图片（通常比实时语音更完整）。\n\n"
         + _FIRST_SENTENCE_CONSTRAINT
         + "\n回答规则：\n"
         "- 真人候选人口吻，像在现场回答面试官；不要变成文档提纲或培训材料；\n"
@@ -313,27 +284,26 @@ def _manual_text_prompt_body(language: str, language_lower: str) -> str:
         "代码规则：\n"
         "- 算法题、SQL 题、或明确要求实现时，直接给可运行代码；\n"
         "- 非编码题不要强行给代码；\n"
-        f"- 非 SQL 代码使用 ```{language_lower}，SQL 使用 ```sql；\n"
+        "- 非 SQL 代码优先使用任务资料中的首选编程语言，代码块注明语言；SQL 使用 ```sql；\n"
         "- 给代码时优先覆盖思路、代码、复杂度这些必要内容，但仍用贴合本题的 `##` 标题承载，不要输出固定模板。\n\n"
         "输出格式：\n"
         "- 默认使用 `##` 二级标题组织 section；section 内可用短段落或 1. 2. 3. 编号；\n"
         "- 除标题和代码块外，不要使用加粗和分隔线；\n"
         "- 不要输出\u201c题型模板\u201d\u201c场景题/设计题/排障题\u201d\u201c八股原理题\u201d等内部标签。\n"
+        + _FOLLOWUP_COHERENCE
         + _FEWSHOT_MANUAL
     )
 
 
-def _server_screen_prompt_body(language: str, language_lower: str, screen_region: str) -> str:
-    region_label = _screen_region_label(screen_region)
+def _server_screen_prompt_body() -> str:
     return (
-        "\n场景：本轮输入包含电脑截图，需要先从图中识别题意再回答。\n"
-        f"截图区域提示：{region_label}。\n\n"
+        "\n场景：本轮输入包含电脑截图，需要先从图中识别题意再回答。\n\n"
         "任务要求：\n"
         "1. 仅依据图中可见信息作答；看不清时明确指出缺失信息，不要编造；\n"
         "2. 若可判断是编程/SQL题，先给主方案完整代码；\n"
         "3. 默认不要给完整备选代码；只有题目要求多解或主方案取舍明显时，再补 1 个备选思路；\n"
         "4. 保留思路与复杂度分析，并给出关键测试用例；\n"
-        f"5. 编程语言优先使用 {language}（SQL 题使用 sql）；\n"
+        "5. 编程语言优先使用任务资料中的首选编程语言（SQL 题使用 SQL）；\n"
         "6. 输出代码前，先用题目示例或自构的边界用例在脑中走一遍逻辑，确保代码正确；\n"
         "7. 注意边界：空输入、单元素、最大值溢出、负数、重复元素等。\n\n"
         "输出硬约束：\n"
@@ -346,7 +316,7 @@ def _server_screen_prompt_body(language: str, language_lower: str, screen_region
         '- 如果截图无法明确题目：先说明缺失信息，再给\u201c最合理假设下的最小可执行方案\u201d；\n'
         "- 不强制给 LeetCode 难度，只有在能判断时再给。\n\n"
         "代码规则：\n"
-        f"- 非 SQL 代码使用 ```{language_lower}；\n"
+        "- 非 SQL 代码块注明所用编程语言；\n"
         "- SQL 使用 ```sql；\n"
         "- 所有代码必须在代码块中，解释文字必须放在代码块外；\n"
         "- 若有多段代码，必须使用独立代码块。\n"
@@ -354,12 +324,10 @@ def _server_screen_prompt_body(language: str, language_lower: str, screen_region
     )
 
 
-def _written_exam_prompt_body(language: str, language_lower: str, screen_region: str) -> str:
-    region_label = _screen_region_label(screen_region)
+def _written_exam_prompt_body() -> str:
     lines = [
         "\n",
-        "场景: 笔试机考模式, 截图中是笔试题目, 需要最快速度给出可直接提交的答案。\n",
-        "截图区域提示: %s。\n\n" % region_label,
+        "场景: 笔试机考模式, 题目来自文本或截图, 需要最快速度给出可直接提交的答案。\n\n",
         "核心原则: 不说废话, 不做铺垫, 不输出分析过程, 直接给答案。\n\n",
         "题型判定与输出规则:\n\n",
         "选择题(单选/多选/判断):\n",
@@ -375,7 +343,7 @@ def _written_exam_prompt_body(language: str, language_lower: str, screen_region:
         "编程题/算法题/SQL题:\n",
         "- 确认逻辑无误后直接输出完整可运行代码, 不展示验证过程;\n",
         "- 不要思路分析、不要复杂度分析;\n",
-        "- 非SQL代码使用 ```%s 代码块, SQL使用 ```sql 代码块;\n" % language_lower,
+        "- 非 SQL 代码优先使用任务资料中的首选编程语言，代码块注明语言；SQL 使用 ```sql;\n",
         "- 代码必须完整可提交(含必要的import、类定义、函数签名);\n",
         "- 如果题目要求特定函数签名, 严格遵守;\n",
         "- 只在代码上方用1行注释写核心思路(如: // 双指针 O(n)), 不要多写;\n",
@@ -402,6 +370,15 @@ def _written_exam_prompt_body(language: str, language_lower: str, screen_region:
 # ---------------------------------------------------------------------------
 # Answer post-processing
 # ---------------------------------------------------------------------------
+
+_THOUGHT_TAG_START = re.compile(r"<(?P<closing>/?)(?:thinking|think|analysis)\b", re.IGNORECASE)
+_THOUGHT_TAG = re.compile(_THOUGHT_TAG_START.pattern + r"[^<>]*>", re.IGNORECASE)
+_MARKDOWN_FENCE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})", re.MULTILINE)
+_THOUGHT_TAG_OR_FENCE = re.compile(
+    f"{_MARKDOWN_FENCE.pattern}|{_THOUGHT_TAG.pattern}",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def _strip_internal_thought_artifacts(text: str) -> str:
     t = text or ""
@@ -452,7 +429,10 @@ def _normalize_non_code_markdown(text: str) -> str:
     return t
 
 
-def postprocess_answer_for_mode(text: str, mode: str) -> str:
+def postprocess_answer_for_mode(text: str, mode: str, *, preserve_format: bool = False) -> str:
+    if preserve_format:
+        sanitizer = AnswerStreamSanitizer(mode, preserve_format=True)
+        return sanitizer.push(text) + sanitizer.finish()
     t = _strip_internal_thought_artifacts(text)
     if mode in (PROMPT_MODE_ASR_REALTIME, PROMPT_MODE_MANUAL_TEXT):
         t = _strip_meta_preface(t)
@@ -465,13 +445,16 @@ class AnswerStreamSanitizer:
 
     _TAIL_KEEP = 64
 
-    def __init__(self, mode: str):
+    def __init__(self, mode: str, *, preserve_format: bool = False):
         self.mode = mode
+        self.preserve_format = preserve_format
         self._buffer = ""
         self._in_hidden = False
         self._started = False
         self._line_start = True
         self._in_code = False
+        self._raw_line_start = True
+        self._fence_delimiter = ""
 
     def push(self, chunk: str) -> str:
         if not chunk:
@@ -493,8 +476,8 @@ class AnswerStreamSanitizer:
         if not text:
             return ""
         text = self._strip_hidden_stream(text)
-        if not text:
-            return ""
+        if not text or self.preserve_format:
+            return text
         if not self._started and self.mode in (PROMPT_MODE_ASR_REALTIME, PROMPT_MODE_MANUAL_TEXT):
             text = _strip_meta_preface(text)
         text = self._clean_markdown_stream(text)
@@ -506,40 +489,44 @@ class AnswerStreamSanitizer:
 
     def _safe_emit_len(self) -> int:
         base = max(0, len(self._buffer) - self._TAIL_KEEP)
-        if base <= 0:
-            return 0
-        lower = self._buffer.lower()
-        guard_start = max(0, base - 16)
-        tag_start = lower.rfind("<", guard_start, base)
-        if tag_start >= 0:
-            return tag_start
-        for marker in ("<think", "<analysis", "</think", "</analysis"):
-            pos = lower.rfind(marker, guard_start, base)
-            if pos >= 0:
-                return pos
+        tag_start = self._buffer.rfind("<", 0, base)
+        if (
+            tag_start >= 0
+            and self._buffer.find(">", tag_start, base) == -1
+            and _THOUGHT_TAG_START.match(self._buffer, tag_start)
+        ):
+            base = tag_start
+        if self.preserve_format:
+            line_start = self._buffer.rfind("\n", 0, base) + 1
+            if line_start or self._raw_line_start:
+                fence = _MARKDOWN_FENCE.match(self._buffer, line_start)
+                if fence and base < fence.end():
+                    base = line_start
         return base
 
     def _strip_hidden_stream(self, text: str) -> str:
         out: list[str] = []
-        i = 0
-        lower = text.lower()
-        while i < len(text):
-            if self._in_hidden:
-                close_match = re.search(r"</(?:think|thinking|analysis)>", lower[i:])
-                if not close_match:
-                    return "".join(out)
-                i += close_match.end()
-                self._in_hidden = False
+        start = 0
+        markers = _THOUGHT_TAG_OR_FENCE if self.preserve_format else _THOUGHT_TAG
+        for tag in markers.finditer(text):
+            fence = tag.group("fence") if self.preserve_format else None
+            if fence:
+                if self._in_hidden or (tag.start() == 0 and not self._raw_line_start):
+                    continue
+                if not self._fence_delimiter:
+                    self._fence_delimiter = fence
+                elif fence.startswith(self._fence_delimiter):
+                    self._fence_delimiter = ""
                 continue
-            open_match = re.search(r"<(?:think|thinking|analysis)\b[^>]*>", lower[i:])
-            if not open_match:
-                out.append(text[i:])
-                break
-            start = i + open_match.start()
-            out.append(text[i:start])
-            tag_end = i + open_match.end()
-            self._in_hidden = True
-            i = tag_end
+            if self._fence_delimiter:
+                continue
+            if not self._in_hidden:
+                out.append(text[start:tag.start()])
+            self._in_hidden = not tag.group("closing") and not tag.group().endswith("/>")
+            start = tag.end()
+        if not self._in_hidden:
+            out.append(text[start:])
+        self._raw_line_start = text.endswith("\n")
         return "".join(out)
 
     def _clean_markdown_stream(self, text: str) -> str:
@@ -575,45 +562,107 @@ class AnswerStreamSanitizer:
         return segment.replace("**", "")
 
 
-def create_answer_stream_sanitizer(mode: str) -> AnswerStreamSanitizer:
-    return AnswerStreamSanitizer(mode)
+def create_answer_stream_sanitizer(mode: str, *, preserve_format: bool = False) -> AnswerStreamSanitizer:
+    return AnswerStreamSanitizer(mode, preserve_format=preserve_format)
+
+
+def assist_prompt_scene(mode: PromptMode, *, high_churn_short_answer: bool = False) -> str:
+    if mode == PROMPT_MODE_ASR_REALTIME:
+        return "assist_realtime_short" if high_churn_short_answer else "assist_realtime"
+    return {
+        PROMPT_MODE_MANUAL_TEXT: "assist_manual",
+        PROMPT_MODE_SERVER_SCREEN: "assist_screen",
+        PROMPT_MODE_WRITTEN_EXAM: "assist_exam",
+    }[mode]
+
+
+def max_tokens_for_assist_prompt(
+    mode: PromptMode,
+    cfg,
+    *,
+    high_churn_short_answer: bool = False,
+) -> int:
+    base_limit = max(1, int(getattr(cfg, "max_tokens", 4096) or 4096))
+    if mode == PROMPT_MODE_ASR_REALTIME:
+        cap = (
+            int(getattr(cfg, "assist_realtime_high_churn_max_tokens", 420) or 420)
+            if high_churn_short_answer
+            else int(getattr(cfg, "assist_realtime_max_tokens", 900) or 900)
+        )
+        return max(1, min(base_limit, cap))
+    return base_limit
+
+
+def _default_system_prompt(mode: PromptMode, high_churn_short_answer: bool) -> str:
+    if mode == PROMPT_MODE_WRITTEN_EXAM:
+        return _written_exam_prefix() + _written_exam_prompt_body()
+    if mode == PROMPT_MODE_SERVER_SCREEN:
+        body = _server_screen_prompt_body()
+    elif mode == PROMPT_MODE_MANUAL_TEXT:
+        body = _manual_text_prompt_body()
+    else:
+        body = _asr_realtime_prompt_body(high_churn_short_answer)
+    return _base_prompt_prefix() + body
+
+
+def assist_prompt_specs(cfg) -> dict[str, tuple[str, str, int]]:
+    scenes = (
+        (PROMPT_MODE_ASR_REALTIME, False),
+        (PROMPT_MODE_ASR_REALTIME, True),
+        (PROMPT_MODE_MANUAL_TEXT, False),
+        (PROMPT_MODE_SERVER_SCREEN, False),
+        (PROMPT_MODE_WRITTEN_EXAM, False),
+    )
+    return {
+        assist_prompt_scene(mode, high_churn_short_answer=short): (
+            _default_system_prompt(mode, short),
+            "",
+            max_tokens_for_assist_prompt(mode, cfg, high_churn_short_answer=short),
+        )
+        for mode, short in scenes
+    }
 
 
 def build_system_prompt(
     manual_input: bool = False,
     mode: Optional[PromptMode] = None,
-    screen_region: Optional[str] = None,
     high_churn_short_answer: bool = False,
-    kb_hits: Optional[Sequence[KBHit]] = None,
-    include_resume: Optional[bool] = None,
+    *,
+    cfg=None,
 ) -> str:
-    cfg = get_config()
+    cfg = get_config() if cfg is None else cfg
     if mode is None:
         mode = PROMPT_MODE_MANUAL_TEXT if manual_input else PROMPT_MODE_ASR_REALTIME
-    include_resume_section = False if mode == PROMPT_MODE_WRITTEN_EXAM else (
-        bool(include_resume) if include_resume is not None else True
+    scene = assist_prompt_scene(mode, high_churn_short_answer=high_churn_short_answer)
+    return resolve_system_prompt(
+        getattr(cfg, "system_prompts", {}),
+        scene,
+        _default_system_prompt(mode, high_churn_short_answer),
     )
-    resume_section = _resume_reference_section(cfg.resume_text) if include_resume_section else ""
-    kb_section = _kb_reference_section(
-        kb_hits or [],
+
+
+def build_assist_user_context(
+    cfg,
+    *,
+    mode: PromptMode,
+    kb_hits: Sequence[KBHit] = (),
+    include_resume: bool = True,
+) -> str:
+    parts = []
+    position = getattr(cfg, "position", "")
+    language = getattr(cfg, "language", "")
+    if position and mode != PROMPT_MODE_WRITTEN_EXAM:
+        parts.append(f"岗位：{position}")
+    if language:
+        parts.append(f"首选编程语言：{language}")
+    if include_resume and mode != PROMPT_MODE_WRITTEN_EXAM:
+        resume = _resume_reference_section(getattr(cfg, "resume_text", None))
+        if resume:
+            parts.append(resume.rstrip())
+    kb_context = _kb_reference_section(
+        kb_hits,
         excerpt_chars=int(getattr(cfg, "kb_prompt_excerpt_chars", 300) or 300),
     )
-    lang_lower = cfg.language.lower()
-    region = _normalize_screen_region(screen_region or getattr(cfg, "screen_capture_region", "left_half"))
-    if mode == PROMPT_MODE_WRITTEN_EXAM:
-        prefix = _written_exam_prefix(kb_section)
-        body = _written_exam_prompt_body(cfg.language, lang_lower, region)
-    elif mode == PROMPT_MODE_SERVER_SCREEN:
-        prefix = _base_prompt_prefix(cfg.position, cfg.language, resume_section, kb_section)
-        body = _server_screen_prompt_body(cfg.language, lang_lower, region)
-    elif mode == PROMPT_MODE_MANUAL_TEXT:
-        prefix = _base_prompt_prefix(cfg.position, cfg.language, resume_section, kb_section)
-        body = _manual_text_prompt_body(cfg.language, lang_lower)
-    else:
-        prefix = _base_prompt_prefix(cfg.position, cfg.language, resume_section, kb_section)
-        body = _asr_realtime_prompt_body(
-            cfg.language,
-            lang_lower,
-            high_churn_short_answer=high_churn_short_answer,
-        )
-    return prefix + body
+    if kb_context:
+        parts.append(kb_context.rstrip())
+    return "\n".join(parts)

@@ -1,8 +1,9 @@
-"""KB prompt 注入测试: build_system_prompt 接受 kb_hits 后输出 <kb_context>。"""
+"""知识库摘录作为答题任务资料传递。"""
 from __future__ import annotations
 
 from services.kb.types import KBHit
-from services.llm import build_system_prompt
+from core.config import AppConfig
+from services.llm.prompts import build_assist_user_context
 
 
 def test_prompt_includes_kb_reference_section_when_hits_provided():
@@ -20,7 +21,7 @@ def test_prompt_includes_kb_reference_section_when_hits_provided():
             score=0.9,
         ),
     ]
-    prompt = build_system_prompt(mode="manual_text", kb_hits=hits)
+    prompt = build_assist_user_context(AppConfig(), mode="manual_text", kb_hits=hits)
     assert "<kb_context>" in prompt
     assert "</kb_context>" in prompt
     assert "Redis > RDB" in prompt
@@ -29,13 +30,13 @@ def test_prompt_includes_kb_reference_section_when_hits_provided():
 
 
 def test_prompt_has_no_kb_section_when_no_hits():
-    prompt = build_system_prompt(mode="manual_text", kb_hits=[])
+    prompt = build_assist_user_context(AppConfig(), mode="manual_text", kb_hits=[])
     assert "<kb_context>" not in prompt
 
 
 def test_prompt_has_no_kb_section_when_kb_hits_omitted():
     """老调用方不传 kb_hits 时, 行为不变 (不引入 kb_context)。"""
-    prompt = build_system_prompt(mode="manual_text")
+    prompt = build_assist_user_context(AppConfig(), mode="manual_text")
     assert "<kb_context>" not in prompt
 
 
@@ -58,23 +59,19 @@ def test_kb_section_marks_origin_for_vision_and_ocr():
             origin="vision",
         ),
     ]
-    prompt = build_system_prompt(mode="manual_text", kb_hits=hits)
+    prompt = build_assist_user_context(AppConfig(), mode="manual_text", kb_hits=hits)
     assert "OCR" in prompt
     assert "Vision" in prompt
     assert "第 3 页" in prompt
     assert "第 5 页" in prompt
 
 
-def test_kb_excerpt_truncates_long_text(monkeypatch):
+def test_kb_excerpt_truncates_long_text():
     long_text = "Redis 持久化方式 " * 200
     hits = [KBHit(path="x.md", section_path="X", text=long_text, score=1.0)]
 
-    from core.config import get_config
-
-    cfg = get_config()
-    cfg.kb_prompt_excerpt_chars = 80
-
-    prompt = build_system_prompt(mode="manual_text", kb_hits=hits)
+    cfg = AppConfig(kb_prompt_excerpt_chars=80)
+    prompt = build_assist_user_context(cfg, mode="manual_text", kb_hits=hits)
     kb_lines = [
         ln for ln in prompt.splitlines()
         if ln.startswith("    ") and "Redis" in ln
@@ -87,5 +84,5 @@ def test_kb_excerpt_truncates_long_text(monkeypatch):
 def test_kb_section_appears_in_all_modes():
     hits = [KBHit(path="x.md", section_path="X", text="some", score=1.0)]
     for mode in ("asr_realtime", "manual_text", "server_screen_code", "written_exam"):
-        prompt = build_system_prompt(mode=mode, kb_hits=hits)
+        prompt = build_assist_user_context(AppConfig(), mode=mode, kb_hits=hits)
         assert "<kb_context>" in prompt, f"mode={mode} 应注入 KB"

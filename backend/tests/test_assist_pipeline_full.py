@@ -179,28 +179,28 @@ def test_dispatched_worker_keeps_full_config_snapshot_when_settings_change(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Queued work must not switch prompt/generation settings mid-flight."""
+    from services.llm import build_system_prompt
 
     cfg = pipeline.get_config()
     cfg.written_exam_mode = True
     cfg.written_exam_think = False
-    cfg.screen_capture_region = "left_half"
+    cfg.language = "Rust"
+    cfg.system_prompts = {"assist_exam": "按段落提交笔试答案。"}
     cfg.max_tokens = 777
     cfg.models[0].supports_vision = True
 
     captured: dict[str, object] = {}
     monkeypatch.setattr(pipeline, "broadcast", lambda _data: None)
 
-    def fake_prompt(**kwargs):
-        captured["prompt_mode"] = kwargs["mode"]
-        captured["screen_region"] = kwargs["screen_region"]
-        return "system"
-
-    def fake_stream(_model_cfg, _messages, **kwargs):
+    def fake_stream(_model_cfg, messages, **kwargs):
+        captured["system_prompt"] = kwargs["system_prompt"]
+        captured["question"] = messages[-1]["content"][0]["text"]
         captured["override_think_mode"] = kwargs.get("override_think_mode")
         captured["override_max_tokens"] = kwargs.get("override_max_tokens")
         yield ("text", "截图答案")
 
-    monkeypatch.setattr(answer_worker, "build_system_prompt", fake_prompt)
+    monkeypatch.setattr(answer_worker, "build_system_prompt", build_system_prompt)
+    monkeypatch.setattr("services.vision_verify.schedule_self_verify", lambda **_kw: None)
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     assert pipeline.submit_answer_task(
@@ -217,13 +217,14 @@ def test_dispatched_worker_keeps_full_config_snapshot_when_settings_change(
     # Simulate a settings save while the worker is queued.
     cfg.written_exam_mode = False
     cfg.written_exam_think = True
-    cfg.screen_capture_region = "right_half"
+    cfg.language = "Python"
+    cfg.system_prompts["assist_exam"] = "改用表格。"
     cfg.max_tokens = 2048
 
     _DeferredThread.started[0].run()
 
-    assert captured["prompt_mode"] == answer_worker.PROMPT_MODE_WRITTEN_EXAM
-    assert captured["screen_region"] == "left_half"
+    assert captured["system_prompt"] == "按段落提交笔试答案。"
+    assert captured["question"] == "[本轮任务资料]\n首选编程语言：Rust\n\n[当前输入]\n截图题"
     assert captured["override_think_mode"] is False
     assert captured["override_max_tokens"] == 777
 

@@ -200,8 +200,8 @@ def test_generate_preflight_answer_uses_real_answer_pipeline(monkeypatch: pytest
         yield ('text', '真实')
         yield ('text', '回答')
 
-    def fake_postprocess(text, mode):
-        calls['postprocess'] = (text, mode)
+    def fake_postprocess(text, mode, *, preserve_format):
+        calls['postprocess'] = (text, mode, preserve_format)
         return text
 
     monkeypatch.setattr(sound_test, 'build_system_prompt', fake_build_system_prompt)
@@ -215,10 +215,11 @@ def test_generate_preflight_answer_uses_real_answer_pipeline(monkeypatch: pytest
     assert result == {'answer': '真实回答', 'first_token_ms': 400, 'total_ms': 900}
     assert calls['prompt_kwargs']['manual_input'] is True
     assert calls['prompt_kwargs']['mode'] == sound_test.PROMPT_MODE_MANUAL_TEXT
+    assert calls['prompt_kwargs']['cfg'] is cfg
     assert calls['model'] is model_cfg
     assert calls['messages'] == [{'role': 'user', 'content': '请做一下自我介绍'}]
     assert calls['system_prompt'] == 'system-prompt'
-    assert calls['postprocess'] == ('真实回答', sound_test.PROMPT_MODE_MANUAL_TEXT)
+    assert calls['postprocess'] == ('真实回答', sound_test.PROMPT_MODE_MANUAL_TEXT, False)
 
 
 def test_replay_preflight_capture_stt_collects_round_stats(monkeypatch: pytest.MonkeyPatch):

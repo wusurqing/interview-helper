@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import pytest
 from core.config import get_config
-from services.llm import build_system_prompt, create_answer_stream_sanitizer
+from services.llm import build_system_prompt, create_answer_stream_sanitizer, postprocess_answer_for_mode
+from services.llm.prompts import build_assist_user_context
 
 
 @pytest.fixture
@@ -51,9 +52,7 @@ def test_asr_realtime_no_longer_uses_information_insufficient_halt():
 
 # ---- 4.2 resume two-mode color ------------------------------------------
 
-def test_prompt_has_resume_two_mode_rule_when_resume_present(reset_resume):
-    cfg = reset_resume
-    cfg.resume_text = "项目A: 后端重构，Kafka, Redis；2022 字节实习。"
+def test_default_prompt_has_resume_two_mode_rule():
     p = _manual_prompt()
     assert "简历使用规则" in p
     assert "简历深挖题" in p
@@ -61,14 +60,14 @@ def test_prompt_has_resume_two_mode_rule_when_resume_present(reset_resume):
     assert "简历无关题" in p
 
 
-def test_no_resume_rule_when_resume_missing(reset_resume):
+def test_user_context_has_no_resume_reference_when_resume_missing(reset_resume):
     cfg = reset_resume
     cfg.resume_text = None
-    p = _manual_prompt()
-    assert "简历使用规则" not in p
+    context = build_assist_user_context(cfg, mode="manual_text")
+    assert "<resume_context>" not in context
 
 
-def test_written_exam_prompt_never_includes_resume(reset_resume):
+def test_written_exam_task_never_includes_resume(reset_resume):
     cfg = reset_resume
     cfg.resume_text = "项目A: 后端重构，Kafka, Redis；2022 字节实习。"
     p = build_system_prompt(mode="written_exam")
@@ -76,16 +75,15 @@ def test_written_exam_prompt_never_includes_resume(reset_resume):
     assert "Kafka" not in p
     assert "简历使用规则" not in p
     assert "<resume_context>" not in p
+    assert "项目A" not in build_assist_user_context(cfg, mode="written_exam")
 
 
-def test_prompt_can_explicitly_disable_resume_context(reset_resume):
+def test_user_context_can_explicitly_disable_resume_reference(reset_resume):
     cfg = reset_resume
     cfg.resume_text = "项目A: 后端重构，Kafka, Redis；2022 字节实习。"
-    p = build_system_prompt(mode="asr_realtime", include_resume=False)
-    assert "项目A" not in p
-    assert "Kafka" not in p
-    assert "简历使用规则" not in p
-    assert "<resume_context>" not in p
+    context = build_assist_user_context(cfg, mode="asr_realtime", include_resume=False)
+    assert "项目A" not in context
+    assert "<resume_context>" not in context
 
 
 def test_written_exam_prompt_handles_incremental_screenshots_and_failures(reset_resume):
@@ -224,3 +222,27 @@ def test_stream_sanitizer_keeps_screen_markdown_but_removes_think():
     out = s.push("<analysis>草稿</analysis># 题目理解\n正文") + s.finish()
     assert "草稿" not in out
     assert "# 题目理解" in out
+
+
+def test_custom_answer_keeps_unicode_and_indentation_across_thought_tag_boundary():
+    visible = "    İstanbul\n\n# Başlık\n**Kalın**"
+    tag_start = '<think reason="' + "x" * 100
+    chunks = [visible[:12] + tag_start, '">隐藏内容</thi', "nk>" + visible[12:]]
+
+    sanitizer = create_answer_stream_sanitizer("manual_text", preserve_format=True)
+    streamed = "".join(sanitizer.push(chunk) for chunk in chunks) + sanitizer.finish()
+
+    assert streamed == visible
+    assert postprocess_answer_for_mode("".join(chunks), "manual_text", preserve_format=True) == visible
+
+
+def test_custom_answer_preserves_literal_thought_tags_in_markdown_fences():
+    literal = "```xml\n<think>示例</think>\n</analysis>\n```"
+    visible = "示例：\n\n" + literal + "\n\n" + "以上是代码示例。" * 15
+    raw = "<analysis>隐藏内容</analysis>" + visible
+    chunks = [raw[index:index + 7] for index in range(0, len(raw), 7)]
+    mode = "manual_text"
+    sanitizer = create_answer_stream_sanitizer(mode, preserve_format=True)
+
+    assert "".join(sanitizer.push(chunk) for chunk in chunks) + sanitizer.finish() == visible
+    assert postprocess_answer_for_mode(raw, mode, preserve_format=True) == visible

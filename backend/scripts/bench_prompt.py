@@ -219,13 +219,18 @@ def _run_one_case(
     variant: str,
     prompts_by_variant: dict[str, Callable[[dict[str, Any]], str]],
 ) -> RunResult:
+    from core.config import get_config
     from services.llm import chat_stream_single_model
+    from services.llm.prompts import build_assist_user_context
 
     system_prompt = prompts_by_variant[variant](case)
     user_text = case["input"]
     if case.get("context") and case["context"].get("prev_idx"):
         prev_idx = case["context"]["prev_idx"]
         user_text = f"[追问上下文] 上一轮用户问: (case {prev_idx})\n\n{user_text}"
+    user_context = build_assist_user_context(get_config(), mode=case["mode"])
+    if user_context:
+        user_text = f"[本轮任务资料]\n{user_context}\n\n[当前输入]\n{user_text}"
 
     t0 = time.monotonic()
     chunks: list[str] = []
