@@ -11,7 +11,7 @@ from core.logger import get_logger
 from core.session import get_session
 from services.audio import AudioBusyError, audio_capture
 from services.stt.mmpg import MmpgError, MmpgManager
-from . import pipeline
+from . import candidate_mmpg, pipeline
 from .mmpg_turns import MmpgTurns
 
 PROVIDER = "doubao_mmpg"
@@ -151,6 +151,8 @@ async def start_capture(mode, device_ids, candidate_mic_id):
 
 
 async def stop_capture(mode, reason):
+    if mode != "test" and reason == "owner_disconnected":
+        await candidate_mmpg.stop(reason)
     if mode == "test":
         await run_in_threadpool(audio_capture.stop, owner="mmpg-test")
     elif pipeline.is_streaming_interview() and not pipeline.is_paused():
@@ -162,6 +164,8 @@ async def stop_capture(mode, reason):
 def _broadcast_state(status):
     if status.get("mode") != "test":
         broadcast({"type": "stt_status", **stt_status(status)})
+        if status["state"] == "error" and pipeline.is_streaming_interview() and candidate_mmpg.manager.active:
+            asyncio.create_task(candidate_mmpg.stop("interviewer_disconnected"))
 
 
 def stt_status(status=None):

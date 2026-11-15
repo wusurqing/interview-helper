@@ -484,7 +484,7 @@ STT_FALLBACK_PROVIDER_OPTIONS = ["whisper", "funasr", "none"]
 # FunASR 本地模型（中文面试场景推荐 paraformer-zh：准确率高、CPU 快、支持热词）
 FUNASR_MODEL_OPTIONS = ["paraformer-zh", "sensevoice-small", "paraformer-zh-streaming"]
 # 语音识别引擎：whisper=本地，funasr=本地 FunASR，doubao=豆包 API，generic=OpenAI-compatible HTTP ASR
-CANDIDATE_STT_PROVIDER_OPTIONS = ["whisper", "funasr", "doubao", "generic"]
-STT_PROVIDER_OPTIONS = [*CANDIDATE_STT_PROVIDER_OPTIONS, MMPG_STT_PROVIDER]
+STT_PROVIDER_OPTIONS = ["whisper", "funasr", "doubao", "generic", MMPG_STT_PROVIDER]
+CANDIDATE_STT_PROVIDER_OPTIONS = STT_PROVIDER_OPTIONS.copy()
 # 电脑截图区域
 SCREEN_CAPTURE_REGION_OPTIONS = ["full", "left_half", "right_half", "top_half", "bottom_half"]

@@ -511,11 +511,36 @@ class MmpgManager:
             if last_audio is not None and time.monotonic() - last_audio >= AUDIO_STALL_TIMEOUT:
                 raise MmpgError("audio_stalled")
 
-    def _interrupt_conversations(self, generation):
+    async def drain_transcripts(self):
+        """Send silence after capture stops so the provider can finish the current turn."""
+        generation = self._current
+        if generation is None or self._state != "listening":
+            return
+
+        started = self._loop.time()
+        deadline = started + 3
+        grace = started + 0.24
+        silence = bytes(640 * 4)  # 40 ms of 16 kHz float32 PCM.
+        while self._current is generation and self._state == "listening":
+            now = self._loop.time()
+            if now >= deadline or (not generation.open_conversations and now >= grace):
+                break
+            if not self.offer_audio(silence):
+                break
+            await asyncio.sleep(0.04)
+
+    def discard_turns(self):
+        if self._current is not None:
+            self._discard_conversations(self._current)
+
+    def _discard_conversations(self, generation):
         if self._on_turn and self._run and self._run.mode != "test":
             self._on_turn("reset", "")
         generation.cancelled.update(generation.open_conversations)
         generation.open_conversations.clear()
+
+    def _interrupt_conversations(self, generation):
+        self._discard_conversations(generation)
         generation.recent_underruns.clear()
         self._set_audio_gate(None)
 

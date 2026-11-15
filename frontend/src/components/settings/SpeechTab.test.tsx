@@ -83,21 +83,34 @@ describe('SpeechTab', () => {
     expect(screen.getByText(/请切换到“通用 ASR”或“Whisper”/)).toBeInTheDocument()
   })
 
-  it('offers MMPG only for the main link and sends an explicit null to clear a stored secret', async () => {
+  it('saves MMPG for the microphone and sends an explicit null to clear a stored secret', async () => {
     useInterviewStore.setState((state) => ({
-      config: { ...(state.config as any), stt_provider: 'doubao_mmpg', mmpg: { volc_secret_key_configured: true } },
-      options: { ...(state.options as any), stt_providers: ['whisper', 'doubao_mmpg'], candidate_stt_providers: ['whisper'] },
+      config: { ...(state.config as any), stt_provider: 'doubao_mmpg', candidate_asr_enabled: true, mmpg: { volc_secret_key_configured: true } },
+      options: { ...(state.options as any), stt_providers: ['whisper', 'doubao_mmpg'], candidate_stt_providers: ['whisper', 'doubao_mmpg'] },
     }) as any)
     render(<SpeechTab />)
-    expect(screen.queryByRole('option', { name: /MMPG/ })).not.toBeInTheDocument()
+    const option = screen.getByRole('option', { name: /豆包 MMPG/ })
+    fireEvent.change(option.closest('select')!, { target: { value: 'doubao_mmpg' } })
     const secret = screen.getByLabelText('火山引擎 Secret Key')
     expect(secret).toHaveValue('')
     expect(secret).toHaveAttribute('placeholder', '已配置 · 留空保留')
     fireEvent.click(screen.getByRole('button', { name: '清除 火山引擎 Secret Key' }))
     fireEvent.click(screen.getByRole('button', { name: '保存' }))
     await waitFor(() => expect(updateConfigAndRefresh).toHaveBeenCalledWith(expect.objectContaining({
-      stt_provider: 'doubao_mmpg', mmpg: { volc_secret_key: null },
+      stt_provider: 'doubao_mmpg', candidate_stt_provider: 'doubao_mmpg', mmpg: { volc_secret_key: null },
     })))
+  })
+
+  it('exposes shared MMPG credentials when only the microphone uses it', () => {
+    useInterviewStore.setState((state) => ({
+      config: { ...state.config!, stt_provider: 'whisper', candidate_asr_enabled: true, candidate_stt_provider: 'doubao_mmpg' },
+      options: { ...state.options!, candidate_stt_providers: ['whisper', 'doubao_mmpg'] },
+    }))
+    render(<SpeechTab />)
+
+    expect(screen.getByDisplayValue('豆包 MMPG（云端）')).toBeInTheDocument()
+    expect(screen.getByLabelText('RTC App ID')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '保存并测试 MMPG' })).not.toBeInTheDocument()
   })
 
   it('shows candidate microphone ASR defaults as local whisper', () => {

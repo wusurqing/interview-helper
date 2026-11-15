@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import ControlBar from './ControlBar'
 import { useInterviewStore } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
-import { mmpgController } from '@/lib/mmpg/rtcController'
+import { candidateMmpgController, mmpgController } from '@/lib/mmpg/rtcController'
 
 
 const apiMock = vi.hoisted(() => ({
@@ -591,6 +591,37 @@ describe('ControlBar', () => {
     await waitFor(() => {
       expect(apiMock.start).toHaveBeenCalledWith(10, 11)
     })
+  })
+
+  it.each(['start', 'resume'] as const)('gates candidate MMPG %s on a separate interviewer connection', async (mode) => {
+    const interviewer = deferred<void>()
+    const primaryStart = vi.spyOn(mmpgController, 'start').mockReturnValue(interviewer.promise)
+    const micReady = vi.fn()
+    const micStart = vi.spyOn(candidateMmpgController, 'start').mockImplementation(async (_mode, _device, _mic, _platform, prepare) => {
+      micReady(await prepare?.())
+    })
+    try {
+      useInterviewStore.setState((state) => ({
+        config: { ...state.config!, stt_provider: 'doubao_mmpg', candidate_asr_enabled: true, candidate_stt_provider: 'doubao_mmpg' },
+        devices: [
+          { id: 10, name: 'Meeting Audio', channels: 2, is_loopback: true, host_api: 'WASAPI' },
+          { id: 11, name: 'Microphone', channels: 1, is_loopback: false, host_api: 'WASAPI' },
+        ],
+        isRecording: mode === 'resume',
+        isPaused: mode === 'resume',
+        interviewerStreaming: mode === 'resume',
+      }))
+      render(<ControlBar />)
+      fireEvent.click(screen.getByRole('button', { name: mode === 'resume' ? '继续' : '开始面试' }))
+      expect(primaryStart).toHaveBeenCalledWith(mode, 10, 11, undefined)
+      expect(micStart).toHaveBeenCalledWith(mode, 11, null, undefined, expect.any(Function))
+      expect(micReady).not.toHaveBeenCalled()
+      await act(async () => interviewer.resolve())
+      expect(micReady).toHaveBeenCalledWith(true)
+    } finally {
+      micStart.mockRestore()
+      primaryStart.mockRestore()
+    }
   })
 
   it('prevents duplicate start requests while the interview is starting', async () => {

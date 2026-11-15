@@ -18,7 +18,7 @@ import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { api, getErrorMessage } from '@/lib/api'
-import { mmpgController, mmpgStateLabels } from '@/lib/mmpg/rtcController'
+import { candidateMmpgController, mmpgController, mmpgStateLabels } from '@/lib/mmpg/rtcController'
 import { useMmpgStatus } from '@/lib/mmpg/useMmpgStatus'
 import { showExamOverlayPrompt } from '@/lib/examOverlay'
 import { ResumeMountInline } from '@/components/resume/ResumeMount'
@@ -185,6 +185,7 @@ export default function ControlBar() {
   selectedCandidateMicRef.current = selectedCandidateMic
   const selectedCandidateIsMic = selectedCandidateDevice?.is_loopback === false
   const candidateCaptureEnabled = config?.candidate_asr_enabled ?? false
+  const candidateUsesMmpg = candidateCaptureEnabled && config?.candidate_stt_provider === 'doubao_mmpg'
   const candidateMicMatchesMeetingAudio = Boolean(
     !isExamMode &&
     candidateCaptureEnabled &&
@@ -291,17 +292,27 @@ export default function ControlBar() {
     }
   }, [])
 
+  const connectCandidateMmpg = useCallback((mode: 'start' | 'resume', interviewer: Promise<unknown>) => {
+    if (!candidateUsesMmpg || effectiveCandidateMic === null) return
+    const interviewReady = interviewer.then(() => true, () => false)
+    void candidateMmpgController.start(mode, effectiveCandidateMic, null, platformInfo?.platform, () => interviewReady)
+      .catch(async (error: unknown) => {
+        if (error instanceof Error && error.name === 'AbortError') return
+        if (await interviewReady) setError(`我的麦克风 · ${getErrorMessage(error, 'MMPG 连接失败')}`)
+      })
+  }, [candidateUsesMmpg, effectiveCandidateMic, platformInfo?.platform])
+
   const handleStart = useCallback(async () => {
     if (lifecycleActionRef.current) return
     if (!isExamMode && selectedDevice === null) { setError('请先选择音频设备'); return }
     lifecycleActionRef.current = true
     setLoading(true); setError(null)
     try {
-      if (usesMmpg && selectedDevice !== null) {
-        await mmpgController.start('start', selectedDevice, effectiveCandidateMic, platformInfo?.platform)
-      } else {
-        await api.start(isExamMode ? null : selectedDevice, effectiveCandidateMic)
-      }
+      const interviewer = usesMmpg && selectedDevice !== null
+        ? mmpgController.start('start', selectedDevice, effectiveCandidateMic, platformInfo?.platform)
+        : api.start(isExamMode ? null : selectedDevice, effectiveCandidateMic)
+      connectCandidateMmpg('start', interviewer)
+      await interviewer
       if (isExamMode) {
         showExamOverlayPrompt()
         return
@@ -333,13 +344,14 @@ export default function ControlBar() {
       lifecycleActionRef.current = false
       setLoading(false)
     }
-  }, [selectedDevice, effectiveCandidateMic, isExamMode, usesMmpg, platformInfo?.platform])
+  }, [selectedDevice, effectiveCandidateMic, isExamMode, usesMmpg, platformInfo?.platform, connectCandidateMmpg])
   const handleStop = useCallback(async () => {
     if (lifecycleActionRef.current) return
     if (isRecording && !window.confirm(isExamMode ? '结束本次笔试？当前答案会保留在页面上。' : '结束本次面试？将停止录音，当前转录与答案会保留在页面上。')) return
     lifecycleActionRef.current = true
     setLoading(true)
     try {
+      candidateMmpgController.cancelConnection()
       await api.stop()
       window.electronAPI?.syncOverlayWindow?.({ visible: false }).catch(() => {})
     } catch (e: unknown) {
@@ -353,7 +365,10 @@ export default function ControlBar() {
     if (lifecycleActionRef.current) return
     lifecycleActionRef.current = true
     setLoading(true)
-    try { await api.pause() } catch (e: unknown) { setError(getErrorMessage(e, '暂停失败')) } finally {
+    try {
+      candidateMmpgController.cancelConnection()
+      await api.pause()
+    } catch (e: unknown) { setError(getErrorMessage(e, '暂停失败')) } finally {
       lifecycleActionRef.current = false
       setLoading(false)
     }
@@ -375,10 +390,15 @@ export default function ControlBar() {
     lifecycleActionRef.current = true
     setLoading(true)
     try {
-      if (isExamMode) await api.resume()
-      else if (interviewerStreaming && selectedDevice !== null) {
-        await mmpgController.start('resume', selectedDevice, effectiveCandidateMic, platformInfo?.platform)
-      } else await api.resume(selectedDevice ?? undefined, effectiveCandidateMic)
+      if (isExamMode) {
+        await api.resume()
+      } else {
+        const interviewer = interviewerStreaming && selectedDevice !== null
+          ? mmpgController.start('resume', selectedDevice, effectiveCandidateMic, platformInfo?.platform)
+          : api.resume(selectedDevice ?? undefined, effectiveCandidateMic)
+        connectCandidateMmpg('resume', interviewer)
+        await interviewer
+      }
     } catch (e: unknown) {
       if (!(interviewerStreaming && e instanceof Error && e.name === 'AbortError')) {
         setError(getErrorMessage(e, isExamMode ? '继续失败' : '继续录音失败'))
@@ -387,7 +407,7 @@ export default function ControlBar() {
       lifecycleActionRef.current = false
       setLoading(false)
     }
-  }, [selectedDevice, effectiveCandidateMic, isExamMode, interviewerStreaming, platformInfo?.platform])
+  }, [selectedDevice, effectiveCandidateMic, isExamMode, interviewerStreaming, platformInfo?.platform, connectCandidateMmpg])
   const handleClear = useCallback(async () => {
     if (clearingRef.current) return
     if (qaPairs.length > 0 || transcriptions.length > 0 || candidateTranscriptions.length > 0) {
@@ -698,7 +718,7 @@ export default function ControlBar() {
             {candidateCaptureEnabled ? (
               <div className="flex min-w-0 flex-col gap-1 lg:max-w-[19rem]">
                 <span className="text-[10px] font-medium text-text-muted leading-none">
-                  我的麦克风 · 记录我的回答
+                  我的麦克风 · 记录我的回答{candidateUsesMmpg ? ' · 豆包 MMPG' : ''}
                   {candidateSttLoading && <Loader2 className="w-3 h-3 animate-spin inline ml-1 text-accent-blue" />}
                   {!candidateSttLoading && candidateSttLoaded && <span className="text-accent-green ml-1">✓</span>}
                 </span>

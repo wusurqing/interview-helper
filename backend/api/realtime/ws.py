@@ -173,7 +173,7 @@ async def websocket_endpoint(ws: WebSocket):
     ws._ia_last_pong = now  # type: ignore[attr-defined]
     try:
         from core.config import get_config
-        from api.assist import mmpg_integration
+        from api.assist import candidate_mmpg, mmpg_integration
         cfg = get_config()
         provider = cfg.stt_provider
         streaming = mmpg_integration.pipeline.is_streaming_interview()
@@ -209,6 +209,8 @@ async def websocket_endpoint(ws: WebSocket):
         })
         if current_stt is not None:
             await ws.send_json({"type": "stt_status", **current_stt})
+        if candidate_mmpg.enabled(get_config()) or candidate_mmpg.manager.active:
+            await ws.send_json(candidate_mmpg.status())
         ws_clients.add(ws)
         _log.info("WS connect clients=%d", len(ws_clients))
         while True:

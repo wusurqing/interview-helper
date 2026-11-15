@@ -589,3 +589,136 @@ def test_mmpg_ws_rejects_non_loopback_and_cross_origin_owners(monkeypatch):
                 assert busy.receive_json() == {"type": "error", "code": "mmpg_busy"}
                 busy.receive_text()
         assert exc.value.code == 1008
+
+def test_candidate_mmpg_routes_final_transcripts_to_qa_and_drains_on_pause(monkeypatch):
+    from api.assist import candidate_mmpg, pipeline
+    from core.config import AppConfig, Mmpg
+    from core.session import Session
+    from services.stt.mmpg import MmpgManager
+
+    cfg = AppConfig(stt_provider="doubao_mmpg", candidate_stt_provider="doubao_mmpg",
+                    candidate_asr_enabled=True, mmpg=Mmpg(**CONFIG))
+    session = Session(is_recording=True, last_device_id=10, last_candidate_mic_device_id=20)
+    saved, interviewer_texts, statuses = [], [], []
+    monkeypatch.setattr(candidate_mmpg, "get_config", lambda: cfg)
+    monkeypatch.setattr(candidate_mmpg, "get_session", lambda: session)
+    monkeypatch.setattr(candidate_mmpg, "_pending", {})
+    monkeypatch.setattr(pipeline, "is_streaming_interview", lambda: True)
+    monkeypatch.setattr(pipeline, "_device_is_loopback", lambda _: False)
+    monkeypatch.setattr(pipeline, "broadcast", statuses.append)
+    monkeypatch.setattr(pipeline, "_submit_candidate_knowledge_update", lambda *args: saved.append(args))
+
+    class Mic:
+        callback = None
+        stopped = False
+
+        def start(self, device_id, *, on_audio, owner, mic_compatibility_mode, queue_audio):
+            assert device_id == 20 and owner == "assist-candidate-mmpg"
+            assert mic_compatibility_mode and not queue_audio
+            self.callback = on_audio
+
+        def stop(self, *, owner):
+            assert owner == "assist-candidate-mmpg"
+            self.stopped = True
+
+    mic = Mic()
+    monkeypatch.setattr(pipeline, "_candidate_audio_capture", mic)
+
+    async def check():
+        primary_cloud, candidate_cloud = CloudSocket(), CloudSocket()
+
+        async def primary_connect(_):
+            return primary_cloud
+
+        async def candidate_connect(_):
+            return candidate_cloud
+
+        interviewer = MmpgManager(lambda: cfg.mmpg, lambda text, _: interviewer_texts.append(text),
+                                  connector=primary_connect)
+        candidate = MmpgManager(
+            lambda: cfg.mmpg, candidate_mmpg._on_transcript, on_turn=candidate_mmpg._on_turn,
+            on_capture_start=candidate_mmpg._start_capture, on_capture_stop=candidate_mmpg._stop_capture,
+            connector=candidate_connect,
+        )
+        monkeypatch.setattr(candidate_mmpg, "manager", candidate)
+        owners = [object(), object()]
+        controls, pcm = [[], []], [[], []]
+
+        async def primary_send(payload):
+            (pcm[0] if isinstance(payload, bytes) else controls[0]).append(payload)
+
+        async def candidate_send(payload):
+            (pcm[1] if isinstance(payload, bytes) else controls[1]).append(payload)
+            if mic.stopped and isinstance(payload, bytes) and not any(payload):
+                candidate_cloud.push("user.audio.transcription.done", conv_id="tail", transcript="最后一句")
+
+        interviewer.attach(owners[0], primary_send)
+        candidate.attach(owners[1], candidate_send)
+        interviewer.start(owners[0], "start", [10], 20)
+        candidate.start(owners[1], "start", [20], preflight=candidate_mmpg.prepare)
+
+        try:
+            await wait_until(lambda: all(any(p["type"] == "rtc_join" for p in messages) for messages in controls))
+            joins = [next(p for p in messages if p["type"] == "rtc_join") for messages in controls]
+            assert joins[0]["roomId"] != joins[1]["roomId"]
+            for manager, owner, join, cloud in zip(
+                (interviewer, candidate), owners, joins, (primary_cloud, candidate_cloud),
+            ):
+                await manager.rtc_event(owner, {"type": "rtc_ready", "generation": join["generation"]})
+                cloud.push("session.created")
+            await wait_until(lambda: all(m.status()["state"] == "listening" for m in (interviewer, candidate)))
+            assert interviewer.offer_audio(np.array([0.25]))
+            assert mic.callback(np.array([0.75]))
+            await wait_until(lambda: all(pcm))
+            assert pcm[0] == [struct.pack("<f", 0.25)]
+            assert pcm[1] == [struct.pack("<f", 0.75)]
+
+            session.open_candidate_answer_window("qa-1")
+            candidate_cloud.push("user.audio.transcription.started", conv_id="reply")
+            await wait_until(lambda: session.has_candidate_asr_pending_for_qa("qa-1"))
+            session.open_candidate_answer_window("qa-2")
+            primary_cloud.push("user.audio.transcription.done", conv_id="question", transcript="下一道问题")
+            candidate_cloud.push("user.audio.transcription.done", conv_id="reply", transcript="我的真实回答")
+            await wait_until(lambda: bool(saved) and bool(interviewer_texts))
+            assert interviewer_texts == ["下一道问题"]
+            assert saved == [("qa-1", "我的真实回答")]
+            assert statuses[-1]["type"] == "candidate_transcription"
+            assert statuses[-1]["provider"] == "doubao_mmpg"
+            assert statuses[-1]["is_final"] is True
+
+            candidate_cloud.push("user.audio.transcription.started", conv_id="cleared")
+            await wait_until(lambda: session.has_candidate_asr_pending_for_qa("qa-2"))
+            candidate.discard_turns()
+            candidate_cloud.push("user.audio.transcription.done", conv_id="cleared", transcript="旧记录")
+            candidate_cloud.push("user.audio.transcription.started", conv_id="tail")
+            await wait_until(lambda: session.has_candidate_asr_pending_for_qa("qa-2"))
+            await candidate_mmpg.stop("paused", drain=True)
+            assert candidate_cloud.closed and mic.stopped
+            assert interviewer.status()["state"] == "listening" and not primary_cloud.closed
+            assert saved == [("qa-1", "我的真实回答"), ("qa-2", "最后一句")]
+            assert not session.candidate_asr_busy
+        finally:
+            await candidate.stop()
+            await interviewer.stop()
+
+    asyncio.run(check())
+
+
+def test_candidate_mmpg_does_not_share_the_interviewer_manual_token(monkeypatch):
+    from api.assist import candidate_mmpg, pipeline
+    from core.config import AppConfig, Mmpg
+    from core.session import Session
+    from services.stt.mmpg import MmpgError
+
+    cfg = AppConfig(candidate_stt_provider="doubao_mmpg", candidate_asr_enabled=True,
+                    mmpg=Mmpg(**{**CONFIG, "token_mode": "manual"}))
+    monkeypatch.setattr(candidate_mmpg, "get_config", lambda: cfg)
+    monkeypatch.setattr(candidate_mmpg, "get_session", lambda: Session(
+        is_recording=True, last_device_id=10, last_candidate_mic_device_id=20,
+    ))
+    monkeypatch.setattr(pipeline, "is_streaming_interview", lambda: True)
+    with pytest.raises(MmpgError, match="candidate_mmpg_auto_token_required"):
+        asyncio.run(candidate_mmpg.prepare("start", [20], None))
+
+    monkeypatch.setattr(pipeline, "is_streaming_interview", lambda: False)
+    asyncio.run(candidate_mmpg.prepare("start", [20], None))

@@ -87,6 +87,8 @@ type SpeechForm = {
   auto_detect: boolean
 }
 
+const REMOTE_CANDIDATE_PROVIDERS = ['doubao', 'generic', 'doubao_mmpg']
+
 const DEFAULT_SPEECH_FORM: SpeechForm = {
   stt_provider: 'whisper',
   mmpg: mmpgFormFromConfig(),
@@ -314,7 +316,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
       const savedForm = {
         ...form,
         candidate_stt_provider: normalizedCandidateProvider,
-        candidate_remote_stt_enabled: form.candidate_asr_enabled && ['doubao', 'generic'].includes(normalizedCandidateProvider),
+        candidate_remote_stt_enabled: form.candidate_asr_enabled && REMOTE_CANDIDATE_PROVIDERS.includes(normalizedCandidateProvider),
         candidate_context_wait_ms: clampIntegerInput(form.candidate_context_wait_ms, 0, 2000, 200),
         candidate_context_max_chars: clampIntegerInput(form.candidate_context_max_chars, 100, 4000, 900),
         candidate_context_min_chars: clampIntegerInput(form.candidate_context_min_chars, 1, 100, 6),
@@ -397,7 +399,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
   }
 
   const providers = options?.stt_providers ?? ['whisper', 'funasr', 'doubao', 'doubao_mmpg', 'generic']
-  const candidateProviders = (options?.candidate_stt_providers ?? providers).filter((provider) => provider !== 'doubao_mmpg')
+  const candidateProviders = options?.candidate_stt_providers ?? providers
 
   const activeLatencyPreset = Object.entries(LATENCY_PRESETS).find(([, preset]) =>
     Object.entries(preset.values).every(([key, value]) => Number((form as any)[key]) === value),
@@ -442,7 +444,8 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
       ? 'FunASR 本地'
       : form.candidate_stt_provider === 'doubao'
         ? '豆包云端'
-        : '通用云端'
+        : effectiveCandidateProvider === 'doubao_mmpg' ? '豆包 MMPG' : '通用云端'
+  const candidateUsesMmpg = form.candidate_asr_enabled && effectiveCandidateProvider === 'doubao_mmpg'
   const candidateRemoteSelected = form.candidate_asr_enabled && ['doubao', 'generic'].includes(form.candidate_stt_provider)
   const candidateRemoteCredentialReady = !candidateRemoteSelected || credentialConfigured(form.candidate_stt_provider)
   const candidateRemoteProviderLabel = providerMeta[form.candidate_stt_provider]?.label ?? form.candidate_stt_provider
@@ -696,8 +699,9 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
           </>
         )}
 
-        {form.stt_provider === 'doubao_mmpg' && (
+        {(form.stt_provider === 'doubao_mmpg' || candidateUsesMmpg) && (
           <MmpgSettings
+            testEnabled={form.stt_provider === 'doubao_mmpg'}
             form={form.mmpg}
             stored={config?.mmpg}
             onChange={(mmpg) => setForm((current) => ({ ...current, mmpg }))}
@@ -839,7 +843,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                 setForm({
                   ...form,
                   candidate_stt_provider: nextProvider,
-                  candidate_remote_stt_enabled: ['doubao', 'generic'].includes(nextProvider),
+                  candidate_remote_stt_enabled: REMOTE_CANDIDATE_PROVIDERS.includes(nextProvider),
                 })
               }}
                 className="input-field"
@@ -855,7 +859,9 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                         ? `FunASR（本地，中文更准${primaryLocalEngine === 'funasr' ? '，跟随主链路' : ''}）`
                         : provider === 'doubao'
                           ? '豆包（云端，会增加成本）'
-                          : '通用 ASR（云端，会增加成本）'}
+                          : provider === 'doubao_mmpg'
+                            ? '豆包 MMPG（云端）'
+                            : '通用 ASR（云端，会增加成本）'}
                   </option>
                 ))}
               </select>
@@ -877,6 +883,13 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
               </label>
             </Field>
           </div>
+          {candidateUsesMmpg && (
+            <p className="text-xs text-text-secondary">
+              开始或继续面试时，麦克风会用独立 RTC 会话，复用上方豆包 MMPG 配置。
+              {form.stt_provider === 'doubao_mmpg' && form.mmpg.token_mode === 'manual' &&
+                '两路同时使用时，请把 RTC Token 方式设为自动签发。'}
+            </p>
+          )}
           {form.candidate_asr_enabled && ['doubao', 'generic'].includes(form.candidate_stt_provider) && (
             <div className={`rounded-lg border px-3 py-2 text-xs leading-relaxed ${
               candidateRemoteCredentialReady
