@@ -139,6 +139,14 @@ class Mmpg(BaseModel):
     token_mode: Literal["auto", "manual"] = "auto"
 
 
+class KnowledgeAnalysisSettings(BaseModel):
+    model_index: Annotated[int, Field(strict=True, ge=0)] | None = None
+    system_prompt: StrictStr | None = None
+    temperature: float = Field(default=0.3, ge=0, le=2, allow_inf_nan=False)
+    max_tokens: int = Field(default=1024, strict=True, ge=256, le=32768)
+    think_effort: Literal["off", "low", "medium", "high", "xhigh"] = "off"
+
+
 class AppConfig(BaseModel):
     system_prompts: dict[str, StrictStr] = Field(default_factory=dict)
     models: list[ModelConfig] = Field(default_factory=lambda: [_default_model_config()])
@@ -282,6 +290,7 @@ class AppConfig(BaseModel):
     # --- Review (面试复盘) ---
     review_enabled: bool = False
     review_model_index: int = 0
+    knowledge_analysis: KnowledgeAnalysisSettings = Field(default_factory=KnowledgeAnalysisSettings)
 
     @field_validator("temperature", mode="before")
     @classmethod
@@ -397,10 +406,21 @@ def get_config() -> AppConfig:
         return _config
 
 
-def update_config(updates: dict) -> AppConfig:
+class ModelListChanged(ValueError):
+    pass
+
+
+def update_config(
+    updates: dict,
+    *,
+    model_origins: list[int | None] | None = None,
+    model_snapshot: list[ModelConfig] | None = None,
+) -> AppConfig:
     global _config
     with _config_lock:
         cfg = get_config()
+        if model_snapshot is not None and model_snapshot != cfg.models:
+            raise ModelListChanged("模型列表已更新，请刷新后重试")
         data = cfg.model_dump()
         for key, value in updates.items():
             if key == "mmpg":
@@ -424,9 +444,43 @@ def update_config(updates: dict) -> AppConfig:
             elif hasattr(cfg, key):
                 data[key] = value
         updated = AppConfig(**data)
+        index = cfg.knowledge_analysis.model_index
+        if "models" in updates and index is not None:
+            if model_origins is not None:
+                matches = [new for new, old in enumerate(model_origins) if old == index]
+            elif index < len(cfg.models):
+                # Full-list edits may carry indices from an older model layout.
+                fingerprint = model_health_fingerprint(cfg.models[index])
+                matches = [
+                    new for new, model in enumerate(updated.models)
+                    if model_health_fingerprint(model) == fingerprint
+                ]
+            else:
+                matches = []
+            updated.knowledge_analysis.model_index = matches[0] if len(matches) == 1 else None
         _save_config(updated)
         _config = updated
         return updated
+
+
+def knowledge_model_available(model: ModelConfig) -> bool:
+    return bool(model.enabled and model.api_key.strip() not in ("", "sk-your-api-key-here"))
+
+
+def update_knowledge_analysis_settings(
+    settings: KnowledgeAnalysisSettings, fingerprint: str | None,
+) -> AppConfig:
+    with _config_lock:
+        models = get_config().models
+        index = settings.model_index
+        if index is not None:
+            if index >= len(models) or fingerprint != model_health_fingerprint(models[index]):
+                raise ModelListChanged("模型列表已更新，请重新选择分析模型")
+            if not knowledge_model_available(models[index]):
+                raise ValueError("请选择已启用且配置了 API Key 的分析模型")
+            if settings.think_effort != "off" and not models[index].supports_think:
+                raise ValueError("该模型未启用推理能力，请将推理强度设为关闭")
+        return update_config({"knowledge_analysis": settings.model_dump()})
 
 
 def _load_config() -> AppConfig:

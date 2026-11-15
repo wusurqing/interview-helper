@@ -1,6 +1,35 @@
 import { buildApiUrl } from './backendUrl'
 import { getAuthToken } from './auth'
 
+export type KnowledgeThinkEffort = 'off' | 'low' | 'medium' | 'high' | 'xhigh'
+
+export interface KnowledgeSettings {
+  model_index: number | null
+  system_prompt: string | null
+  temperature: number
+  max_tokens: number
+  think_effort: KnowledgeThinkEffort
+}
+
+export interface KnowledgeSettingsPayload {
+  settings: KnowledgeSettings
+  default_system_prompt: string
+  output_contract: string
+  models: { index: number; name: string; model?: string; fingerprint: string; available: boolean; supports_think: boolean }[]
+}
+
+export interface KnowledgeAnalysisState {
+  pending_count: number
+  job: {
+    job_id: string
+    status: 'running' | 'completed'
+    total: number
+    succeeded: number
+    failed: number
+    skipped: number
+  } | null
+}
+
 const BACKEND_UNREACHABLE_MESSAGE = '无法连接后端服务，请确认应用服务已启动后重试'
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -335,6 +364,11 @@ export const api = {
   sttTest: () => request<{ ok: boolean; detail?: string; text?: string }>('/api/stt/test', { method: 'POST' }),
 
   // Knowledge
+  knowledgeSettings: () => request<KnowledgeSettingsPayload>('/api/knowledge/settings'),
+  saveKnowledgeSettings: (settings: KnowledgeSettings & { model_fingerprint: string | null }) =>
+    request<KnowledgeSettingsPayload>('/api/knowledge/settings', { method: 'PUT', body: JSON.stringify(settings) }),
+  knowledgeAnalysisStatus: () => request<KnowledgeAnalysisState>('/api/knowledge/analysis'),
+  startKnowledgeAnalysis: () => request<KnowledgeAnalysisState>('/api/knowledge/analysis', { method: 'POST' }),
   knowledgeSummary: () => request('/api/knowledge/summary'),
   knowledgeHistory: (page: number = 1, pageSize: number = 20) =>
     request(`/api/knowledge/history?page=${page}&page_size=${pageSize}`),

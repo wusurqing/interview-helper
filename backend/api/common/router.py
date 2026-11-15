@@ -13,7 +13,7 @@ from pydantic import BaseModel, StrictStr, ValidationError
 from core.auth import get_token, is_auth_disabled, is_loopback_host, loopback_bypass_allowed
 from core.config import (
     CANDIDATE_STT_PROVIDER_OPTIONS, MMPG_SECRET_FIELDS, MMPG_STT_PROVIDER, Mmpg,
-    get_config, update_config,
+    get_config, update_config, ModelListChanged,
     POSITION_OPTIONS, LANGUAGE_OPTIONS, WHISPER_MODEL_OPTIONS, STT_PROVIDER_OPTIONS,
     FUNASR_MODEL_OPTIONS,
     STT_FALLBACK_PROVIDER_OPTIONS,
@@ -349,6 +349,7 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
     from core.config import ModelConfig
 
     d = body.model_dump(exclude_none=True)
+    model_snapshot = None
     try:
         if body.mmpg is not None:
             _require_local_mmpg_request(request)
@@ -359,6 +360,7 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
         if "models" in d:
             raw_models = []
             current_models = list(get_config().models)
+            model_snapshot = current_models
             for idx, x in enumerate(d["models"]):
                 if not isinstance(x, dict):
                     continue
@@ -514,13 +516,18 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
         if "kb_asr_deadline_ms" in d:
             d["kb_asr_deadline_ms"] = max(20, min(1000, int(d["kb_asr_deadline_ms"])))
 
-        await run_in_threadpool(update_config, d)
+        if model_snapshot is None:
+            await run_in_threadpool(update_config, d)
+        else:
+            await run_in_threadpool(update_config, d, model_snapshot=model_snapshot)
         if d.get("auto_detect") is False:
             from api.assist.mmpg_integration import clear_turns
 
             clear_turns()
     except HTTPException:
         raise
+    except ModelListChanged as e:
+        raise HTTPException(409, str(e)) from e
     except OSError:
         raise HTTPException(500, "无法保存设置，请检查配置文件目录的写入权限") from None
     except ValidationError as e:
@@ -944,8 +951,9 @@ async def api_models_layout(body: dict):
     """调整模型顺序、开关与并行路数，不丢失各模型 api_key。"""
     cfg = get_config()
     order = body.get("order")
+    origins = list(range(len(cfg.models)))
     if order is not None and isinstance(order, list):
-        models = []
+        origins = []
         seen = set()
         for i in order:
             # 必须显式排除 bool: Python 中 isinstance(True, int) 为 True,
@@ -957,13 +965,12 @@ async def api_models_layout(body: dict):
                 and 0 <= i < len(cfg.models)
                 and i not in seen
             ):
-                models.append(cfg.models[i])
+                origins.append(i)
                 seen.add(i)
-        for i, m in enumerate(cfg.models):
+        for i in range(len(cfg.models)):
             if i not in seen:
-                models.append(m)
-    else:
-        models = list(cfg.models)
+                origins.append(i)
+    models = [cfg.models[i] for i in origins]
     enabled = body.get("enabled")
     if isinstance(enabled, list):
         for i in range(min(len(enabled), len(models))):
@@ -1006,5 +1013,8 @@ async def api_models_layout(body: dict):
                 updates["active_model"] = min(active, len(models) - 1)
         except Exception:
             updates["active_model"] = 0
-    await run_in_threadpool(update_config, updates)
+    try:
+        await run_in_threadpool(update_config, updates, model_origins=origins, model_snapshot=cfg.models)
+    except ModelListChanged as e:
+        raise HTTPException(409, str(e)) from e
     return {"ok": True}

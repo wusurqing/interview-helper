@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import KnowledgeMap from './KnowledgeMap'
 import { useInterviewStore } from '@/stores/configStore'
@@ -7,6 +7,10 @@ const apiMock = vi.hoisted(() => ({
   knowledgeSummary: vi.fn(),
   knowledgeHistory: vi.fn(),
   knowledgeReset: vi.fn(),
+  knowledgeSettings: vi.fn(),
+  saveKnowledgeSettings: vi.fn(),
+  knowledgeAnalysisStatus: vi.fn(),
+  startKnowledgeAnalysis: vi.fn(),
   ask: vi.fn(),
   audioInputMonitorStatus: vi.fn(),
 }))
@@ -16,6 +20,13 @@ vi.mock('@/lib/api', () => ({ api: apiMock }))
 describe('KnowledgeMap', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    apiMock.knowledgeSettings.mockResolvedValue({
+      settings: { model_index: 1, system_prompt: null, temperature: 0.3, max_tokens: 1024, think_effort: 'off' },
+      default_system_prompt: '默认知识点提示词',
+      output_contract: 'JSON 数组',
+      models: [{ index: 1, name: '知识模型', fingerprint: 'model-1', available: true, supports_think: true }],
+    })
+    apiMock.knowledgeAnalysisStatus.mockResolvedValue({ pending_count: 2, job: null })
     useInterviewStore.setState({
       setToastMessage: vi.fn(),
       candidateTranscriptions: [
@@ -75,6 +86,73 @@ describe('KnowledgeMap', () => {
     render(<KnowledgeMap />)
     await waitFor(() => expect(screen.getByText(/历史记录/)).toBeInTheDocument())
     expect(screen.getByText(/×2/)).toBeInTheDocument()
+  })
+
+  it('saves independent analysis settings from the ability page', async () => {
+    apiMock.saveKnowledgeSettings.mockResolvedValue({
+      ...(await apiMock.knowledgeSettings()),
+      settings: { model_index: 1, system_prompt: '自定义知识点提示词', temperature: 0.7, max_tokens: 2048, think_effort: 'low' },
+    })
+    render(<KnowledgeMap />)
+    fireEvent.click(await screen.findByRole('button', { name: '分析设置' }))
+    fireEvent.change(screen.getByLabelText('系统提示词'), { target: { value: '自定义知识点提示词' } })
+    fireEvent.change(screen.getByLabelText('温度'), { target: { value: '0.7' } })
+    fireEvent.change(screen.getByLabelText('最大输出 token'), { target: { value: '2048' } })
+    fireEvent.change(screen.getByLabelText('推理强度'), { target: { value: 'low' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    await waitFor(() => expect(apiMock.saveKnowledgeSettings).toHaveBeenCalledWith({
+      model_index: 1,
+      model_fingerprint: 'model-1',
+      system_prompt: '自定义知识点提示词',
+      temperature: 0.7,
+      max_tokens: 2048,
+      think_effort: 'low',
+    }))
+    expect(apiMock.startKnowledgeAnalysis).not.toHaveBeenCalled()
+  })
+
+  it('starts analysis only on click and refreshes results after a partial failure', async () => {
+    apiMock.startKnowledgeAnalysis.mockResolvedValue({
+      pending_count: 2,
+      job: { job_id: 'job', status: 'running', total: 2, succeeded: 0, failed: 0, skipped: 0 },
+    })
+    apiMock.knowledgeAnalysisStatus
+      .mockResolvedValueOnce({ pending_count: 2, job: null })
+      .mockResolvedValueOnce({
+        pending_count: 1,
+        job: { job_id: 'job', status: 'completed', total: 2, succeeded: 1, failed: 1, skipped: 0 },
+      })
+    render(<KnowledgeMap />)
+    const start = await screen.findByRole('button', { name: '开始分析' })
+    await waitFor(() => expect(start).toBeEnabled())
+    expect(apiMock.startKnowledgeAnalysis).not.toHaveBeenCalled()
+    fireEvent.click(start)
+    await waitFor(() => expect(screen.getByRole('button', { name: /分析中/ })).toBeDisabled())
+    await screen.findByText(/失败 1 条/, {}, { timeout: 2500 })
+    expect(apiMock.knowledgeSummary).toHaveBeenCalledTimes(2)
+    expect(apiMock.knowledgeHistory).toHaveBeenCalledTimes(2)
+    expect(screen.getByRole('button', { name: '开始分析' })).toBeEnabled()
+  })
+
+  it('keeps polling if a refresh requested before start returns an older status', async () => {
+    let releaseRefresh: (state: { pending_count: number; job: null }) => void = () => {}
+    const refreshResult = new Promise(resolve => { releaseRefresh = resolve })
+    apiMock.knowledgeAnalysisStatus
+      .mockResolvedValueOnce({ pending_count: 2, job: null })
+      .mockReturnValueOnce(refreshResult)
+    apiMock.startKnowledgeAnalysis.mockResolvedValue({
+      pending_count: 2,
+      job: { job_id: 'new', status: 'running', total: 2, succeeded: 0, failed: 0, skipped: 0 },
+    })
+    render(<KnowledgeMap />)
+    const start = await screen.findByRole('button', { name: '开始分析' })
+    await waitFor(() => expect(start).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: '刷新能力分析' }))
+    await waitFor(() => expect(apiMock.knowledgeAnalysisStatus).toHaveBeenCalledTimes(2))
+    fireEvent.click(start)
+    await screen.findByRole('button', { name: '分析中…' })
+    await act(async () => releaseRefresh({ pending_count: 2, job: null }))
+    expect(screen.getByRole('button', { name: '分析中…' })).toBeDisabled()
   })
 
   it('requests targeted review questions', async () => {

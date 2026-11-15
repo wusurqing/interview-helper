@@ -8,6 +8,7 @@ import {
   mergeHistoryByTimeGap,
   type HistoryRecord,
 } from './knowledge-map/mergeHistory'
+import KnowledgeAnalysisPanel from './knowledge-map/KnowledgeAnalysisPanel'
 
 interface TagSummary {
   tag: string
@@ -120,6 +121,7 @@ function getErrorMessage(error: unknown, fallback: string) {
 }
 
 export default function KnowledgeMap() {
+  const [analysisRefresh, setAnalysisRefresh] = useState(0)
   const [tags, setTags] = useState<TagSummary[]>([])
   /** 接口返回的原始行（分页累积），合并仅用于展示 */
   const [rawHistory, setRawHistory] = useState<HistoryRecord[]>([])
@@ -221,6 +223,7 @@ export default function KnowledgeMap() {
     if (!confirm('确定要清空所有知识记录吗？清空后不可恢复。')) return
     try {
       await api.knowledgeReset()
+      setAnalysisRefresh(version => version + 1)
       loadData()
     } catch (e) {
       const message = getErrorMessage(e, '清空能力记录失败')
@@ -280,7 +283,10 @@ export default function KnowledgeMap() {
           能力分析
         </h2>
         <div className="flex items-center gap-2">
-          <button onClick={loadData} disabled={loading}
+          <button aria-label="刷新能力分析" onClick={() => {
+            setAnalysisRefresh(version => version + 1)
+            void loadData()
+          }} disabled={loading}
             className="p-1.5 rounded-lg hover:bg-bg-tertiary text-text-muted hover:text-text-primary transition-colors">
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
           </button>
@@ -290,6 +296,8 @@ export default function KnowledgeMap() {
           </button>
         </div>
       </div>
+
+      <KnowledgeAnalysisPanel refresh={analysisRefresh} onComplete={loadData} />
 
       {(tags.length > 0 || rawHistory.length > 0) && (
         <div className="grid gap-2 sm:grid-cols-3">
@@ -423,9 +431,9 @@ export default function KnowledgeMap() {
               <Sparkles className="w-3.5 h-3.5 text-accent-amber/80" />
             </p>
             <p className="text-text-muted text-xs leading-relaxed">
-              完成几次「实时辅助」或「面试复盘」后，系统会自动从问答中提取知识点，
+              实时辅助保存问答后，可点击「开始分析」提取知识点。
               <br className="hidden sm:inline" />
-              生成雷达图、薄弱点排名和历史记录。
+              知识点可用于查看出现频次和生成针对性复习题。
             </p>
           </div>
           <div className="flex items-center gap-2 flex-wrap justify-center">
@@ -489,7 +497,7 @@ export default function KnowledgeMap() {
                 <div className="rounded-lg border border-bg-hover/60 bg-bg-tertiary/30 px-3 py-3">
                   <p className="text-xs font-medium text-text-secondary">还没有评分样本</p>
                   <p className="mt-1 text-[10px] leading-relaxed text-text-muted">
-                    实时辅助记录会先沉淀为知识点；完成复盘分析后会补充分数。现在也可以按高频知识点生成练习题。
+                    未评分的知识点按出现频次排列，也可用于生成练习题。
                   </p>
                   {unscoredTags.length > 0 && (
                     <div className="mt-2 flex flex-wrap gap-1">
