@@ -76,6 +76,20 @@ describe('SpeechTab', () => {
     } as any)
   })
 
+  it('offers Qwen GPU ASR and saves it as the main local engine', async () => {
+    useInterviewStore.setState((state) => ({
+      config: { ...(state.config as any), stt_provider: 'whisper' },
+      options: { ...(state.options as any), stt_providers: ['whisper', 'qwen3_asr'] },
+    }) as any)
+    render(<SpeechTab />)
+    fireEvent.click(screen.getByRole('button', { name: /Qwen3-ASR/ }))
+    expect(screen.getByText(/CUDA.*FP32/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(updateConfigAndRefresh).toHaveBeenCalledWith(
+      expect.objectContaining({ stt_provider: 'qwen3_asr' }),
+    ))
+  })
+
   it('shows a warning when the saved provider is no longer supported', async () => {
     render(<SpeechTab />)
 

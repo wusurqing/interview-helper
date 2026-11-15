@@ -473,8 +473,9 @@ class FunASRSTT:
         return FUNASR_MODEL_REPOS[self.model_name]
 
     def _auto_model_kwargs(self) -> dict:
+        from .local_runtime import funasr_model_reference
         kwargs: dict[str, Any] = {
-            "model": self._repo_id(),
+            "model": funasr_model_reference(self._repo_id()),
             "disable_update": True,
             "disable_pbar": True,
             "disable_log": True,
@@ -484,7 +485,9 @@ class FunASRSTT:
         elif self.model_name == "paraformer-zh":
             # 短音频片段上游已做 VAD；只挂标点模型，不重复挂 VAD
             kwargs["vad_model"] = None
-            kwargs["punc_model"] = "ct-punc-c"
+            punc_repo = "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
+            cached_punc = funasr_model_reference(punc_repo)
+            kwargs["punc_model"] = cached_punc if cached_punc != punc_repo else "ct-punc-c"
         elif self.model_name == "paraformer-zh-streaming":
             kwargs["vad_model"] = None
             kwargs["punc_model"] = None
@@ -500,6 +503,9 @@ class FunASRSTT:
                 raise RuntimeError(self._last_load_error or "FunASR 模型加载失败")
             self._loading = True
             try:
+                from core.config import get_config
+                from .local_runtime import configure_funasr_cache
+                configure_funasr_cache(get_config())
                 try:
                     from funasr import AutoModel
                 except ImportError as e:
@@ -526,6 +532,7 @@ class FunASRSTT:
                 kwargs = self._auto_model_kwargs()
                 kwargs["device"] = device
                 self._model = AutoModel(**kwargs)
+                self.device = device
                 self._load_failed_until = 0.0
                 self._last_load_error = ""
             except Exception as e:
@@ -563,6 +570,11 @@ class FunASRSTT:
             audio_f = audio_f[indices]
 
         generate_kwargs: dict[str, Any] = {"input": audio_f}
+        if self.model_name == "paraformer-zh-streaming":
+            # Each VAD segment is submitted in one call, so flush the final
+            # streaming chunk; otherwise the last words are held in cache.
+            generate_kwargs.update(cache={}, is_final=True, chunk_size=[0, 10, 5],
+                                   encoder_chunk_look_back=4, decoder_chunk_look_back=1)
         if self.model_name.startswith("paraformer"):
             hotwords = self._hotword_string(position, language)
             if hotwords:
@@ -628,15 +640,29 @@ class STTEngine:
                 return
             self._loading = True
             try:
-                from faster_whisper import WhisperModel
+                from core.config import get_config
+                from .local_runtime import configure_whisper_cuda11, whisper_cache_path
+                cfg = get_config()
                 device, compute_type = self._best_device()
+                configure_whisper_cuda11(cfg)
+                from faster_whisper import WhisperModel
+                if device == "cuda" and getattr(cfg, "whisper_cuda11_compat", False):
+                    # On the GTX 1650, tiny produces repeated tokens in FP16;
+                    # FP32 is stable and its small weights still fit easily.
+                    # Larger models use quantization to fit a 4 GiB card.
+                    compute_type = "float32" if self.model_size == "tiny" else "int8_float16"
                 model_kwargs: dict = {"device": device, "compute_type": compute_type}
+                cache_path = whisper_cache_path(cfg)
+                if cache_path:
+                    model_kwargs["download_root"] = cache_path
                 if device == "cpu":
                     from core.config import get_config
 
                     configured = int(getattr(get_config(), "stt_infer_threads", 0) or 0)
                     model_kwargs["cpu_threads"] = configured if configured > 0 else self._cpu_threads()
                 self._model = WhisperModel(self.model_size, **model_kwargs)
+                self.device = device
+                self.compute_type = compute_type
             finally:
                 self._loading = False
 

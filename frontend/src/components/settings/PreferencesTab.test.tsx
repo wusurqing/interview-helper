@@ -68,6 +68,18 @@ describe('PreferencesTab', () => {
     })
   })
 
+  it('does not call the main Whisper engine a fallback', () => {
+    render(<PreferencesTab />)
+    expect(screen.queryByText(/Whisper 降级就绪/)).not.toBeInTheDocument()
+    expect(screen.getByText(/就绪 · Whisper/)).toBeInTheDocument()
+  })
+
+  it('shows Whisper as a fallback when the configured provider is remote', () => {
+    useInterviewStore.setState({ config: { stt_provider: 'generic' } } as any)
+    render(<PreferencesTab />)
+    expect(screen.getByText(/Whisper 降级就绪/)).toBeInTheDocument()
+  })
+
   it('saves answer length choices immediately from common preferences', async () => {
     render(<PreferencesTab />)
 

@@ -804,7 +804,7 @@ export default function ControlBar() {
           <button disabled
             className="flex min-h-[38px] items-center gap-1.5 rounded-lg px-4 py-2 bg-bg-tertiary text-text-muted text-xs font-semibold cursor-not-allowed flex-shrink-0">
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            <span>{sttActiveProvider === 'whisper' ? '降级加载 Whisper…' : '语音加载中…'}</span>
+            <span>{sttActiveProvider === 'whisper' && config?.stt_provider && config.stt_provider !== 'whisper' ? '降级加载 Whisper…' : '语音加载中…'}</span>
           </button>
         ) : !isExamMode && !usesMmpg && !sttLoaded ? (
           <button onClick={handleStart} disabled={loading || selectedDevice === null}

@@ -26,6 +26,7 @@ from services.stt import (
     transcription_for_publish,
     postprocess_interview_transcription,
 )
+from services.stt.factory import LOCAL_STT_PROVIDERS
 from api.common import get_model_health
 from api.realtime.ws import broadcast
 from api.assist.answer_worker import (
@@ -1574,10 +1575,8 @@ def _candidate_provider_config(cfg) -> tuple[str, str, str, bool]:
     # 本地引擎互斥：候选人链路跟随主链路的本地引擎，避免 funasr 与 whisper
     # 两个模型同时驻留内存（合计 ~1GB+）把 CPU 机器拖卡。
     primary = (getattr(cfg, "stt_provider", "whisper") or "whisper").strip()
-    if primary == "funasr" and provider == "whisper":
-        provider = "funasr"
-    elif primary == "whisper" and provider == "funasr":
-        provider = "whisper"
+    if primary in LOCAL_STT_PROVIDERS and provider in LOCAL_STT_PROVIDERS:
+        provider = primary
     model = (getattr(cfg, "candidate_whisper_model", "") or getattr(cfg, "whisper_model", "base") or "base").strip()
     candidate_lang_raw = (getattr(cfg, "candidate_whisper_language", "") or "").strip()
     language = candidate_lang_raw or (getattr(cfg, "whisper_language", "auto") or "auto").strip() or "auto"
@@ -1585,7 +1584,7 @@ def _candidate_provider_config(cfg) -> tuple[str, str, str, bool]:
 
 
 def _candidate_streaming_config(cfg, provider: str) -> tuple[bool, int]:
-    enabled = bool(getattr(cfg, "candidate_streaming_asr_enabled", True)) and provider in ("whisper", "funasr")
+    enabled = bool(getattr(cfg, "candidate_streaming_asr_enabled", True)) and provider in LOCAL_STT_PROVIDERS
     interval_ms = max(800, min(5000, int(getattr(cfg, "candidate_streaming_asr_interval_ms", 1500) or 1500)))
     return enabled, interval_ms
 

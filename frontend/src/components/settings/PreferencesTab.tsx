@@ -86,6 +86,7 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
   const sttLoading = useInterviewStore((s) => s.sttLoading)
   const sttActiveProvider = useInterviewStore((s) => s.sttActiveProvider)
   const sttFallbackLoaded = useInterviewStore((s) => s.sttFallbackLoaded)
+  const isWhisperFallback = sttActiveProvider === 'whisper' && !!config?.stt_provider && config.stt_provider !== 'whisper'
   const setSettingsDrawerTab = useInterviewStore((s) => s.setSettingsDrawerTab)
   const answerPanelLayout = useUiPrefsStore((s) => s.answerPanelLayout)
   const setAnswerPanelLayout = useUiPrefsStore((s) => s.setAnswerPanelLayout)
@@ -158,7 +159,11 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
         ? '通用 ASR'
         : config?.stt_provider === 'whisper'
           ? 'Whisper'
-          : `不支持 (${config?.stt_provider ?? 'unknown'})`
+          : config?.stt_provider === 'qwen3_asr'
+            ? 'Qwen3-ASR GPU'
+            : config?.stt_provider === 'funasr'
+              ? 'FunASR'
+              : `不支持 (${config?.stt_provider ?? 'unknown'})`
   const hasScreenCapture = (options?.screen_capture_regions?.length ?? 0) > 0
   const searchQuery = useSettingsSearch()
   const inSearch = searchQuery.trim().length > 0
@@ -201,11 +206,11 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
           <div className="rounded-xl border border-bg-hover/60 bg-bg-tertiary/25 px-3 py-2.5">
             <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${sttLoaded ? (sttActiveProvider === 'whisper' ? 'bg-accent-amber' : 'bg-accent-green') : sttLoading ? 'bg-accent-amber animate-pulse' : 'bg-accent-red'}`} />
+              <div className={`w-2 h-2 rounded-full ${sttLoaded ? (isWhisperFallback ? 'bg-accent-amber' : 'bg-accent-green') : sttLoading ? 'bg-accent-amber animate-pulse' : 'bg-accent-red'}`} />
               <span className="text-xs font-medium text-text-primary">语音识别</span>
             </div>
             <p className="text-[11px] text-text-muted mt-1">
-              {sttLoaded ? (sttActiveProvider === 'whisper' ? 'Whisper 降级就绪' : sttFallbackLoaded ? '就绪，降级已预备' : '就绪') : sttLoading ? '加载中' : '未就绪'} · {sttLabel}
+              {sttLoaded ? (isWhisperFallback ? 'Whisper 降级就绪' : sttFallbackLoaded ? '就绪，降级已预备' : '就绪') : sttLoading ? '加载中' : '未就绪'} · {sttLabel}
             </p>
           </div>
           <button

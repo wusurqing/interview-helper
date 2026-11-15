@@ -1,0 +1,5 @@
+# The installed torch and torchaudio builds must match each other and the GPU driver.
+funasr==1.4.21
+modelscope==1.40.2
+numpy>=1.24,<2
+scikit-learn==1.6.1

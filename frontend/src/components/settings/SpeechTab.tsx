@@ -87,6 +87,7 @@ type SpeechForm = {
   auto_detect: boolean
 }
 
+const LOCAL_STT_PROVIDERS = ['whisper', 'funasr', 'qwen3_asr']
 const REMOTE_CANDIDATE_PROVIDERS = ['doubao', 'generic', 'doubao_mmpg']
 
 const DEFAULT_SPEECH_FORM: SpeechForm = {
@@ -310,7 +311,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
     setSaveState('saving')
     setSaveError(null)
     try {
-      const normalizedCandidateProvider = primaryLocalEngine && ['whisper', 'funasr'].includes(form.candidate_stt_provider)
+      const normalizedCandidateProvider = primaryLocalEngine && LOCAL_STT_PROVIDERS.includes(form.candidate_stt_provider)
         ? primaryLocalEngine
         : form.candidate_stt_provider
       const savedForm = {
@@ -398,7 +399,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
     }
   }
 
-  const providers = options?.stt_providers ?? ['whisper', 'funasr', 'doubao', 'doubao_mmpg', 'generic']
+  const providers = options?.stt_providers ?? ['whisper', 'funasr', 'qwen3_asr', 'doubao', 'doubao_mmpg', 'generic']
   const candidateProviders = options?.candidate_stt_providers ?? providers
 
   const activeLatencyPreset = Object.entries(LATENCY_PRESETS).find(([, preset]) =>
@@ -409,6 +410,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
   const providerMeta: Record<string, { label: string; desc: string; icon: React.ReactNode; brandClass: string }> = {
     whisper: { label: 'Whisper', desc: '本地运行，免费无限', icon: <Volume2 className="w-5 h-5" />, brandClass: 'sky' },
     funasr: { label: 'FunASR', desc: '本地·中文更强·支持热词', icon: <AudioWaveform className="w-5 h-5" />, brandClass: 'violet' },
+    qwen3_asr: { label: 'Qwen3-ASR', desc: '0.6B · 本地 GPU', icon: <AudioWaveform className="w-5 h-5" />, brandClass: 'violet' },
     doubao: { label: '豆包', desc: '火山引擎云端 API', icon: <Zap className="w-5 h-5" />, brandClass: 'orange' },
     doubao_mmpg: { label: '豆包 MMPG', desc: '火山 RTC · 智能判停', icon: <AudioWaveform className="w-5 h-5" />, brandClass: 'orange' },
     generic: { label: '通用 ASR', desc: 'OpenAI-compatible multipart', icon: <Sparkles className="w-5 h-5" />, brandClass: 'blue' },
@@ -417,6 +419,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
   const brandBorder: Record<string, string> = {
     whisper: 'border-sky-400/40',
     funasr: 'border-accent-violet/40',
+    qwen3_asr: 'border-accent-violet/40',
     doubao: 'border-orange-400/40',
     doubao_mmpg: 'border-orange-400/40',
     generic: 'border-blue-400/40',
@@ -425,6 +428,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
   const credentialConfigured = (provider: string): boolean => {
     if (provider === 'whisper') return true
     if (provider === 'funasr') return true
+    if (provider === 'qwen3_asr') return true
     if (provider === 'doubao') return !!(form.doubao_stt_api_key || (form.doubao_stt_app_id && form.doubao_stt_access_token))
     if (provider === 'doubao_mmpg') return mmpgCredentialsPresent(form.mmpg, config?.mmpg)
     if (provider === 'generic') return !!(form.generic_stt_api_base_url && form.generic_stt_api_key && form.generic_stt_model)
@@ -434,11 +438,13 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
   const mainSttLabel = providerMeta[form.stt_provider]?.label ?? form.stt_provider
   // 本地引擎互斥：主链路为本地引擎时，候选人链路的本地选项跟随主链路，
   // 避免 funasr 与 whisper 双模型同时驻留（后端会做同样收敛，这里保持 UI 一致）
-  const primaryLocalEngine = ['whisper', 'funasr'].includes(form.stt_provider) ? form.stt_provider : null
-  const effectiveCandidateProvider = primaryLocalEngine && ['whisper', 'funasr'].includes(form.candidate_stt_provider)
+  const primaryLocalEngine = LOCAL_STT_PROVIDERS.includes(form.stt_provider) ? form.stt_provider : null
+  const effectiveCandidateProvider = primaryLocalEngine && LOCAL_STT_PROVIDERS.includes(form.candidate_stt_provider)
     ? primaryLocalEngine
     : form.candidate_stt_provider
-  const candidateSttLabel = effectiveCandidateProvider === 'whisper'
+  const candidateSttLabel = effectiveCandidateProvider === 'qwen3_asr'
+    ? 'Qwen3-ASR GPU'
+    : effectiveCandidateProvider === 'whisper'
     ? 'Whisper 本地'
     : effectiveCandidateProvider === 'funasr'
       ? 'FunASR 本地'
@@ -552,7 +558,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
       </Section>
 
       <Section title="主链路 ASR（面试官 / 会议音频）" icon={<Mic className="w-3.5 h-3.5" />} keywords="stt asr whisper funasr paraformer 识别引擎 model device 转写 sense-voice 面试官 会议音频">
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
           {providers.map((p) => {
             const meta = providerMeta[p] || { label: p, desc: '', icon: <Mic className="w-5 h-5" />, brandClass: 'blue' }
             const sel = form.stt_provider === p
@@ -628,6 +634,14 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
               </select>
             </Field>
           </>
+        )}
+
+        {form.stt_provider === 'qwen3_asr' && (
+          <p className="text-xs leading-relaxed text-text-secondary">
+            Qwen3-ASR-0.6B · CUDA GPU。GTX 1650 使用混合精度：音频 FP32、文字解码 FP16。
+            自动识别语言，使用岗位热词作为上下文。
+            首次加载会下载模型；可用下方「保存并测试」检查实际转写。
+          </p>
         )}
 
         {form.stt_provider === 'funasr' && (
@@ -850,11 +864,13 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                 disabled={!form.candidate_asr_enabled}
               >
                 {candidateProviders
-                  .filter((provider) => !primaryLocalEngine || !['whisper', 'funasr'].includes(provider) || provider === primaryLocalEngine)
+                  .filter((provider) => !primaryLocalEngine || !LOCAL_STT_PROVIDERS.includes(provider) || provider === primaryLocalEngine)
                   .map((provider) => (
                   <option key={provider} value={provider}>
                     {provider === 'whisper'
                       ? `Whisper（本地，免费${primaryLocalEngine === 'whisper' ? '，跟随主链路' : ''}）`
+                      : provider === 'qwen3_asr'
+                        ? `Qwen3-ASR（本地 GPU${primaryLocalEngine === 'qwen3_asr' ? '，跟随主链路' : ''}）`
                       : provider === 'funasr'
                         ? `FunASR（本地，中文更准${primaryLocalEngine === 'funasr' ? '，跟随主链路' : ''}）`
                         : provider === 'doubao'
@@ -919,10 +935,10 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                     checked={form.candidate_streaming_asr_enabled}
                     onChange={(e) => setForm({ ...form, candidate_streaming_asr_enabled: e.target.checked })}
                     className="rounded border-border text-accent-blue focus:ring-accent-blue/30"
-                    disabled={!form.candidate_asr_enabled || !['whisper', 'funasr'].includes(effectiveCandidateProvider)}
+                    disabled={!form.candidate_asr_enabled || !LOCAL_STT_PROVIDERS.includes(effectiveCandidateProvider)}
                   />
                   <span className="text-xs text-text-secondary">
-                    {['whisper', 'funasr'].includes(effectiveCandidateProvider)
+                    {LOCAL_STT_PROVIDERS.includes(effectiveCandidateProvider)
                       ? form.candidate_streaming_asr_enabled ? '已开启' : '已关闭'
                       : '云端 ASR 不做预转写'}
                   </span>
@@ -981,7 +997,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                     value={form.candidate_streaming_asr_interval_ms}
                     onChange={(e) => setForm({ ...form, candidate_streaming_asr_interval_ms: clampIntegerInput(e.target.value, 800, 5000, 1500) })}
                     className="input-field"
-                    disabled={!form.candidate_asr_enabled || !form.candidate_streaming_asr_enabled || !['whisper', 'funasr'].includes(effectiveCandidateProvider)}
+                    disabled={!form.candidate_asr_enabled || !form.candidate_streaming_asr_enabled || !LOCAL_STT_PROVIDERS.includes(effectiveCandidateProvider)}
                   />
                 </Field>
                 <Field label="兜底等最后一句 (ms)" hint="边听边写已经会提前写入上下文；这个只是在你刚说完、最后一句还没写进去时，下一题生成前最多再等一下。0=不等。">
