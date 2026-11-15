@@ -2,6 +2,10 @@ import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
 
+const backendAddress = process.env.IA_DEV_BACKEND_PORT
+  ? `127.0.0.1:${process.env.IA_DEV_BACKEND_PORT}`
+  : 'localhost:18080'
+
 function manualChunks(id: string) {
   if (!id.includes('node_modules')) return
 
@@ -51,9 +55,10 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      '/api': 'http://localhost:18080',
+      // Keep the browser's Host header for the backend's same-origin check.
+      '/api': { target: `http://${backendAddress}`, changeOrigin: false },
       '/ws': {
-        target: 'ws://localhost:18080',
+        target: `ws://${backendAddress}`,
         ws: true,
       },
     },

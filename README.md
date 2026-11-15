@@ -210,17 +210,27 @@ python start.py --mode network  # 浏览器模式，默认 http://localhost:1808
 
 ## 开发与自测
 
-```bash
-cd frontend && npm run dev
-cd backend && python -m uvicorn main:app --host 127.0.0.1 --port 18080 --reload
+在项目根目录运行一条命令，即可打开 Electron 桌面端进行本地调试。
 
-cd frontend && npm test
-python -m pytest backend/tests -q
+```bash
+python dev.py
 ```
 
-开发模式提示：本地直接跑后端时默认不启用鉴权，`npm run dev` 的 Vite 代理可以直接访问
-`http://localhost:18080`。只有 `python start.py --mode network`、`IA_AUTH_ENABLE=1`
-或设置了 `IA_AUTH_TOKEN` 时，才会要求局域网请求携带 token。
+前端通过 Vite 热更新，修改 Python 源码后启动器会自动重启后端。终端会显示实时日志，按 `Ctrl+C` 停止。修改 Electron 主进程或 preload 后，重新运行命令即可生效。
+
+首次运行会安装缺少的依赖，并优先使用当前 Python 虚拟环境或项目下的 `.venv`。全新检出时请用 Python 3.12 创建环境，例如安装 Python 3.12 后在 Windows 执行 `py -3.12 dev.py`。之后可直接使用 `python dev.py`。模型与语音沿用 `backend/config.json` 中的本地配置（也支持 `IA_CONFIG_PATH`）。
+
+```bash
+python dev.py --web                                    # 使用默认浏览器调试
+python dev.py --backend-port 18081 --frontend-port 5174 # 默认端口被占用时换一组端口
+```
+
+前端默认使用 `127.0.0.1:5173`，后端默认使用 `127.0.0.1:18080`，两者都只监听本机。
+
+```bash
+cd frontend && npm test
+cd ../backend && python -m pytest tests -q
+```
 
 ## README 素材更新
 

@@ -81,6 +81,8 @@ const ROOT = path.resolve(__dirname, '..');
 const BACKEND_DIR = path.join(ROOT, 'backend');
 const PORT = parseInt(process.env.PORT || '18080', 10);
 const SERVER_URL = `http://127.0.0.1:${PORT}`;
+const DEV_FRONTEND_PORT = process.env.IA_DEV_FRONTEND_PORT;
+const FRONTEND_URL = DEV_FRONTEND_PORT ? `http://127.0.0.1:${DEV_FRONTEND_PORT}` : SERVER_URL;
 
 let mainWindow = null;
 let overlayWindow = null;
@@ -366,7 +368,7 @@ function createWindow() {
 
   // 每次启动清除缓存，确保加载到最新的前端构建（避免设置里识别引擎等不更新）
   mainWindow.webContents.session.clearCache().then(() => {
-    mainWindow.loadURL(SERVER_URL);
+    mainWindow.loadURL(FRONTEND_URL);
   });
 
   mainWindow.webContents.on('did-finish-load', () => {
@@ -454,7 +456,7 @@ function createOverlayWindow() {
     overlayWindow.setFocusable(false);
     overlayWindow.setAlwaysOnTop(true, 'screen-saver', FRONT_REASSERT_LEVEL);
   });
-  overlayWindow.loadURL(`${SERVER_URL}?overlay=1`);
+  overlayWindow.loadURL(`${FRONTEND_URL}?overlay=1`);
   overlayWindow.webContents.on('did-finish-load', () => {
     if (!overlayWindow || overlayWindow.isDestroyed()) return;
     overlayWindow.setContentProtection(true);
@@ -1239,8 +1241,10 @@ app.whenReady().then(async () => {
     /* 个别平台/版本可能不支持 */
   }
   createAppMenu();
-  console.log('Starting Python backend...');
-  startPythonBackend();
+  if (!DEV_FRONTEND_PORT) {
+    console.log('Starting Python backend...');
+    startPythonBackend();
+  }
 
   try {
     await waitForServer();
