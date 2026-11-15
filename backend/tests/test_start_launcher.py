@@ -19,6 +19,27 @@ def load_start():
     return module
 
 
+def test_dependency_check_installs_requirements_when_upload_support_is_missing(monkeypatch):
+    start = load_start()
+    installed = False
+
+    def import_package(name):
+        if name == "multipart.multipart" and not installed:
+            raise ModuleNotFoundError(name)
+
+    def install_requirements(command):
+        nonlocal installed
+        assert command[:4] == [sys.executable, "-m", "pip", "install"]
+        assert command[4:6] == ["-r", str(ROOT / "backend" / "requirements.txt")]
+        installed = True
+        return start.subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(start, "__import__", import_package, raising=False)
+    monkeypatch.setattr(start.subprocess, "run", install_requirements)
+    start.ensure_python_deps()
+    assert installed
+
+
 def _patch_common(monkeypatch, tmp_path, *, ready, poll_results):
     start = load_start()
     log_path = tmp_path / "startup-console.log"
