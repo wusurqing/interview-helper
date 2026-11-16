@@ -20,6 +20,7 @@ logger = get_logger(__name__)
 
 DEFAULT_TEMPERATURE = 0.5
 DEFAULT_MAX_TOKENS = 4096
+DEFAULT_CONTEXT_WINDOW_TOKENS = 262_144
 _MODEL_HEALTH_FINGERPRINT_KEY = secrets.token_bytes(32)
 
 # LLM 接口协议（模型级配置 api_type 的取值范围）
@@ -58,6 +59,7 @@ class ModelConfig(BaseModel):
     api_base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     model: str = "gpt-4o-mini"
+    context_window_tokens: int = Field(default=DEFAULT_CONTEXT_WINDOW_TOKENS, strict=True, ge=1, le=2**53 - 1)
     # 接口协议：openai=Chat Completions，anthropic=Messages，responses=Responses
     api_type: str = API_TYPE_OPENAI
     supports_think: bool = False

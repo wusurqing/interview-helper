@@ -39,6 +39,7 @@ API_TYPE_RESPONSES = "responses"
 API_TYPE_OPTIONS = (API_TYPE_OPENAI, API_TYPE_ANTHROPIC, API_TYPE_RESPONSES)
 
 ANTHROPIC_VERSION = "2023-06-01"
+RESPONSES_MIN_OUTPUT_TOKENS = 16
 
 # 形如 /v1 /v2 /v3 /v1beta 的末尾版本段
 _VERSION_SEGMENT_RE = re.compile(r"/v\d+[a-z]*$", re.IGNORECASE)
@@ -216,7 +217,7 @@ def build_chat_payload(
         payload = {
             "model": model_id,
             "input": msgs,
-            "max_output_tokens": max(16, int(max_tokens or 16)),
+            "max_output_tokens": max(RESPONSES_MIN_OUTPUT_TOKENS, int(max_tokens or 1)),
             "stream": stream,
         }
         if system_text:
@@ -309,26 +310,37 @@ def extract_reply_text(body: object, api_type: str) -> tuple[str, str]:
 # Raw HTTP: status mapping + SSE streaming
 # ---------------------------------------------------------------------------
 
-def raise_for_llm_status(status_code: int, body_text: str) -> None:
+def raise_for_llm_status(status_code: int, body: str | dict) -> None:
     """Map an HTTP >=400 response to the typed LLM error taxonomy."""
     from services.llm.streaming import (
         LLMAuthError,
-        LLMContextExceeded,
         LLMError,
         LLMRateLimit,
         LLMServerError,
+        provider_context_error,
     )
 
-    text = str(body_text)[:200]
+    detail = f"HTTP {status_code}: {str(body)[:200]}"
     if status_code in (401, 403):
-        raise LLMAuthError(f"HTTP {status_code}: {text}")
+        raise LLMAuthError(detail)
     if status_code == 429:
-        raise LLMRateLimit(f"HTTP {status_code}: {text}")
-    if status_code == 400 and ("context" in text.lower() or "token" in text.lower()):
-        raise LLMContextExceeded(f"HTTP {status_code}: {text}")
+        raise LLMRateLimit(detail)
+    if status_code in (400, 413, 422):
+        overflow = provider_context_error(body, detail)
+        if overflow is not None:
+            raise overflow
     if 500 <= status_code < 600:
-        raise LLMServerError(f"HTTP {status_code}: {text}")
-    raise LLMError(f"HTTP {status_code}: {text}")
+        raise LLMServerError(detail)
+    raise LLMError(detail)
+
+
+def _raise_llm_stream_error(body, label):
+    from services.llm.streaming import LLMError, provider_context_error
+
+    fields = body.get("error") or body
+    message = fields.get("message") if isinstance(fields, dict) else fields
+    detail = f"{label}: {str(message or fields)[:200]}"
+    raise provider_context_error(body, detail) or LLMError(detail)
 
 
 def _iter_sse_lines(resp: requests.Response) -> Generator[str, None, None]:
@@ -341,6 +353,8 @@ def _iter_sse_lines(resp: requests.Response) -> Generator[str, None, None]:
 
 
 def _openai_chunk(obj: dict) -> SimpleNamespace:
+    if obj.get("error"):
+        _raise_llm_stream_error(obj, "openai stream error")
     choices = obj.get("choices") or []
     usage = obj.get("usage")
     if choices:
@@ -370,10 +384,7 @@ def _anthropic_chunk(obj: dict) -> SimpleNamespace:
     reasoning = None
     usage_obj = None
     if event_type == "error":
-        err = obj.get("error") or {}
-        from services.llm.streaming import LLMError
-
-        raise LLMError(f"anthropic stream error: {str(err.get('message') or obj)[:200]}")
+        _raise_llm_stream_error(obj, "anthropic stream error")
     if event_type == "content_block_delta":
         delta = obj.get("delta") or {}
         if delta.get("type") == _ANTHROPIC_TEXT_DELTA:
@@ -418,10 +429,9 @@ def _responses_chunk(obj: dict) -> SimpleNamespace:
         )
     elif event_type == "response.failed":
         response = obj.get("response") or {}
-        err = response.get("error") or {}
-        from services.llm.streaming import LLMError
-
-        raise LLMError(f"responses failed: {str(err.get('message') or err)[:200]}")
+        _raise_llm_stream_error(response, "responses failed")
+    elif event_type == "error":
+        _raise_llm_stream_error(obj, "responses stream error")
     if content is None and reasoning is None and usage_obj is None:
         return SimpleNamespace(choices=[], usage=None)
     delta = SimpleNamespace(content=content, reasoning_content=reasoning, reasoning=None)
@@ -571,7 +581,7 @@ def post_chat_stream(
                         except Exception:
                             body = resp.text
                         attempt.response(body)
-                        raise_for_llm_status(resp.status_code, str(body))
+                        raise_for_llm_status(resp.status_code, body)
                     for line in _iter_sse_lines(resp):
                         _trace_sse_line(attempt, line)
                         chunk, done = _parse_sse_data(line, api_type, parser)
@@ -638,7 +648,7 @@ def post_chat_blocking(
                     body = response.text
                 attempt.response(body)
                 attempt.finish("failed")
-                raise_for_llm_status(response.status_code, str(body))
+                raise_for_llm_status(response.status_code, body)
             try:
                 data = response.json()
             except Exception:

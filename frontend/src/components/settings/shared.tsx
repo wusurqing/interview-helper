@@ -119,10 +119,15 @@ export function InfoHint({ text, className = '' }: { text: string; className?: s
   )
 }
 
-export function Field({ label, hint, children }: { label: React.ReactNode; hint?: string; children: React.ReactNode }) {
+export function Field({ label, hint, htmlFor, children }: {
+  label: React.ReactNode
+  hint?: string
+  htmlFor?: string
+  children: React.ReactNode
+}) {
   return (
     <div className="space-y-1.5">
-      <label className="text-xs font-medium text-text-secondary inline-flex items-center gap-1">
+      <label htmlFor={htmlFor} className="text-xs font-medium text-text-secondary inline-flex items-center gap-1">
         {label}
         {hint && <InfoHint text={hint} />}
       </label>

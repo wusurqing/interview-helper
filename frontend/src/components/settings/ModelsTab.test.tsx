@@ -175,6 +175,38 @@ describe('ModelsTab state sync', () => {
     expect(screen.getByText('有未保存更改')).toBeInTheDocument()
   })
 
+  it('defaults a legacy model context window and saves edits with the model queue', async () => {
+    render(<ModelsTab />)
+
+    fireEvent.click(await screen.findByText('Main Model'))
+    const contextWindow = screen.getByRole('textbox', { name: '最大上下文窗口' })
+    expect(contextWindow).toHaveValue('262144')
+    expect(screen.getByText('tokens')).toBeVisible()
+    fireEvent.change(contextWindow, { target: { value: '65536' } })
+    expect(screen.getByText('有未保存更改')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('保存模型队列'))
+
+    await waitFor(() => {
+      expect(apiMock.updateConfig).toHaveBeenCalledWith(expect.objectContaining({
+        models: [expect.objectContaining({ context_window_tokens: 65536 })],
+      }))
+    })
+    expect(apiMock.updateConfig.mock.calls[0][0]).not.toHaveProperty('max_tokens')
+  })
+
+  it.each(['', '0', '-1', '1.5', '9007199254740992'])('keeps the invalid context window %j editable without saving', async (value) => {
+    render(<ModelsTab />)
+
+    fireEvent.click(await screen.findByText('Main Model'))
+    const contextWindow = screen.getByRole('textbox', { name: '最大上下文窗口' })
+    fireEvent.change(contextWindow, { target: { value } })
+    fireEvent.click(screen.getByText('保存模型队列'))
+
+    expect(contextWindow).toHaveValue(value)
+    expect(contextWindow).toHaveAttribute('aria-invalid', 'true')
+    expect(apiMock.updateConfig).not.toHaveBeenCalled()
+  })
+
   it('keeps an existing saved API key when the key field is left blank', async () => {
     apiMock.getModelsFull.mockResolvedValueOnce({
       models: [
@@ -205,7 +237,7 @@ describe('ModelsTab state sync', () => {
     expect(payload.models[0].api_key).toBe('__IA_KEEP_EXISTING_API_KEY__')
   })
 
-  it('keeps saved API keys tied to the original model when rows are reordered', async () => {
+  it('keeps saved model context windows and API keys with their models when rows are reordered', async () => {
     apiMock.getModelsFull.mockResolvedValueOnce({
       models: [
         {
@@ -213,6 +245,7 @@ describe('ModelsTab state sync', () => {
           api_base_url: 'https://api.openai.com/v1',
           api_key: '',
           model: 'gpt-4o-mini',
+          context_window_tokens: 32768,
           supports_think: false,
           supports_vision: false,
           enabled: true,
@@ -223,6 +256,7 @@ describe('ModelsTab state sync', () => {
           api_base_url: 'https://api.openai.com/v1',
           api_key: '',
           model: 'gpt-4o',
+          context_window_tokens: 131072,
           supports_think: false,
           supports_vision: false,
           enabled: true,
@@ -245,11 +279,13 @@ describe('ModelsTab state sync', () => {
     expect(payload.models[0]).toEqual(expect.objectContaining({
       name: 'Second Model',
       api_key: '__IA_KEEP_EXISTING_API_KEY__',
+      context_window_tokens: 131072,
       model_original_index: 1,
     }))
     expect(payload.models[1]).toEqual(expect.objectContaining({
       name: 'First Model',
       api_key: '__IA_KEEP_EXISTING_API_KEY__',
+      context_window_tokens: 32768,
       model_original_index: 0,
     }))
   })
@@ -525,6 +561,7 @@ describe('ModelsTab state sync', () => {
 
     await screen.findByText('保存模型队列')
     fireEvent.click(screen.getByText('添加'))
+    expect(screen.getByRole('textbox', { name: '最大上下文窗口' })).toHaveValue('262144')
     const nameInputs = screen.getAllByPlaceholderText('如：GPT-4o、DeepSeek-V3')
     await waitFor(() => {
       expect(nameInputs[nameInputs.length - 1]).toHaveFocus()

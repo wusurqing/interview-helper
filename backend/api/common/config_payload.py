@@ -1,4 +1,4 @@
-from core.config import MMPG_SECRET_FIELDS, Mmpg, model_health_fingerprint
+from core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, Mmpg, model_health_fingerprint
 from services.storage.resume_history import get_filename_for_id
 
 
@@ -14,6 +14,7 @@ def build_config_payload(cfg) -> dict:
             {
                 "name": model.name,
                 "api_type": getattr(model, "api_type", "openai") or "openai",
+                "context_window_tokens": getattr(model, "context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS),
                 "supports_think": model.supports_think,
                 "supports_vision": model.supports_vision,
                 "enabled": getattr(model, "enabled", True),

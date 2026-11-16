@@ -247,13 +247,15 @@ def traced(scene):
             @functools.wraps(func)
             def generator(*args, **kwargs):
                 context = dict(kwargs.pop("trace_context", None) or {})
-                with scope(context.pop("scene", scene), call_id=uuid4().hex, **context):
+                context.setdefault("call_id", uuid4().hex)
+                with scope(context.pop("scene", scene), **context):
                     yield from func(*args, **kwargs)
             return generator
         @functools.wraps(func)
         def normal(*args, **kwargs):
             context = dict(kwargs.pop("trace_context", None) or {})
-            with scope(context.pop("scene", scene), call_id=uuid4().hex, **context):
+            context.setdefault("call_id", uuid4().hex)
+            with scope(context.pop("scene", scene), **context):
                 return func(*args, **kwargs)
         return normal
     return decorate

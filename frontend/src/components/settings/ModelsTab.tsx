@@ -77,6 +77,7 @@ interface ModelRow {
   id: string
   originalIndex: number
   model: ModelFullInfo
+  contextWindowInput: string
 }
 
 type ModelProbeResult = {
@@ -116,6 +117,7 @@ const EMPTY_REMOTE_MODEL_LIST: RemoteModelListState = {
 const KEEP_EXISTING_API_KEY = '__IA_KEEP_EXISTING_API_KEY__'
 const DEFAULT_TEMPERATURE = 0.5
 const DEFAULT_MAX_TOKENS = 4096
+const DEFAULT_CONTEXT_WINDOW_TOKENS = 262144
 
 function clampNumberInput(value: unknown, min: number, max: number, fallback: number): number {
   const parsed = Number(value)
@@ -127,22 +129,30 @@ function clampIntegerInput(value: unknown, min: number, max: number, fallback: n
   return Math.floor(clampNumberInput(value, min, max, fallback))
 }
 
-function toModelRow(model: ModelFullInfo, index: number): ModelRow {
+function parseContextWindowTokens(input: string): number | null {
+  const value = input.trim()
+  const tokens = Number(value)
+  return /^\d+$/.test(value) && Number.isSafeInteger(tokens) && tokens > 0 ? tokens : null
+}
+
+function toModelRow({ context_window_tokens, ...model }: ModelFullInfo, index: number): ModelRow {
   return {
     id: `${index}:${model.name}:${model.model}:${model.api_base_url}`,
     originalIndex: index,
     model,
+    contextWindowInput: String(context_window_tokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS),
   }
 }
 
 function buildModelPayloadFromRows(rows: ModelRow[]) {
-  return rows.map(({ model: m, originalIndex }) => ({
+  return rows.map(({ model: m, originalIndex, contextWindowInput }) => ({
     name: m.name.trim(),
     api_base_url: m.api_base_url.trim() || 'https://api.openai.com/v1',
     api_key: m.api_key.trim() ? m.api_key : m.has_key ? KEEP_EXISTING_API_KEY : '',
     model_original_index: originalIndex,
     model: m.model.trim() || 'gpt-4o-mini',
     api_type: m.api_type || 'openai',
+    context_window_tokens: parseContextWindowTokens(contextWindowInput),
     supports_think: m.supports_think,
     supports_vision: m.supports_vision,
     enabled: m.enabled,
@@ -479,6 +489,7 @@ export default function ModelsTab() {
         id: `new-${Date.now()}-${prev.length}`,
         originalIndex: prev.length,
         model: { ...EMPTY_MODEL },
+        contextWindowInput: String(DEFAULT_CONTEXT_WINDOW_TOKENS),
       },
     ])
     setExpandedIdx(nextIdx)
@@ -507,11 +518,17 @@ export default function ModelsTab() {
     if (!options?.allowDuringAction && (testingIdxRef.current !== null || healthCheckingRef.current)) {
       return { ok: false as const, skipped: true as const }
     }
-    const invalid = modelRows.find((row) => !row.model.name.trim())
-    if (invalid) {
-      useInterviewStore.getState().setToastMessage('模型名称不能为空')
+    const invalidIndex = modelRows.findIndex(
+      (row) => !row.model.name.trim() || parseContextWindowTokens(row.contextWindowInput) === null,
+    )
+    if (invalidIndex >= 0) {
+      const message = modelRows[invalidIndex].model.name.trim()
+        ? '最大上下文窗口必须是有效的正整数'
+        : '模型名称不能为空'
+      setExpandedIdx(invalidIndex)
+      useInterviewStore.getState().setToastMessage(message)
       setQueueSaveState('error')
-      setQueueSaveError('模型名称不能为空')
+      setQueueSaveError(message)
       return { ok: false as const }
     }
     savingRef.current = true
@@ -970,6 +987,29 @@ export default function ModelsTab() {
                             />
                           </Field>
                         </div>
+                        <Field label="最大上下文窗口" htmlFor={`model-context-window-${idx}`}>
+                          <div className="relative max-w-xs">
+                            <input
+                              id={`model-context-window-${idx}`}
+                              type="text"
+                              inputMode="numeric"
+                              value={row.contextWindowInput}
+                              aria-invalid={parseContextWindowTokens(row.contextWindowInput) === null || undefined}
+                              aria-describedby={`model-context-window-unit-${idx}`}
+                              onChange={(e) => {
+                                const contextWindowInput = e.target.value
+                                setModelRows((prev) => prev.map((item, i) => i === idx ? { ...item, contextWindowInput } : item))
+                              }}
+                              className="w-full rounded-lg border border-bg-hover bg-bg-tertiary/80 py-2 pl-3 pr-16 text-sm text-text-primary"
+                            />
+                            <span
+                              id={`model-context-window-unit-${idx}`}
+                              className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-text-muted"
+                            >
+                              tokens
+                            </span>
+                          </div>
+                        </Field>
                         <Field label="接口类型" hint={API_TYPE_OPTIONS.find((t) => t.value === (m.api_type || 'openai'))?.hint}>
                           <div className="grid grid-cols-3 gap-1.5" role="radiogroup" aria-label="接口类型">
                             {API_TYPE_OPTIONS.map((t) => {

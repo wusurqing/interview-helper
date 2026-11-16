@@ -13,6 +13,7 @@ export type ApiType = 'openai' | 'anthropic' | 'responses'
 export interface ModelInfo {
   name: string
   api_type?: ApiType
+  context_window_tokens?: number
   supports_think: boolean
   supports_vision: boolean
   enabled?: boolean
@@ -28,6 +29,7 @@ export interface ModelFullInfo {
   api_key: string
   model: string
   api_type: ApiType
+  context_window_tokens?: number
   supports_think: boolean
   supports_vision: boolean
   enabled: boolean

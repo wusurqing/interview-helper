@@ -57,6 +57,13 @@ class LLMRateLimit(LLMError):
 class LLMContextExceeded(LLMError):
     user_msg = "上下文超长，请清空会话或缩短问题后重试。"
 
+    def __init__(
+        self, message: str, *, context_window_tokens: int | None = None,
+        cause: BaseException | None = None,
+    ):
+        super().__init__(message, cause=cause)
+        self.context_window_tokens = context_window_tokens
+
 
 class LLMServerError(LLMError):
     user_msg = "大模型服务端异常（5xx），稍后重试。"
@@ -85,6 +92,71 @@ def _compact_error_detail(error: BaseException, max_chars: int = 240) -> str:
     return compact or error.__class__.__name__
 
 
+_CONTEXT_ERROR_CODES = {
+    "context_length_exceeded", "context_window_exceeded", "context_length_limit_exceeded",
+    "context_window_limit_exceeded", "input_too_long", "prompt_too_long",
+    "prompt_length_exceeded", "input_length_exceeded",
+}
+_CONTEXT_ERROR_TEXT = re.compile(
+    r"\b(?:prompt|input) (?:is )?too long\b|\btoo many (?:prompt|input) tokens\b|"
+    r"\b(?:maximum|max) (?:model )?context (?:length|window|size)\b|"
+    r"\bcontext (?:length|window|size) (?:limit )?(?:was |is )?exceeded\b|"
+    r"\b(?:prompt|input|messages|context length)\b[^.\n]*?\bexceed(?:s|ed)?\b"
+    r"[^.\n]*?\b(?:context (?:window|length|size)|(?:input|prompt) token limit)\b",
+    re.IGNORECASE,
+)
+_CONTEXT_LIMIT_TEXT = re.compile(
+    r"\b(?:max(?:imum)? )?(?:model )?context (?:length|window|size) "
+    r"(?:(?:is|of|limit)\s*[:=]?\s*|[:=]\s*)([\d,]+)\b|"
+    r"\b(?:prompt|input) (?:is )?too long\s*:\s*[\d,]+\s+tokens\s*>\s*([\d,]+)\b",
+    re.IGNORECASE,
+)
+_CREDENTIAL_ERROR_TEXT = re.compile(
+    r"\b(?:invalid|incorrect|missing|expired) (?:api|access|auth(?:entication|orization)?) (?:key|token)\b",
+    re.IGNORECASE,
+)
+_OUTPUT_LIMIT_ERROR_TEXT = re.compile(
+    r"^\s*(?:invalid (?:value (?:for|of) )?|the )?[`'\"]?"
+    r"(?:max_(?:completion_|output_)?tokens|(?:max(?:imum)? )?(?:completion|output) tokens?)\b",
+    re.IGNORECASE,
+)
+_OUTPUT_LIMIT_PARAMS = {"max_tokens", "max_completion_tokens", "max_output_tokens"}
+
+
+def provider_context_error(body, detail: str, *, cause: BaseException | None = None) -> LLMContextExceeded | None:
+    """Recognize an explicit input or total-context overflow from an SDK or HTTP response."""
+    if isinstance(body, str) and body.lstrip().startswith("{"):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            pass
+    fields = body if isinstance(body, dict) else {}
+    if isinstance(fields.get("error"), dict):
+        fields = fields["error"]
+    code = str(fields.get("code") or fields.get("type") or "").lower()
+    message = str(fields.get("message") or (body if isinstance(body, str) else detail))
+    if _CREDENTIAL_ERROR_TEXT.search(message):
+        return None
+    if code not in _CONTEXT_ERROR_CODES:
+        param = str(fields.get("param") or "").lower()
+        if param in _OUTPUT_LIMIT_PARAMS or _OUTPUT_LIMIT_ERROR_TEXT.match(message):
+            return None
+        if not _CONTEXT_ERROR_TEXT.search(message):
+            return None
+
+    candidates = [
+        fields.get(key) for key in ("context_window_tokens", "maximum_context_length", "max_context_length")
+    ]
+    match = _CONTEXT_LIMIT_TEXT.search(message)
+    if match:
+        candidates.extend(match.groups())
+    for candidate in candidates:
+        raw = str(candidate).replace(",", "")
+        if raw.isascii() and raw.isdecimal() and len(raw) <= 12 and int(raw) > 0:
+            return LLMContextExceeded(detail, context_window_tokens=int(raw), cause=cause)
+    return LLMContextExceeded(detail, cause=cause)
+
+
 def _classify_exception(e: BaseException) -> LLMError:
     """Map any underlying SDK/HTTP exception to a typed LLMError."""
     if isinstance(e, LLMError):
@@ -97,15 +169,13 @@ def _classify_exception(e: BaseException) -> LLMError:
         return LLMAuthError(_compact_error_detail(e), cause=e)
     if isinstance(e, openai.RateLimitError):
         return LLMRateLimit(_compact_error_detail(e), cause=e)
-    if isinstance(e, openai.BadRequestError):
-        msg = str(e).lower()
-        if "context" in msg or "maximum context" in msg or "token" in msg:
-            return LLMContextExceeded(_compact_error_detail(e), cause=e)
-        return LLMError(_compact_error_detail(e), cause=e)
     if isinstance(e, openai.InternalServerError):
         return LLMServerError(_compact_error_detail(e), cause=e)
     if isinstance(e, openai.APIConnectionError):
         return LLMConnectionError(_compact_error_detail(e), cause=e)
+    if isinstance(e, openai.APIError) and getattr(e, "status_code", None) in (None, 400, 413, 422):
+        detail = _compact_error_detail(e)
+        return provider_context_error(e.body or str(e), detail, cause=e) or LLMError(detail, cause=e)
     if isinstance(e, requests.exceptions.Timeout):
         return LLMTimeout(_compact_error_detail(e), cause=e)
     if isinstance(e, httpx.TimeoutException):
@@ -576,9 +646,10 @@ def _should_emit_think(model_cfg, cfg) -> bool:
     )
 
 
-def _try_stream_with_model(model_cfg, full_messages, cfg):
+def _try_stream_with_model(model_cfg, full_messages, cfg, *, think_params=None):
     api_type = get_api_type(model_cfg)
-    think_params = _build_think_params(model_cfg, cfg)
+    if think_params is None:
+        think_params = _build_think_params(model_cfg, cfg)
     if api_type != "openai":
         # anthropic / responses：统一走裸 HTTP SSE（候选 URL 自动探测）
         payload = build_chat_payload(
@@ -730,13 +801,15 @@ def chat_stream(
         yield ("text", f"\n\n[{last_error.user_msg}]")
 
 
-def _mmpg_stream(model, messages, cfg, request, abort_check):
+def _mmpg_stream(model, messages, cfg, request, abort_check, *, think_params=None):
     """Read an async HTTP stream from the existing answer worker thread."""
     loop = request.loop
     api_type = get_api_type(model)
+    if think_params is None:
+        think_params = _build_think_params(model, cfg)
     payload = build_chat_payload(
         api_type, model.model, messages, temperature=cfg.temperature, max_tokens=cfg.max_tokens,
-        stream=True, think_params=_build_think_params(model, cfg),
+        stream=True, think_params=think_params,
     )
     if api_type == "openai":
         payload.pop("max_tokens", None)
@@ -744,7 +817,10 @@ def _mmpg_stream(model, messages, cfg, request, abort_check):
         payload.update(_completion_token_kwargs(model, cfg.max_tokens))
 
     def started():
-        request.started_at = loop.time()
+        with request.lock:
+            if request.started_at is not None or request.cancelled:
+                return
+            request.started_at = loop.time()
         get_logger("mmpg.diagnostics").info(
             "turn=%s group=%s revision=%s event=llm_start seq=%s since_final_ms=%.1f",
             request.traces[-1], request.group_id, request.revision, request.seq,
@@ -798,6 +874,7 @@ def chat_stream_single_model(
     override_max_tokens: Optional[int] = None,
     mmpg_request=None,
     config_snapshot=None,
+    protect_output_limit: bool = False,
 ) -> Generator[tuple[str, str], None, None]:
     """仅使用指定模型流式输出，不做跨模型降级（供并行答题）。"""
     cfg = _config_with_think_override(config_snapshot if config_snapshot is not None else get_config(), override_think_mode)
@@ -811,10 +888,16 @@ def chat_stream_single_model(
     model_name = model_cfg.name
     try:
         emit_think = _should_emit_think(model_cfg, cfg)
+        transport_options = {}
+        if protect_output_limit:
+            think_params = _build_think_params(model_cfg, cfg)
+            for field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+                think_params.pop(field, None)
+            transport_options["think_params"] = think_params
         if mmpg_request is not None:
-            response = _mmpg_stream(model_cfg, full_messages, cfg, mmpg_request, abort_check)
+            response = _mmpg_stream(model_cfg, full_messages, cfg, mmpg_request, abort_check, **transport_options)
         else:
-            response = _try_stream_with_model(model_cfg, full_messages, cfg)
+            response = _try_stream_with_model(model_cfg, full_messages, cfg, **transport_options)
         last_usage = (0, 0)
         for chunk in response:
             if abort_check and abort_check():

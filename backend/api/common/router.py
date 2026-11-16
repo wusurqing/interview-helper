@@ -12,7 +12,7 @@ from pydantic import BaseModel, StrictStr, ValidationError
 
 from core.auth import get_token, is_auth_disabled, is_loopback_host, loopback_bypass_allowed
 from core.config import (
-    CANDIDATE_STT_PROVIDER_OPTIONS, MMPG_SECRET_FIELDS, MMPG_STT_PROVIDER, Mmpg,
+    CANDIDATE_STT_PROVIDER_OPTIONS, DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, MMPG_STT_PROVIDER, Mmpg,
     get_config, update_config, ModelListChanged,
     POSITION_OPTIONS, LANGUAGE_OPTIONS, WHISPER_MODEL_OPTIONS, STT_PROVIDER_OPTIONS,
     FUNASR_MODEL_OPTIONS,
@@ -332,6 +332,7 @@ async def api_get_models_full():
                 "api_key": "",
                 "model": mdl.model,
                 "api_type": getattr(mdl, "api_type", "openai") or "openai",
+                "context_window_tokens": getattr(mdl, "context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS),
                 "supports_think": mdl.supports_think,
                 "supports_vision": mdl.supports_vision,
                 "enabled": getattr(mdl, "enabled", True),
