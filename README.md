@@ -2,7 +2,7 @@
 
 实时听题，自动生成专业面试回答。你可以把它理解成一个开着就能用的面试辅助工具：你负责听题和临场反应，它负责转写、答题、截图审题，卡壳的时候还能把问答框挂在旁边。
 
-面向真实技术面试场景：支持系统音频 / 麦克风转写、截图审题、多模型切换、知识库引用；Electron 端提供共享隐身、Boss Key、托盘和轻量悬浮窗，绝大多数常见面试软件场景下都能更稳地避开屏幕共享检测，但具体效果仍建议自行充分实测。
+面向技术面试准备与复盘：支持会议音频和麦克风双路转写、截图审题、多模型切换、知识库引用；Electron 端提供共享隐身、Boss Key、托盘和悬浮窗。屏幕共享保护的效果取决于操作系统及会议软件，请在使用前自行验证。
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-CC%20BY--NC%204.0-284B63" alt="License" />
@@ -27,22 +27,21 @@ https://github.com/user-attachments/assets/1013b772-c59d-4ec4-8256-f932caa8ea3c
 
 | 场景 | 能力 |
 | --- | --- |
-| **实时面试** | 系统音频 / 麦克风转写，自动识别问题，多模型并行生成回答 |
-| **语音与模型灵活接入** | 本地 FunASR / Whisper / 豆包 / 通用 ASR 四种转写引擎；OpenAI Chat、Anthropic Messages、OpenAI Responses 三种 LLM 接口协议，Base URL 带不带 `/v1` 都能用 |
-| **卡壳补位** | 截图审题、识图模型分析、知识库引用本地笔记 |
-| **个人材料接入** | 简历上传、简历优化、知识库引用本地笔记，让答案更贴近你的经历 |
-| **桌面端使用体验** | 共享隐身、Boss Key、托盘、轻量悬浮问答框、移动到鼠标附近 |
-| **复盘与提升** | 面试复盘、知识点能力分析、求职看板、Offer 对比 |
+| **实时面试** | 会议音频识别面试官发言；可选麦克风转写自己的回答，为追问和复盘提供上下文 |
+| **语音与模型接入** | Whisper、FunASR、Qwen3-ASR、豆包、豆包 MMPG、通用 ASR 六种引擎；支持 Chat、Messages、Responses 三种 LLM 接口 |
+| **手动与截图答题** | 手动输入或粘贴图片；截图审题、多图提交和笔试模式 |
+| **个人材料接入** | 简历上传、简历优化、本地知识库检索与回答引用 |
+| **桌面端使用体验** | 共享隐身、Boss Key、托盘、悬浮窗，以及位置、字体、颜色和透明度设置 |
+| **复盘与提升** | 面试复盘、手动触发知识点能力分析、求职看板和 Offer 对比 |
 
 ## 面试主流程
 
-1. 选择系统音频或麦克风，点击开始。
-2. 左侧实时转写持续落字，系统自动识别“值得回答”的问题。
-3. 右侧答案区按当前模型配置流式生成正式回答。
-4. 需要审图时，可粘贴截图，把题目、代码片段或页面内容交给模型分析。
-5. 开启知识库后，答案上方会显示引用角标，关联你的本地笔记或资料。
-6. 空间紧张时，可用 `⌘⇧J / Ctrl+Shift+J` 折叠左侧实时转录面板，让回答区铺满。
-7. 使用桌面模式时，还可以配合共享隐身、Boss Key 和悬浮提示窗一起使用，但不同面试软件策略不同，请务必自行充分实测。
+1. 在「设置 → 模型」配置可用模型，在「设置 → 语音」选择识别引擎。
+2. 选择会议音频设备并开始；如需记录自己的口述，在语音设置中启用「我的回答记录」，再选择独立的麦克风设备。
+3. 面试官发言触发自动答题；启用麦克风后，已转写的双方发言可按顺序用于实时语音上下文，候选人的口述本身不会触发自动答题。
+4. 也可手动输入问题、粘贴图片或截图审题；在「设置 → 模式」可开启适用于手动输入和截图的笔试模式。
+5. 开启知识库后，回答可引用本地笔记。需要复盘时，可在「能力分析」中选择分析模型并手动分析待处理问答；已记录的候选人口述也可用于分析。
+6. 使用桌面模式时，可按需调整悬浮窗位置、尺寸、文字与透明度；`⌘⇧J / Ctrl+Shift+J` 可折叠实时转录面板。
 
 ## 主界面速览
 
@@ -56,17 +55,17 @@ https://github.com/user-attachments/assets/1013b772-c59d-4ec4-8256-f932caa8ea3c
   <tr>
     <td width="50%" valign="top">
       <h3>实时辅助</h3>
-      <p>ASR 转写（FunASR / Whisper / 豆包，本地引擎支持岗位热词）、自动识别问题、流式回答、截图审题、知识库引用、多协议模型接入、模型健康与 Token 统计。</p>
+      <p>会议音频与可选麦克风双路转写、结合对话上下文流式回答、手动提问、截图审题、知识库引用与多协议模型接入。</p>
     </td>
     <td width="50%" valign="top">
       <h3>桌面协同</h3>
-      <p>Electron 端提供共享隐身、Boss Key、托盘、悬浮问答框和快捷键，尽量减少主界面暴露。</p>
+      <p>Electron 端提供共享隐身、Boss Key、托盘和快捷键；悬浮窗支持按模式调整位置、尺寸、字体、颜色与透明度。</p>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
       <h3>训练与复盘</h3>
-      <p>面试复盘、问答记录、能力分析和薄弱点沉淀，方便把“答过的问题”变成“会讲的话题”。</p>
+      <p>面试及笔试复盘、候选人口述记录、手动触发的能力分析与薄弱点沉淀。</p>
     </td>
     <td width="50%" valign="top">
       <h3>求职材料</h3>
@@ -92,48 +91,53 @@ https://github.com/user-attachments/assets/1013b772-c59d-4ec4-8256-f932caa8ea3c
 
 | 模块 | 现在能做什么 |
 | --- | --- |
-| **实时辅助** | ASR 转写 → 问题识别 → 多模型回答 → 截图审题 / 知识库引用 |
+| **实时辅助** | 会议音频与可选麦克风转写、结合双方发言生成回答、手动提问和截图审题 |
+| **笔试模式** | 手动输入或截图答题，可配置截图范围、多图提交和支持的模型推理选项 |
 | **知识库** | 上传 `.md` / `.txt` / `.log` / `.docx` / `.pdf`，支持检索测试、最近命中和回答引用 |
-| **面试复盘** | 录制真实问答、ASR 纠错、逐题分析、整场总结 |
-| **能力分析** | 知识点标签、历史问答记录、薄弱点趋势 |
+| **面试复盘** | 记录真实问答、ASR 纠错、逐题分析和整场总结 |
+| **能力分析** | 手动分析待处理问答，生成知识点标签与趋势；可单独设置分析模型和提示词 |
 | **简历优化** | 上传简历，对照 JD 给出优化建议和改写方向 |
 | **求职看板** | 表格 / Kanban、状态标签、拖拽排序、Offer 对比 |
-| **设置中心** | 模型管理、STT 引擎、主题、偏好、快捷键、截图区域等配置 |
+| **设置中心** | 模型与语音引擎、按场景编辑系统提示词、悬浮窗样式、主题和快捷键 |
 
 ## 技术结构
 
 ```mermaid
 sequenceDiagram
-    participant Entry as start.py / quick-start.py
+    participant Entry as start.py / dev.py
     participant Client as Electron / Browser
     participant UI as React + Vite + Zustand
     participant API as FastAPI + WebSocket
     participant Capture as 音频 / 截图采集
-    participant STT as STT 引擎
+    participant STT as STT 引擎 / RTC
     participant LLM as LLM 路由
     participant KB as 知识库检索
-    participant DB as SQLite / 本地存储
+    participant Local as 本地配置 / SQLite / 文件
 
     Entry->>Client: 启动桌面模式或浏览器模式
-    Client->>UI: 加载实时辅助 / 面试复盘 / 看板等前端模块
-    UI->>API: 读取配置、设备列表、历史数据
-    API->>DB: 读取 config / resume / knowledge / jobs
-    DB-->>API: 返回本地状态
-    API-->>UI: REST 初始化结果
+    Client->>UI: 加载实时辅助、复盘与看板
+    UI->>API: 读取配置、设备列表和历史数据
+    API->>Local: 读取配置与本地数据
+    API-->>UI: 返回初始化结果
 
-    UI->>API: 建立 WebSocket 会话
-    UI->>API: 开始面试 / 截图审题 / 请求回答
-    API->>Capture: 采集系统音频、麦克风或屏幕区域
-    Capture->>STT: 音频流转写
-    STT-->>API: 实时转录文本
+    UI->>API: 建立 WebSocket 会话并开始面试
+    API->>Capture: 采集会议音频 / 可选麦克风
+    Capture-->>API: 音频数据
+    alt 豆包 MMPG
+        API-->>UI: 转发音频
+        UI->>STT: 通过火山 RTC 发送音频
+    else 其他语音引擎
+        API->>STT: 提交音频转写
+    end
+    STT-->>API: 返回转写文本
+    UI->>API: 可选手动提问 / 截图
     API->>KB: 按问题检索本地笔记
-    KB->>DB: 读取索引与命中文档
-    DB-->>KB: 返回相关片段
-    KB-->>API: 返回引用结果
-    API->>LLM: 组合转写、截图、知识库上下文
+    KB->>Local: 读取索引与命中文档
+    KB-->>API: 返回相关片段
+    API->>LLM: 组合对话、截图或知识库上下文
     LLM-->>API: 流式回答 / 复盘分析 / 简历建议
-    API->>DB: 持久化问答、配置、知识点与求职数据
-    API-->>UI: 推送转录、答案、引用、状态更新
+    API->>Local: 保存问答、知识点及求职数据
+    API-->>UI: 推送转写、回答和状态
 ```
 
 ### 技术栈
@@ -142,7 +146,7 @@ sequenceDiagram
 | --- | --- |
 | **前端** | React 18 · TypeScript · Vite · Zustand · Tailwind CSS · Playwright |
 | **后端** | Python 3.10+ · FastAPI · Uvicorn · WebSocket |
-| **语音识别** | faster-whisper · 豆包 (Volcengine) · 通用 ASR (OpenAI-compatible) |
+| **语音识别** | faster-whisper · FunASR · Qwen3-ASR · 豆包流式 ASR / MMPG · 通用 ASR |
 | **LLM** | OpenAI 兼容接口 · 多模型并行 · Think 推理 · 识图 |
 | **存储** | SQLite · 本地简历历史 · 知识库索引 |
 | **桌面** | Electron |
@@ -151,62 +155,66 @@ sequenceDiagram
 
 ### 1. 准备环境
 
-- Python `3.10+`
-- Node.js `18+`
+- Python `3.10+`；全新 Windows 开发环境建议使用 Python 3.12。
+- Node.js `18+` 和 npm。
+- 音频采集设备；系统音频配置见[音频配置](docs/音频配置.md)。
 
-### 2. 安装依赖
+### 2. 获取项目并安装依赖
 
 ```bash
-git clone https://github.com/powAu3/interview-assistant.git
-cd interview-assistant
+git clone https://github.com/wusurqing/interview-helper.git
+cd interview-helper
 
-pip install -r backend/requirements.txt
+python -m pip install -r backend/requirements.txt
 
 cd frontend
 npm install
 npm run build
 cd ..
-
-cp backend/config.example.json backend/config.json
 ```
+
+首次启动时，如默认配置文件不存在，应用会从 `backend/config.example.json` 创建本地 `backend/config.json`；也可以在启动后通过设置中心配置。已有配置不会因首次初始化被覆盖。
 
 ### 3. 配置模型与语音
 
-模型支持三种接口协议（设置 → 模型 → 接口类型）：
+在「设置 → 模型」添加模型并选择接口类型：
 
-- **Chat**：OpenAI 兼容 `/chat/completions`，绝大多数中转站与国产模型用这个
-- **Messages**：Anthropic `/v1/messages`（Claude 官方及 claudecode 类中转）
-- **Responses**：OpenAI 新版 `/responses` 接口
+- **Chat**：OpenAI 兼容 `/chat/completions`。
+- **Messages**：Anthropic `/v1/messages`。
+- **Responses**：OpenAI `/responses`。
 
-Base URL 带不带 `/v1` 都能自动适配；模型队列按优先级并行竞速，自动健康检查与故障降级。
+Base URL 带不带 `/v1` 都可适配；模型队列支持并行竞速、健康检查与故障降级。按需在「设置 → 系统提示词」分别编辑语音回答、手动提问、截图、笔试、复盘和简历优化等场景的指令。
 
-语音识别四种引擎（设置 → 语音）：
+在「设置 → 语音」选择转写引擎：
 
-- **FunASR**（本地，中文面试推荐）：`pip install funasr` 后在设置页点「下载模型」；支持岗位热词偏置，纠正 RAG 等术语识别
-- **Whisper**（本地，多语种）
-- **豆包 / 通用 ASR**（云端）：可配置失败降级引擎（FunASR / Whisper / 不降级）
+| 引擎 | 运行位置与配置 |
+| --- | --- |
+| **Whisper** | 本地 `faster-whisper`，支持多语种；首次使用需准备模型文件。 |
+| **FunASR** | 本地识别，支持中文和岗位热词；执行 `python -m pip install funasr torch`，然后在语音设置中下载模型。 |
+| **Qwen3-ASR** | 本地 GPU 识别，需要 CUDA 和单独安装的可选依赖；安装及 GPU 检查见 [Qwen3-ASR 本地部署](docs/qwen-local.md)。 |
+| **豆包** | 火山引擎云端流式 ASR，需要开通服务并配置凭据。 |
+| **豆包 MMPG** | 火山 RTC 会话式 ASR，支持智能判停与续说；需 Windows 本机后端，以及桌面应用或通过 localhost 打开的本机浏览器。在语音设置中配置 RTC、火山引擎和豆包 ASR 凭据，并可先运行「保存并测试 MMPG」。 |
+| **通用 ASR** | 云端 OpenAI 兼容音频转写接口，需要配置服务地址与凭据。 |
 
-相关设置都在应用的「设置中心」里（语音、节奏、热词、模型分区），改 `backend/config.json` 也可以。
+豆包 MMPG 会将所选设备的音频发送到火山引擎，使用云服务可能产生费用。会议音频和候选人麦克风两路同时使用 MMPG 时，须配置 RTC App Key 并选择自动签发 Token。若主链路使用本地引擎，候选人链路的本地引擎跟随主链路。
 
-参考文档：
+其他参考：
 
-- [配置说明](docs/配置说明.md)
-- [API 密钥与模型](docs/API密钥与模型.md)
-- [音频配置](docs/音频配置.md)
-- [豆包语音识别](docs/豆包语音识别.md)
+- [配置说明](docs/配置说明.md)与 [API 密钥与模型](docs/API密钥与模型.md)。
+- [豆包流式 ASR 配置参考](docs/豆包语音识别.md)：仅适用于原有豆包流式 ASR，不是 MMPG 指南；其中部分界面描述已过时，请以当前设置页面为准。
 
 ### 4. 启动应用
 
 ```bash
-python start.py                 # 桌面模式（推荐）
-python start.py --mode network  # 浏览器模式，默认 http://localhost:18080
+python start.py                 # Electron 桌面模式
+python start.py --mode network  # 浏览器 / 局域网模式，本机访问 http://localhost:18080
 ```
 
-补充说明：
+Windows 也可双击 `启动.bat`，或运行 `python quick_start.py`；首次运行会尝试安装缺少的依赖。首次启动时，如前端尚未构建，启动器会尝试安装前端依赖并构建；桌面模式还会检查 Electron 依赖。
 
-- **双击 `启动.bat`**（或 `python quick_start.py`）：首次自动装依赖，之后直接启动；桌面应用就绪后命令行窗口自动隐藏，启动失败会保留窗口并显示日志。
-- `python start.py` 桌面模式（推荐）；`--mode network` 浏览器模式，默认 `http://localhost:18080`。
-- 首次启动如果前端尚未构建，会自动安装并构建前端，因此本机仍需要 Node.js。
+### 本地日志与隐私
+
+大模型请求默认记录在项目根目录的 `log/llm.jsonl`，其中包含完整提示词和回复；图片输入可能保存到 `log/llm_assets/`。已知 API Key 等凭据会脱敏，但日志和图片仍可能包含简历、问答或截图等敏感内容。`log/` 已被 Git 忽略，请妥善保管，详见[大模型调用日志](backend/README.md#大模型调用日志)。
 
 ## 开发与自测
 
@@ -255,9 +263,10 @@ npm run demo:readme
 ## 项目结构
 
 ```text
-interview-assistant/
+interview-helper/
 ├── start.py
-├── quick-start.py
+├── quick_start.py / quick-start.py
+├── dev.py
 ├── backend/
 │   ├── main.py
 │   ├── api/
