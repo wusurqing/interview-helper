@@ -9,7 +9,7 @@ const longMarkdown = [
   `\`\`\`text\n${longToken}\n\`\`\``,
 ].join('\n\n')
 
-async function openPrompt(page, sizeMode, viewport, cap, autoFollow = false) {
+async function openPrompt(page, sizeMode, viewport, cap, autoFollow = false, mode = 'prompt') {
   await page.setViewportSize(viewport)
   await page.route('**/api/**', (route) => {
     const request = route.request()
@@ -18,28 +18,40 @@ async function openPrompt(page, sizeMode, viewport, cap, autoFollow = false) {
   await page.route('https://fonts.googleapis.com/**', (route) => route.abort())
   let socket
   await page.routeWebSocket('**/ws', (connection) => { socket = connection })
-  await page.addInitScript(({ sizeMode, cap, autoFollow }) => {
+  await page.addInitScript(({ sizeMode, cap, autoFollow, mode }) => {
     localStorage.setItem('ia_overlay_enabled', '1')
-    localStorage.setItem('ia_overlay_mode', 'prompt')
+    localStorage.setItem('ia_overlay_mode', mode)
     localStorage.setItem('ia_overlay_appearance', JSON.stringify({
-      prompt: { fontSize: 48, fontFamily: 'mono', textAlign: 'right', autoFollow },
+      [mode]: { fontSize: 48, fontFamily: 'mono', textAlign: 'right', autoFollow, fontColor: '#e3d7ff', backgroundColor: '#111111' },
     }))
     window.overlayMeasurements = []
     window.promptScrollable = []
     window.electronAPI = {
       reportPromptScrollable: async (value) => { window.promptScrollable.push(value); return { ok: true } },
       onPromptWheel: (callback) => { window.promptWheel = callback; return () => { window.promptWheel = undefined } },
-      getOverlayState: async () => ({ enabled: true, visible: true, mode: 'prompt' }),
+      getOverlayState: async () => ({ enabled: true, visible: true, mode }),
       getOverlayLayout: async () => ({ promptViewport: { ...cap, sizeMode } }),
       resizeOverlayWindow: async (dimensions) => {
         window.overlayMeasurements.push(dimensions)
         return { ok: true, ...dimensions }
       },
     }
-  }, { sizeMode, cap, autoFollow })
+  }, { sizeMode, cap, autoFollow, mode })
   await page.goto('/?overlay=1')
   await expect.poll(() => Boolean(socket)).toBe(true)
   return (message) => socket.send(JSON.stringify(message))
+}
+
+for (const mode of ['glass', 'prompt', 'focus']) {
+  test(`${mode} Markdown inherits the configured answer color`, async ({ page }) => {
+    const send = await openPrompt(page, 'fixed', { width: 800, height: 600 }, { width: 800, height: 600 }, false, mode)
+    send({ type: 'answer_start', id: mode, question: '请回答' })
+    send({ type: 'answer_done', id: mode, question: '请回答', answer: '# 标题\n\n正文 **重点**' })
+    const markdown = page.locator('.ov-markdown')
+    await expect(markdown.locator('strong')).toHaveCSS('color', 'rgb(227, 215, 255)')
+    await expect(markdown.locator('h1')).toHaveCSS('color', 'rgb(227, 215, 255)')
+    if (mode === 'focus') await expect(page.locator('.ov-focus-section > h2')).toHaveCSS('color', 'rgb(227, 215, 255)')
+  })
 }
 
 test('detects delayed image overflow after standby content is replaced', async ({ page }) => {

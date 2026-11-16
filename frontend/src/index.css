@@ -1085,11 +1085,11 @@ code, pre, .font-mono {
   min-height: 100%;
 }
 
-.ov-focus-section h2 {
+.ov-focus-section > h2 {
   position: relative;
   margin: 0 0 8px;
   padding-left: 18px;
-  color: rgba(31, 41, 55, 0.86);
+  color: inherit;
   font-size: 1.05em;
   font-weight: 800;
 }
@@ -1225,7 +1225,7 @@ code, pre, .font-mono {
   color: rgba(226, 232, 240, 0.82);
 }
 
-.ov-focus-section h2::before {
+.ov-focus-section > h2::before {
   content: '';
   position: absolute;
   left: 0;
@@ -1306,6 +1306,10 @@ code, pre, .font-mono {
   color: inherit;
   font-weight: 800;
   line-height: 1.35;
+}
+
+.ov-markdown strong {
+  color: inherit;
 }
 
 .ov-markdown h1:first-child,
@@ -1436,12 +1440,6 @@ code, pre, .font-mono {
 
 .ov-root--prompt .ov-markdown code {
   font-size: 0.84em;
-}
-
-.ov-focus-content .ov-markdown h1,
-.ov-focus-content .ov-markdown h2,
-.ov-focus-content .ov-markdown h3 {
-  color: rgba(31, 41, 55, 0.84);
 }
 
 .ov-focus-content .ov-markdown pre {
