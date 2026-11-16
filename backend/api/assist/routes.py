@@ -1,7 +1,7 @@
 """Interview assist HTTP routes."""
 
 import asyncio
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
@@ -35,6 +35,7 @@ class ManualQuestion(BaseModel):
     text: str = Field(..., max_length=10000)
     image: Optional[str] = None
     override_think_mode: Optional[bool] = None
+    purpose: Literal["interview", "knowledge_practice"] = "interview"
 
 
 class MultiServerScreenQuestion(BaseModel):
@@ -189,6 +190,8 @@ async def api_ask(body: ManualQuestion):
     text = body.text.strip() or "粘贴的图片"
     src = "manual_image" if body.image else "manual_text"
     meta = {"origin": "manual"}
+    if body.purpose == "knowledge_practice":
+        meta["purpose"] = body.purpose
     if body.override_think_mode is not None:
         meta["override_think_mode"] = bool(body.override_think_mode)
     queued = submit_answer_task((text, body.image, True, src, meta))

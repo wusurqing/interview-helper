@@ -1078,6 +1078,28 @@ code, pre, .font-mono {
   min-width: 0;
 }
 
+.ov-plain-meta {
+  display: flex;
+  gap: 0.5em;
+  contain: inline-size;
+  height: 1.6em;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 0.8em;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.72;
+}
+
+.ov-root--prompt .ov-plain-answer {
+  min-width: min(168px, var(--ov-prompt-max-width, 804px));
+}
+
+.ov-plain-meta span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .ov-root--prompt .ov-answer-stack {
   display: inline-flex;
   width: max-content;

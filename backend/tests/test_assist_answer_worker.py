@@ -465,20 +465,22 @@ def test_process_question_parallel_marks_seq_skipped_when_aborted(
     )
 
     event_types = [event["type"] for event in broadcasts]
-    assert event_types == ["answer_start", "answer_cancelled"]
+    assert event_types == ["answer_start", "answer_chunk", "answer_cancelled"]
+    assert broadcasts[1]["chunk"] == "部分答案"
     assert skipped == [5]
     assert get_session().qa_pairs == []
 
 
-def test_process_question_parallel_sanitizes_streamed_answer_chunks(
+def test_plain_answer_streams_short_chunks_and_saves_exact_visible_text(
     monkeypatch: pytest.MonkeyPatch,
 ):
     broadcasts: list[dict] = []
 
     def fake_stream(*_args, **_kwargs):
-        yield ("text", "<thi")
-        yield ("text", "nk>草稿</think># 回答\n**用 AOF**")
-        yield ("text", " 和 RDB。")
+        yield ("text", "用 AOF\n<thi")
+        assert [event["chunk"] for event in broadcasts if event["type"] == "answer_chunk"] == ["用 AOF\n"]
+        yield ("text", "nk>草稿</thi")
+        yield ("text", "nk>    和 RDB。")
 
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
@@ -493,15 +495,14 @@ def test_process_question_parallel_sanitizes_streamed_answer_chunks(
     streamed = "".join(
         event["chunk"] for event in broadcasts if event["type"] == "answer_chunk"
     )
-    assert "<think>" not in streamed
-    assert "草稿" not in streamed
-    assert "#" not in streamed
-    assert "回答" not in streamed
-    assert "**" not in streamed
-    assert "用 AOF 和 RDB。" in streamed
-
+    assert streamed == "用 AOF\n    和 RDB。"
+    start = next(event for event in broadcasts if event["type"] == "answer_start")
     done = next(event for event in broadcasts if event["type"] == "answer_done")
-    assert done["answer"] == "用 AOF 和 RDB。"
+    assert start["answer_format"] == done["answer_format"] == "plain_text"
+    assert done["answer"] == streamed
+    saved = get_session().snapshot()["qa_pairs"][0]
+    assert saved["answer"] == streamed
+    assert saved["answer_format"] == "plain_text"
 
 
 def test_followup_prompt_uses_candidate_spoken_answer_as_auxiliary_context(monkeypatch: pytest.MonkeyPatch):
@@ -1508,7 +1509,7 @@ def test_process_question_parallel_flushes_batched_chunks_before_error(
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
 
     answer_worker.process_question_parallel(
-        ("Redis 怎么持久化？", None, True, "manual_text", {"origin": "manual"}),
+        ("给一道 Redis 持久化练习题", None, True, "manual_text", {"origin": "manual", "purpose": "knowledge_practice"}),
         seq=0,
         model_idx=0,
         sess_v=0,

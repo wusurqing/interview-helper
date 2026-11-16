@@ -155,6 +155,7 @@ export interface QAPair {
   modelLabel?: string
   firstTokenMs?: number
   totalMs?: number
+  answerFormat?: 'plain_text'
   visionVerify?: { verdict: 'PASS' | 'FAIL' | 'UNKNOWN'; reason: string }
   status?: QAStatus
   updatesQaId?: string

@@ -35,6 +35,23 @@ describe('AnswerPanel empty recording state', () => {
     resetStores(false)
   })
 
+  it.each(['cards', 'stream'] as const)('keeps the same plain answer element when %s complete', async (layout) => {
+    useUiPrefsStore.setState({ answerPanelLayout: layout })
+    const store = useInterviewStore.getState()
+    const answer = 'Redis 在内存里读写。\n\n指针类型 int **p 也应原样显示。'
+    store.startAnswer('plain', 'Redis 为什么快？', {
+      source: 'manual_text', modelName: 'Lite', answerFormat: 'plain_text',
+    })
+    store.appendAnswerChunk('plain', answer)
+    render(<AnswerPanel />)
+    const body = await screen.findByText(/指针类型 int \*\*p/)
+    act(() => store.finalizeAnswer('plain', 'Redis 为什么快？', answer, '', 'Lite', 90, 240))
+    expect(screen.getByText('总 240ms')).toBeInTheDocument()
+    expect(screen.getByText(/指针类型 int \*\*p/)).toBe(body)
+    expect(body.textContent).toBe(answer)
+    expect(document.querySelector('.markdown-body')).toBeNull()
+  })
+
   it('hides the sound preflight panel while interview recording is active', async () => {
     render(<AnswerPanel />)
 

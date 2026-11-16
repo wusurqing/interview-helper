@@ -15,6 +15,9 @@ class QAPair:
     vision_verify_verdict: str = ""
     vision_verify_reason: str = ""
     updates_qa_id: str | None = None
+    answer_format: str | None = None
+    first_token_ms: int | None = None
+    total_ms: int | None = None
 
 
 @dataclass
@@ -174,6 +177,10 @@ class Session:
         source: str = "",
         model_name: str = "",
         updates_qa_id: str | None = None,
+        *,
+        answer_format: str | None = None,
+        first_token_ms: int | None = None,
+        total_ms: int | None = None,
     ) -> QAPair:
         qa = QAPair(
             id=qa_id or f"qa-{len(self.qa_pairs)}-{int(time.time())}",
@@ -182,6 +189,9 @@ class Session:
             source=source,
             model_name=model_name,
             updates_qa_id=updates_qa_id,
+            answer_format=answer_format,
+            first_token_ms=first_token_ms,
+            total_ms=total_ms,
         )
         self.qa_pairs.append(qa)
         if len(self.qa_pairs) > self.MAX_QA_PAIRS:
@@ -372,6 +382,9 @@ class Session:
         reason = str(payload.pop("vision_verify_reason", "") or "")
         if not payload.get("updates_qa_id"):
             payload.pop("updates_qa_id", None)
+        for key in ("answer_format", "first_token_ms", "total_ms"):
+            if payload[key] is None:
+                payload.pop(key)
         payload["source"] = getattr(qa, "source", "") or ""
         payload["model_name"] = getattr(qa, "model_name", "") or ""
         if verdict:

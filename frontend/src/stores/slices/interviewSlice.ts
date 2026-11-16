@@ -11,6 +11,17 @@ const _chunkBuffer: Map<string, { answer: string; think: string }> = new Map()
 let _chunkFlushTimer: ReturnType<typeof setTimeout> | null = null
 let _candidateSegmentIds: Array<string | null> = []
 
+type AnswerMeta = { source?: string; modelName?: string; updatesQaId?: string; answerFormat?: QAPair['answerFormat'] }
+
+function appendBufferedText(qa: QAPair, buf: { answer: string; think: string }): QAPair {
+  return {
+    ...qa,
+    thinkContent: qa.thinkContent + buf.think,
+    answer: qa.answer + buf.answer,
+    isThinking: buf.answer ? false : buf.think ? true : qa.isThinking,
+  }
+}
+
 function takeTail<T>(items: T[], maxItems: number): T[] {
   return items.length > maxItems ? items.slice(-maxItems) : items
 }
@@ -39,12 +50,7 @@ function _scheduleChunkFlush(set: (fn: (s: RootState) => Partial<RootState>) => 
         qaPairs: s.qaPairs.map((qa) => {
           const buf = pending.get(qa.id)
           if (!buf || qa.status !== 'streaming' || !activeStreamingIds.has(qa.id)) return qa
-          return {
-            ...qa,
-            thinkContent: buf.think ? qa.thinkContent + buf.think : qa.thinkContent,
-            answer: buf.answer ? qa.answer + buf.answer : qa.answer,
-            isThinking: buf.answer ? false : buf.think ? true : qa.isThinking,
-          }
+          return appendBufferedText(qa, buf)
         }),
       }
     })
@@ -76,7 +82,7 @@ export interface InterviewSliceActions {
   startAnswer: (
     id: string,
     question: string,
-    meta?: { source?: string; modelName?: string; updatesQaId?: string },
+    meta?: AnswerMeta,
   ) => void
   appendThinkChunk: (id: string, chunk: string) => void
   appendAnswerChunk: (id: string, chunk: string) => void
@@ -89,6 +95,7 @@ export interface InterviewSliceActions {
     firstTokenMs?: number,
     totalMs?: number,
     updatesQaId?: string,
+    meta?: Pick<AnswerMeta, 'source' | 'answerFormat'>,
   ) => void
   cancelAnswer: (id: string, reason?: string) => void
   errorAnswer: (id: string, message: string) => void
@@ -99,7 +106,7 @@ export interface InterviewSliceActions {
 
 export type InterviewSlice = InterviewSliceState & InterviewSliceActions
 
-export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlice> = (set) => ({
+export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlice> = (set, get) => ({
   isRecording: false,
   interviewerStreaming: false,
   mmpgAnswerLabel: null,
@@ -170,6 +177,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
                   questionSource: meta?.source ?? qa.questionSource,
                   modelLabel: meta?.modelName ?? qa.modelLabel,
                   updatesQaId: meta?.updatesQaId ?? qa.updatesQaId,
+                  answerFormat: meta?.answerFormat ?? qa.answerFormat,
                 }
               : qa,
           ),
@@ -190,6 +198,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
             questionSource: meta?.source,
             modelLabel: meta?.modelName,
             updatesQaId: meta?.updatesQaId,
+            answerFormat: meta?.answerFormat,
             status: 'streaming' as QAStatus,
           },
         ],
@@ -206,35 +215,54 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
   appendAnswerChunk: (id, chunk) => {
     const buf = _chunkBuffer.get(id) ?? { answer: '', think: '' }
     buf.answer += chunk
+    const qa = get().qaPairs.find(item => item.id === id)
+    if (qa?.answerFormat === 'plain_text' && qa.status === 'streaming' && !qa.answer.trim()) {
+      _chunkBuffer.delete(id)
+      set((s) => ({ qaPairs: s.qaPairs.map(item => item.id === id ? appendBufferedText(item, buf) : item) }))
+      return
+    }
     _chunkBuffer.set(id, buf)
     _scheduleChunkFlush(set)
   },
 
-  finalizeAnswer: (id, question, answer, thinkContent, modelName, firstTokenMs, totalMs, updatesQaId) => {
+  finalizeAnswer: (id, question, answer, thinkContent, modelName, firstTokenMs, totalMs, updatesQaId, meta) => {
+    const buffered = _chunkBuffer.get(id)
     _chunkBuffer.delete(id)
     set((s) => {
       const next = s.streamingIds.filter((x) => x !== id)
-      const existing = s.qaPairs.some((qa) => qa.id === id)
-      if (s.qaPairs.some((qa) => qa.id === id && qa.status === 'cancelled' && qa.cancelReason === 'continuation')) {
+      const existing = s.qaPairs.find((qa) => qa.id === id)
+      const answerFormat = meta?.answerFormat ?? existing?.answerFormat
+      if (existing?.status === 'cancelled' && existing.cancelReason === 'continuation') {
         return s
       }
+      if (answerFormat === 'plain_text' && existing && existing.status !== 'streaming') return s
       const qaPairs = existing
-        ? s.qaPairs.map((qa) =>
-            qa.id === id
-              ? {
-                  ...qa,
-                  question,
-                  answer,
-                  thinkContent: thinkContent ?? qa.thinkContent,
-                  isThinking: false,
-                  modelLabel: modelName ?? qa.modelLabel,
-                  firstTokenMs: firstTokenMs ?? qa.firstTokenMs,
-                  totalMs: totalMs ?? qa.totalMs,
-                  updatesQaId: updatesQaId ?? qa.updatesQaId,
-                  status: 'done' as QAStatus,
-                }
-              : qa,
-          )
+        ? s.qaPairs.map((qa) => {
+            if (qa.id !== id) return qa
+            const terminal = {
+              isThinking: false,
+              firstTokenMs: firstTokenMs ?? qa.firstTokenMs,
+              totalMs: totalMs ?? qa.totalMs,
+              status: 'done' as const,
+            }
+            if (answerFormat === 'plain_text') {
+              const streamed = buffered ? appendBufferedText(qa, buffered) : qa
+              // The full answer is a recovery copy for a missed WebSocket fragment.
+              const recovered = typeof answer === 'string' && answer !== streamed.answer
+              return {
+                ...streamed,
+                ...terminal,
+                answerFormat,
+                ...(recovered ? { answer, thinkContent: thinkContent ?? streamed.thinkContent } : {}),
+              }
+            }
+            return {
+              ...qa, ...terminal, question, answer,
+              thinkContent: thinkContent ?? qa.thinkContent,
+              modelLabel: modelName ?? qa.modelLabel,
+              updatesQaId: updatesQaId ?? qa.updatesQaId,
+            }
+          })
         : [
             ...s.qaPairs,
             {
@@ -245,6 +273,8 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
               isThinking: false,
               timestamp: Date.now() / 1000,
               modelLabel: modelName,
+              questionSource: meta?.source,
+              answerFormat,
               firstTokenMs,
               totalMs,
               updatesQaId,
@@ -271,7 +301,8 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
           qa.id === id && qa.status !== 'done'
             ? {
                 ...qa,
-                answer: reason === 'continuation' ? qa.answer + (buffered?.answer ?? '') : qa.answer,
+                answer: reason === 'continuation' || qa.answerFormat === 'plain_text'
+                  ? qa.answer + (buffered?.answer ?? '') : qa.answer,
                 isThinking: false,
                 status: 'cancelled' as QAStatus,
                 cancelReason: reason,
@@ -283,6 +314,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
   },
 
   errorAnswer: (id, message) => {
+    const buffered = _chunkBuffer.get(id)
     _chunkBuffer.delete(id)
     set((s) => {
       const next = s.streamingIds.filter((x) => x !== id)
@@ -291,7 +323,10 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
         streamingIds: next,
         qaPairs: s.qaPairs.map((qa) =>
           qa.id === id
-            ? { ...qa, isThinking: false, status: 'error' as QAStatus, errorMessage: message }
+            ? {
+                ...(qa.answerFormat === 'plain_text' && buffered ? appendBufferedText(qa, buffered) : qa),
+                isThinking: false, status: 'error' as QAStatus, errorMessage: message,
+              }
             : qa,
         ),
       }
@@ -331,7 +366,8 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
       transcriptions: takeTail(data.transcriptions ?? [], MAX_TRANSCRIPTIONS),
       candidateTranscriptions: restoredCandidateTranscriptions,
       qaPairs: (data.qa_pairs ?? []).map(
-        (qa: Partial<QAPair> & { id: string; question: string; answer: string }) => {
+        (qa: Partial<QAPair> & { id: string; question: string; answer: string; answer_format?: unknown;
+          first_token_ms?: number; total_ms?: number }) => {
           const visionVerify = normalizeVisionVerify((qa as any).visionVerify ?? (qa as any).vision_verify)
           return {
             ...qa,
@@ -340,6 +376,9 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
             timestamp: qa.timestamp ?? Date.now() / 1000,
             questionSource: (qa as any).source ?? qa.questionSource,
             modelLabel: (qa as any).model_name ?? qa.modelLabel,
+            answerFormat: qa.answer_format === 'plain_text' ? 'plain_text' : qa.answerFormat,
+            firstTokenMs: qa.first_token_ms ?? qa.firstTokenMs,
+            totalMs: qa.total_ms ?? qa.totalMs,
             updatesQaId: (qa as any).updates_qa_id ?? qa.updatesQaId,
             status: qa.status ?? 'done' as QAStatus,
             ...(visionVerify ? { visionVerify } : {}),

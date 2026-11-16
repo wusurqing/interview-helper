@@ -256,7 +256,7 @@ export default function KnowledgeMap() {
       const text = scoredWeakTags.length > 0
         ? `请针对以下薄弱知识点出 3 道面试题：${reviewTags.join('、')}`
         : `请针对以下高频但尚未评分的知识点出 3 道面试题，并给出评分要点：${reviewTags.join('、')}`
-      await api.ask(text)
+      await api.ask(text, undefined, 'knowledge_practice')
     } catch (e) {
       useInterviewStore.getState().setToastMessage(getErrorMessage(e, '生成复习题失败'))
     }

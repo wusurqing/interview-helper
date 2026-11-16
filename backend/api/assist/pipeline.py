@@ -30,6 +30,7 @@ from services.stt.factory import LOCAL_STT_PROVIDERS
 from api.common import get_model_health
 from api.realtime.ws import broadcast
 from api.assist.answer_worker import (
+    AnswerCommit,
     AnswerWorkerDeps,
     process_question_parallel,
     prompt_mode_for_task as answer_prompt_mode_for_task,
@@ -506,9 +507,13 @@ def _reset_answer_state():
             _cancel_mmpg_request(request, reason="stopped")
     # commit 相关操作单独处理
     with _commit_lock:
-        _commit_buffer.clear()
-        _skipped_commit_seqs.clear()
-        _next_commit_seq = next_commit_seq
+        discarded = [_commit_buffer.pop(seq) for seq in list(_commit_buffer) if seq < next_commit_seq]
+        _skipped_commit_seqs.difference_update({seq for seq in _skipped_commit_seqs if seq < next_commit_seq})
+        _next_commit_seq = max(_next_commit_seq, next_commit_seq)
+        _drain_commit_queue_locked()
+    for commit in discarded:
+        if isinstance(commit, AnswerCommit):
+            commit.cancel()
 
 
 def cancel_answer_work(reset_session_data: bool = False):
@@ -605,9 +610,11 @@ def _mark_seq_skipped(seq: int):
     with _commit_lock:
         if seq < _next_commit_seq:
             return
-        _commit_buffer.pop(seq, None)
+        discarded = _commit_buffer.pop(seq, None)
         _skipped_commit_seqs.add(seq)
         _drain_commit_queue_locked()
+    if isinstance(discarded, AnswerCommit):
+        discarded.cancel()
 
 
 def _answer_work_idle() -> bool:
@@ -900,10 +907,12 @@ def _run_answer_worker(
 
 def _flush_commit(seq: int, apply_fn: Callable[[], None]):
     with _commit_lock:
-        if seq < _next_commit_seq or seq in _skipped_commit_seqs:
+        if seq >= _next_commit_seq and seq not in _skipped_commit_seqs:
+            _commit_buffer[seq] = apply_fn
+            _drain_commit_queue_locked()
             return
-        _commit_buffer[seq] = apply_fn
-        _drain_commit_queue_locked()
+    if isinstance(apply_fn, AnswerCommit):
+        apply_fn.cancel()
 
 
 # ---------------------------------------------------------------------------

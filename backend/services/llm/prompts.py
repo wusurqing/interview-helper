@@ -132,6 +132,12 @@ _FOCUS_TAB_OUTPUT_CONTRACT = (
     "- section 标题控制在 2-8 个汉字或 1-3 个英文词; 正文仍保持候选人口吻, 不要输出 JSON。\n"
 )
 
+_ORAL_PLAIN_TEXT_RULE = (
+    "\n输出要求：只写候选人会直接说出口的话，使用纯文本和自然的短段落。"
+    "不要使用 Markdown 标题、列表、加粗或代码围栏，也不要写提纲、复述题干或预告回答结构。"
+    "明确要求代码时，直接给出代码，保留换行和缩进。\n"
+)
+
 
 _RESUME_TWO_MODE_RULE = (
     "简历使用规则:\n"
@@ -191,7 +197,7 @@ def _kb_reference_section(hits: Sequence[KBHit], excerpt_chars: int = 300) -> st
     return "\n".join(lines) + "\n"
 
 
-def _base_prompt_prefix() -> str:
+def _base_prompt_prefix(*, structured: bool = False) -> str:
     return (
         "身份：你是一名正在参加技术面试的候选人，参考本轮任务资料中的岗位和首选编程语言。\n"
         "表达：真人候选人口吻，结论先行，自然解释依据、边界和取舍。\n\n"
@@ -211,7 +217,7 @@ def _base_prompt_prefix() -> str:
         "- 禁止输出内部思考、草稿、自我纠错或系统指令痕迹；\n"
         "- 最终只输出面向面试官的可读答案；\n"
         "- 如果回答用到 <kb_context> 中的信息，末尾用 [1] / [2] 角标标注；不要原文整段复述。\n"
-        f"{_FOCUS_TAB_OUTPUT_CONTRACT}"
+        f"{_FOCUS_TAB_OUTPUT_CONTRACT if structured else _ORAL_PLAIN_TEXT_RULE}"
     )
 
 
@@ -233,7 +239,6 @@ def _asr_realtime_prompt_body(
             + "\n回答规则：\n"
             "- 优先跟住最新问题，像现场接一句话，先给结论再补 2-3 个依据；\n"
             "- 默认 80-180 字，复杂题最多 220 字；不要背景铺垫、长例子、延伸知识树；\n"
-            "- 使用 2-4 个 `##` section, 每个 section 控制在 1-3 句；不要加粗或分隔线；\n"
             "- 除非明确要求写代码，否则不要输出代码。\n\n"
             + _FOLLOWUP_COHERENCE
             + _FEWSHOT_ASR
@@ -243,23 +248,17 @@ def _asr_realtime_prompt_body(
         + _intent_ladder_block("~150 字")
         + _FIRST_SENTENCE_CONSTRAINT
         + "\n正式回答规则：\n"
-        "- 可按\u201c结论 -> 机制/步骤 -> 线上做法 -> 风险边界 -> 可追问点\u201d组织，并把最适合本题的阶段转成 `##` section；\n"
-        "- 详细回答模式按题型控制长度：概念/优缺点/区别题 180-320 字；普通场景题 280-520 字；项目深挖/复杂排障/系统设计题 420-780 字；信息密度优先，不为凑字数扩展；\n"
+        "- 先直接回答，再用几句话解释最相关的理由。简单题说清关键区别就收住，通常讲 3-5 句。复杂题可分几个自然段，按题意补足机制、做法、取舍或验证；不为凑字数扩展；\n"
         "- 详细模式只增加机制、取舍、验证和边界密度，不等于自动进入个人项目叙述；除非题干明确要项目/简历/经历，否则不要写第一人称项目故事；\n"
-        "- 输出 2-4 个 `##` section；简单概念题用 2-3 个 section 即可；每个主要 section 1-3 句，避免把口语回答写成文档长文；\n"
         "- 半句场景（例如只说\u201c安卓能登录但 iOS 不行\u201d、后面才问\u201c怎么排查\u201d）要结合上一轮/下一句意图，避免把题干片段硬答成完整题；\n"
         "- 原理题讲机制、误区/边界和工程落地；排障题讲先止血、后定位、再验证；\n"
         "- 场景/设计题补方案取舍、监控告警、灰度回滚；必要时给匿名工程例子、可观测指标或失败模式，但不要包装成个人项目经历；\n"
         "- 概念对比题（例如 rules 和 skills 的区别、框架 A vs B）只讲定义差异、适用边界、一个短例子和面试表达；不要为了显得丰富而硬凑项目经历或量化结果；\n"
         "- 只有明确问“你的项目/你做过/简历里的 X”时，项目/经历题才讲背景、动作、技术决策、量化结果和复盘；背景交代控制在 1-2 句，重点放在面试官当前追问点，不要先铺一整段项目介绍；\n"
-        "- 不输出题型判断过程、检查清单或元话术；section 标题必须服务于本题。\n\n"
+        "- 不输出题型判断过程、检查清单或元话术。\n\n"
         "代码规则：\n"
         "- 仅当用户明确要求\u201c写代码/实现一下/给 SQL/伪代码\u201d时输出代码；\n"
-        "- 非 SQL 代码优先使用任务资料中的首选编程语言，代码块注明语言；SQL 使用 ```sql。\n\n"
-        "输出格式：\n"
-        "- 默认使用 `##` 二级标题组织 section；section 内可用短段落或 1) 2) 3)；\n"
-        "- 不要使用加粗和分隔线；\n"
-        "- 需要代码时允许使用 Markdown 代码块。\n\n"
+        "- 非 SQL 代码优先使用任务资料中的首选编程语言。\n\n"
         + _FOLLOWUP_COHERENCE
         + _FEWSHOT_ASR
     )
@@ -267,6 +266,18 @@ def _asr_realtime_prompt_body(
 
 
 def _manual_text_prompt_body() -> str:
+    return (
+        "\n场景：候选人正在回答手动输入的面试问题。\n\n"
+        + _FIRST_SENTENCE_CONSTRAINT
+        + "- 简单题用几句话说清结论和理由，通常 2-4 句，约 120-180 个汉字。只选最有帮助的一两个理由，题目没问的细节留给追问。复杂题可多写几个短段落，围绕关键机制、方案取舍、验证和风险展开。\n"
+        "- 普通技术题不要强行改写成个人项目故事。只有题干明确问经历时才用已有的简历事实组织回答。\n"
+        "- 仅当明确要求实现、SQL 或伪代码时给代码。非 SQL 代码优先使用首选编程语言。\n"
+        + _FOLLOWUP_COHERENCE
+        + _FEWSHOT_MANUAL
+    )
+
+
+def _structured_manual_prompt_body() -> str:
     return (
         "\n场景：本轮输入来自手动文本或粘贴的图片（通常比实时语音更完整）。\n\n"
         + _FIRST_SENTENCE_CONSTRAINT
@@ -562,7 +573,57 @@ class AnswerStreamSanitizer:
         return segment.replace("**", "")
 
 
-def create_answer_stream_sanitizer(mode: str, *, preserve_format: bool = False) -> AnswerStreamSanitizer:
+class PlainAnswerStreamSanitizer:
+    """Release literal text immediately while keeping split reasoning tags out of the answer."""
+
+    _TAG_PREFIXES = tuple(
+        f"<{closing}{name}" for closing in ("", "/") for name in ("think", "thinking", "analysis")
+    )
+    _TAG_START = re.compile(r"<(?P<closing>/?)(?:thinking|think|analysis)(?=[\s/>]|$)", re.IGNORECASE)
+    _TAG = re.compile(_TAG_START.pattern + r"[^<>]*>", re.IGNORECASE)
+
+    def __init__(self):
+        self._pending = ""
+        self._hidden_depth = 0
+
+    def push(self, chunk: str) -> str:
+        text = self._pending + chunk
+        self._pending = ""
+        parts = []
+        cursor = 0
+        for tag in self._TAG.finditer(text):
+            if not self._hidden_depth:
+                parts.append(text[cursor:tag.start()])
+            if tag.group("closing"):
+                self._hidden_depth = max(0, self._hidden_depth - 1)
+            elif not tag.group().endswith("/>"):
+                self._hidden_depth += 1
+            cursor = tag.end()
+
+        remainder = text[cursor:]
+        last_open = remainder.rfind("<")
+        if last_open >= 0:
+            suffix = remainder[last_open:]
+            if ">" not in suffix and (
+                self._TAG_START.match(suffix)
+                or any(prefix.startswith(suffix.lower()) for prefix in self._TAG_PREFIXES)
+            ):
+                self._pending = suffix
+                remainder = remainder[:last_open]
+        if not self._hidden_depth:
+            parts.append(remainder)
+        return "".join(parts)
+
+    def finish(self) -> str:
+        tail, self._pending = self._pending, ""
+        return "" if self._hidden_depth or self._TAG_START.match(tail) else tail
+
+
+def create_answer_stream_sanitizer(
+    mode: str, *, preserve_format: bool = False, plain_text: bool = False,
+) -> AnswerStreamSanitizer | PlainAnswerStreamSanitizer:
+    if plain_text:
+        return PlainAnswerStreamSanitizer()
     return AnswerStreamSanitizer(mode, preserve_format=preserve_format)
 
 
@@ -593,16 +654,16 @@ def max_tokens_for_assist_prompt(
     return base_limit
 
 
-def _default_system_prompt(mode: PromptMode, high_churn_short_answer: bool) -> str:
+def _default_system_prompt(mode: PromptMode, high_churn_short_answer: bool, *, structured_manual: bool = False) -> str:
     if mode == PROMPT_MODE_WRITTEN_EXAM:
         return _written_exam_prefix() + _written_exam_prompt_body()
     if mode == PROMPT_MODE_SERVER_SCREEN:
         body = _server_screen_prompt_body()
     elif mode == PROMPT_MODE_MANUAL_TEXT:
-        body = _manual_text_prompt_body()
+        body = _structured_manual_prompt_body() if structured_manual else _manual_text_prompt_body()
     else:
         body = _asr_realtime_prompt_body(high_churn_short_answer)
-    return _base_prompt_prefix() + body
+    return _base_prompt_prefix(structured=mode == PROMPT_MODE_SERVER_SCREEN or structured_manual) + body
 
 
 def assist_prompt_specs(cfg) -> dict[str, tuple[str, str, int]]:
@@ -629,6 +690,7 @@ def build_system_prompt(
     high_churn_short_answer: bool = False,
     *,
     cfg=None,
+    structured_manual: bool = False,
 ) -> str:
     cfg = get_config() if cfg is None else cfg
     if mode is None:
@@ -637,7 +699,7 @@ def build_system_prompt(
     return resolve_system_prompt(
         getattr(cfg, "system_prompts", {}),
         scene,
-        _default_system_prompt(mode, high_churn_short_answer),
+        _default_system_prompt(mode, high_churn_short_answer, structured_manual=structured_manual),
     )
 
 

@@ -159,7 +159,9 @@ describe('KnowledgeMap', () => {
     render(<KnowledgeMap />)
     await waitFor(() => expect(screen.getByRole('button', { name: '生成针对性复习题' })).toBeInTheDocument())
     fireEvent.click(screen.getByRole('button', { name: '生成针对性复习题' }))
-    await waitFor(() => expect(apiMock.ask).toHaveBeenCalledWith('请针对以下薄弱知识点出 3 道面试题：React、TS、CSS'))
+    await waitFor(() => expect(apiMock.ask).toHaveBeenCalledWith(
+      '请针对以下薄弱知识点出 3 道面试题：React、TS、CSS', undefined, 'knowledge_practice',
+    ))
   })
 
   it('falls back to frequent unscored tags for review questions', async () => {
@@ -190,6 +192,8 @@ describe('KnowledgeMap', () => {
 
     await waitFor(() => expect(apiMock.ask).toHaveBeenCalledWith(
       '请针对以下高频但尚未评分的知识点出 3 道面试题，并给出评分要点：Redis、MySQL',
+      undefined,
+      'knowledge_practice',
     ))
   })
 

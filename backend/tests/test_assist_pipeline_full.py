@@ -263,6 +263,41 @@ def test_parallel_answers_commit_in_submit_order_when_workers_finish_out_of_orde
     assert pipeline._commit_buffer == {}
 
 
+def test_cancelling_a_plain_answer_waiting_for_an_earlier_commit_emits_terminal_event(monkeypatch):
+    broadcasts: list[dict] = []
+    monkeypatch.setattr(pipeline, "broadcast", broadcasts.append)
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", lambda *_args, **_kwargs: iter([("text", "已显示。")]))
+    for question in ("第一个问题", "第二个问题"):
+        assert pipeline.submit_answer_task((question, None, True, "manual_text", {"origin": "manual"}))
+
+    _DeferredThread.started[1].run()
+    qa_id = broadcasts[0]["id"]
+    assert [event["type"] for event in broadcasts] == ["answer_start", "answer_chunk"]
+    pipeline.cancel_answer_work()
+    _DeferredThread.started[0].run()
+
+    assert broadcasts[-1] == {"type": "answer_cancelled", "id": qa_id}
+    assert get_session().qa_pairs == []
+
+
+def test_cancelling_between_plain_stream_and_commit_discards_it_and_emits_terminal_event(monkeypatch):
+    broadcasts: list[dict] = []
+    monkeypatch.setattr(pipeline, "broadcast", broadcasts.append)
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", lambda *_args, **_kwargs: iter([("text", "已显示。")]))
+    flush_commit = pipeline._flush_commit
+
+    def cancel_then_commit(seq, apply_fn):
+        pipeline.cancel_answer_work()
+        flush_commit(seq, apply_fn)
+
+    monkeypatch.setattr(pipeline, "_flush_commit", cancel_then_commit)
+    assert pipeline.submit_answer_task(("已取消", None, True, "manual_text", {"origin": "manual"}))
+    _DeferredThread.started[0].run()
+
+    assert [event["type"] for event in broadcasts] == ["answer_start", "answer_chunk", "answer_cancelled"]
+    assert get_session().qa_pairs == []
+
+
 def test_cancel_after_dispatch_before_worker_start_suppresses_stale_answer(
     monkeypatch: pytest.MonkeyPatch,
 ):

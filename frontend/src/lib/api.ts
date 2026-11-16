@@ -272,8 +272,8 @@ export const api = {
     }),
   }),
   clear: () => request('/api/clear', { method: 'POST' }),
-  ask: (text: string, image?: string) =>
-    request('/api/ask', { method: 'POST', body: JSON.stringify({ text, image }) }),
+  ask: (text: string, image?: string, purpose?: 'knowledge_practice') =>
+    request('/api/ask', { method: 'POST', body: JSON.stringify({ text, image, purpose }) }),
   cancelAsk: () => request('/api/ask/cancel', { method: 'POST' }),
   preflightScenarios: () => request<{ scenarios: { id: string; label: string; question: string; recommended: boolean }[] }>('/api/preflight/scenarios'),
   preflightRun: (scenario_id: string, device_id?: number | null) =>

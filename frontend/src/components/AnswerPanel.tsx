@@ -4,6 +4,7 @@ import { useInterviewStore, QAPair } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import KbReferenceBanner from '@/components/kb/KbReferenceBanner'
 import type { ColorSchemeId } from '@/lib/colorScheme'
+import PlainAnswerContent, { plainAnswerStatus } from './PlainAnswerContent'
 
 const SoundTest = lazy(() => import('./SoundTest'))
 const WrittenExamTest = lazy(() => import('./WrittenExamTest'))
@@ -119,8 +120,17 @@ function renderAnswerBody(
   return (
     <>
       {qa.updatesQaId && <p className="mb-1 text-xs text-text-secondary">补充后的回答</p>}
-      {qa.thinkContent && <ThinkBlock content={qa.thinkContent} isThinking={qa.isThinking} streamLayout={stream} />}
-      {qaStatus === 'cancelled' ? (
+      {qa.answerFormat !== 'plain_text' && qa.thinkContent && (
+        <ThinkBlock content={qa.thinkContent} isThinking={qa.isThinking} streamLayout={stream} />
+      )}
+      {qa.answerFormat === 'plain_text' ? (
+        <div className="text-sm text-text-primary leading-relaxed">
+          <PlainAnswerContent text={qa.answer} />
+          {qa.thinkContent && (
+            <ThinkBlock content={qa.thinkContent} isThinking={qa.isThinking} streamLayout={stream} />
+          )}
+        </div>
+      ) : qaStatus === 'cancelled' ? (
         <div className="space-y-2">
           {qa.cancelReason === 'continuation' && qa.answer && (
             <div className="whitespace-pre-wrap break-words text-sm text-text-secondary">{qa.answer}</div>
@@ -174,6 +184,28 @@ function renderAnswerBody(
   )
 }
 
+function AnswerMetaLine({ qa, isStreaming }: { qa: QAPair; isStreaming: boolean }) {
+  const plain = qa.answerFormat === 'plain_text'
+  const status = plain ? plainAnswerStatus(qa, isStreaming) : ''
+
+  return (
+    <div className={`flex items-center gap-1.5 mb-1 ${plain ? 'h-6 min-w-0 overflow-hidden whitespace-nowrap' : ''}`}>
+      {qa.modelLabel && (
+        <span className="truncate text-[10px] px-1.5 py-0.5 rounded-full bg-bg-tertiary text-text-muted border border-bg-hover/60 font-medium">
+          {qa.modelLabel}
+        </span>
+      )}
+      {plain && <span title={status} className="truncate text-[10px] text-text-muted">{status}</span>}
+      {qa.firstTokenMs != null && (
+        <span className="shrink-0 text-[10px] font-mono text-text-muted tabular-nums">首字 {qa.firstTokenMs}ms</span>
+      )}
+      {qa.totalMs != null && (
+        <span className="shrink-0 text-[10px] font-mono text-text-muted tabular-nums">总 {qa.totalMs}ms</span>
+      )}
+    </div>
+  )
+}
+
 type QACardProps = {
   qa: QAPair
   isStreaming: boolean
@@ -202,7 +234,7 @@ const QACard = memo(function QACard({ qa, isStreaming, stream, colorScheme, anim
                   {srcLabel}
                 </span>
               )}
-              {isStreaming && (
+              {isStreaming && qa.answerFormat !== 'plain_text' && (
                 <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-accent-green/15 text-accent-green border border-accent-green/20 font-medium animate-pulse">
                   {'\u8F93\u51FA\u4E2D'}
                 </span>
@@ -214,23 +246,7 @@ const QACard = memo(function QACard({ qa, isStreaming, stream, colorScheme, anim
         <div className="flex items-start gap-2 sm:gap-3 pl-1 sm:pl-2">
           <span className="w-7 sm:w-8 flex-shrink-0 text-center text-accent-green text-xs font-bold pt-1">A</span>
           <div className="flex-1 min-w-0 pb-4 border-l-2 border-accent-green/25 pl-3 sm:pl-4 -ml-1">
-            <div className="flex items-center gap-1.5 mb-1">
-              {qa.modelLabel && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-bg-tertiary text-text-muted border border-bg-hover/60 font-medium">
-                  {qa.modelLabel}
-                </span>
-              )}
-              {qa.firstTokenMs != null && (
-                <span className="text-[10px] font-mono text-text-muted tabular-nums">
-                  首字 {qa.firstTokenMs}ms
-                </span>
-              )}
-              {qa.totalMs != null && (
-                <span className="text-[10px] font-mono text-text-muted tabular-nums">
-                  总 {qa.totalMs}ms
-                </span>
-              )}
-            </div>
+            <AnswerMetaLine qa={qa} isStreaming={isStreaming} />
             <KbReferenceBanner qaId={qa.id} />
             {renderAnswerBody(qa, isStreaming, stream, colorScheme)}
           </div>
@@ -262,23 +278,7 @@ const QACard = memo(function QACard({ qa, isStreaming, stream, colorScheme, anim
           <span className="text-accent-green text-xs font-bold">A</span>
         </div>
         <div className="flex-1 min-w-0 max-h-[280px] overflow-y-auto rounded-xl bg-bg-tertiary/15 p-3">
-          <div className="flex items-center gap-1.5 mb-1">
-            {qa.modelLabel && (
-              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-bg-tertiary text-text-muted border border-bg-hover/60 font-medium">
-                {qa.modelLabel}
-              </span>
-            )}
-            {qa.firstTokenMs != null && (
-              <span className="text-[10px] font-mono text-text-muted tabular-nums">
-                首字 {qa.firstTokenMs}ms
-              </span>
-            )}
-            {qa.totalMs != null && (
-              <span className="text-[10px] font-mono text-text-muted tabular-nums">
-                总 {qa.totalMs}ms
-              </span>
-            )}
-          </div>
+          <AnswerMetaLine qa={qa} isStreaming={isStreaming} />
           <KbReferenceBanner qaId={qa.id} />
           {renderAnswerBody(qa, isStreaming, stream, colorScheme)}
         </div>
@@ -303,6 +303,7 @@ export default function AnswerPanel() {
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const autoFollowRef = useRef(true)
+  const previousQaPairs = useRef<QAPair[]>([])
 
   const scrollThreshold = Math.max(4, Math.min(400, config?.answer_autoscroll_bottom_px ?? 40))
   const [nearBottom, setNearBottom] = useState(true)
@@ -330,17 +331,20 @@ export default function AnswerPanel() {
   }, [updateNearBottom])
 
   useEffect(() => {
-    const el = scrollContainerRef.current
-    if (!el || !bottomRef.current) return
-    if (autoFollowRef.current) {
-      // Streaming/layout updates should never temporarily mark the user as
-      // scrolled away from the latest answer. `auto` also avoids intermediate
-      // scroll events from smooth scrolling toggling the follow state.
-      requestAnimationFrame(() => scrollToLatest('auto'))
-    } else {
-      setNearBottom(false)
+    const before = new Map(previousQaPairs.current.map(qa => [qa.id, qa]))
+    previousQaPairs.current = qaPairs
+    const grew = qaPairs.some(qa => {
+      const previous = before.get(qa.id)
+      return !previous || (qa.answerFormat === 'plain_text'
+        ? qa.answer.length > previous.answer.length
+        : qa !== previous)
+    })
+    if (grew && autoFollowRef.current && bottomRef.current) {
+      requestAnimationFrame(() => {
+        if (autoFollowRef.current && bottomRef.current) scrollToLatest('auto')
+      })
     }
-  }, [qaPairs, streamingIds, scrollToLatest])
+  }, [qaPairs, scrollToLatest])
 
   useEffect(() => {
     const el = scrollContainerRef.current
@@ -350,7 +354,9 @@ export default function AnswerPanel() {
     el.addEventListener('scroll', onScroll, { passive: true })
     const ro = new ResizeObserver(() => {
       if (autoFollowRef.current) {
-        requestAnimationFrame(() => scrollToLatest('auto'))
+        requestAnimationFrame(() => {
+          if (autoFollowRef.current && bottomRef.current) scrollToLatest('auto')
+        })
       } else {
         updateNearBottom(false)
       }
@@ -449,19 +455,19 @@ export default function AnswerPanel() {
 
   return (
     <div className="relative h-full min-h-0 flex flex-col">
-      <div
-        ref={scrollContainerRef}
-        className={`flex-1 min-h-0 overflow-y-auto px-3 py-3 md:px-4 md:py-4 ${stream ? 'space-y-10' : 'space-y-5'}`}
-      >
       {multiStream && (
-        <div className="sticky top-0 z-10 flex items-center gap-2 px-3 py-2 rounded-lg bg-accent-amber/10 border border-accent-amber/25 text-accent-amber text-xs font-medium backdrop-blur-sm">
+        <div className="pointer-events-none absolute top-1 right-4 z-10 flex items-center gap-2 px-2 py-1 rounded-lg bg-bg-secondary/90 text-accent-amber text-xs font-medium">
           <Layers className="w-4 h-4 flex-shrink-0" />
           <span>
-            {streamingIds.length} 路模型同时生成中，答案自上而下依次出现，请向下滚动查看各路输出
+            {streamingIds.length} 路回答生成中
           </span>
         </div>
       )}
 
+      <div
+        ref={scrollContainerRef}
+        className={`flex-1 min-h-0 overflow-y-auto px-3 py-3 md:px-4 md:py-4 ${stream ? 'space-y-10' : 'space-y-5'}`}
+      >
       {qaPairs.map((qa, idx) => {
         const isStreaming = streamingIds.includes(qa.id)
         const isLatest = idx === qaPairs.length - 1

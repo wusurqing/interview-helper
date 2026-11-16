@@ -18,10 +18,9 @@ from services.llm import (
     PROMPT_MODE_ASR_REALTIME,
     build_system_prompt,
     chat_stream_single_model,
-    postprocess_answer_for_mode,
+    create_answer_stream_sanitizer,
 )
 from services.llm.prompts import (
-    assist_prompt_scene,
     build_assist_user_context,
     max_tokens_for_assist_prompt,
 )
@@ -478,8 +477,6 @@ def resolve_preflight_scenario(scenario_id: str) -> dict:
 def generate_preflight_answer(cfg, model_cfg, question: str) -> dict:
     prompt_mode = PROMPT_MODE_ASR_REALTIME
     short_answer = bool(getattr(cfg, "assist_high_churn_short_answer", False))
-    scene = assist_prompt_scene(prompt_mode, high_churn_short_answer=short_answer)
-    customized_prompt = scene in getattr(cfg, "system_prompts", {})
     system_prompt = build_system_prompt(
         mode=prompt_mode,
         high_churn_short_answer=short_answer,
@@ -487,7 +484,8 @@ def generate_preflight_answer(cfg, model_cfg, question: str) -> dict:
     )
     user_context = build_assist_user_context(cfg, mode=prompt_mode)
     user_text = f"[本轮任务资料]\n{user_context}\n\n[当前输入]\n{question}" if user_context else question
-    raw_answer = ""
+    sanitizer = create_answer_stream_sanitizer(prompt_mode, plain_text=True)
+    answer_parts: list[str] = []
     started = time.monotonic()
     first_token_mono: Optional[float] = None
     for chunk_type, chunk_text in chat_stream_single_model(
@@ -499,13 +497,14 @@ def generate_preflight_answer(cfg, model_cfg, question: str) -> dict:
     ):
         if chunk_type != "text":
             continue
-        if first_token_mono is None and chunk_text:
+        visible = sanitizer.push(chunk_text)
+        if first_token_mono is None and visible.strip():
             first_token_mono = time.monotonic()
-        raw_answer += chunk_text
+        answer_parts.append(visible)
     total_ms = int((time.monotonic() - started) * 1000)
     first_token_ms = int((first_token_mono - started) * 1000) if first_token_mono is not None else total_ms
     return {
-        "answer": postprocess_answer_for_mode(raw_answer, prompt_mode, preserve_format=customized_prompt),
+        "answer": "".join(answer_parts) + sanitizer.finish(),
         "first_token_ms": first_token_ms,
         "total_ms": total_ms,
     }

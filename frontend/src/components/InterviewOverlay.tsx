@@ -10,9 +10,10 @@ import {
   warnInterviewOverlaySyncIssue,
 } from '@/lib/interviewOverlay'
 import { getShortcutDisplay } from '@/lib/shortcuts'
-import { useInterviewStore } from '@/stores/configStore'
+import { useInterviewStore, type QAPair } from '@/stores/configStore'
 import { useShortcutsStore } from '@/stores/shortcutsStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
+import PlainAnswerContent, { plainAnswerStatus } from './PlainAnswerContent'
 
 type FocusTabPane = {
   key: string
@@ -114,9 +115,11 @@ export default function InterviewOverlay() {
   )
   const displayedQaIndex = displayedQa ? qaPairs.findIndex((item) => item.id === displayedQa.id) : -1
   const isReviewingHistory = Boolean(reviewQaId && displayedQa)
+  const plain = displayedQa?.answerFormat === 'plain_text'
 
   const answerText =
-    displayedQa?.status === 'cancelled'
+    plain ? displayedQa.answer
+    : displayedQa?.status === 'cancelled'
       ? (displayedQa.cancelReason === 'continuation'
           ? [displayedQa.answer, '已因续说停止'].filter(Boolean).join('\n\n')
           : '上一条回答已取消')
@@ -137,8 +140,10 @@ export default function InterviewOverlay() {
     [displayedQa?.id, qaPairs, streamingIds],
   )
   const focusTabs = useMemo(
-    () => buildFocusTabs(answerText, displayedQa?.question ?? '', isStreaming),
-    [answerText, displayedQa?.question, isStreaming],
+    () => plain
+      ? [{ key: 'answer', label: '回答', content: answerText, isGenerating: false }]
+      : buildFocusTabs(answerText, displayedQa?.question ?? '', isStreaming),
+    [answerText, displayedQa?.question, isStreaming, plain],
   )
   const displayedQaKey = displayedQa?.id ?? '__empty__'
   const retainedFocusQaIds = useMemo(
@@ -148,10 +153,12 @@ export default function InterviewOverlay() {
   const activeFocusTab = activeFocusTabsByQaId[displayedQaKey] ?? focusTabs[0]?.key ?? 'answer'
   const activeSection = focusTabs.find((tab) => tab.key === activeFocusTab) ?? focusTabs[0]
 
-  const overlayAnswerSlice = useMemo(() => sliceMaxLines(answerText, maxLines), [answerText, maxLines])
+  const overlayAnswerSlice = useMemo(() => sliceMaxLines(answerText, maxLines, !plain), [answerText, maxLines, plain])
 
   const answerScrollRef = useRef<HTMLDivElement | null>(null)
   const answerAutoFollowRef = useRef(true)
+  const previousAnswer = useRef({ id: '', text: '' })
+  const previousNewestQaId = useRef<string | null>(null)
   const updateAnswerAutoFollow = useCallback(() => {
     if (overlayMode === 'prompt' && !overlayPromptAutoFollow) {
       answerAutoFollowRef.current = false
@@ -167,13 +174,15 @@ export default function InterviewOverlay() {
   }, [displayedQaKey, overlayMode, activeFocusTab, overlayPromptAutoFollow])
 
   useLayoutEffect(() => {
-    if (!isStreaming) return
+    const before = previousAnswer.current
+    previousAnswer.current = { id: displayedQaKey, text: answerText }
+    if (plain ? before.id === displayedQaKey && before.text === answerText : !isStreaming) return
     if (overlayMode === 'prompt' && !overlayPromptAutoFollow) return
     const el = answerScrollRef.current
     if (!el) return
     if (!answerAutoFollowRef.current) return
     el.scrollTop = el.scrollHeight
-  }, [answerText, activeFocusTab, isStreaming, overlayMode, overlayPromptAutoFollow])
+  }, [answerText, activeFocusTab, displayedQaKey, isStreaming, overlayMode, overlayPromptAutoFollow, plain])
 
   useLayoutEffect(() => {
     if (!enabled || !overlayVisible || overlayMode !== 'prompt') return
@@ -271,6 +280,7 @@ export default function InterviewOverlay() {
     try {
       if (action === 'screen') {
         await api.askFromServerScreen()
+        setLiveFocusQaId(null)
         setReviewQaId(null)
         setToastMessage('已提交截图审题')
       } else if (action === 'cancel') {
@@ -298,14 +308,14 @@ export default function InterviewOverlay() {
   }, [qaPairs, reviewQaId])
 
   useEffect(() => {
+    const newest = qaPairs[qaPairs.length - 1]?.id ?? null
+    const before = previousNewestQaId.current
+    previousNewestQaId.current = newest
     if (reviewQaId) return
     setLiveFocusQaId((current) => {
-      const currentStillLive = Boolean(
-        current
-        && streamingIds.includes(current)
-        && qaPairs.some((item) => item.id === current),
-      )
-      if (currentStillLive) return current
+      const currentQa = qaPairs.find(item => item.id === current)
+      if (currentQa && streamingIds.includes(currentQa.id)) return current
+      if (currentQa?.answerFormat === 'plain_text') return newest !== before ? newest : current
       return latestQa?.id ?? null
     })
   }, [latestQa?.id, qaPairs, reviewQaId, streamingIds])
@@ -422,8 +432,10 @@ export default function InterviewOverlay() {
         </div>
       )}
       {activeVisionVerify && <OverlayVisionVerify verify={activeVisionVerify} />}
-      <OverlayMarkdown content={overlayAnswerSlice.text} />
-      {isStreaming && <span className="ov-caret" />}
+      {plain
+        ? <OverlayPlainAnswer qa={displayedQa} text={overlayAnswerSlice.text} isStreaming={isStreaming} />
+        : <OverlayMarkdown content={overlayAnswerSlice.text} />}
+      {!plain && isStreaming && <span className="ov-caret" />}
     </div>
   ) : (
     <span className="ov-standby-hint" style={{ fontSize: `${answerFontSize}px` }}>
@@ -470,18 +482,20 @@ export default function InterviewOverlay() {
                 {tab.label}
               </button>
             ))}
-            <span className="ov-focus-tab-keys" aria-hidden>
-              <span>切换分区</span>
-              <kbd>{getShortcutDisplay(shortcuts.focusPrevTab?.key ?? 'CommandOrControl+Left')}</kbd>
-              <kbd>{getShortcutDisplay(shortcuts.focusNextTab?.key ?? 'CommandOrControl+Right')}</kbd>
-            </span>
+            {!plain && (
+              <span className="ov-focus-tab-keys" aria-hidden>
+                <span>切换分区</span>
+                <kbd>{getShortcutDisplay(shortcuts.focusPrevTab?.key ?? 'CommandOrControl+Left')}</kbd>
+                <kbd>{getShortcutDisplay(shortcuts.focusNextTab?.key ?? 'CommandOrControl+Right')}</kbd>
+              </span>
+            )}
           </div>
           {displayedQa && (
             <div className="ov-focus-question-strip" aria-label="题目导航">
               <span>{isReviewingHistory ? '回看' : '当前'} {displayedQaIndex + 1}/{qaPairs.length || 1}</span>
               <strong>{displayedQa.updatesQaId ? '补充后的回答 · ' : ''}{displayedQa.question}</strong>
-              {liveGeneratingQa && (
-                <span className="ov-focus-live-hint" title={liveGeneratingQa.question}>
+              {(liveGeneratingQa || plain) && (
+                <span className={`ov-focus-live-hint ${liveGeneratingQa ? '' : 'invisible'}`} title={liveGeneratingQa?.question}>
                   新答案生成中
                 </span>
               )}
@@ -502,13 +516,17 @@ export default function InterviewOverlay() {
             {hasContent ? (
               <div className="ov-focus-active-pane" key={`${displayedQaKey}:${activeSection.key}`}>
                 {activeVisionVerify && <OverlayVisionVerify verify={activeVisionVerify} />}
-                <FocusSection
-                  title={activeSection.label}
-                  section={sliceMaxLines(activeSection.content, maxLines)}
-                  muted={!activeSection.content.trim()}
-                  emptyHint={activeSection.isGenerating ? '正在生成这个分区…' : '当前回答还没有拆出这个分区。'}
-                />
-                {isStreaming && <span className="ov-caret" />}
+                {plain ? (
+                  <OverlayPlainAnswer qa={displayedQa} text={overlayAnswerSlice.text} isStreaming={isStreaming} />
+                ) : (
+                  <FocusSection
+                    title={activeSection.label}
+                    section={sliceMaxLines(activeSection.content, maxLines)}
+                    muted={!activeSection.content.trim()}
+                    emptyHint={activeSection.isGenerating ? '正在生成这个分区…' : '当前回答还没有拆出这个分区。'}
+                  />
+                )}
+                {!plain && isStreaming && <span className="ov-caret" />}
               </div>
             ) : (
               <span className="ov-standby-hint" style={{ fontSize: `${answerFontSize}px` }}>
@@ -575,13 +593,13 @@ function pruneFocusTabCache<T>(cache: Record<string, T>, retainedQaIds: Set<stri
   return changed ? next : cache
 }
 
-function sliceMaxLines(text: string, maxLines: number): { text: string; omitted: boolean } {
+function sliceMaxLines(text: string, maxLines: number, markdown = true): { text: string; omitted: boolean } {
   if (maxLines <= 0) return { text, omitted: false }
   const lines = text.split('\n')
   if (lines.length <= maxLines) return { text, omitted: false }
   const start = Math.max(0, lines.length - maxLines)
   const tail = lines.slice(start)
-  const openFence = getOpenMarkdownFenceAt(lines.slice(0, start))
+  const openFence = markdown ? getOpenMarkdownFenceAt(lines.slice(0, start)) : ''
   if (openFence) tail.unshift(openFence)
   return { text: tail.join('\n'), omitted: true }
 }
@@ -731,6 +749,20 @@ function OverlayMarkdown({ content }: { content: string }) {
   return (
     <div className="ov-markdown markdown-body">
       <ReactMarkdown components={OVERLAY_MARKDOWN_COMPONENTS}>{content}</ReactMarkdown>
+    </div>
+  )
+}
+
+function OverlayPlainAnswer({ qa, text, isStreaming }: { qa: QAPair; text: string; isStreaming: boolean }) {
+  const status = plainAnswerStatus(qa, isStreaming)
+  return (
+    <div className="ov-plain-answer max-w-full min-w-0">
+      <div className="ov-plain-meta" title={status}>
+        <span>{status}</span>
+        {qa.firstTokenMs != null && <span>首字 {qa.firstTokenMs}ms</span>}
+        {qa.totalMs != null && <span>总 {qa.totalMs}ms</span>}
+      </div>
+      <PlainAnswerContent text={text} />
     </div>
   )
 }

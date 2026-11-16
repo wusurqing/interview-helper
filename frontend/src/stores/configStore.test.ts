@@ -122,6 +122,62 @@ describe('configStore answer streaming', () => {
     expect(state.streamingIds).toEqual([])
   })
 
+  it('flushes buffered plain text at completion without replacing read question metadata', () => {
+    const store = useInterviewStore.getState()
+    store.startAnswer('plain', '当前问题', { answerFormat: 'plain_text', source: 'manual_text', modelName: 'Lite' })
+    store.appendAnswerChunk('plain', '已经读到。')
+    vi.advanceTimersByTime(80)
+    store.appendAnswerChunk('plain', '\n最后一句。')
+    store.finalizeAnswer('plain', '完成事件里的问题', '已经读到。\n最后一句。', '', 'Other', 90, 240)
+    expect(useInterviewStore.getState().qaPairs[0]).toMatchObject({
+      id: 'plain',
+      question: '当前问题',
+      modelLabel: 'Lite',
+      answerFormat: 'plain_text',
+      answer: '已经读到。\n最后一句。',
+      status: 'done',
+      firstTokenMs: 90,
+      totalMs: 240,
+    })
+  })
+
+  it('publishes the first plain text fragment before the throttle or completion', () => {
+    const store = useInterviewStore.getState()
+    store.startAnswer('qa-short', '一句话的题', { answerFormat: 'plain_text' })
+    store.appendAnswerChunk('qa-short', '可以。')
+    expect(useInterviewStore.getState().qaPairs[0]).toMatchObject({
+      id: 'qa-short', answer: '可以。', status: 'streaming',
+    })
+  })
+
+  it('recovers a plain answer when the start or a streamed chunk was missed', () => {
+    const store = useInterviewStore.getState()
+    const meta = { answerFormat: 'plain_text' as const, source: 'manual_text' }
+    store.startAnswer('qa-gap', '第一个问题', meta)
+    store.appendAnswerChunk('qa-gap', '第一句。')
+    store.finalizeAnswer('qa-gap', '第一个问题', '第一句。\n第二句。', '', 'Lite', 90, 240, undefined, meta)
+    store.finalizeAnswer('qa-rejoined', '重连的问题', '重连的正文。', '', 'Lite', 90, 240, undefined, meta)
+    expect(useInterviewStore.getState().qaPairs).toMatchObject([
+      { id: 'qa-gap', answerFormat: 'plain_text', answer: '第一句。\n第二句。' },
+      { id: 'qa-rejoined', answerFormat: 'plain_text', answer: '重连的正文。', questionSource: 'manual_text' },
+    ])
+  })
+
+  it('keeps buffered plain text when generation fails or is cancelled', () => {
+    const store = useInterviewStore.getState()
+    store.startAnswer('qa-error', '第一个问题', { answerFormat: 'plain_text' })
+    store.appendAnswerChunk('qa-error', '保留失败前的文字。')
+    store.errorAnswer('qa-error', '出错')
+    store.startAnswer('qa-cancelled', '第二个问题', { answerFormat: 'plain_text' })
+    store.appendAnswerChunk('qa-cancelled', '保留取消前的文字。')
+    store.cancelAnswer('qa-cancelled')
+    store.finalizeAnswer('qa-cancelled', '第二个问题', '迟到的完成事件。')
+    expect(useInterviewStore.getState().qaPairs).toMatchObject([
+      { id: 'qa-error', status: 'error', answer: '保留失败前的文字。' },
+      { id: 'qa-cancelled', status: 'cancelled', answer: '保留取消前的文字。' },
+    ])
+  })
+
   it('ignores duplicate answer_start events after completion', () => {
     const store = useInterviewStore.getState()
 

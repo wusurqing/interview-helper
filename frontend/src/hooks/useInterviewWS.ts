@@ -139,6 +139,7 @@ export function useInterviewWS(active = true) {
         s.startAnswer(msg.id as string, msg.question as string, {
           source: msg.source as string,
           modelName: msg.model_name as string,
+          ...(msg.answer_format === 'plain_text' ? { answerFormat: 'plain_text' as const } : {}),
           updatesQaId: msg.updates_qa_id as string | undefined,
         })
         break
@@ -161,6 +162,9 @@ export function useInterviewWS(active = true) {
           msg.first_token_ms as number | undefined,
           msg.total_ms as number | undefined,
           msg.updates_qa_id as string | undefined,
+          msg.answer_format === 'plain_text'
+            ? { answerFormat: 'plain_text', source: msg.source as string | undefined }
+            : undefined,
         )
         break
       case 'answer_cancelled':

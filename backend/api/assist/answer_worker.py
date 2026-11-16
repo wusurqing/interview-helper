@@ -33,6 +33,15 @@ from api.assist.scheduler import TaskPayload
 
 
 @dataclass(frozen=True)
+class AnswerCommit:
+    apply: Callable[[], None]
+    cancel: Callable[[], None]
+
+    def __call__(self) -> None:
+        self.apply()
+
+
+@dataclass(frozen=True)
 class AnswerWorkerDeps:
     abort_check: Callable[[], bool]
     is_session_current: Callable[[int], bool]
@@ -724,6 +733,13 @@ def process_question_parallel(
     written_exam = bool(meta.get("exam_preflight") or getattr(cfg, "written_exam_mode", False))
     written_exam_think = bool(getattr(cfg, "written_exam_think", False))
     prompt_mode = prompt_mode_for_task(source, manual_input, written_exam=written_exam)
+    plain_text = prompt_mode == PROMPT_MODE_ASR_REALTIME or (
+        prompt_mode == PROMPT_MODE_MANUAL_TEXT
+        and source == "manual_text"
+        and not image
+        and meta.get("purpose") != "knowledge_practice"
+    )
+    format_payload = {"answer_format": "plain_text"} if plain_text else {}
     short_answer = bool(getattr(cfg, "assist_high_churn_short_answer", False))
     scene = assist_prompt_scene(prompt_mode, high_churn_short_answer=short_answer)
     customized_prompt = scene in getattr(cfg, "system_prompts", {})
@@ -898,6 +914,7 @@ def process_question_parallel(
         mode=prompt_mode,
         high_churn_short_answer=short_answer,
         cfg=cfg,
+        structured_manual=prompt_mode == PROMPT_MODE_MANUAL_TEXT and not plain_text,
     )
     user_context = build_assist_user_context(
         cfg,
@@ -963,6 +980,7 @@ def process_question_parallel(
             "source": source,
             "model_name": model_cfg.name,
             "model_index": model_idx,
+            **format_payload,
         }
     )
     # 候选人回答窗口用于下一轮上下文、知识记录或后续手动复盘；只要候选人 ASR 开启就绑定 qa_id。
@@ -997,7 +1015,10 @@ def process_question_parallel(
             deps.error_logger.warning("broadcast kb_hits failed: %s", exc)
 
     raw_full_answer = ""
-    stream_sanitizer = create_answer_stream_sanitizer(prompt_mode, preserve_format=customized_prompt)
+    stream_sanitizer = create_answer_stream_sanitizer(
+        prompt_mode, preserve_format=customized_prompt, plain_text=plain_text,
+    )
+    visible_chunks: list[str] = []
     full_think = ""
     token_prompt_delta = 0
     token_completion_delta = 0
@@ -1066,7 +1087,8 @@ def process_question_parallel(
                         }
                     )
             else:
-                if first_token_mono is None and chunk_text:
+                clean_chunk = stream_sanitizer.push(chunk_text)
+                if first_token_mono is None and (clean_chunk.strip() if plain_text else chunk_text):
                     first_token_mono = time.monotonic()
                     if mmpg_trace:
                         if mmpg_request:
@@ -1082,14 +1104,17 @@ def process_question_parallel(
                                 mmpg_trace, seq, (first_token_mono - gen_start) * 1000,
                             )
                 raw_full_answer += chunk_text
-                clean_chunk = stream_sanitizer.push(chunk_text)
                 if clean_chunk:
-                    chunk_buffer.append(clean_chunk)
-                    if len(chunk_buffer) >= batch_size:
-                        _broadcast(
-                            {"type": "answer_chunk", "id": qa_id, "chunk": "".join(chunk_buffer)}
-                        )
-                        chunk_buffer.clear()
+                    if plain_text:
+                        visible_chunks.append(clean_chunk)
+                        _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": clean_chunk})
+                    else:
+                        chunk_buffer.append(clean_chunk)
+                        if len(chunk_buffer) >= batch_size:
+                            _broadcast(
+                                {"type": "answer_chunk", "id": qa_id, "chunk": "".join(chunk_buffer)}
+                            )
+                            chunk_buffer.clear()
         if chunk_buffer:
             _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": "".join(chunk_buffer)})
             chunk_buffer.clear()
@@ -1142,7 +1167,10 @@ def process_question_parallel(
     if tail:
         _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": tail})
 
-    full_answer = postprocess_answer_for_mode(raw_full_answer, prompt_mode, preserve_format=customized_prompt)
+    full_answer = (
+        "".join(visible_chunks) + tail if plain_text else
+        postprocess_answer_for_mode(raw_full_answer, prompt_mode, preserve_format=customized_prompt)
+    )
     if not full_answer.strip():
         deps.error_logger.warning(
             "ANSWER_EMPTY id=%s model=%s source=%s think_len=%d raw_len=%d",
@@ -1163,8 +1191,13 @@ def process_question_parallel(
         deps.mark_seq_skipped(seq)
         return
 
+    def _cancel_visible_answer():
+        _broadcast({"type": "answer_cancelled", "id": qa_id})
+
     def _commit():
         if not deps.is_session_current(sess_v) or (mmpg_request and mmpg_request.cancelled):
+            if plain_text:
+                _cancel_visible_answer()
             return
         session = get_session()
         if exam_preflight_id:
@@ -1215,6 +1248,8 @@ def process_question_parallel(
                     qa_id=qa_id,
                     source=source,
                     model_name=model_cfg.name,
+                    **({"answer_format": "plain_text", "first_token_ms": int(first_token_ms),
+                        "total_ms": int(gen_elapsed)} if plain_text else {}),
                     **({"updates_qa_id": mmpg_request.updates_qa_id} if mmpg_request and mmpg_request.updates_qa_id else {}),
                 )
                 if mmpg_request:
@@ -1245,6 +1280,8 @@ def process_question_parallel(
                     "model_name": model_cfg.name,
                     "first_token_ms": int(first_token_ms),
                     "total_ms": int(gen_elapsed),
+                    **format_payload,
+                    **({"source": source} if plain_text else {}),
                 }
             )
             deps.broadcast(
@@ -1307,4 +1344,5 @@ def process_question_parallel(
         with mmpg_request.lock:
             _commit()
 
-    deps.flush_commit(seq, _commit_current_request if mmpg_request else _commit)
+    apply_commit = _commit_current_request if mmpg_request else _commit
+    deps.flush_commit(seq, AnswerCommit(apply_commit, _cancel_visible_answer) if plain_text else apply_commit)

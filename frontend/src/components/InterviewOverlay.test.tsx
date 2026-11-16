@@ -70,6 +70,40 @@ beforeEach(() => {
 })
 
 describe('InterviewOverlay', () => {
+  it('keeps the plain focus body and tab in place when its answer completes', () => {
+    localStorage.setItem('ia_overlay_mode', 'focus')
+    useUiPrefsStore.setState({ interviewOverlayMode: 'focus' })
+    const answer = '## 原样文字\n\n第二行。'
+    const plainQa = { ...qa, answer, answerFormat: 'plain_text' as const, status: 'streaming' as const }
+    useInterviewStore.setState({ qaPairs: [plainQa], streamingIds: [qa.id] })
+    render(<InterviewOverlay />)
+    expect(screen.getByRole('button', { name: '回答' })).toBeInTheDocument()
+    const body = screen.getByText(/## 原样文字/)
+    expect(body.textContent).toBe(answer)
+    act(() => {
+      useInterviewStore.setState({
+        qaPairs: [{ ...plainQa, status: 'done', totalMs: 180 }],
+        streamingIds: [],
+      })
+    })
+    expect(screen.getByText(/## 原样文字/)).toBe(body)
+    expect(screen.getByText(/180ms/)).toBeInTheDocument()
+  })
+
+  it('keeps reading the completed plain answer while another model is generating', () => {
+    const first = { ...qa, answerFormat: 'plain_text' as const, status: 'streaming' as const }
+    const parallel = { ...first, id: 'qa-parallel', answer: '另一个模型的回答。' }
+    useInterviewStore.setState({ qaPairs: [first], streamingIds: [qa.id] })
+    render(<InterviewOverlay />)
+    const body = screen.getByText(first.answer)
+    act(() => useInterviewStore.setState({ qaPairs: [first, parallel], streamingIds: [first.id, parallel.id] }))
+    act(() => useInterviewStore.setState({
+      qaPairs: [{ ...first, status: 'done' }, parallel], streamingIds: [parallel.id],
+    }))
+    expect(screen.getByText(first.answer)).toBe(body)
+    expect(screen.queryByText(parallel.answer)).not.toBeInTheDocument()
+  })
+
   it('connects its websocket only while the overlay window is enabled and visible', () => {
     ;(window as unknown as { electronAPI: unknown }).electronAPI = {
       getOverlayState: vi.fn().mockResolvedValue(null),
@@ -890,6 +924,36 @@ describe('InterviewOverlay', () => {
     expect(await screen.findByText(/第二题正在生成/)).toBeInTheDocument()
     expect(screen.getByText(/当前 2\/2/)).toBeInTheDocument()
     expect(screen.queryByText(/第一题答案/)).not.toBeInTheDocument()
+  })
+
+  it('shows a screenshot that starts before the action exits plain answer history', async () => {
+    let questionListener: ((direction: 'prev' | 'next') => void) | undefined
+    let resolveScreenshot: (value: { ok: boolean }) => void = () => {}
+    apiMock.askFromServerScreen.mockImplementation(() => new Promise(resolve => { resolveScreenshot = resolve }))
+    ;(window as unknown as { electronAPI: unknown }).electronAPI = {
+      onOverlayQuestionCommand: (listener: NonNullable<typeof questionListener>) => {
+        questionListener = listener
+        return vi.fn()
+      },
+    }
+    const history = [
+      { ...qa, id: 'old', answer: '正在回看的文字。' },
+      { ...qa, id: 'plain', answer: '最新完成的文字。', answerFormat: 'plain_text' as const, status: 'done' as const },
+    ]
+    useInterviewStore.setState({ qaPairs: history, streamingIds: [] })
+    useUiPrefsStore.setState({ interviewOverlayMode: 'focus' })
+    localStorage.setItem('ia_overlay_mode', 'focus')
+    render(<InterviewOverlay />)
+
+    act(() => questionListener?.('prev'))
+    fireEvent.click(screen.getByRole('button', { name: /^截图审题/ }))
+    act(() => useInterviewStore.setState({
+      qaPairs: [...history, { ...qa, id: 'shot', answer: '## 思路\n\n截图答案正在输出。', status: 'streaming' }],
+      streamingIds: ['shot'],
+    }))
+    expect(screen.getByText('正在回看的文字。')).toBeInTheDocument()
+    await act(async () => resolveScreenshot({ ok: true }))
+    expect(screen.getByText('截图答案正在输出。')).toBeInTheDocument()
   })
 
   it('keeps tab state for older questions that are still generating in parallel', async () => {

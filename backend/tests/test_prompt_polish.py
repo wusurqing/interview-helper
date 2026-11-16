@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pytest
+from types import SimpleNamespace
 from core.config import get_config
 from services.llm import build_system_prompt, create_answer_stream_sanitizer, postprocess_answer_for_mode
 from services.llm.prompts import build_assist_user_context
@@ -124,14 +125,14 @@ def test_normal_asr_still_has_followup_rule():
 
 # ---- 4.5 candidate voice / anti-template polish -------------------------
 
-def test_asr_prompt_asks_for_candidate_voice_not_template_headings():
-    p = _asr_prompt(high_churn=False)
-    assert "真人候选人口吻" in p
-    assert "结论先行" in p
-    assert "专注面板输出协议" in p
-    assert "## 标题" in p
-    assert "普通场景题 280-520 字" in p
-    assert "项目深挖/复杂排障/系统设计题 420-780 字" in p
+@pytest.mark.parametrize("mode,short", [("asr_realtime", False), ("asr_realtime", True), ("manual_text", False)])
+def test_live_prompt_asks_for_candidate_voice_without_markdown(mode, short):
+    prompt = build_system_prompt(mode=mode, high_churn_short_answer=short, cfg=SimpleNamespace(system_prompts={}))
+    assert "真人候选人口吻" in prompt
+    assert "纯文本" in prompt
+    assert "不要使用 Markdown 标题、列表、加粗或代码围栏" in prompt
+    assert "专注面板输出协议" not in prompt
+    assert "`##`" not in prompt
 
 
 def test_asr_prompt_keeps_concept_comparison_from_forced_project_story():
@@ -147,9 +148,8 @@ def test_asr_prompt_keeps_concept_comparison_from_forced_project_story():
 
 def test_asr_prompt_uses_density_by_question_type_not_fixed_long_answer():
     p = _asr_prompt(high_churn=False)
-    assert "概念/优缺点/区别题 180-320 字" in p
-    assert "普通场景题 280-520 字" in p
-    assert "项目深挖/复杂排障/系统设计题 420-780 字" in p
+    assert "简单题说清关键区别就收住" in p
+    assert "复杂题可分几个自然段" in p
     assert "详细模式只增加机制、取舍、验证和边界密度" in p
     assert "不等于自动进入个人项目叙述" in p
     assert "不为凑字数扩展" in p
@@ -181,16 +181,20 @@ def test_asr_high_churn_keeps_oral_short_answer_shape():
 def test_manual_prompt_warns_not_to_emit_template_labels():
     p = _manual_prompt()
     assert "真人候选人口吻" in p
-    assert "贴合本题的 `##` section 标题" in p
-    assert "不要输出固定模板" in p
-    assert "给代码时固定三段" not in p
-    assert "普通题 500-900 字" in p
-    assert "复杂设计/排障/治理题 900-1500 字" in p
-    assert "题型模板" in p
+    assert "简单题用几句话说清结论和理由" in p
+    assert "复杂题可多写几个短段落" in p
     assert "普通技术题不要强行改写成个人项目故事" in p
-    assert "详细模式只代表讲清机制、方案取舍、验证和风险" in p
-    assert "不代表要编个人项目经历" in p
+    assert "关键机制、方案取舍、验证和风险" in p
     assert "只有题干明确问" in p
+
+
+def test_structured_manual_use_keeps_the_focus_output_contract():
+    prompt = build_system_prompt(
+        mode="manual_text", structured_manual=True, cfg=SimpleNamespace(system_prompts={}),
+    )
+    assert "专注面板输出协议" in prompt
+    assert "3-6 个 `##` section" in prompt
+    assert "不要使用 Markdown 标题" not in prompt
 
 
 def test_stream_sanitizer_removes_split_think_tags():
@@ -198,6 +202,23 @@ def test_stream_sanitizer_removes_split_think_tags():
     chunks = ["<thi", "nking>内部思考</thinking>用 AOF", " 和 RDB。"]
     out = "".join(s.push(c) for c in chunks) + s.finish()
     assert out == "用 AOF 和 RDB。"
+
+
+def test_plain_stream_keeps_code_and_suppresses_nested_internal_tags():
+    sanitizer = create_answer_stream_sanitizer("manual_text", plain_text=True)
+    assert sanitizer.push("可用条件 x <") == "可用条件 x "
+    assert sanitizer.push(" 3。\n<ana") == "< 3。\n"
+    assert sanitizer.push("lysis>草稿<THINK/>仍是草稿<thinking>内层</thinking>外层") == ""
+    assert sanitizer.push("</analysis>    int **p;") == "    int **p;"
+    assert sanitizer.finish() == ""
+
+
+def test_plain_stream_preserves_xml_elements_with_similar_names():
+    sanitizer = create_answer_stream_sanitizer("manual_text", plain_text=True)
+    assert sanitizer.push("<analysis") == ""
+    literal = "<analysis-result>data</analysis-result>"
+    assert sanitizer.push("-result>data</analysis-result>") == literal
+    assert sanitizer.finish() == ""
 
 
 def test_stream_sanitizer_cleans_manual_markdown_and_meta_preface():
