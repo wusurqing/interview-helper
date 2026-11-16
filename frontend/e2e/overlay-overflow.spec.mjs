@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { resolveApiPayload } from './fixtures/sample-data.mjs'
+import { installMocks, COMMON_WS_BOOTSTRAP } from './fixtures/setup.mjs'
 
 const longToken = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'.repeat(10)
 const longMarkdown = [
@@ -54,11 +55,36 @@ for (const mode of ['glass', 'prompt', 'focus']) {
   })
 }
 
+test('settings previews use the configured color and main answer keeps its theme', async ({ context, page }) => {
+  const appearance = Object.fromEntries(['glass', 'prompt', 'focus'].map((mode) => [mode, { fontColor: '#e3d7ff' }]))
+  await installMocks(context, {
+    localStorage: { ia_overlay_appearance: JSON.stringify(appearance), 'ia-color-scheme': 'vscode-light-plus' },
+    messages: [...COMMON_WS_BOOTSTRAP, { type: 'init', delay: 50, transcriptions: [], qa_pairs: [{ id: 'theme', question: '主题测试', answer: '正文 **重点**', timestamp: Date.now() / 1000 }], is_recording: false, stt_loaded: true }],
+  })
+  await page.goto('/')
+  const strong = page.locator('.markdown-body strong').first()
+  await expect(strong).toHaveText('重点')
+  const themeColor = await strong.evaluate((element) => {
+    const probe = document.createElement('span')
+    probe.style.color = 'rgb(var(--c-md-strong))'
+    element.appendChild(probe)
+    const color = getComputedStyle(probe).color
+    probe.remove()
+    return color
+  })
+  await expect(strong).toHaveCSS('color', themeColor)
+  await page.getByRole('button', { name: '打开设置', exact: true }).click()
+  await page.getByRole('navigation', { name: '设置分区' }).getByRole('button', { name: /悬浮窗设置/ }).click()
+  for (const label of ['磨砂玻璃', '提词模式', '专注面板']) {
+    await page.getByRole('group', { name: '显示模式' }).getByRole('button', { name: label }).click()
+    await expect(page.locator('.ov-settings-preview .ov-answer, .ov-settings-preview .ov-focus-content')).toHaveCSS('color', 'rgb(227, 215, 255)')
+  }
+})
+
 test('detects delayed image overflow after standby content is replaced', async ({ page }) => {
-  let releaseImage
-  const imageGate = new Promise((resolve) => { releaseImage = resolve })
-  await page.route('**/delayed-image.svg', async (route) => {
-    await imageGate
+  const releases = []
+  await page.route('**/delayed-image.svg*', async (route) => {
+    await new Promise((resolve) => { releases.push(resolve) })
     await route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="900"></svg>' })
   })
   const send = await openPrompt(page, 'fixed', { width: 220, height: 180 }, { width: 220, height: 180 })
@@ -66,9 +92,10 @@ test('detects delayed image overflow after standby content is replaced', async (
   send({ type: 'answer_done', id: 'image', question: '请回答', answer: '简答\n\n![图片](/delayed-image.svg)' })
   try {
     await expect(page.locator('.ov-markdown img')).toHaveCount(1)
+    await expect.poll(() => releases.length).toBe(1)
     await expect.poll(() => page.evaluate(() => window.promptScrollable.at(-1))).toBe(false)
   } finally {
-    releaseImage()
+    releases.shift()?.()
   }
   await expect.poll(() => page.evaluate(() => window.promptScrollable.at(-1))).toBe(true)
   const answer = page.locator('.ov-answer')
@@ -76,6 +103,15 @@ test('detects delayed image overflow after standby content is replaced', async (
   await expect.poll(() => answer.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
   send({ type: 'session_cleared' })
   await expect.poll(() => page.evaluate(() => window.promptScrollable.at(-1))).toBe(false)
+  send({ type: 'answer_start', id: 'image-again', question: '请回答' })
+  send({ type: 'answer_done', id: 'image-again', question: '请回答', answer: '简答\n\n![图片](/delayed-image.svg?again)' })
+  try {
+    await expect.poll(() => releases.length).toBe(1)
+    await expect.poll(() => page.evaluate(() => window.promptScrollable.at(-1))).toBe(false)
+  } finally {
+    releases.shift()?.()
+  }
+  await expect.poll(() => page.evaluate(() => window.promptScrollable.at(-1))).toBe(true)
 })
 
 async function expectTextFits(page, selector, text = longToken) {

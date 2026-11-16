@@ -180,6 +180,11 @@ export default function InterviewOverlay() {
     answerAutoFollowRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= threshold
   }, [overlayMode, overlayPromptAutoFollow])
 
+  const wheelOptionsRef = useRef({ fontSize, updateAnswerAutoFollow })
+  useLayoutEffect(() => {
+    wheelOptionsRef.current = { fontSize, updateAnswerAutoFollow }
+  }, [fontSize, updateAnswerAutoFollow])
+
   const reportPromptScrollability = useCallback(() => {
     const report = window.electronAPI?.reportPromptScrollable
     if (!report) return
@@ -221,7 +226,7 @@ export default function InterviewOverlay() {
       const el = answerScrollRef.current
       if (!el || !Number.isFinite(delta) || el.scrollHeight <= el.clientHeight) return
       const lineHeight = Number.parseFloat(window.getComputedStyle(el).lineHeight)
-      const linePixels = Number.isFinite(lineHeight) ? lineHeight : fontSize * 1.5
+      const linePixels = Number.isFinite(lineHeight) ? lineHeight : wheelOptionsRef.current.fontSize * 1.5
       const previousTop = el.scrollTop
       const wanted = promptWheelRemainder.current - delta * linePixels * 3 / 120
       const wholePixels = Math.trunc(wanted)
@@ -232,7 +237,7 @@ export default function InterviewOverlay() {
       if (delta > 0 && el.scrollTop < previousTop) {
         answerAutoFollowRef.current = false
       } else {
-        updateAnswerAutoFollow()
+        wheelOptionsRef.current.updateAnswerAutoFollow()
       }
     })
     reportPromptScrollability()
@@ -242,7 +247,7 @@ export default function InterviewOverlay() {
       promptScrollableRef.current = null
       api.reportPromptScrollable?.(false).catch(() => {})
     }
-  }, [enabled, overlayVisible, overlayMode, reportPromptScrollability, updateAnswerAutoFollow, fontSize])
+  }, [enabled, overlayVisible, overlayMode, reportPromptScrollability])
 
   useEffect(() => {
     answerAutoFollowRef.current = overlayMode !== 'prompt' || overlayPromptAutoFollow

@@ -77,6 +77,27 @@ beforeEach(() => {
 })
 
 describe('InterviewOverlay', () => {
+  it('keeps the wheel subscription while prompt appearance changes', () => {
+    let wheel: ((delta: number) => void) | undefined
+    const report = vi.fn().mockResolvedValue({ ok: true })
+    const unsubscribe = vi.fn()
+    const subscribe = vi.fn((callback: (delta: number) => void) => { wheel = callback; return unsubscribe })
+    window.electronAPI = { reportPromptScrollable: report, onPromptWheel: subscribe } as unknown as Window['electronAPI']
+    localStorage.setItem('ia_overlay_mode', 'prompt')
+    useUiPrefsStore.setState({ interviewOverlayMode: 'prompt', interviewOverlayVisible: true })
+    render(<InterviewOverlay />)
+    const scroller = document.querySelector('.ov-answer') as HTMLDivElement
+    Object.defineProperty(scroller, 'scrollHeight', { value: 1000, configurable: true })
+    Object.defineProperty(scroller, 'clientHeight', { value: 200, configurable: true })
+    act(() => { wheel?.(-20) })
+    expect(scroller.scrollTop).toBe(0)
+    act(() => useUiPrefsStore.getState().updateOverlayAppearance('prompt', { fontSize: 28, autoFollow: true }))
+    expect(subscribe).toHaveBeenCalledTimes(1)
+    expect(unsubscribe).not.toHaveBeenCalled()
+    act(() => { wheel?.(-20) })
+    expect(scroller.scrollTop).toBeGreaterThan(0)
+  })
+
   it('reports prompt overflow and scrolls with proportional native wheel deltas', async () => {
     let wheel: ((delta: number) => void) | undefined
     const reportPromptScrollable = vi.fn().mockResolvedValue({ ok: true })
