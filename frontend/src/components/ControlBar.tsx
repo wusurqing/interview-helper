@@ -626,7 +626,7 @@ export default function ControlBar() {
       {!isExamMode && candidateCaptureEnabled && selectedCandidateMic === null && (
         <div className="flex items-center gap-2 text-xs text-accent-amber bg-accent-amber/10 px-3 py-1.5 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-          <span>未选择“我的麦克风”：不会把你的回答写入复盘，追问也只能参考助手建议答案</span>
+          <span>未选择“我的麦克风”，实时语音上下文只包含会议音频转写。</span>
         </div>
       )}
       {!isExamMode && candidateCaptureEnabled && selectedCandidateMic !== null && !selectedCandidateIsMic && (

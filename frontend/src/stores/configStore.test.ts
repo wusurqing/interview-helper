@@ -19,6 +19,26 @@ describe('configStore answer streaming', () => {
     vi.useRealTimers()
   })
 
+  it('resets recording immediately after clearing the session', () => {
+    const store = useInterviewStore.getState()
+    store.setRecording(true, true)
+    store.setPaused(true)
+    store.setTranscribing(true)
+    store.setAudioLevel(0.75)
+    store.addTranscription('旧发言')
+
+    store.clearSession()
+
+    expect(useInterviewStore.getState()).toMatchObject({
+      isRecording: false,
+      interviewerStreaming: false,
+      isPaused: false,
+      isTranscribing: false,
+      audioLevel: 0,
+      transcriptions: [],
+    })
+  })
+
   it('does not append buffered chunks after finalizeAnswer', async () => {
     const store = useInterviewStore.getState()
 

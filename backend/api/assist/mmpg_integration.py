@@ -1,6 +1,7 @@
 """Connect the MMPG transport to the existing interview lifecycle."""
 
 import asyncio
+import time
 from contextlib import suppress
 
 from fastapi.concurrency import run_in_threadpool
@@ -8,7 +9,7 @@ from fastapi.concurrency import run_in_threadpool
 from api.realtime.ws import broadcast
 from core.config import get_config
 from core.logger import get_logger
-from core.session import get_session
+from core.session import conversation_lock, get_session
 from services.audio import AudioBusyError, audio_capture
 from services.stt.mmpg import MmpgError, MmpgManager
 from . import candidate_mmpg, pipeline
@@ -19,17 +20,23 @@ http_lifecycle_lock = asyncio.Lock()
 _session_settings = None
 _test_settings = None
 _turns = None
+_capture_epoch: int | None = None
+_speech_starts: dict[str, tuple[float, str | None]] = {}
 _log = get_logger("mmpg.diagnostics")
 
 
 def _enabled():
     session = get_session()
-    return pipeline.is_streaming_interview() and not session.is_paused and get_config().auto_detect
+    return pipeline.is_streaming_interview() and not session.is_paused and session.transcript_epoch == _capture_epoch
 
 
 def clear_turns():
     if _turns is not None:
         _turns.clear(cancel_running=True)
+    session = get_session()
+    for _, anchor in _speech_starts.values():
+        session.discard_unfinished_transcript(anchor)
+    _speech_starts.clear()
 
 
 def answer_phase():
@@ -41,26 +48,43 @@ def _turn_event(kind, trace):
         return
     if kind == "reset":
         clear_turns()
-    elif kind == "started":
+    elif kind == "started" and _enabled():
+        if trace not in _speech_starts:
+            started_at = time.monotonic()
+            anchor = get_session().record_transcript(
+                "interviewer", "", started_at=started_at, utterance_key=trace,
+                is_final=False, epoch=_capture_epoch,
+            )
+            _speech_starts[trace] = started_at, anchor
         _turns.started(trace)
     elif kind == "cancelled":
+        _, anchor = _speech_starts.pop(trace, (0.0, None))
+        get_session().discard_unfinished_transcript(anchor)
         _turns.cancelled(trace)
 
 
 def _final_transcript(text, trace):
-    pipeline.publish_streaming_asr_turn(text)
-    if _turns is not None:
+    if _turns is not None and _enabled():
         _turns.final(trace, text)
+
+
+def _record_final(text, trace, group_id):
+    started_at, _ = _speech_starts.pop(trace, (time.monotonic(), None))
+    return pipeline.publish_streaming_asr_turn(
+        text, trace=trace, started_at=started_at, question_group=group_id, transcript_epoch=_capture_epoch,
+    )
 
 
 def _new_turns():
     loop = asyncio.get_running_loop()
 
     def submit(request):
+        if not _enabled():
+            return False
         request.loop = loop
         request.on_started = lambda at: turns.request_started(request, at)
         request.on_finished = lambda: loop.call_soon_threadsafe(turns.request_finished, request)
-        return pipeline.submit_mmpg_question(request)
+        return pipeline.submit_mmpg_question(request, transcript_epoch=_capture_epoch)
 
     def log_event(event, **fields):
         _log.info("event=%s %s", event, " ".join(f"{name}={value}" for name, value in fields.items()))
@@ -72,6 +96,7 @@ def _new_turns():
         cancel_on_clear=lambda request: pipeline.cancel_mmpg_answer(request, reason="stopped"),
         answer_delay_ms=_session_settings.answer_delay_ms,
         followup_window_ms=_session_settings.followup_window_ms,
+        record_final=_record_final,
     )
     return turns
 
@@ -122,7 +147,7 @@ async def prepare(mode, device_ids, candidate_mic_id):
 
 
 async def start_capture(mode, device_ids, candidate_mic_id):
-    global _turns
+    global _turns, _capture_epoch
     if get_session().is_recording and not pipeline.is_streaming_interview():
         raise MmpgError("interview_active")
     device = device_ids[0]
@@ -133,12 +158,16 @@ async def start_capture(mode, device_ids, candidate_mic_id):
                 owner="mmpg-test", queue_audio=False,
             )
         else:
+            clear_turns()
             _turns = _new_turns()
             action = pipeline.unpause_interview if pipeline.is_streaming_interview() else pipeline.start_nonblocking
             worker = run_in_threadpool(action, device, candidate_mic_id, stream_audio=manager.offer_audio)
         task = asyncio.create_task(worker)
         try:
             await asyncio.shield(task)
+            if mode != "test":
+                with conversation_lock:
+                    _capture_epoch = get_session().transcript_epoch
         except asyncio.CancelledError:
             # Wait for the device operation before the manager closes capture.
             with suppress(Exception):

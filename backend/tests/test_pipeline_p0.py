@@ -21,6 +21,7 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 pipeline = importlib.import_module("api.assist.pipeline")
+from core.session import Session
 
 
 # ---------- 共享 fakes -------------------------------------------------------
@@ -36,13 +37,9 @@ class _FakeEngine:
         return ""
 
 
-class _FakeSession:
+class _FakeSession(Session):
     def __init__(self):
-        self.is_recording = True
-        self.is_paused = False
-        self.transcription_history = []
-        self.qa_pairs = []
-        self.capture_is_loopback = True
+        super().__init__(is_recording=True)
 
 
 class _RecordingAudioCapture:
@@ -91,6 +88,7 @@ def _wire_common_fakes(monkeypatch, audio_capture, session, *, gc_counter=None):
     """统一打桩 _interview_worker 的全部外部依赖."""
 
     monkeypatch.setattr(pipeline, "audio_capture", audio_capture)
+    monkeypatch.setattr(pipeline.AudioCapture, "list_devices", lambda: [])
     monkeypatch.setattr(pipeline, "get_stt_engine", lambda: _FakeEngine())
     monkeypatch.setattr(pipeline, "get_session", lambda: session)
     monkeypatch.setattr(pipeline, "broadcast", lambda *a, **kw: None)
@@ -528,7 +526,7 @@ def test_stop_interview_loop_drains_pending_interviewer_segment_before_review_ar
         )
     )
 
-    def _append(_cfg, sess, pub, _now, _force):
+    def _append(_cfg, sess, pub, _now, _force, **_metadata):
         sess.qa_pairs.append(pub)
 
     class _JoinThread:
@@ -608,7 +606,7 @@ def test_interviewer_segment_respects_assist_vad_min_speech_sec(monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "_append_transcription_fragment",
-        lambda _cfg, _session, pub, _now, _force: published.append(pub),
+        lambda _cfg, _session, pub, _now, _force, **_metadata: published.append(pub),
     )
 
     pipeline._interview_worker()
@@ -763,7 +761,7 @@ def test_audio_capture_drain_chunks_feeds_interviewer_vad_per_chunk(monkeypatch)
     monkeypatch.setattr(
         pipeline,
         "_append_transcription_fragment",
-        lambda _cfg, _session, pub, _now, _force: published.append(pub),
+        lambda _cfg, _session, pub, _now, _force, **_metadata: published.append(pub),
     )
 
     pipeline._interview_worker()
@@ -905,7 +903,7 @@ def test_worker_drains_remaining_raw_audio_after_stop_before_tail_flush(monkeypa
     monkeypatch.setattr(
         pipeline,
         "_append_transcription_fragment",
-        lambda _cfg, _session, pub, _now, _force: published.append(pub),
+        lambda _cfg, _session, pub, _now, _force, **_metadata: published.append(pub),
     )
 
     pipeline._interview_worker()

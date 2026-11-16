@@ -168,10 +168,14 @@ async def _api_resume_interview(body: Optional[dict] = None):
 @router.post("/clear")
 async def api_clear():
     from api.realtime.ws import broadcast
-    mmpg.clear_turns()
-    candidate_mmpg.manager.discard_turns()
-    cancel_answer_work(reset_session_data=True)
-    broadcast({"type": "session_cleared"})
+    async with mmpg.http_lifecycle_lock:
+        mmpg.clear_turns()
+        candidate_mmpg.manager.discard_turns()
+        cancel_answer_work(invalidate_capture=True)
+        await asyncio.gather(mmpg.manager.stop("stopped"), candidate_mmpg.stop("stopped"))
+        await run_in_threadpool(stop_interview_loop)
+        cancel_answer_work(reset_session_data=True)
+        broadcast({"type": "session_cleared"})
     return {"ok": True}
 
 

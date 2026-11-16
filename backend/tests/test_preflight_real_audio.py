@@ -217,7 +217,7 @@ def test_generate_preflight_answer_uses_selected_voice_prompt(
 
     assert result == {'answer': '# 真实回答', 'first_token_ms': 400, 'total_ms': 900}
     assert calls['model'] is model_cfg
-    assert calls['messages'] == [{'role': 'user', 'content': '请做一下自我介绍'}]
+    assert calls['messages'] == [{'role': 'user', 'content': '【面试官｜当前发言】"请做一下自我介绍"'}]
     assert calls['system_prompt'] == expected_prompt
     assert calls['override_max_tokens'] == expected_limit
 

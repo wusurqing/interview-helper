@@ -1,5 +1,7 @@
 """Transmit the candidate microphone to its own MMPG session."""
 
+import time
+
 from fastapi.concurrency import run_in_threadpool
 
 from api.realtime.ws import broadcast
@@ -10,7 +12,8 @@ from services.stt.mmpg import MmpgError, MmpgManager
 from . import pipeline
 
 _CAPTURE_OWNER = "assist-candidate-mmpg"
-_pending: dict[str, str] = {}
+_pending: dict[str, tuple[str, float]] = {}
+_capture_epoch: int | None = None
 
 
 def enabled(cfg):
@@ -38,11 +41,13 @@ async def prepare(mode, device_ids, _candidate_mic_id):
 
 
 async def _start_capture(_mode, device_ids, _candidate_mic_id):
+    global _capture_epoch
     cfg = get_config()
     session = get_session()
     device_id = device_ids[0]
     if not session.is_recording or session.last_candidate_mic_device_id != device_id or not enabled(cfg):
         raise MmpgError("candidate_interview_inactive")
+    epoch = session.transcript_epoch
     if await run_in_threadpool(pipeline._device_is_loopback, device_id):
         raise MmpgError("candidate_mic_required")
     try:
@@ -55,6 +60,9 @@ async def _start_capture(_mode, device_ids, _candidate_mic_id):
         raise MmpgError("capture_busy") from None
     except Exception:
         raise MmpgError("device_unavailable") from None
+    with conversation_lock:
+        _pending.clear()
+        _capture_epoch = epoch
 
 
 async def _stop_capture(_mode, _reason):
@@ -75,15 +83,18 @@ async def stop(reason, *, drain=False):
 def _on_turn(kind, trace):
     session = get_session()
     with conversation_lock:
+        if session.transcript_epoch != _capture_epoch:
+            return
         if kind == "started":
             if trace not in _pending:
-                _pending[trace] = session.current_candidate_qa_id
+                _pending[trace] = session.current_candidate_qa_id, time.monotonic()
         elif kind == "reset":
             _pending.clear()
         else:
             _pending.pop(trace, None)
         if _pending:
-            session.mark_candidate_asr_busy(next(reversed(_pending.values())))
+            qa_id, _ = next(reversed(_pending.values()))
+            session.mark_candidate_asr_busy(qa_id)
         else:
             session.mark_candidate_asr_idle()
 
@@ -91,10 +102,15 @@ def _on_turn(kind, trace):
 def _on_transcript(text, trace):
     session = get_session()
     try:
-        if session.is_recording and enabled(get_config()):
+        with conversation_lock:
+            epoch = _capture_epoch
+            accepted = session.is_recording and session.transcript_epoch == epoch and enabled(get_config())
+            qa_id, started_at = _pending.get(trace) or (session.current_candidate_qa_id, time.monotonic())
+        if accepted:
             pipeline._publish_candidate_transcription(
-                session, text, MMPG_STT_PROVIDER, _pending.get(trace, ""),
+                session, text, MMPG_STT_PROVIDER, qa_id,
                 segment_id=f"candidate-mmpg-{trace}",
+                started_at=started_at, transcript_epoch=epoch,
             )
     finally:
         _on_turn("cancelled", trace)

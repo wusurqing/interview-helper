@@ -457,10 +457,10 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
   const candidateRemoteProviderLabel = providerMeta[form.candidate_stt_provider]?.label ?? form.candidate_stt_provider
   const candidateContextActive = form.candidate_asr_enabled && form.candidate_context_enabled
   const candidateUsageLabel = !form.candidate_asr_enabled
-    ? '不读取麦克风，不写入复盘，追问按旧逻辑'
+    ? '实时语音只使用会议音频转写'
     : candidateContextActive
-      ? `${candidateSttLabel}，记录复盘，并给追问补真实口述`
-      : `${candidateSttLabel}，仅记录复盘，追问按旧逻辑`
+      ? `${candidateSttLabel}，用于复盘、实时语音和手动提问上下文`
+      : `${candidateSttLabel}，用于复盘和实时语音上下文`
   const searchQuery = useSettingsSearch()
   const inSearch = searchQuery.trim().length > 0
   const effectiveSaveState: SaveState = saveState === 'saving' || saveState === 'error'
@@ -547,7 +547,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                 <StatusBadge status={form.candidate_asr_enabled ? 'ok' : 'idle'} label={form.candidate_asr_enabled ? '回答记录' : '已关闭'} />
               </div>
               <p className="mt-2 text-xs leading-relaxed text-text-secondary">
-                只识别你实际说出口的回答，用于复盘记录；可选写入追问上下文，不会触发自动答题，也不会混入面试官问题流。
+                转写你实际说出口的话，用于复盘和实时语音上下文。只有面试官的提问会触发自动答题。
               </p>
               <p className="mt-2 text-[11px] text-text-muted">
                 当前：{candidateUsageLabel}。
@@ -806,7 +806,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
             <div className="min-w-0">
               <h3 className="text-sm font-semibold text-text-primary">我的回答记录（麦克风）</h3>
               <p className="text-[11px] leading-relaxed text-text-muted mt-0.5">
-                记录你真实说出口的回答，用于面试复盘；也可以给下一轮追问做上下文，不会触发自动答题。
+                记录你真实说出口的话，用于复盘和实时语音上下文，不会触发自动答题。
               </p>
             </div>
             <div className="inline-flex shrink-0 items-center gap-2 self-start rounded-lg border border-bg-hover bg-bg-tertiary/45 px-2.5 py-2">
@@ -824,12 +824,12 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
           </div>
           {!form.candidate_asr_enabled && (
             <div className="rounded-lg border border-bg-hover bg-bg-tertiary/40 px-3 py-2 text-xs text-text-muted">
-              当前已关闭我的麦克风 ASR：启动面试时不会传入“我的麦克风”设备，追问上下文会退回旧的模型答案链路。
+              麦克风 ASR 已关闭。实时语音上下文使用会议音频转写。
             </div>
           )}
           {form.candidate_asr_enabled && (
             <div className="rounded-lg border border-emerald-400/20 bg-emerald-500/10 px-3 py-2 text-xs leading-relaxed text-text-secondary">
-              开启后控制条会多选一路“我的麦克风”，用于把你的真实回答写入复盘；开启“下一题使用真实回答上下文”后，追问也会优先参考这一路口述。这一路只用共享方式读取；如果会议软件独占麦克风，会自动关闭我的口述记录，不影响面试录音。
+              开启后可在控制条选择“我的麦克风”，用于把你的真实回答写入复盘和实时语音上下文。麦克风以共享方式读取。会议软件独占设备时，口述记录会自动关闭。
             </div>
           )}
 
@@ -882,7 +882,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                 ))}
               </select>
             </Field>
-            <Field label="下一题使用真实回答上下文" hint="开启后下一轮问题会带上你的真实口述；追问时强优先，非追问时只作背景">
+            <Field label="手动提问参考麦克风转写" hint="开启后，手动提问可以参考上一轮已转写的候选人回答。">
               <label className="inline-flex items-center gap-2 cursor-pointer select-none">
                 <input
                   type="checkbox"
@@ -893,8 +893,8 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                 />
                 <span className="text-xs text-text-secondary">{
                   !form.candidate_asr_enabled
-                    ? (form.candidate_context_enabled ? '开启麦克风后生效' : '按旧逻辑')
-                    : (candidateContextActive ? '下一题携带真实口述' : '仅写入复盘记录')
+                    ? (form.candidate_context_enabled ? '开启麦克风后生效' : '手动参考已关闭')
+                    : (candidateContextActive ? '手动参考已开启' : '手动参考已关闭')
                 }</span>
               </label>
             </Field>
@@ -921,11 +921,11 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
           <details className="group rounded-lg border border-bg-hover bg-bg-tertiary/25 px-3 py-2">
             <summary className="cursor-pointer select-none text-xs font-medium text-text-secondary group-open:text-text-primary">
               高级设置：{candidateSttLabel}
-              {effectiveCandidateProvider === 'whisper' ? '模型与追问上下文' : '与追问上下文'}
+              {effectiveCandidateProvider === 'whisper' ? '模型与手动提问上下文' : '与手动提问上下文'}
             </summary>
             <div className="mt-3 space-y-3">
               <div className="rounded-lg border border-bg-hover bg-bg-secondary/40 px-3 py-2 text-xs leading-relaxed text-text-secondary">
-                上下文流程：先由“会议音频”识别面试官问题；生成下一轮答案时会携带上一轮“我的麦克风”真实转写作为背景。若系统判断这是追问，真实口述会强优先；若不是追问，真实口述只作背景，和当前问题无关时会被忽略。
+                实时语音按发言顺序使用面试官和候选人已经转写的原话。下方等待时间和字数设置适用于手动提问。
               </div>
 
               <Field label="边听边写" hint="开启后会一边听你的麦克风一边预转写；面试官提下一题时，直接使用已经写入的内容。停顿后再用完整结果覆盖。云端 ASR 不做预转写，避免反复计费。">
@@ -1000,7 +1000,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                     disabled={!form.candidate_asr_enabled || !form.candidate_streaming_asr_enabled || !LOCAL_STT_PROVIDERS.includes(effectiveCandidateProvider)}
                   />
                 </Field>
-                <Field label="兜底等最后一句 (ms)" hint="边听边写已经会提前写入上下文；这个只是在你刚说完、最后一句还没写进去时，下一题生成前最多再等一下。0=不等。">
+                <Field label="手动提问等待转写 (ms)" hint="手动提问生成前等待候选人最终转写的最长时间。设为 0 立即提交。">
                   <input
                     type="number"
                     min={0}
@@ -1012,7 +1012,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                     disabled={!form.candidate_asr_enabled || !form.candidate_context_enabled}
                   />
                 </Field>
-                <Field label="上下文字数" hint="注入下一轮 prompt 的真实回答上限">
+                <Field label="手动提问上下文字数" hint="手动提问最多携带多少候选人转写字数。">
                   <input
                     type="number"
                     min={100}
@@ -1024,7 +1024,7 @@ export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines'
                     disabled={!form.candidate_asr_enabled || !form.candidate_context_enabled}
                   />
                 </Field>
-                <Field label="最少有效字" hint="太短的候选人转写不作为上下文">
+                <Field label="手动提问最少有效字" hint="手动提问参考候选人转写时要求的最少字数。">
                   <input
                     type="number"
                     min={1}

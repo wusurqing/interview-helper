@@ -15,6 +15,8 @@ class MmpgRequest:
     traces: tuple[str, ...]
     final_at: float
     updates_qa_id: str | None
+    transcript_anchor: str | None = field(default=None, kw_only=True)
+    transcript_anchors: tuple[str, ...] = field(default=(), kw_only=True)
     completed_qa_id: str | None = None
     cancelled: bool = False
     on_started: Callable[[float], None] | None = None
@@ -41,6 +43,7 @@ class MmpgRequest:
 class _Question:
     id: str = field(default_factory=lambda: uuid4().hex[:12])
     utterances: dict[str, tuple[int, str]] = field(default_factory=dict)
+    transcript_anchors: dict[str, str] = field(default_factory=dict)
     speaking: dict[str, int] = field(default_factory=dict)
     final_at: float = 0
     revision: int = 0
@@ -52,12 +55,13 @@ class _Question:
 
 class MmpgTurns:
     def __init__(self, *, submit, cancel, publish, enabled, clock, call_later,
-                 answer_delay_ms, followup_window_ms, log=None, cancel_on_clear=None):
+                 answer_delay_ms, followup_window_ms, log=None, cancel_on_clear=None, record_final=None):
         self._submit = submit
         self._cancel = cancel
         self._cancel_on_clear = cancel_on_clear or cancel
         self._publish = publish
         self._enabled = enabled
+        self._record_final = record_final
         self._clock = clock
         self._call_later = call_later
         self._delay = answer_delay_ms / 1000
@@ -171,6 +175,9 @@ class MmpgTurns:
         self._seen.add(trace)
         if text:
             group.utterances[trace] = (order, text)
+            if self._record_final is not None:
+                if anchor := self._record_final(text, trace, group.id):
+                    group.transcript_anchors[trace] = anchor
             group.final_at = self._clock()
             group.waiting_for_new_text = False
         if group.speaking:
@@ -203,6 +210,8 @@ class MmpgTurns:
             group.id, group.revision,
             "\n".join(group.utterances[key][1] for key in traces),
             traces, group.final_at, group.updates_qa_id,
+            transcript_anchor=group.transcript_anchors.get(traces[-1]),
+            transcript_anchors=tuple(group.transcript_anchors[trace] for trace in traces if trace in group.transcript_anchors),
         )
         group.request = request
         self._log("answer_wait_elapsed", group=group.id, revision=group.revision, turns=",".join(traces))

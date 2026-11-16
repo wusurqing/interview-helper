@@ -24,9 +24,11 @@ from services.llm import (
     LLMError,
     postprocess_answer_for_mode,
 )
+from services.llm.interview_budget import stream_interview_answer
 from services.llm.prompts import (
     assist_prompt_scene,
     build_assist_user_context,
+    format_interview_utterance,
     max_tokens_for_assist_prompt,
 )
 from api.assist.scheduler import TaskPayload
@@ -560,10 +562,8 @@ def _question_rejects_resume_context(question_text: str) -> bool:
 def _should_include_resume_context(
     prompt_mode: PromptMode,
     question_text: str,
-    *,
-    last_qa=None,
-    is_followup: bool = False,
-    followup_needs_bridge: bool = False,
+    previous_question: str,
+    is_followup: bool,
 ) -> bool:
     if _question_rejects_resume_context(question_text):
         return False
@@ -571,41 +571,14 @@ def _should_include_resume_context(
         return True
     if _question_explicitly_requests_resume_context(question_text):
         return True
-    if not is_followup or not last_qa or not followup_needs_bridge:
-        return False
-    return _question_explicitly_requests_resume_context(getattr(last_qa, "question", ""))
+    return (
+        is_followup
+        and _followup_needs_bridge(question_text)
+        and _question_explicitly_requests_resume_context(previous_question)
+    )
 
 
-def _empty_history_stats(profile: str) -> dict[str, Any]:
-    return {
-        "messages": 0,
-        "history_messages": 0,
-        "stripped_images": 0,
-        "profile": profile,
-        "raw_text_chars": 0,
-        "trimmed_text_chars": 0,
-        "max_chars_per_message": 0,
-        "total_char_budget": 0,
-    }
-
-
-def _history_context_options(prompt_mode: PromptMode, written_exam: bool) -> dict[str, Any]:
-    if written_exam:
-        return {
-            "profile": "written_none",
-            "turns": 0,
-            "max_chars_per_message": 0,
-            "include_summary": False,
-            "total_char_budget": 0,
-        }
-    if prompt_mode == PROMPT_MODE_ASR_REALTIME:
-        return {
-            "profile": "asr_compact",
-            "turns": 1,
-            "max_chars_per_message": 520,
-            "include_summary": False,
-            "total_char_budget": 1100,
-        }
+def _history_context_options(prompt_mode: PromptMode) -> dict[str, Any]:
     if prompt_mode == PROMPT_MODE_SERVER_SCREEN:
         return {
             "profile": "screen_light",
@@ -774,6 +747,8 @@ def process_question_parallel(
             kb_degraded = True
 
     images = _normalize_task_images(image)
+    realtime_voice = prompt_mode == PROMPT_MODE_ASR_REALTIME and not images
+    transcript_anchor = meta.get("transcript_anchor")
 
     if images:
         user_for_llm: Any = [
@@ -786,7 +761,11 @@ def process_question_parallel(
 
     with conversation_lock:
         session_ref = get_session()
-        if written_exam:
+        transcript = session_ref.transcript_snapshot(transcript_anchor) if realtime_voice and transcript_anchor else ()
+        if realtime_voice:
+            base_messages = []
+            written_followup_context = ""
+        elif written_exam:
             base_messages = []
             history_stats = {"messages": 0, "history_messages": 0, "stripped_images": 0}
             written_followup_context = (
@@ -799,7 +778,7 @@ def process_question_parallel(
                 )
             )
         else:
-            history_options = _history_context_options(prompt_mode, written_exam)
+            history_options = _history_context_options(prompt_mode)
             base_messages = list(session_ref.get_conversation_messages_for_llm(**history_options))
             history_stats = dict(getattr(session_ref, "last_llm_history_stats", {}) or {})
             written_followup_context = ""
@@ -807,7 +786,8 @@ def process_question_parallel(
         candidate_context_enabled, candidate_wait_ms, candidate_max_chars, candidate_min_chars = _candidate_context_settings(cfg)
         candidate_source_ok = _supports_candidate_context_source(source, meta)
         should_use_candidate_context = bool(
-            not written_exam
+            not realtime_voice
+            and not written_exam
             and not images
             and last_qa
             and candidate_source_ok
@@ -831,10 +811,17 @@ def process_question_parallel(
         actual_spoken_answer = ""
     candidate_context_chars = len(actual_spoken_answer[:candidate_max_chars]) if actual_spoken_answer else 0
 
+    previous_question = ""
     is_followup = False
-    followup_needs_bridge = False
+    if realtime_voice and len(transcript) > 1:
+        previous_round = transcript[-2]
+        previous_question = "\n".join(entry.text for entry in previous_round if entry.speaker == "interviewer")
+        previous_spoken_answer = "\n".join(entry.text for entry in previous_round if entry.speaker == "candidate")
+        if previous_question:
+            is_followup = classify_followup(question_text, previous_question, previous_spoken_answer)
     if (
-        not written_exam
+        not realtime_voice
+        and not written_exam
         and not images
         and last_qa
         and _supports_candidate_context_source(source, meta)
@@ -882,12 +869,6 @@ def process_question_parallel(
             f"现在面试官问题：{question_text}"
         )
 
-    if prompt_mode == PROMPT_MODE_ASR_REALTIME and is_followup:
-        base_messages = []
-        history_stats = _empty_history_stats(
-            "asr_followup_bridge" if followup_needs_bridge else "asr_followup_anchor_only"
-        )
-
     if written_followup_context:
         if isinstance(user_for_llm, list):
             if user_for_llm and isinstance(user_for_llm[0], dict) and user_for_llm[0].get("type") == "text":
@@ -923,42 +904,57 @@ def process_question_parallel(
         include_resume=_should_include_resume_context(
             prompt_mode,
             question_text,
-            last_qa=last_qa,
-            is_followup=is_followup,
-            followup_needs_bridge=followup_needs_bridge,
+            previous_question,
+            is_followup,
         ),
     )
-    if user_context:
-        context_prefix = f"[本轮任务资料]\n{user_context}\n\n[当前输入]\n"
-        if isinstance(user_for_llm, list):
-            user_for_llm[0]["text"] = context_prefix + user_for_llm[0]["text"]
-        else:
-            user_for_llm = context_prefix + user_for_llm
+    if realtime_voice:
+        voice_rounds = tuple(
+            tuple(
+                format_interview_utterance(
+                    entry.text,
+                    speaker=entry.speaker,
+                    current=entry.id == transcript_anchor,
+                )
+                for entry in spoken_round
+            )
+            for spoken_round in transcript
+        )
+        if not voice_rounds:
+            voice_rounds = ((format_interview_utterance(question_text, speaker="interviewer", current=True),),)
+        voice_prefix = f"[本轮任务资料]\n{user_context}\n\n[真实对话]" if user_context else None
+    else:
+        if user_context:
+            context_prefix = f"[本轮任务资料]\n{user_context}\n\n[当前输入]\n"
+            if isinstance(user_for_llm, list):
+                user_for_llm[0]["text"] = context_prefix + user_for_llm[0]["text"]
+            else:
+                user_for_llm = context_prefix + user_for_llm
 
-    messages_for_llm = base_messages + [{"role": "user", "content": user_for_llm}]
-    deps.logger.info(
-        "LLM_INPUT_STATS source=%s prompt_mode=%s written_exam=%s image_count=%d "
-        "image_payload_chars=%d history_used=%s history_profile=%s history_messages=%d "
-        "historical_images_stripped=%d history_text_raw_chars=%d "
-        "history_text_trimmed_chars=%d candidate_context_chars=%d "
-        "message_count=%d text_chars=%d prompt_scene=%s customized_prompt=%s",
-        source,
-        prompt_mode,
-        written_exam,
-        len(images),
-        _image_payload_chars(images),
-        bool(base_messages),
-        str(history_stats.get("profile", "default")),
-        int(history_stats.get("history_messages", 0) or 0),
-        int(history_stats.get("stripped_images", 0) or 0),
-        int(history_stats.get("raw_text_chars", 0) or 0),
-        int(history_stats.get("trimmed_text_chars", 0) or 0),
-        candidate_context_chars,
-        len(messages_for_llm),
-        _message_text_chars(messages_for_llm),
-        scene,
-        customized_prompt,
-    )
+        messages_for_llm = base_messages + [{"role": "user", "content": user_for_llm}]
+        deps.logger.info(
+            "LLM_INPUT_STATS source=%s prompt_mode=%s written_exam=%s image_count=%d "
+            "image_payload_chars=%d history_used=%s history_profile=%s history_messages=%d "
+            "historical_images_stripped=%d history_text_raw_chars=%d "
+            "history_text_trimmed_chars=%d candidate_context_chars=%d "
+            "message_count=%d text_chars=%d prompt_scene=%s customized_prompt=%s",
+            source,
+            prompt_mode,
+            written_exam,
+            len(images),
+            _image_payload_chars(images),
+            bool(base_messages),
+            str(history_stats.get("profile", "default")),
+            int(history_stats.get("history_messages", 0) or 0),
+            int(history_stats.get("stripped_images", 0) or 0),
+            int(history_stats.get("raw_text_chars", 0) or 0),
+            int(history_stats.get("trimmed_text_chars", 0) or 0),
+            candidate_context_chars,
+            len(messages_for_llm),
+            _message_text_chars(messages_for_llm),
+            scene,
+            customized_prompt,
+        )
 
     if len(images) > 1:
         display_question = f"{question_text} [📷 多图 x{len(images)}]"
@@ -983,7 +979,7 @@ def process_question_parallel(
             **format_payload,
         }
     )
-    # 候选人回答窗口用于下一轮上下文、知识记录或后续手动复盘；只要候选人 ASR 开启就绑定 qa_id。
+    # 保留答题卡关联，供复盘、知识记录和手动提问使用。
     should_open_candidate_window = (
         _supports_candidate_context_source(source, meta)
         and (
@@ -1046,24 +1042,32 @@ def process_question_parallel(
             think_override = written_exam_think
         else:
             think_override = None
-        for chunk_type, chunk_text in chat_stream_single_model(
-            model_cfg,
-            messages_for_llm,
+        stream_options = dict(
             system_prompt=system_prompt,
             abort_check=deps.abort_check,
             override_think_mode=think_override,
             usage_callback=_record_usage,
             override_max_tokens=max_tokens_for_assist_prompt(
-                prompt_mode,
-                cfg,
-                high_churn_short_answer=short_answer,
+                prompt_mode, cfg, high_churn_short_answer=short_answer,
             ),
-            trace_context={"scene": scene, "qa_id": qa_id, "source": source,
-                           "mmpg_group_id": getattr(mmpg_request, "group_id", None),
-                           "mmpg_revision": getattr(mmpg_request, "revision", None),
-                           "mmpg_seq": getattr(mmpg_request, "seq", None)},
-            **({"mmpg_request": mmpg_request, "config_snapshot": cfg} if mmpg_request else {}),
-        ):
+            trace_context={
+                "scene": scene, "qa_id": qa_id, "source": source,
+                "mmpg_group_id": getattr(mmpg_request, "group_id", None),
+                "mmpg_revision": getattr(mmpg_request, "revision", None),
+                "mmpg_seq": getattr(mmpg_request, "seq", None),
+            },
+        )
+        if realtime_voice:
+            stream = stream_interview_answer(
+                model_cfg, voice_rounds, context_prefix=voice_prefix,
+                mmpg_request=mmpg_request, config_snapshot=cfg,
+                stream_fn=chat_stream_single_model, **stream_options,
+            )
+        else:
+            if mmpg_request:
+                stream_options.update(mmpg_request=mmpg_request, config_snapshot=cfg)
+            stream = chat_stream_single_model(model_cfg, messages_for_llm, **stream_options)
+        for chunk_type, chunk_text in stream:
             if deps.abort_check():
                 break
             if chunk_type == "think":

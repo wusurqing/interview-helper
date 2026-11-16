@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
+from uuid import uuid4
 
 from services.stt import (
     build_asr_question_group_text,
@@ -25,6 +26,8 @@ class PendingASRGroup:
     first_mono: float = 0.0
     last_mono: float = 0.0
     has_promote: bool = False
+    transcript_anchor: str | None = None
+    transcript_anchors: list[str] = field(default_factory=list)
 
 
 class AssistAsrStateMachine:
@@ -35,24 +38,30 @@ class AssistAsrStateMachine:
         submit_answer_task: Callable[[TaskPayload], bool],
         begin_asr_turn: Callable[[], int],
         logger,
-        append_late_constraint_tail: Callable[[str, str, float], bool] | None = None,
+        append_late_constraint_tail: Callable[[str, str, float, str | None], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         self.broadcast = broadcast
         self.submit_answer_task = submit_answer_task
         self.begin_asr_turn = begin_asr_turn
-        self.append_late_constraint_tail = append_late_constraint_tail or (lambda _text, _source, _now: False)
+        self.append_late_constraint_tail = append_late_constraint_tail or (
+            lambda _text, _source, _now, _anchor: False
+        )
         self.logger = logger
         self.clock = clock
         self.merge_parts: list[str] = []
         self.merge_mono_first: Optional[float] = None
         self.merge_mono_last: Optional[float] = None
+        self.merge_transcript_anchor: str | None = None
+        self.merge_transcript_anchors: list[str] = []
         self.pending_group: Optional[PendingASRGroup] = None
 
     def reset_merge_buffer(self):
         self.merge_parts = []
         self.merge_mono_first = None
         self.merge_mono_last = None
+        self.merge_transcript_anchor = None
+        self.merge_transcript_anchors = []
 
     def reset_pending_group(self):
         self.pending_group = None
@@ -69,14 +78,7 @@ class AssistAsrStateMachine:
     def submit_final_question(self, cfg, session, text, mmpg_trace=None, request=None) -> str:
         if not cfg.auto_detect:
             return "auto_answer_disabled"
-        minimum = getattr(cfg, "transcription_min_sig_chars", 2)
-        verdict, _ = classify_asr_question_candidate(text, minimum)
-        # A complete question can end with an extra instruction. Check each
-        # sentence for intent, while submitting the original turn verbatim.
-        if verdict != "promote" and not any(
-            classify_asr_question_candidate(part, minimum)[0] == "promote"
-            for part in split_question_like_text(text)
-        ):
+        if not is_transcript_question(cfg, text):
             return "filtered"
         turn = self.begin_asr_turn() if request is None else 0
         source = "conversation_loopback" if session.capture_is_loopback else "conversation_mic"
@@ -86,6 +88,7 @@ class AssistAsrStateMachine:
             "utterances": text.splitlines() if request is not None else [text],
             "mmpg_trace": mmpg_trace,
             **({"mmpg_request": request} if request is not None else {}),
+            **({"transcript_anchor": request.transcript_anchor} if request and request.transcript_anchor else {}),
         }))
         return "queued" if queued else "no_answer_model"
 
@@ -102,6 +105,8 @@ class AssistAsrStateMachine:
         question_text = build_asr_question_group_text(group.utterances)
         if not question_text:
             return
+        if group.transcript_anchors:
+            session.group_transcript_question(group.transcript_anchors)
         now_mono = self.clock()
         turn_id = self.begin_asr_turn()
         self.logger.info(
@@ -121,6 +126,7 @@ class AssistAsrStateMachine:
                     "utterances": list(group.utterances),
                     "dispatch_after_mono": now_mono + _asr_late_constraint_grace_sec(cfg),
                     "asr_tail_grace_until_mono": now_mono + _asr_late_constraint_grace_sec(cfg),
+                    **({"transcript_anchor": group.transcript_anchor} if group.transcript_anchor else {}),
                 },
             )
         )
@@ -145,7 +151,10 @@ class AssistAsrStateMachine:
         elif not group.has_promote and since_last >= confirm * 2:
             self.flush_question_group_now(cfg, session)
 
-    def handle_auto_detect_asr_text(self, cfg, session, pub: str, source: str, now_mono: float) -> None:
+    def handle_auto_detect_asr_text(
+        self, cfg, session, pub: str, source: str, now_mono: float,
+        transcript_anchor: str | None = None, transcript_anchors: tuple[str, ...] = (),
+    ) -> None:
         kind, cleaned = classify_asr_question_candidate(
             pub,
             getattr(cfg, "transcription_min_sig_chars", 2),
@@ -156,7 +165,7 @@ class AssistAsrStateMachine:
             self.pending_group is None
             and kind == "candidate"
             and is_asr_question_constraint_tail(cleaned)
-            and self.append_late_constraint_tail(cleaned, source, now_mono)
+            and self.append_late_constraint_tail(cleaned, source, now_mono, transcript_anchor)
         ):
             return
         if (
@@ -167,6 +176,8 @@ class AssistAsrStateMachine:
             self.pending_group.utterances.append(cleaned)
             self.pending_group.last_mono = now_mono
             self.pending_group.source = source
+            self.pending_group.transcript_anchor = transcript_anchor or self.pending_group.transcript_anchor
+            self.pending_group.transcript_anchors.extend(transcript_anchors)
             return
         self.try_flush_question_group(cfg, session, now_mono, False)
         if kind == "ignore" and self.pending_group is None:
@@ -178,20 +189,25 @@ class AssistAsrStateMachine:
                 first_mono=now_mono,
                 last_mono=now_mono,
                 has_promote=(kind == "promote"),
+                transcript_anchor=transcript_anchor,
+                transcript_anchors=list(transcript_anchors),
             )
         else:
             self.pending_group.utterances.append(cleaned)
             self.pending_group.last_mono = now_mono
             self.pending_group.source = source
             self.pending_group.has_promote = self.pending_group.has_promote or kind == "promote"
+            if kind != "ignore" and transcript_anchor:
+                self.pending_group.transcript_anchor = transcript_anchor
+                self.pending_group.transcript_anchors.extend(transcript_anchors)
 
     def flush_merge_buffer_now(self, cfg, session) -> None:
         if not self.merge_parts:
             return
         parts = list(self.merge_parts)
-        self.merge_parts.clear()
-        self.merge_mono_first = None
-        self.merge_mono_last = None
+        transcript_anchor = self.merge_transcript_anchor
+        transcript_anchors = tuple(self.merge_transcript_anchors)
+        self.reset_merge_buffer()
         merged_raw = join_transcription_fragments(parts)
         min_sig = getattr(cfg, "transcription_min_sig_chars", 2)
         pub = transcription_for_publish(merged_raw, min_sig)
@@ -205,7 +221,7 @@ class AssistAsrStateMachine:
                 if session.capture_is_loopback
                 else "conversation_mic"
             )
-            self.handle_auto_detect_asr_text(cfg, session, pub, source, self.clock())
+            self.handle_auto_detect_asr_text(cfg, session, pub, source, self.clock(), transcript_anchor, transcript_anchors)
 
     def try_flush_merge_buffer(self, cfg, session, now_mono: float, force: bool = False) -> None:
         if not self.merge_parts:
@@ -233,7 +249,20 @@ class AssistAsrStateMachine:
         pub: str,
         now_mono: float,
         force_flush_tail: bool = False,
+        *,
+        started_at: float | None = None,
+        transcript_key: str = "",
+        transcript_epoch: int | None = None,
+        publish: bool = True,
     ) -> None:
+        transcript_key = transcript_key or uuid4().hex
+        transcript_anchor = session.record_transcript(
+            "interviewer", pub, started_at=now_mono if started_at is None else started_at,
+            utterance_key=transcript_key, epoch=transcript_epoch,
+            question_group=transcript_key if is_transcript_question(cfg, pub) else None,
+        )
+        if transcript_anchor is None or not publish:
+            return
         gap = float(getattr(cfg, "assist_transcription_merge_gap_sec", 2.0) or 0.0)
         if gap <= 0:
             session.add_transcription(pub)
@@ -244,16 +273,28 @@ class AssistAsrStateMachine:
                     if session.capture_is_loopback
                     else "conversation_mic"
                 )
-                self.handle_auto_detect_asr_text(cfg, session, pub, source, now_mono)
+                self.handle_auto_detect_asr_text(cfg, session, pub, source, now_mono, transcript_anchor, (transcript_anchor,))
             return
         if not self.merge_parts:
             self.merge_mono_first = now_mono
         self.merge_parts.append(pub)
+        self.merge_transcript_anchors.append(transcript_anchor)
+        if self.merge_transcript_anchor is None or classify_asr_question_candidate(pub)[0] != "ignore":
+            self.merge_transcript_anchor = transcript_anchor
         self.merge_mono_last = now_mono
         if force_flush_tail:
             self.flush_merge_buffer_now(cfg, session)
         else:
             self.try_flush_merge_buffer(cfg, session, now_mono, False)
+
+
+def is_transcript_question(cfg, text: str) -> bool:
+    minimum = getattr(cfg, "transcription_min_sig_chars", 2)
+    return classify_asr_question_candidate(text, minimum)[0] == "promote" or any(
+        classify_asr_question_candidate(part, minimum)[0] == "promote"
+        for line in text.splitlines()
+        for part in (line, *split_question_like_text(line))
+    )
 
 
 def _asr_confirm_window_sec(cfg) -> float:

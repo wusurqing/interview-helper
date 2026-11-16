@@ -137,18 +137,18 @@ describe('SpeechTab', () => {
     expect(screen.getByText('我的回答记录（麦克风）')).toBeInTheDocument()
     expect(screen.getByRole('switch', { name: '我的回答记录（麦克风）' })).toHaveAttribute('aria-checked', 'false')
     expect(screen.getAllByText(/不会触发自动答题/).length).toBeGreaterThan(0)
-    expect(screen.getByText(/不读取麦克风，不写入复盘，追问按旧逻辑/)).toBeInTheDocument()
+    expect(screen.getByText(/实时语音只使用会议音频转写/)).toBeInTheDocument()
     expect(screen.getByText('麦克风兼容模式')).toBeInTheDocument()
     expect(screen.getByText('共享兼容优先')).toBeInTheDocument()
     expect(screen.getByDisplayValue('Whisper（本地，免费）')).toBeInTheDocument()
     expect(screen.getByText(/高级设置：/)).toBeInTheDocument()
-    expect(screen.getByText(/生成下一轮答案时会携带上一轮/)).toBeInTheDocument()
+    expect(screen.getByText(/按发言顺序使用面试官和候选人已经转写的原话/)).toBeInTheDocument()
     expect(screen.getByText('边听边写')).toBeInTheDocument()
-    expect(screen.getByText('兜底等最后一句 (ms)')).toBeInTheDocument()
+    expect(screen.getByText('手动提问等待转写 (ms)')).toBeInTheDocument()
     expect(screen.getByDisplayValue('200')).toBeInTheDocument()
   })
 
-  it('describes candidate microphone ASR as review recording even when follow-up context is off', () => {
+  it('keeps speech context and review enabled when manual context is off', () => {
     useInterviewStore.setState((state) => ({
       config: {
         ...(state.config as any),
@@ -160,12 +160,12 @@ describe('SpeechTab', () => {
 
     render(<SpeechTab />)
 
-    expect(screen.getByText(/Whisper 本地，仅记录复盘，追问按旧逻辑/)).toBeInTheDocument()
+    expect(screen.getByText(/Whisper 本地，用于复盘和实时语音上下文/)).toBeInTheDocument()
     expect(screen.getByText(/用于把你的真实回答写入复盘/)).toBeInTheDocument()
-    expect(screen.getByText('仅写入复盘记录')).toBeInTheDocument()
+    expect(screen.getByText('手动参考已关闭')).toBeInTheDocument()
   })
 
-  it('describes candidate microphone ASR as review recording plus spoken follow-up context when enabled', () => {
+  it('describes both voice and manual context when manual reference is enabled', () => {
     useInterviewStore.setState((state) => ({
       config: {
         ...(state.config as any),
@@ -177,8 +177,8 @@ describe('SpeechTab', () => {
 
     render(<SpeechTab />)
 
-    expect(screen.getByText(/Whisper 本地，记录复盘，并给追问补真实口述/)).toBeInTheDocument()
-    expect(screen.getByText('下一题携带真实口述')).toBeInTheDocument()
+    expect(screen.getByText(/Whisper 本地，用于复盘、实时语音和手动提问上下文/)).toBeInTheDocument()
+    expect(screen.getByText('手动参考已开启')).toBeInTheDocument()
   })
 
   it('warns when candidate cloud ASR is selected without matching credentials', () => {

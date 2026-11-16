@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """LLM prompt builders and answer post-processing."""
 
+import json
 import re
 from typing import Literal, Optional, Sequence
 from core.config import get_config
@@ -27,14 +28,6 @@ _FIRST_SENTENCE_CONSTRAINT = (
 )
 
 # ---- few-shot examples for each mode ----
-
-_FEWSHOT_ASR = (
-    "\n示例（输入\u2192输出）：\n"
-    'Q: "Redis 的 RDB 和 AOF 区别是什么"\n'
-    "A: RDB 是快照持久化，AOF 是追加写日志。区别在于安全性与性能的取舍\u2014\u2014RDB 恢复快但可能丢几分钟数据，AOF 可做到秒级持久化但文件体积更大。线上通常两者搭配使用。\n\n"
-    'Q: "锁怎么搞"（B 档可猜意图）\n'
-    "A: 先按大概率问分布式锁的理解。常用方案 Redisson + Lua 脚本，核心是续期和自动释放，配合看门狗机制防死锁。如果你实际想问别种锁，我可以换个方向。\n"
-)
 
 _FEWSHOT_MANUAL = (
     "\n示例（输入\u2192输出）：\n"
@@ -83,27 +76,6 @@ _FEWSHOT_EXAM = (
     "    return prev\n"
     "```\n"
 )
-
-
-def _intent_ladder_block(short_answer_budget: str) -> str:
-    """Three-tier intent ladder injected at the top of the standard and short voice prompts.
-
-    short_answer_budget: 描述 B 档最小可用回答的字数窗口（如 "~150 字" / "~80 字"）。
-    """
-    return (
-        "输入判定三档 ladder（按顺序往下匹配）:\n"
-        "A. 完整可答的面试问题 -> 直接进入正式回答, 不输出任何判定过程。\n"
-        "B. 可猜意图（半句话、术语模糊、不完整但能推出方向） ->\n"
-        "   1) 先对最可能的意图给 1 句说明: \u201c先按大概率问 X 理解\u201d;\n"
-        f"   2) 给一个 {short_answer_budget} 的最小可用回答;\n"
-        "   3) 最后一句挂 clarifier: \u201c如果你实际想问 Y, 我可以换个方向\u201d;\n"
-        "   不要输出\u201c信息不足\u201d这种空回答。\n"
-        "C. 纯寒暄 / 口头禅 / 设备噪声 / 明显无关内容 -> 只输出一句:\n"
-        '   \u201c等你问题\u201d 或 \u201c在听呢, 请继续\u201d, 其他不写。\n'
-        '   C 档典型输入: \u201c好不急\u201d\u3001\u201c嗯嗯\u201d\u3001\u201c可以\u201d\u3001\u201c我看看啊\u201d\u3001\u201cOK\u201d\u3001\u201c没事\u201d\u3001\n'
-        '   \u201c好嘞\u201d\u3001\u201c稍等\u201d\u3001\u201c就是这个意思\u201d\u3002这些只需 \u201c在听呢\u201d 级回复\u3002\n'
-        "默认倾向: 宁可按 B 给点东西, 也不要按 C 停; 但若连最可能方向都无法合理推断时, 按 C 处理。\n\n"
-    )
 
 
 _FOLLOWUP_COHERENCE = (
@@ -228,41 +200,27 @@ def _written_exam_prefix() -> str:
     )
 
 
-def _asr_realtime_prompt_body(
-    high_churn_short_answer: bool = False,
-) -> str:
-    if high_churn_short_answer:
-        return (
-            "\n场景：本轮输入来自实时语音转写，当前使用简短回答模式。\n\n"
-            + _intent_ladder_block("~80 字")
-            + _FIRST_SENTENCE_CONSTRAINT
-            + "\n回答规则：\n"
-            "- 优先跟住最新问题，像现场接一句话，先给结论再补 2-3 个依据；\n"
-            "- 默认 80-180 字，复杂题最多 220 字；不要背景铺垫、长例子、延伸知识树；\n"
-            "- 除非明确要求写代码，否则不要输出代码。\n\n"
-            + _FOLLOWUP_COHERENCE
-            + _FEWSHOT_ASR
-        )
-    body = (
-        "\n场景：本轮输入来自实时语音转写（可能是碎句、口头禅、半句话）。\n\n"
-        + _intent_ladder_block("~150 字")
-        + _FIRST_SENTENCE_CONSTRAINT
-        + "\n正式回答规则：\n"
-        "- 先直接回答，再用几句话解释最相关的理由。简单题说清关键区别就收住，通常讲 3-5 句。复杂题可分几个自然段，按题意补足机制、做法、取舍或验证；不为凑字数扩展；\n"
-        "- 详细模式只增加机制、取舍、验证和边界密度，不等于自动进入个人项目叙述；除非题干明确要项目/简历/经历，否则不要写第一人称项目故事；\n"
-        "- 半句场景（例如只说\u201c安卓能登录但 iOS 不行\u201d、后面才问\u201c怎么排查\u201d）要结合上一轮/下一句意图，避免把题干片段硬答成完整题；\n"
-        "- 原理题讲机制、误区/边界和工程落地；排障题讲先止血、后定位、再验证；\n"
-        "- 场景/设计题补方案取舍、监控告警、灰度回滚；必要时给匿名工程例子、可观测指标或失败模式，但不要包装成个人项目经历；\n"
-        "- 概念对比题（例如 rules 和 skills 的区别、框架 A vs B）只讲定义差异、适用边界、一个短例子和面试表达；不要为了显得丰富而硬凑项目经历或量化结果；\n"
-        "- 只有明确问“你的项目/你做过/简历里的 X”时，项目/经历题才讲背景、动作、技术决策、量化结果和复盘；背景交代控制在 1-2 句，重点放在面试官当前追问点，不要先铺一整段项目介绍；\n"
-        "- 不输出题型判断过程、检查清单或元话术。\n\n"
-        "代码规则：\n"
-        "- 仅当用户明确要求\u201c写代码/实现一下/给 SQL/伪代码\u201d时输出代码；\n"
-        "- 非 SQL 代码优先使用任务资料中的首选编程语言。\n\n"
-        + _FOLLOWUP_COHERENCE
-        + _FEWSHOT_ASR
+def format_interview_utterance(text: str, *, speaker: str, current: bool = False) -> str:
+    """Quote the spoken text so embedded newlines cannot impersonate a speaker label."""
+    if speaker == "candidate":
+        label = "候选人"
+    else:
+        label = "面试官｜当前发言" if current else "面试官"
+    return f"【{label}】{json.dumps(text, ensure_ascii=False)}"
+
+
+def _asr_realtime_prompt(high_churn_short_answer: bool) -> str:
+    prompt = (
+        "你是正在参加技术面试的候选人。根据【面试官】和【候选人】的真实对话，"
+        "接着回应【面试官｜当前发言】标记的最新提问或发言。参考前文理解省略、术语和语音转写偏差，"
+        "确实无法判断时，直接向面试官问一句澄清。候选人发言是已说过的内容；涉及经历时使用已有事实。\n"
+        "只输出可以直接说出口的话。第一句直接回答，后面用自然、简洁的短句说明理由。"
+        "使用纯文本，不展示猜题过程，不要使用 Markdown 标题、列表、加粗或代码围栏。"
+        "明确要求写代码时，保留代码换行和缩进。"
     )
-    return body
+    if high_churn_short_answer:
+        return prompt + "\n简短回答模式，尽量用两三句说清结论和最重要的理由。"
+    return prompt
 
 
 def _manual_text_prompt_body() -> str:
@@ -657,12 +615,12 @@ def max_tokens_for_assist_prompt(
 def _default_system_prompt(mode: PromptMode, high_churn_short_answer: bool, *, structured_manual: bool = False) -> str:
     if mode == PROMPT_MODE_WRITTEN_EXAM:
         return _written_exam_prefix() + _written_exam_prompt_body()
+    if mode == PROMPT_MODE_ASR_REALTIME:
+        return _asr_realtime_prompt(high_churn_short_answer)
     if mode == PROMPT_MODE_SERVER_SCREEN:
         body = _server_screen_prompt_body()
-    elif mode == PROMPT_MODE_MANUAL_TEXT:
-        body = _structured_manual_prompt_body() if structured_manual else _manual_text_prompt_body()
     else:
-        body = _asr_realtime_prompt_body(high_churn_short_answer)
+        body = _structured_manual_prompt_body() if structured_manual else _manual_text_prompt_body()
     return _base_prompt_prefix(structured=mode == PROMPT_MODE_SERVER_SCREEN or structured_manual) + body
 
 

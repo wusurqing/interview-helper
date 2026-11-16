@@ -1,4 +1,4 @@
-"""Prompt polish (2026-04-17): intent ladder + resume two-mode + 首句硬约束 + 高 churn 追问."""
+"""Default assist prompts and output cleaning."""
 from __future__ import annotations
 
 import pytest
@@ -28,30 +28,20 @@ def _manual_prompt() -> str:
     return build_system_prompt(mode="manual_text")
 
 
-# ---- 4.1 intent ladder ---------------------------------------------------
+@pytest.mark.parametrize("short", [False, True])
+def test_voice_prompt_uses_real_speaker_labeled_conversation(short):
+    prompt = _asr_prompt(high_churn=short)
+    assert "真实对话" in prompt
+    assert "【面试官】" in prompt and "【候选人】" in prompt
+    assert "【面试官｜当前发言】" in prompt
+    assert "直接说出口" in prompt
+    assert "第一句直接" in prompt
+    assert "先按大概率" not in prompt
+    assert "我可以换个方向" not in prompt
+    assert "追问上下文" not in prompt
+    assert "术语" in prompt and "转写" in prompt
+    assert len(prompt) < 500
 
-def test_asr_realtime_has_intent_ladder_three_tiers():
-    p = _asr_prompt(high_churn=False)
-    assert "输入判定三档 ladder" in p
-    assert "A. 完整" in p
-    assert "B. 可猜意图" in p
-    assert "C. 纯寒暄" in p
-    assert "clarifier" in p or "我可以换个方向" in p
-
-
-def test_asr_realtime_high_churn_also_has_intent_ladder():
-    p = _asr_prompt(high_churn=True)
-    assert "输入判定三档 ladder" in p
-    assert "B. 可猜意图" in p
-    assert "~80" in p or "80 字" in p
-
-
-def test_asr_realtime_no_longer_uses_information_insufficient_halt():
-    p = _asr_prompt(high_churn=False)
-    assert "信息不足，先等待更完整的问题" not in p
-
-
-# ---- 4.2 resume two-mode color ------------------------------------------
 
 def test_default_prompt_has_resume_two_mode_rule():
     p = _manual_prompt()
@@ -96,86 +86,17 @@ def test_written_exam_prompt_handles_incremental_screenshots_and_failures(reset_
     assert "修正后的完整可提交代码" in p
 
 
-# ---- 4.3 first-sentence hard constraint ---------------------------------
-
-def test_first_sentence_hard_constraint_in_asr():
-    p = _asr_prompt(high_churn=False)
-    assert "首句硬约束" in p
-    assert "第一句直接给结论" in p
-    assert "我理解你问的是" in p
-
-
 def test_first_sentence_hard_constraint_in_manual_text():
-    p = _manual_prompt()
-    assert "首句硬约束" in p
+    assert "首句硬约束" in _manual_prompt()
 
-
-# ---- 4.4 high-churn follow-up coherence ---------------------------------
-
-def test_high_churn_branch_has_followup_coherence_rule():
-    p = _asr_prompt(high_churn=True)
-    assert "追问连贯" in p
-    assert "[追问上下文]" in p
-
-
-def test_normal_asr_still_has_followup_rule():
-    p = _asr_prompt(high_churn=False)
-    assert "[追问上下文]" in p
-
-
-# ---- 4.5 candidate voice / anti-template polish -------------------------
 
 @pytest.mark.parametrize("mode,short", [("asr_realtime", False), ("asr_realtime", True), ("manual_text", False)])
 def test_live_prompt_asks_for_candidate_voice_without_markdown(mode, short):
     prompt = build_system_prompt(mode=mode, high_churn_short_answer=short, cfg=SimpleNamespace(system_prompts={}))
-    assert "真人候选人口吻" in prompt
     assert "纯文本" in prompt
     assert "不要使用 Markdown 标题、列表、加粗或代码围栏" in prompt
     assert "专注面板输出协议" not in prompt
     assert "`##`" not in prompt
-
-
-def test_asr_prompt_keeps_concept_comparison_from_forced_project_story():
-    p = _asr_prompt(high_churn=False)
-    assert "概念对比题" in p
-    assert "rules 和 skills" in p
-    assert "不要为了显得丰富而硬凑项目经历" in p
-    assert "只有明确问“你的项目/你做过/简历里的 X”" in p
-    assert "项目/经历使用硬规则" in p
-    assert "不要把例子伪装成候选人亲历" in p
-    assert "匿名工程例子" in p
-
-
-def test_asr_prompt_uses_density_by_question_type_not_fixed_long_answer():
-    p = _asr_prompt(high_churn=False)
-    assert "简单题说清关键区别就收住" in p
-    assert "复杂题可分几个自然段" in p
-    assert "详细模式只增加机制、取舍、验证和边界密度" in p
-    assert "不等于自动进入个人项目叙述" in p
-    assert "不为凑字数扩展" in p
-    assert "普通题 360-700 字" not in p
-
-
-def test_asr_prompt_contains_recent_asr_term_repairs():
-    p = _asr_prompt(high_churn=False)
-    assert "健身测试→兼容性测试" in p
-    assert "is 登录→iOS 登录" in p
-    assert "街舞综合框架→接口自动化/自动化测试框架" in p
-    assert "scale→skills" in p
-
-
-def test_followup_prompt_inherits_context_for_fragments():
-    p = _asr_prompt(high_churn=False)
-    assert "优先继承上一轮的业务场景和技术对象" in p
-    assert "当前追问已经把对象、条件和要问点说完整了" in p
-    assert "题干续句" in p
-    assert "安卓能登录但 iOS 不行" in p
-
-
-def test_asr_high_churn_keeps_oral_short_answer_shape():
-    p = _asr_prompt(high_churn=True)
-    assert "像现场接一句话" in p
-    assert "默认 80-180 字" in p
 
 
 def test_manual_prompt_warns_not_to_emit_template_labels():

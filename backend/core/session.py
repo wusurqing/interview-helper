@@ -2,6 +2,9 @@ import time
 import threading
 from typing import Optional, Union
 from dataclasses import asdict, dataclass, field
+from collections.abc import Iterable
+
+from core.live_transcript import LiveTranscript, Speaker, TranscriptUtterance
 
 
 @dataclass
@@ -53,6 +56,7 @@ class Session:
     created_at: float = field(default_factory=time.time)
     system_summary: str = ""
     _compaction_running: bool = False
+    _live_transcript: LiveTranscript = field(default_factory=LiveTranscript, repr=False, compare=False)
 
     MAX_HISTORY = 20
     MAX_TRANSCRIPTION_HISTORY = 200
@@ -66,6 +70,41 @@ class Session:
     SUMMARY_TRIGGER = 12
     # 摘要后保留最近 N 条原文(必须为偶数,代表完整轮数 * 2)
     SUMMARY_KEEP_RECENT = 4
+
+    @property
+    def transcript_epoch(self) -> int:
+        return self._live_transcript.epoch
+
+    def begin_transcript_capture(self) -> None:
+        self._live_transcript.reset()
+
+    def stop_transcript_capture(self) -> None:
+        self._live_transcript.stop()
+
+    def record_transcript(
+        self,
+        speaker: Speaker,
+        text: str,
+        *,
+        started_at: float,
+        utterance_key: str = "",
+        is_final: bool = True,
+        epoch: int | None = None,
+        question_group: str | None = None,
+    ) -> str | None:
+        return self._live_transcript.record(
+            speaker, text, started_at=started_at, utterance_key=utterance_key,
+            is_final=is_final, epoch=epoch, question_group=question_group,
+        )
+
+    def discard_unfinished_transcript(self, utterance_id: str | None) -> None:
+        self._live_transcript.discard_unfinished(utterance_id)
+
+    def group_transcript_question(self, anchors: Iterable[str | None], *, split_after_reply: bool = False) -> None:
+        self._live_transcript.group_question(anchors, split_after_reply=split_after_reply)
+
+    def transcript_snapshot(self, anchor: str | None) -> tuple[tuple[TranscriptUtterance, ...], ...]:
+        return self._live_transcript.snapshot(anchor)
 
     def add_transcription(self, text: str):
         if text.strip():
@@ -340,6 +379,7 @@ class Session:
             self._compaction_running = False
 
     def clear(self):
+        self._live_transcript.reset()
         self.transcription_history.clear()
         self.candidate_transcription_history.clear()
         self.candidate_answer_segments.clear()

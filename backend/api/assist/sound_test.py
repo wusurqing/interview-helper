@@ -20,8 +20,10 @@ from services.llm import (
     chat_stream_single_model,
     create_answer_stream_sanitizer,
 )
+from services.llm.interview_budget import stream_interview_answer
 from services.llm.prompts import (
     build_assist_user_context,
+    format_interview_utterance,
     max_tokens_for_assist_prompt,
 )
 from services.stt import transcribe_with_fallback
@@ -483,15 +485,18 @@ def generate_preflight_answer(cfg, model_cfg, question: str) -> dict:
         cfg=cfg,
     )
     user_context = build_assist_user_context(cfg, mode=prompt_mode)
-    user_text = f"[本轮任务资料]\n{user_context}\n\n[当前输入]\n{question}" if user_context else question
+    context_prefix = f"[本轮任务资料]\n{user_context}\n\n[真实对话]" if user_context else None
+    turn = format_interview_utterance(question, speaker="interviewer", current=True)
     sanitizer = create_answer_stream_sanitizer(prompt_mode, plain_text=True)
     answer_parts: list[str] = []
     started = time.monotonic()
     first_token_mono: Optional[float] = None
-    for chunk_type, chunk_text in chat_stream_single_model(
+    for chunk_type, chunk_text in stream_interview_answer(
         model_cfg,
-        [{"role": "user", "content": user_text}],
+        ((turn,),),
         system_prompt=system_prompt,
+        context_prefix=context_prefix,
+        stream_fn=chat_stream_single_model,
         override_max_tokens=max_tokens_for_assist_prompt(prompt_mode, cfg, high_churn_short_answer=short_answer),
         config_snapshot=cfg,
     ):

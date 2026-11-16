@@ -262,7 +262,6 @@ def test_build_system_prompt_includes_voice_short_answer_instructions():
 
     assert "简短回答模式" not in normal
     assert "简短回答模式" in short
-    assert "80-180" in short
-    assert "输入判定三档 ladder" in normal
-    assert "输入判定三档 ladder" in short
-    assert "追问连贯规则" in short
+    assert "两三句" in short
+    assert "【面试官｜当前发言】" in normal
+    assert "【面试官｜当前发言】" in short

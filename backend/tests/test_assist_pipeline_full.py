@@ -91,8 +91,8 @@ def reset_pipeline_state(monkeypatch: pytest.MonkeyPatch):
     pipeline._next_commit_seq = 0
     pipeline._next_submit_seq = 0
     pipeline._task_session_version = 0
-    pipeline._interview_thread = None
-    pipeline._candidate_thread = None
+    monkeypatch.setattr(pipeline, "_interview_thread", None)
+    monkeypatch.setattr(pipeline, "_candidate_thread", None)
     pipeline._stop_event.clear()
     pipeline._pause_event.clear()
     pipeline._candidate_flush_event.clear()
