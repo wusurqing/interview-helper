@@ -15,17 +15,11 @@ export function useOverlayWindowSync(_isRecording: boolean, _appMode: string) {
   const interviewOverlayPromptMaxWidth = useUiPrefsStore((s) => s.interviewOverlayPromptMaxWidth)
   const interviewOverlayPromptAutoFollow = useUiPrefsStore((s) => s.interviewOverlayPromptAutoFollow)
   const interviewOverlayMaxLines = useUiPrefsStore((s) => s.interviewOverlayMaxLines)
-  const applyInterviewOverlayState = useUiPrefsStore((s) => s.applyInterviewOverlayState)
-
-  const overlaySyncUntilRef = useRef(0)
-  const prevEnabledRef = useRef(interviewOverlayEnabled)
+  const prevEnabledRef = useRef<boolean | undefined>(undefined)
 
   useEffect(() => {
     if (!window.electronAPI?.syncOverlayWindow) return
-    overlaySyncUntilRef.current = Date.now() + 500
-
     const payload: Record<string, unknown> = {
-      enabled: interviewOverlayEnabled,
       opacity: interviewOverlayOpacity,
       fontSize: interviewOverlayFontSize,
       fontColor: interviewOverlayFontColor,
@@ -38,6 +32,9 @@ export function useOverlayWindowSync(_isRecording: boolean, _appMode: string) {
       maxLines: interviewOverlayMaxLines,
     }
 
+    if (prevEnabledRef.current !== interviewOverlayEnabled) {
+      payload.enabled = interviewOverlayEnabled
+    }
     // enabled OFF → force hide overlay + show main window
     if (prevEnabledRef.current && !interviewOverlayEnabled) {
       payload.visible = false
@@ -71,9 +68,13 @@ export function useOverlayWindowSync(_isRecording: boolean, _appMode: string) {
   useEffect(() => {
     if (!window.electronAPI?.onOverlayState) return
     const removeOverlayListener = window.electronAPI.onOverlayState((payload) => {
-      if (Date.now() < overlaySyncUntilRef.current) return
-      applyInterviewOverlayState(payload, { persistStyle: true })
+      if (typeof payload.visible === 'boolean') {
+        useUiPrefsStore.setState({ interviewOverlayVisible: payload.visible })
+      }
+      if (payload.trigger === 'shortcut' && payload.enabled && !useUiPrefsStore.getState().interviewOverlayEnabled) {
+        useUiPrefsStore.getState().setInterviewOverlayEnabled(true)
+      }
     })
     return () => removeOverlayListener?.()
-  }, [applyInterviewOverlayState])
+  }, [])
 }

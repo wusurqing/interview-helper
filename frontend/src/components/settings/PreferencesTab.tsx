@@ -11,16 +11,10 @@ import {
   Keyboard,
 } from 'lucide-react'
 import { useInterviewStore } from '@/stores/configStore'
-import { useShortcutsStore } from '@/stores/shortcutsStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { updateConfigAndRefresh } from '@/lib/configSync'
 import { COLOR_SCHEME_OPTIONS } from '@/lib/colorScheme'
 import { prepareExamOverlayPrompt } from '@/lib/examOverlay'
-import { getShortcutDisplay } from '@/lib/shortcuts'
-import {
-  INTERVIEW_OVERLAY_PROMPT_MAX_WIDTH,
-  INTERVIEW_OVERLAY_PROMPT_MIN_WIDTH,
-} from '@/lib/interviewOverlay'
 import { Section, Field, SaveStateBadge, matchSettingsSearch, useAutoSaveSetting, useSettingsSearch } from './shared'
 import NetworkQRCode from './NetworkQRCode'
 import QuickPromptsEditor from './QuickPromptsEditor'
@@ -92,28 +86,6 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
   const setAnswerPanelLayout = useUiPrefsStore((s) => s.setAnswerPanelLayout)
   const colorScheme = useUiPrefsStore((s) => s.colorScheme)
   const setColorScheme = useUiPrefsStore((s) => s.setColorScheme)
-  const overlayEnabled = useUiPrefsStore((s) => s.interviewOverlayEnabled)
-  const overlayOpacity = useUiPrefsStore((s) => s.interviewOverlayOpacity)
-  const overlayFontSize = useUiPrefsStore((s) => s.interviewOverlayFontSize)
-  const overlayFontColor = useUiPrefsStore((s) => s.interviewOverlayFontColor)
-  const overlayMode = useUiPrefsStore((s) => s.interviewOverlayMode)
-  const overlayFocusWidthPct = useUiPrefsStore((s) => s.interviewOverlayFocusWidthPct)
-  const overlayFocusHeightPct = useUiPrefsStore((s) => s.interviewOverlayFocusHeightPct)
-  const overlayPromptMaxWidth = useUiPrefsStore((s) => s.interviewOverlayPromptMaxWidth)
-  const overlayPromptAutoFollow = useUiPrefsStore((s) => s.interviewOverlayPromptAutoFollow)
-  const overlayMaxLines = useUiPrefsStore((s) => s.interviewOverlayMaxLines)
-  const setOverlayEnabled = useUiPrefsStore((s) => s.setInterviewOverlayEnabled)
-  const setOverlayOpacity = useUiPrefsStore((s) => s.setInterviewOverlayOpacity)
-  const setOverlayFontSize = useUiPrefsStore((s) => s.setInterviewOverlayFontSize)
-  const setOverlayFontColor = useUiPrefsStore((s) => s.setInterviewOverlayFontColor)
-  const setOverlayMode = useUiPrefsStore((s) => s.setInterviewOverlayMode)
-  const setOverlayFocusWidthPct = useUiPrefsStore((s) => s.setInterviewOverlayFocusWidthPct)
-  const setOverlayFocusHeightPct = useUiPrefsStore((s) => s.setInterviewOverlayFocusHeightPct)
-  const setOverlayPromptMaxWidth = useUiPrefsStore((s) => s.setInterviewOverlayPromptMaxWidth)
-  const setOverlayPromptAutoFollow = useUiPrefsStore((s) => s.setInterviewOverlayPromptAutoFollow)
-  const setOverlayMaxLines = useUiPrefsStore((s) => s.setInterviewOverlayMaxLines)
-  const shortcuts = useShortcutsStore((s) => s.shortcuts)
-
   const [scrollBottomPx, setScrollBottomPx] = useState(40)
   const [screenMaxLongEdge, setScreenMaxLongEdge] = useState(1600)
   const [multiScreenIdleSec, setMultiScreenIdleSec] = useState(10)
@@ -174,7 +146,7 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
         <div>
           <p className="text-sm font-semibold text-text-primary">
             {variant === 'appearance' ? '外观与快捷操作'
-              : variant === 'mode' ? '悬浮窗与笔试模式'
+              : variant === 'mode' ? '笔试与截图'
               : variant === 'kb' ? '本地知识库'
               : '常用偏好'}
           </p>
@@ -182,7 +154,7 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
             {variant === 'appearance'
               ? '配色与快捷词即时生效；快捷键修改后需要重新聚焦页面。'
               : variant === 'mode'
-                ? '悬浮提示窗、笔试模式与截图审题的开关都在这里，自动保存。'
+                ? '笔试模式与截图审题设置自动保存。'
                 : variant === 'kb'
                   ? '开启后回答会引用本地知识库笔记；检索参数可按延迟预算调整。'
                   : '这里的运行偏好会自动保存；外观和悬浮窗本机偏好即时生效。'}
@@ -281,7 +253,7 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
       </Section>
       </>)}
 
-      {/* ── 2. 悬浮提示窗（含截图区域、笔试模式） ── */}
+      {/* ── 2. 笔试模式与截图 ── */}
       {variant === 'mode' && (<>
       <Collapsible
         alwaysOpen
@@ -290,19 +262,14 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
         icon={<Monitor className="w-3.5 h-3.5" />}
         keywords="overlay 截图 笔试 toolbar ocr vision 悬浮窗 浮窗 exam"
       >
-        <div className="flex justify-end">
-          <SaveStateBadge mode="auto" state="idle" label="悬浮窗外观本机即时生效" />
-        </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
           <button
             type="button"
-            onClick={() => setOverlayEnabled(!overlayEnabled)}
-            className={`rounded-xl border px-3 py-2.5 text-left transition-all ${
-              overlayEnabled ? 'border-accent-blue bg-accent-blue/10' : 'border-bg-hover bg-bg-tertiary/25 hover:border-bg-hover'
-            }`}
+            onClick={() => setSettingsDrawerTab('overlay')}
+            className="rounded-xl border border-bg-hover bg-bg-tertiary/25 px-3 py-2.5 text-left hover:bg-bg-hover/40"
           >
-            <span className="text-xs font-medium text-text-primary">悬浮提示窗</span>
-            <p className="text-[10px] text-text-muted mt-1">{overlayEnabled ? '已开启' : '已关闭'}</p>
+            <span className="text-xs font-medium text-text-primary">悬浮窗设置</span>
+            <p className="text-[10px] text-text-muted mt-1">位置、尺寸和外观</p>
           </button>
           {config && hasScreenCapture && (
             <button
@@ -331,123 +298,6 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
             macOS 15+ 的 <span className="font-mono text-[10px]">ScreenCaptureKit</span> 会绕过保护位，实际效果请以你自己的环境测试为准。
           </div>
         </div>
-        {overlayEnabled && (
-          <>
-            <Field label="显示模式">
-              <div className="grid grid-cols-3 gap-2">
-                {([
-                  { key: 'glass' as const, label: '磨砂面板', hint: '半透明深色背景' },
-                  { key: 'prompt' as const, label: '提词模式', hint: '纯文字不带框' },
-                  { key: 'focus' as const, label: '专注面板', hint: '浅色解题面板' },
-                ]).map((item) => (
-                  <button
-                    key={item.key}
-                    type="button"
-                    onClick={() => setOverlayMode(item.key)}
-                    className={`px-3 py-2 text-xs rounded-lg border text-left transition-all ${
-                      overlayMode === item.key
-                        ? 'border-accent-blue bg-accent-blue/10 text-accent-blue'
-                        : 'border-bg-hover bg-bg-tertiary/30 text-text-secondary hover:border-bg-hover'
-                    }`}
-                  >
-                    <span className="block font-medium">{item.label}</span>
-                    <span className="mt-0.5 block text-[10px] text-text-muted leading-snug">{item.hint}</span>
-                  </button>
-                ))}
-              </div>
-              <p className="text-[10px] text-text-muted mt-1 leading-relaxed">
-                {overlayMode === 'focus'
-                  ? '浅色半透明大面板，复用悬浮窗防捕获与不抢焦点能力'
-                  : overlayMode === 'glass'
-                    ? '半透明磨砂玻璃背景，适合暗色桌面'
-                    : '无框纯文字、隐藏多余信息，仅保留答案'}
-              </p>
-            </Field>
-            <Field label={`不透明度: ${Math.round(overlayOpacity * 100)}%`}>
-              <input type="range" min={10} max={100} value={Math.round(overlayOpacity * 100)}
-                onChange={(e) => setOverlayOpacity(Number(e.target.value) / 100)} className="w-full max-w-[200px]" />
-            </Field>
-            {overlayMode === 'focus' && (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <Field label={`专注面板宽度: ${overlayFocusWidthPct}%`}>
-                  <input
-                    type="range"
-                    min={50}
-                    max={100}
-                    value={overlayFocusWidthPct}
-                    onChange={(e) => setOverlayFocusWidthPct(Number(e.target.value))}
-                    className="w-full max-w-[200px]"
-                  />
-                </Field>
-                <Field label={`专注面板高度: ${overlayFocusHeightPct}%`}>
-                  <input
-                    type="range"
-                    min={35}
-                    max={100}
-                    value={overlayFocusHeightPct}
-                    onChange={(e) => setOverlayFocusHeightPct(Number(e.target.value))}
-                    className="w-full max-w-[200px]"
-                  />
-                </Field>
-              </div>
-            )}
-            {overlayMode === 'prompt' && (
-              <div className="space-y-3">
-                <Field label={`提词模式最大宽度: ${overlayPromptMaxWidth}px`}>
-                  <input
-                    type="range"
-                    min={INTERVIEW_OVERLAY_PROMPT_MIN_WIDTH}
-                    max={INTERVIEW_OVERLAY_PROMPT_MAX_WIDTH}
-                    step={10}
-                    value={overlayPromptMaxWidth}
-                    onChange={(e) => setOverlayPromptMaxWidth(Number(e.target.value))}
-                    className="w-full max-w-[200px]"
-                  />
-                </Field>
-                <Field label="提词模式滚动" hint="关闭后生成内容不会自动滚到底，适合从开头读答案">
-                  <Toggle
-                    checked={overlayPromptAutoFollow}
-                    onChange={setOverlayPromptAutoFollow}
-                    label="靠近底部时自动跟随最新内容"
-                  />
-                </Field>
-              </div>
-            )}
-            <Field label={`字号: ${overlayFontSize}px`}>
-              <input type="range" min={10} max={48} value={overlayFontSize}
-                onChange={(e) => setOverlayFontSize(Number(e.target.value))} className="w-full max-w-[200px]" />
-            </Field>
-            <div className="flex items-center gap-4">
-              <Field label="字体颜色">
-                <div className="flex items-center gap-1.5">
-                  <input type="color" value={overlayFontColor}
-                    onChange={(e) => setOverlayFontColor(e.target.value)}
-                    className="w-6 h-6 rounded border border-bg-hover cursor-pointer bg-transparent p-0" />
-                  <span className="text-[10px] text-text-muted font-mono">{overlayFontColor}</span>
-                </div>
-              </Field>
-              <Field label={`最大行数: ${overlayMaxLines > 0 ? overlayMaxLines : '不限'}`}>
-                <input type="range" min={0} max={50} value={overlayMaxLines}
-                  onChange={(e) => setOverlayMaxLines(Number(e.target.value))} className="w-24" />
-              </Field>
-            </div>
-            <p className="text-[10px] text-text-muted leading-relaxed -mt-1">
-              悬浮窗不会抢占焦点,直接用鼠标滚轮即可滚动内容,
-              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.moveOverlayToMouse?.key ?? 'CommandOrControl+M')}</kbd> 可把窗口一键移到鼠标附近。
-              专注面板打开时,
-              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.focusPrevTab?.key ?? 'CommandOrControl+Left')}</kbd>
-              /
-              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.focusNextTab?.key ?? 'CommandOrControl+Right')}</kbd>
-              切换分区。
-              悬浮窗打开时,
-              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.overlayPrevQuestion?.key ?? 'CommandOrControl+Up')}</kbd>
-              /
-              <kbd className="px-1 py-0.5 bg-bg-hover rounded text-[9px]">{getShortcutDisplay(shortcuts.overlayNextQuestion?.key ?? 'CommandOrControl+Down')}</kbd>
-              回看上一题/下一题, 不影响当前生成。
-            </p>
-          </>
-        )}
-
         {/* 截图区域 */}
         {config && hasScreenCapture && (
           <Field label="截图区域" hint="服务端截图审题时，后端截取主显示器的范围">

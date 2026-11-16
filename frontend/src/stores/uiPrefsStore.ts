@@ -17,6 +17,7 @@ import {
   type OverlayMode,
   type OverlayStatePayload,
 } from '@/lib/interviewOverlay'
+import { defaultOverlayAppearance, normalizeOverlayAppearance, type OverlayAppearance, type OverlayAppearances } from '@/lib/overlayAppearance'
 
 const ANSWER_LAYOUT_KEY = 'ia_answer_panel_layout'
 const ASSIST_SPLIT_KEY = 'ia_assist_split_pct'
@@ -104,6 +105,21 @@ function readOverlayFontColor(): string {
     if (raw && /^#[0-9a-fA-F]{6}$/.test(raw)) return raw
   } catch { /* ignore */ }
   return '#e2e8f0'
+}
+
+function readOverlayAppearances(): OverlayAppearances {
+  try {
+    const raw = JSON.parse(localStorage.getItem(INTERVIEW_OVERLAY_STORAGE_KEYS.appearance) ?? '{}')
+    const result: OverlayAppearances = {}
+    for (const mode of ['glass', 'prompt', 'focus'] as const) {
+      if (raw?.[mode] && typeof raw[mode] === 'object') {
+        result[mode] = normalizeOverlayAppearance(raw[mode], defaultOverlayAppearance(mode))
+      }
+    }
+    return result
+  } catch {
+    return {}
+  }
 }
 
 function readOverlayShowBg(): boolean {
@@ -294,6 +310,7 @@ interface UiPrefsState {
   interviewOverlayPromptAutoFollow: boolean
   interviewOverlayMaxLines: number
   interviewOverlayVisible: boolean
+  interviewOverlayAppearances: OverlayAppearances
 
   setAnswerPanelLayout: (layout: 'cards' | 'stream') => void
   setColorScheme: (id: ColorSchemeId) => void
@@ -313,6 +330,7 @@ interface UiPrefsState {
   setInterviewOverlayPromptMaxWidth: (width: number) => void
   setInterviewOverlayPromptAutoFollow: (enabled: boolean) => void
   setInterviewOverlayMaxLines: (lines: number) => void
+  updateOverlayAppearance: (mode: OverlayMode, patch: Partial<OverlayAppearance> | null) => void
   syncInterviewOverlayPrefs: () => void
   applyInterviewOverlayState: (payload: OverlayStatePayload, options?: { persistStyle?: boolean }) => void
 }
@@ -351,6 +369,7 @@ export const useUiPrefsStore = create<UiPrefsState>((set) => ({
   interviewOverlayPromptAutoFollow: readOverlayPromptAutoFollow(),
   interviewOverlayMaxLines: readOverlayMaxLines(),
   interviewOverlayVisible: false,
+  interviewOverlayAppearances: readOverlayAppearances(),
 
   setAnswerPanelLayout: (layout) => {
     try {
@@ -464,6 +483,16 @@ export const useUiPrefsStore = create<UiPrefsState>((set) => ({
     set({ interviewOverlayMaxLines: next })
   },
 
+  updateOverlayAppearance: (mode, patch) => {
+    set((state) => {
+      const profiles = {
+        ...state.interviewOverlayAppearances,
+        [mode]: patch === null ? defaultOverlayAppearance(mode) : normalizeOverlayAppearance(patch, getOverlayAppearance(state, mode)),
+      }
+      persistOverlayPrefSilently(INTERVIEW_OVERLAY_STORAGE_KEYS.appearance, JSON.stringify(profiles))
+      return { interviewOverlayAppearances: profiles }
+    })
+  },
   syncInterviewOverlayPrefs: () =>
     set({
       interviewOverlayEnabled: readOverlayEnabled(),
@@ -477,6 +506,7 @@ export const useUiPrefsStore = create<UiPrefsState>((set) => ({
       interviewOverlayPromptMaxWidth: readOverlayPromptMaxWidth(),
       interviewOverlayPromptAutoFollow: readOverlayPromptAutoFollow(),
       interviewOverlayMaxLines: readOverlayMaxLines(),
+      interviewOverlayAppearances: readOverlayAppearances(),
     }),
   applyInterviewOverlayState: (payload, options = {}) => {
     const shouldApplyStyle = options.persistStyle === true || payload.initialized === true
@@ -523,5 +553,15 @@ export const useUiPrefsStore = create<UiPrefsState>((set) => ({
     }))
   },
 }))
+
+export function getOverlayAppearance(state: UiPrefsState, mode: OverlayMode): OverlayAppearance {
+  return state.interviewOverlayAppearances[mode] ?? defaultOverlayAppearance(mode, {
+    fontSize: state.interviewOverlayFontSize,
+    fontColor: state.interviewOverlayFontColor,
+    opacity: state.interviewOverlayOpacity,
+    maxLines: state.interviewOverlayMaxLines,
+    promptAutoFollow: state.interviewOverlayPromptAutoFollow,
+  })
+}
 
 applyStoredColorSchemeToDocument()

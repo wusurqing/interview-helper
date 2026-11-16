@@ -54,6 +54,20 @@ afterEach(() => {
 })
 
 describe('useOverlayWindowSync', () => {
+  it('observes a shortcut during a style update without reverting the local style', () => {
+    const api = setupElectronAPI()
+    render(<Harness isRecording={false} appMode="assist" />)
+    act(() => useUiPrefsStore.getState().setInterviewOverlayOpacity(0.5))
+    const receive = (api.onOverlayState.mock.calls as unknown[][])[0][0] as
+      (payload: { trigger: 'shortcut'; enabled: boolean; visible: boolean; opacity: number }) => void
+    act(() => receive({ trigger: 'shortcut', enabled: true, visible: true, opacity: 0.88 }))
+    expect(useUiPrefsStore.getState()).toMatchObject({
+      interviewOverlayEnabled: true,
+      interviewOverlayVisible: true,
+      interviewOverlayOpacity: 0.5,
+    })
+  })
+
   it('initial sync sends style prefs and persisted enabled=false without visible', () => {
     const api = setupElectronAPI()
     render(<Harness isRecording={false} appMode="assist" />)
@@ -119,10 +133,13 @@ describe('useOverlayWindowSync', () => {
 
     expect(api.syncOverlayWindow).toHaveBeenCalledTimes(1)
     expect(api.syncOverlayWindow).toHaveBeenLastCalledWith(
-      expect.objectContaining({ enabled: true, opacity: 0.5 }),
+      expect.objectContaining({ opacity: 0.5 }),
     )
     expect(api.syncOverlayWindow).toHaveBeenLastCalledWith(
       expect.not.objectContaining({ visible: expect.anything() }),
+    )
+    expect(api.syncOverlayWindow).toHaveBeenLastCalledWith(
+      expect.not.objectContaining({ enabled: expect.anything() }),
     )
   })
 

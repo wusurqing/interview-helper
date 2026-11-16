@@ -48,9 +48,12 @@ const {
   PROMPT_OVERLAY_MAX_WIDTH,
   consumePendingOverlayShow,
   createOverlayChromeOptions,
-  getPromptOverlayInitialWidth,
   relayChildOutput,
 } = require('./windowOptions');
+const {
+  MODES, MIN_SIZE, defaultLayout, normalizeLayout, readOverlayLayout,
+  writeOverlayLayout, canMigrateLayout, readModeLayout, resolveOverlayBounds,
+} = require('./overlayLayout');
 const { createMultiScreenBatch } = require('./multiScreenBatch');
 const { normalizeOpacity, readMainWindowOpacity, writeMainWindowOpacity } = require('./mainWindowOpacity');
 
@@ -95,10 +98,13 @@ let isQuitting = false;
 let shortcuts = {};
 let _overlayDragging = false;
 let _blurTimer = null;
-let overlayAutoResizeUntil = 0;
-let overlayPositionSaveTimer = null;
-let overlayPositionSaveForce = false;
+let overlayLayoutFileState;
+const legacyLayoutDisplays = new Map();
+let overlayDisplayId;
+let temporaryOverlayPosition;
+let measuredOverlaySize;
 let overlayToggleBlockedUntil = 0;
+let queuedOverlayToggle = false;
 let lastOverlayState = {
   initialized: false,
   enabled: false,
@@ -115,10 +121,6 @@ let lastOverlayState = {
   maxLines: 0,
 };
 
-const OVERLAY_PRESET = { width: 480, height: 320, minWidth: 300, minHeight: 100, resizable: true };
-const PROMPT_OVERLAY_MIN_SIZE = { width: 180, height: 72 };
-const PROMPT_OVERLAY_MAX_SIZE = { heightRatio: 0.48 };
-const FOCUS_OVERLAY_MARGIN = 14;
 
 let _frontReassertTimer = null;
 const FRONT_REASSERT_LEVEL = 1;
@@ -164,140 +166,113 @@ function getOverlayStateFilePath() {
   return path.join(app.getPath('userData'), 'overlay-window.json');
 }
 
-function loadOverlayWindowState() {
-  try {
-    const raw = fs.readFileSync(getOverlayStateFilePath(), 'utf8');
-    const data = JSON.parse(raw);
-    if (data && typeof data === 'object') return data;
-  } catch {
-    /* ignore */
+function getOverlayMode() {
+  return lastOverlayState.mode;
+}
+
+function getOverlayLayouts() {
+  overlayLayoutFileState ??= readOverlayLayout(getOverlayStateFilePath());
+  for (const display of screen.getAllDisplays()) legacyLayoutDisplays.set(display.id, display);
+  const displays = Array.from(legacyLayoutDisplays.values());
+  return Object.fromEntries(MODES.map((mode) => [
+    mode, readModeLayout(overlayLayoutFileState, mode, displays, lastOverlayState),
+  ]));
+}
+
+function getOverlayPlacement(mode, retainDisplay = false) {
+  let layout = getOverlayLayouts()[mode];
+  if (temporaryOverlayPosition && mode === getOverlayMode()) {
+    layout = { ...layout, ...temporaryOverlayPosition };
   }
-  return { positions: {} };
+  const preferredId = (retainDisplay ? overlayDisplayId : undefined) ?? layout.displayId;
+  const display = screen.getAllDisplays().find(({ id }) => id === preferredId) ?? screen.getPrimaryDisplay();
+  return { layout, display };
 }
 
-function saveOverlayWindowState(data) {
-  try {
-    fs.writeFileSync(getOverlayStateFilePath(), JSON.stringify(data, null, 2), 'utf8');
-  } catch (error) {
-    console.warn('saveOverlayWindowState failed:', error);
+function getOverlayLayoutSnapshot() {
+  const primaryId = screen.getPrimaryDisplay().id;
+  const displays = screen.getAllDisplays().map(({ id, label, workArea }) => ({
+    id, label, workArea, primary: id === primaryId,
+  }));
+  const { layout, display } = getOverlayPlacement('prompt', getOverlayMode() === 'prompt' && lastOverlayState.visible);
+  const { width, height } = resolveOverlayBounds('prompt', layout, display.workArea);
+  return { layouts: getOverlayLayouts(), displays, promptViewport: { sizeMode: layout.sizeMode, width, height } };
+}
+
+function sendOverlayLayout() {
+  const snapshot = getOverlayLayoutSnapshot();
+  for (const win of [mainWindow, overlayWindow]) {
+    if (win && !win.isDestroyed()) win.webContents.send('overlay-layout', snapshot);
   }
+  return snapshot;
 }
 
-function getStoredOverlayPosition() {
-  const saved = loadOverlayWindowState();
-  const pos = saved?.position;
-  if (!pos || typeof pos.x !== 'number' || typeof pos.y !== 'number') return null;
-  const displays = screen.getAllDisplays();
-  const fitsSomeDisplay = displays.some((display) => {
-    const area = display.workArea;
-    return (
-      pos.x >= area.x - 40
-      && pos.x <= area.x + area.width - 80
-      && pos.y >= area.y - 40
-      && pos.y <= area.y + area.height - 60
-    );
-  });
-  if (fitsSomeDisplay) return { x: pos.x, y: pos.y };
-  const primary = screen.getPrimaryDisplay().workArea;
-  return {
-    x: primary.x + Math.max(16, Math.round((primary.width - OVERLAY_PRESET.width) / 2)),
-    y: primary.y + Math.max(16, Math.round((primary.height - OVERLAY_PRESET.height) * 0.18)),
-  };
-}
-
-function getDefaultOverlayBounds() {
-  const primary = screen.getPrimaryDisplay().workArea;
-  return {
-    x: primary.x + Math.max(16, Math.round((primary.width - OVERLAY_PRESET.width) / 2)),
-    y: primary.y + Math.max(16, Math.round((primary.height - OVERLAY_PRESET.height) * 0.18)),
-    width: OVERLAY_PRESET.width,
-    height: OVERLAY_PRESET.height,
-  };
-}
-
-function getFocusOverlayBounds() {
-  const canUseOverlayBounds = overlayWindow
-    && !overlayWindow.isDestroyed()
-    && (typeof overlayWindow.isVisible !== 'function' || overlayWindow.isVisible());
-  const point = canUseOverlayBounds
-    ? {
-        x: overlayWindow.getBounds().x + Math.round(overlayWindow.getBounds().width / 2),
-        y: overlayWindow.getBounds().y + Math.round(overlayWindow.getBounds().height / 2),
-      }
-    : screen.getCursorScreenPoint();
-  const display = screen.getDisplayNearestPoint(point);
+function applyOverlayModeBounds({ retainDisplay = false } = {}) {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  const mode = getOverlayMode();
+  const { layout, display } = getOverlayPlacement(mode, retainDisplay);
   const area = display.workArea;
-  const margin = FOCUS_OVERLAY_MARGIN;
-  const widthPct = Math.max(50, Math.min(100, Number(lastOverlayState?.focusWidthPct) || 96));
-  const heightPct = Math.max(35, Math.min(100, Number(lastOverlayState?.focusHeightPct) || 90));
-  const width = Math.round((area.width - margin * 2) * (widthPct / 100));
-  const height = Math.round((area.height - margin * 2) * (heightPct / 100));
-  return {
-    x: area.x + margin + Math.max(0, Math.round(((area.width - margin * 2) - width) / 2)),
-    y: area.y + margin + Math.max(0, Math.round(((area.height - margin * 2) - height) / 2)),
-    width: Math.max(OVERLAY_PRESET.minWidth, width),
-    height: Math.max(OVERLAY_PRESET.minHeight, height),
-  };
-}
-
-function getNormalOverlayBounds(mode) {
-  const storedPos = getStoredOverlayPosition();
-  const saved = loadOverlayWindowState();
-  const storedSize = saved?.position;
-  const minOverlayWidth = OVERLAY_PRESET.minWidth || OVERLAY_PRESET.width;
-  const minOverlayHeight = OVERLAY_PRESET.minHeight || OVERLAY_PRESET.height;
-  // prompt 模式宽度由内容自适应驱动 (受 promptMaxWidth 约束), 旧物理 position.w 无意义;
-  // 直接用 promptMaxWidth 作初始宽, 避免重开时先显示旧值再被前端收窄/撑开。
-  let width;
-  let height;
-  if (mode === 'prompt') {
-    width = getPromptOverlayInitialWidth(lastOverlayState?.promptMaxWidth);
-    height = Math.max((storedSize?.h > 0) ? storedSize.h : OVERLAY_PRESET.height, minOverlayHeight);
-  } else {
-    width = Math.max((storedSize?.w > 0) ? storedSize.w : OVERLAY_PRESET.width, minOverlayWidth);
-    height = Math.max((storedSize?.h > 0) ? storedSize.h : OVERLAY_PRESET.height, minOverlayHeight);
+  const min = MIN_SIZE[mode];
+  overlayDisplayId = display.id;
+  overlayWindow.setMinimumSize(Math.min(min.width, area.width), Math.min(min.height, area.height));
+  const bounds = resolveOverlayBounds(mode, layout, area, layout.sizeMode === 'auto' ? measuredOverlaySize : undefined);
+  const previous = overlayWindow.getBounds();
+  if (Object.keys(bounds).some((key) => bounds[key] !== previous[key])) {
+    overlayWindow.setBounds(bounds, false);
   }
-  return {
-    ...(storedPos ? storedPos : getDefaultOverlayBounds()),
-    width,
-    height,
-  };
+  return bounds;
 }
 
-function applyOverlayModeBounds() {
-  if (!overlayWindow || overlayWindow.isDestroyed()) return;
-  const mode = lastOverlayState?.mode || (lastOverlayState?.showBg === false ? 'prompt' : 'glass');
-  overlayWindow.setMinimumSize(
-    mode === 'prompt' ? PROMPT_OVERLAY_MIN_SIZE.width : OVERLAY_PRESET.minWidth,
-    mode === 'prompt' ? PROMPT_OVERLAY_MIN_SIZE.height : OVERLAY_PRESET.minHeight,
-  );
-  const bounds = mode === 'focus' ? getFocusOverlayBounds() : getNormalOverlayBounds(mode);
-  overlayWindow.setBounds(bounds, false);
+function persistOverlayLayouts(updates = {}) {
+  const layouts = getOverlayLayouts();
+  const stored = { ...overlayLayoutFileState.layouts, ...updates };
+  const displays = Array.from(legacyLayoutDisplays.values());
+  for (const mode of MODES) {
+    if (!stored[mode] && canMigrateLayout(overlayLayoutFileState, mode, displays)) stored[mode] = layouts[mode];
+  }
+  if (Object.keys(updates).length === 0 && MODES.every((mode) => stored[mode] === overlayLayoutFileState.layouts?.[mode])) {
+    return true;
+  }
+  // Retain the legacy record for older builds using the same user data directory.
+  const next = { ...overlayLayoutFileState, layouts: stored };
+  try {
+    writeOverlayLayout(getOverlayStateFilePath(), next);
+    overlayLayoutFileState = next;
+    return true;
+  } catch (error) {
+    console.warn('saveOverlayLayout failed:', error);
+    return false;
+  }
 }
 
-function persistOverlayPosition(force = false) {
-  if (!overlayWindow || overlayWindow.isDestroyed()) return;
-  if (lastOverlayState?.mode === 'focus') return;
-  // fuse 屏蔽窗口 resize/moved 事件在程序化 setBounds 后 500ms 内的频繁写盘;
-  // force=true 用于程序化设尺寸后的显式落盘 (来自 resize-overlay-window IPC), 绕过 fuse。
-  if (!force && Date.now() < overlayAutoResizeUntil) return;
-  const bounds = overlayWindow.getBounds();
-  const saved = loadOverlayWindowState();
-  saved.position = { x: bounds.x, y: bounds.y, w: bounds.width, h: bounds.height };
-  saveOverlayWindowState(saved);
+function setOverlayLayout(mode, patch) {
+  if (!MODES.includes(mode) || (patch !== null && (!patch || typeof patch !== 'object' || Array.isArray(patch)))) {
+    return { ok: false };
+  }
+  const next = patch === null ? defaultLayout(mode) : normalizeLayout(mode, patch, getOverlayLayouts()[mode]);
+  if (!persistOverlayLayouts({ [mode]: next })) return { ok: false };
+  if (mode === getOverlayMode() && lastOverlayState.visible) {
+    temporaryOverlayPosition = undefined;
+    applyOverlayModeBounds();
+  }
+  return { ok: true, ...sendOverlayLayout() };
 }
 
-function schedulePersistOverlayPosition(force = false) {
-  // force 语义必须保留：程序化 resize 后排的 force 持久化不能被随后的
-  // 窗口 resize 事件（force=false）覆盖降级，否则自适应高度不落盘。
-  overlayPositionSaveForce = overlayPositionSaveForce || force;
-  if (overlayPositionSaveTimer) return;
-  overlayPositionSaveTimer = setTimeout(() => {
-    overlayPositionSaveTimer = null;
-    const f = overlayPositionSaveForce;
-    overlayPositionSaveForce = false;
-    persistOverlayPosition(f);
-  }, 180);
+function onOverlayDisplayChanged(event, display, metrics) {
+  if (lastOverlayState.visible && (!metrics || metrics.some((name) =>
+    ['bounds', 'workArea', 'scaleFactor', 'rotation'].includes(name)))) {
+    applyOverlayModeBounds({ retainDisplay: true });
+  }
+  sendOverlayLayout();
+}
+
+function registerOverlayDisplayListeners() {
+  screen.on('display-removed', onOverlayDisplayChanged);
+  screen.on('display-metrics-changed', onOverlayDisplayChanged);
+  screen.on('display-added', () => {
+    if (lastOverlayState.initialized) persistOverlayLayouts();
+    sendOverlayLayout();
+  });
 }
 
 function createTrayIcon() {
@@ -419,8 +394,10 @@ function createOverlayWindow() {
     return overlayWindow;
   }
 
-  const initialMode = lastOverlayState?.mode || (lastOverlayState?.showBg === false ? 'prompt' : 'glass');
-  const initialBounds = initialMode === 'focus' ? getFocusOverlayBounds() : getNormalOverlayBounds(initialMode);
+  const initialMode = getOverlayMode();
+  const { layout, display } = getOverlayPlacement(initialMode);
+  const initialBounds = resolveOverlayBounds(initialMode, layout, display.workArea);
+  const min = MIN_SIZE[initialMode];
 
   // 透明浮窗: 视觉上能看到桌面, 需要 transparent: true + alpha=0 背景.
   // 注意: setContentProtection 在 macOS 的透明窗口上只是 best effort,
@@ -430,9 +407,9 @@ function createOverlayWindow() {
     height: initialBounds.height,
     x: initialBounds.x,
     y: initialBounds.y,
-    minWidth: OVERLAY_PRESET.minWidth,
-    minHeight: OVERLAY_PRESET.minHeight,
-    ...createOverlayChromeOptions(process.platform, OVERLAY_PRESET.resizable),
+    minWidth: Math.min(min.width, display.workArea.width),
+    minHeight: Math.min(min.height, display.workArea.height),
+    ...createOverlayChromeOptions(process.platform, true),
     maximizable: false,
     minimizable: false,
     fullscreenable: false,
@@ -484,6 +461,7 @@ function createOverlayWindow() {
     if (lastOverlayState) {
       overlayWindow.webContents.send('overlay-state', lastOverlayState);
     }
+    overlayWindow.webContents.send('overlay-layout', getOverlayLayoutSnapshot());
     setTimeout(() => {
       if (!overlayWindow || overlayWindow.isDestroyed()) return;
       overlayWindow._overlayReady = true;
@@ -502,12 +480,13 @@ function createOverlayWindow() {
 
   overlayWindow.on('closed', () => {
     overlayWindow = null;
+    measuredOverlaySize = undefined;
+    temporaryOverlayPosition = undefined;
+    overlayDisplayId = undefined;
     _overlayDragging = false;
     if (_blurTimer) { clearTimeout(_blurTimer); _blurTimer = null; }
     stopFrontReassert();
   });
-  overlayWindow.on('moved', () => schedulePersistOverlayPosition());
-  overlayWindow.on('resize', () => schedulePersistOverlayPosition());
   overlayWindow.on('focus', () => {
     if (_blurTimer) clearTimeout(_blurTimer);
     _blurTimer = setTimeout(() => {
@@ -521,11 +500,11 @@ function createOverlayWindow() {
   return overlayWindow;
 }
 
-function sendOverlayState(payload) {
+function sendOverlayState(payload, trigger) {
   lastOverlayState = payload;
   [mainWindow, overlayWindow].forEach((win) => {
     if (!win || win.isDestroyed()) return;
-    win.webContents.send('overlay-state', payload);
+    win.webContents.send('overlay-state', trigger ? { ...payload, trigger } : payload);
   });
 }
 
@@ -553,7 +532,9 @@ function showOverlayWindow() {
     overlayWindow._pendingShow = true;
     return;
   }
+  temporaryOverlayPosition = undefined;
   applyOverlayModeBounds();
+  sendOverlayLayout();
   overlayWindow.setFocusable(false);
   if (process.platform === 'darwin' || process.platform === 'win32') {
     overlayWindow.showInactive();
@@ -577,6 +558,25 @@ function toggleWindow() {
 function notifyMainWindow(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send(channel, payload);
+  }
+}
+
+function toggleOverlayFromShortcut() {
+  const visible = !Boolean(lastOverlayState.visible);
+  if (visible) measuredOverlaySize = undefined;
+  sendOverlayState({ ...lastOverlayState, enabled: visible || lastOverlayState.enabled, visible }, 'shortcut');
+  syncFocusOverlayShortcuts();
+
+  if (visible) {
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
+      mainWindow._hiddenByOverlay = true;
+      mainWindow.hide();
+    }
+    createOverlayWindow();
+    showOverlayWindow();
+  } else {
+    // Ctrl+O only hides the overlay. The end-session IPC may also restore the main window.
+    hideOverlayWindow();
   }
 }
 
@@ -907,38 +907,25 @@ const shortcutCallbacks = {
     // the toggle so one physical press cannot hide and immediately re-show it.
     if (Date.now() < overlayToggleBlockedUntil) return;
     overlayToggleBlockedUntil = Date.now() + 350;
-    const nextVisible = !Boolean(lastOverlayState.visible);
-    const nextState = {
-      ...lastOverlayState,
-      initialized: true,
-      enabled: nextVisible || lastOverlayState.enabled,
-      visible: nextVisible,
-    };
-    sendOverlayState(nextState);
-    syncFocusOverlayShortcuts();
-
-    if (nextVisible) {
-      if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
-        mainWindow._hiddenByOverlay = true;
-        mainWindow.hide();
-      }
-      createOverlayWindow();
-      showOverlayWindow();
-    } else {
-      // 快捷键仅切换 overlay 可见性, 主窗口保持原状 (用户可通过 Cmd+B 或托盘唤回).
-      // 只有 ControlBar 的 "结束面试" 按钮会走 sync-overlay-window IPC 恢复主窗口.
-      hideOverlayWindow();
+    if (mainWindow && !mainWindow.isDestroyed() && !lastOverlayState.initialized) {
+      // Main renderer owns legacy preferences and the active mode on startup.
+      queuedOverlayToggle = !queuedOverlayToggle;
+      return;
     }
+    toggleOverlayFromShortcut();
   },
   moveOverlayToMouse: () => {
-    if (!overlayWindow || overlayWindow.isDestroyed()) return;
+    if (!overlayWindow || overlayWindow.isDestroyed() || !overlayWindow.isVisible()) return;
     const cursor = screen.getCursorScreenPoint();
-    const offsetX = 20;
-    const offsetY = 20;
-    const nextX = Math.round(cursor.x - offsetX);
-    const nextY = Math.round(cursor.y - offsetY);
-    overlayWindow.setPosition(nextX, nextY);
-    schedulePersistOverlayPosition();
+    const display = screen.getDisplayNearestPoint(cursor);
+    temporaryOverlayPosition = {
+      displayId: display.id,
+      anchor: 'top-left',
+      x: cursor.x - display.workArea.x - 20,
+      y: cursor.y - display.workArea.y - 20,
+    };
+    applyOverlayModeBounds();
+    sendOverlayLayout();
   },
   focusPrevTab: () => sendFocusTabCommand('prev'),
   focusNextTab: () => sendFocusTabCommand('next'),
@@ -1073,10 +1060,20 @@ ipcMain.handle('sync-overlay-window', (_event, payload = {}) => {
   // 的 sync 若也走 showOverlayWindow，会把 prompt 自适应宽度重置回满宽。
   const modeChanged = Boolean(lastOverlayState.mode) !== Boolean(state.mode)
     || (lastOverlayState.mode || '') !== (state.mode || '');
+  if (visibleChanged || modeChanged) measuredOverlaySize = undefined;
 
   lastOverlayState = state;
+  if ('focusWidthPct' in style || 'promptMaxWidth' in style) persistOverlayLayouts();
   sendOverlayState(state);
   syncFocusOverlayShortcuts();
+
+  if (queuedOverlayToggle) {
+    queuedOverlayToggle = false;
+    if (typeof payload.visible !== 'boolean') {
+      toggleOverlayFromShortcut();
+      return { ok: true, visible: lastOverlayState.visible };
+    }
+  }
 
   if (visibleChanged) {
     if (state.visible) {
@@ -1128,33 +1125,20 @@ ipcMain.handle('set-shortcuts-suspended', (_event, on) => {
   }
   return { ok: true, suspended: suspend };
 });
-ipcMain.handle('resize-overlay-window', (_event, payload = {}) => {
-  if (!overlayWindow || overlayWindow.isDestroyed()) return { ok: false };
-  const mode = lastOverlayState?.mode || (lastOverlayState?.showBg === false ? 'prompt' : 'glass');
-  if (mode !== 'prompt') return { ok: true, skipped: true };
-
-  const bounds = overlayWindow.getBounds();
-  const center = {
-    x: bounds.x + Math.round(bounds.width / 2),
-    y: bounds.y + Math.round(bounds.height / 2),
-  };
-  const area = screen.getDisplayNearestPoint(center).workArea;
-  const nextWidth = Number(payload.width);
-  const nextHeight = Number(payload.height);
-  const promptMaxWidth = Math.max(200, Math.min(PROMPT_OVERLAY_MAX_WIDTH, Number(lastOverlayState?.promptMaxWidth) || PROMPT_OVERLAY_DEFAULT_WIDTH));
-  const width = Number.isFinite(nextWidth)
-    ? Math.max(PROMPT_OVERLAY_MIN_SIZE.width, Math.min(promptMaxWidth, area.width - 16, Math.round(nextWidth)))
-    : bounds.width;
-  const height = Number.isFinite(nextHeight)
-    ? Math.max(PROMPT_OVERLAY_MIN_SIZE.height, Math.min(Math.round(area.height * PROMPT_OVERLAY_MAX_SIZE.heightRatio), Math.round(nextHeight)))
-    : bounds.height;
-  const x = Math.max(area.x + 8, Math.min(bounds.x, area.x + area.width - width - 8));
-  const y = Math.max(area.y + 8, Math.min(bounds.y, area.y + area.height - height - 8));
-
-  overlayAutoResizeUntil = Date.now() + 500;
-  overlayWindow.setBounds({ x, y, width, height }, false);
-  // 程序化设的尺寸是 prompt 自适应的权威值, 显式落盘 (绕过 fuse), 使重开时生效。
-  schedulePersistOverlayPosition(true);
+ipcMain.handle('get-overlay-layout', () => getOverlayLayoutSnapshot());
+ipcMain.handle('update-overlay-layout', (_event, mode, patch) => setOverlayLayout(mode, patch));
+ipcMain.handle('reset-overlay-layout', (_event, mode) => setOverlayLayout(mode, null));
+ipcMain.handle('resize-overlay-window', (event, payload = {}) => {
+  if (!overlayWindow || overlayWindow.isDestroyed() || event.sender !== overlayWindow.webContents) {
+    return { ok: false };
+  }
+  const { layout } = getOverlayPlacement('prompt', true);
+  if (!lastOverlayState.visible || getOverlayMode() !== 'prompt' || layout.sizeMode !== 'auto') {
+    return { ok: true, skipped: true };
+  }
+  if (!Number.isFinite(payload?.width) || !Number.isFinite(payload?.height)) return { ok: false };
+  measuredOverlaySize = { width: payload.width, height: payload.height };
+  const { width, height } = applyOverlayModeBounds({ retainDisplay: true });
   return { ok: true, width, height };
 });
 // M3: 添加 destroyOverlay 接口，支持显式销毁悬浮窗
@@ -1276,6 +1260,7 @@ app.on('before-quit', (event) => {
 });
 
 app.whenReady().then(async () => {
+  registerOverlayDisplayListeners();
   try {
     app.setName(APP_DISPLAY_NAME);
   } catch {
@@ -1330,10 +1315,6 @@ app.on('will-quit', () => {
     } catch (error) {
       console.warn('saveMainWindowOpacity failed:', error);
     }
-  }
-  if (overlayPositionSaveTimer) {
-    clearTimeout(overlayPositionSaveTimer);
-    overlayPositionSaveTimer = null;
   }
   if (overlayWindow && !overlayWindow.isDestroyed()) {
     overlayWindow.destroy();

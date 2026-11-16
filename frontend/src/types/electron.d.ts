@@ -1,4 +1,4 @@
-import type { OverlayStatePayload } from '@/lib/interviewOverlay'
+import type { OverlayLayout, OverlayLayoutResult, OverlayLayoutSnapshot, OverlayMode, OverlayStatePayload } from '@/lib/interviewOverlay'
 
 export {}
 
@@ -18,6 +18,10 @@ declare global {
       setWindowOpacity: (opacity: number) => Promise<number>
       syncOverlayWindow?: (payload: Partial<OverlayStatePayload> & { visible?: boolean }) => Promise<{ ok: boolean; visible: boolean }>
       resizeOverlayWindow?: (payload: { width?: number; height?: number }) => Promise<{ ok: boolean; width?: number; height?: number; skipped?: boolean }>
+      getOverlayLayout?: () => Promise<OverlayLayoutSnapshot>
+      updateOverlayLayout?: (mode: OverlayMode, patch: Partial<OverlayLayout>) => Promise<OverlayLayoutResult>
+      resetOverlayLayout?: (mode: OverlayMode) => Promise<OverlayLayoutResult>
+      onOverlayLayout?: (callback: (payload: OverlayLayoutSnapshot) => void) => () => void
       setShortcutsSuspended?: (on: boolean) => Promise<{ ok: boolean; suspended: boolean }>
       destroyOverlay?: () => Promise<{ ok: boolean }>
       moveOverlayWindow?: (dx: number, dy: number) => Promise<void>

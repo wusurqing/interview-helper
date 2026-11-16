@@ -723,20 +723,37 @@ code, pre, .font-mono {
   width: max-content;
   min-width: 0;
   max-width: var(--ov-prompt-max-width, 804px);
-  max-height: min(408px, calc(100vh - 8px));
+  max-height: min(var(--ov-prompt-max-height, 408px), calc(100vh - 8px));
   padding: 2px 4px;
   line-height: 1.5;
   scrollbar-gutter: stable;
 }
 
-.ov-shell--nobg .ov-answer,
-.ov-shell--nobg .ov-standby-hint {
-  /* 三层阴影: 1px 锐利描边 + 2px 近影 + 10px 光晕 -> 任何桌面底色都可读 */
-  text-shadow:
-    0 0 1px rgba(0, 0, 0, 0.95),
-    0 1px 3px rgba(0, 0, 0, 0.92),
-    0 2px 12px rgba(0, 0, 0, 0.6);
+.ov-root--prompt-fixed .ov-shell--nobg,
+.ov-root--prompt-fixed .ov-answer {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: 100%;
 }
+
+.ov-settings-preview {
+  overflow: hidden;
+  padding: 12px;
+  background: linear-gradient(115deg, #334155, #64748b 48%, #b0bdcf);
+}
+
+.ov-settings-preview .ov-shell {
+  min-width: 0;
+  min-height: 84px;
+}
+
+.ov-settings-preview .ov-answer,
+.ov-settings-preview .ov-focus-content {
+  flex: 1 0 auto;
+  padding: 12px 14px;
+}
+
 .ov-shell--nobg .ov-answer::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.35);
 }
@@ -829,6 +846,24 @@ code, pre, .font-mono {
   font-size: 12px;
   font-weight: 600;
   box-shadow: inset 0 -1px 0 rgba(148, 163, 184, 0.22);
+}
+
+@media (max-width: 620px) {
+  .ov-shell--focus .ov-focus-toolbar {
+    gap: 14px;
+    padding-inline: 12px;
+    overflow-x: auto;
+    justify-content: safe center;
+  }
+
+  .ov-shell--focus .ov-focus-toolbar kbd {
+    display: none;
+  }
+
+  .ov-shell--focus .ov-focus-tabs {
+    padding-inline: 12px;
+    justify-content: safe center;
+  }
 }
 
 .ov-focus-tool--icon {
@@ -1105,7 +1140,15 @@ code, pre, .font-mono {
   width: max-content;
   max-width: var(--ov-prompt-max-width, 804px);
   flex-direction: column;
-  align-items: flex-start;
+  align-items: stretch;
+}
+
+/* A fixed prompter uses the window's content width, including for text alignment. */
+.ov-root--prompt-fixed .ov-answer-stack,
+.ov-root--prompt-fixed .ov-answer-stack .ov-markdown {
+  display: block;
+  width: 100%;
+  max-width: 100%;
 }
 
 .ov-verify {

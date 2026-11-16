@@ -70,6 +70,19 @@ beforeEach(() => {
 })
 
 describe('InterviewOverlay', () => {
+  it('renders the saved appearance of the active mode over its legacy defaults', () => {
+    localStorage.setItem('ia_overlay_mode', 'focus')
+    useUiPrefsStore.getState().updateOverlayAppearance('focus', {
+      fontSize: 27, fontFamily: 'mono', fontColor: '#50307a',
+      lineHeight: 1.9, textAlign: 'right', opacity: 0.63,
+    })
+    const { container } = render(<InterviewOverlay />)
+    expect(container.querySelector('.ov-focus-content')).toHaveStyle({
+      fontSize: '27px', color: '#50307a', lineHeight: '1.9', textAlign: 'right',
+    })
+    expect(container.querySelector('.ov-shell--focus')).toHaveStyle({ opacity: '0.63' })
+  })
+
   it('keeps the plain focus body and tab in place when its answer completes', () => {
     localStorage.setItem('ia_overlay_mode', 'focus')
     useUiPrefsStore.setState({ interviewOverlayMode: 'focus' })

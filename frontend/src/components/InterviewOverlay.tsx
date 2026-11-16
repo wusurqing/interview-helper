@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import { useInterviewWS } from '@/hooks/useInterviewWS'
+import { useOverlayLayout } from '@/hooks/useOverlayLayout'
 import { applyStoredColorSchemeToDocument, COLOR_SCHEME_STORAGE_KEY } from '@/lib/colorScheme'
 import { api, getErrorMessage } from '@/lib/api'
 import { mmpgStateLabels } from '@/lib/mmpg/rtcController'
@@ -10,9 +12,10 @@ import {
   warnInterviewOverlaySyncIssue,
 } from '@/lib/interviewOverlay'
 import { getShortcutDisplay } from '@/lib/shortcuts'
+import { getOverlayAppearanceStyles } from '@/lib/overlayAppearance'
 import { useInterviewStore, type QAPair } from '@/stores/configStore'
 import { useShortcutsStore } from '@/stores/shortcutsStore'
-import { useUiPrefsStore } from '@/stores/uiPrefsStore'
+import { getOverlayAppearance, useUiPrefsStore } from '@/stores/uiPrefsStore'
 import PlainAnswerContent, { plainAnswerStatus } from './PlainAnswerContent'
 
 type FocusTabPane = {
@@ -28,7 +31,6 @@ type VisionVerifyState = {
 }
 
 const FOCUS_TAB_CACHE_LIMIT = 20
-const FOCUS_TEXT_COLOR = '#263241'
 
 const OVERLAY_MARKDOWN_COMPONENTS: Components = {
   a({ children }) {
@@ -62,13 +64,15 @@ export default function InterviewOverlay() {
         : mmpgPhase === 'listening' && mmpgAnswerLabel ? mmpgAnswerLabel : mmpgStateLabels[mmpgPhase ?? 'connecting'])
     : isRecording ? (isExamMode ? '笔试中…' : '正在聆听…') : (isExamMode ? '点击开始笔试' : '等待面试开始')
   const enabled = useUiPrefsStore((s) => s.interviewOverlayEnabled)
-  const opacity = useUiPrefsStore((s) => s.interviewOverlayOpacity)
-  const fontSize = useUiPrefsStore((s) => s.interviewOverlayFontSize)
-  const fontColor = useUiPrefsStore((s) => s.interviewOverlayFontColor)
   const overlayMode = useUiPrefsStore((s) => s.interviewOverlayMode)
-  const maxLines = useUiPrefsStore((s) => s.interviewOverlayMaxLines)
-  const overlayPromptMaxWidth = useUiPrefsStore((s) => s.interviewOverlayPromptMaxWidth)
-  const overlayPromptAutoFollow = useUiPrefsStore((s) => s.interviewOverlayPromptAutoFollow)
+  const appearance = useUiPrefsStore(useShallow((state) => getOverlayAppearance(state, state.interviewOverlayMode)))
+  const { fontSize, fontFamily, fontWeight, lineHeight, maxLines, autoFollow: overlayPromptAutoFollow } = appearance
+  const legacyPromptWidth = useUiPrefsStore((s) => s.interviewOverlayPromptMaxWidth)
+  const { layout } = useOverlayLayout()
+  const promptViewport = layout?.promptViewport
+  const overlayPromptMaxWidth = promptViewport?.width ?? legacyPromptWidth
+  const overlayPromptMaxHeight = promptViewport?.height ?? 420
+  const fixedPromptSize = promptViewport?.sizeMode === 'fixed'
   const overlayVisible = useUiPrefsStore((s) => s.interviewOverlayVisible)
   const syncPrefs = useUiPrefsStore((s) => s.syncInterviewOverlayPrefs)
   const applyState = useUiPrefsStore((s) => s.applyInterviewOverlayState)
@@ -185,7 +189,8 @@ export default function InterviewOverlay() {
   }, [answerText, activeFocusTab, displayedQaKey, isStreaming, overlayMode, overlayPromptAutoFollow, plain])
 
   useLayoutEffect(() => {
-    if (!enabled || !overlayVisible || overlayMode !== 'prompt') return
+    const resize = window.electronAPI?.resizeOverlayWindow
+    if (!enabled || !overlayVisible || overlayMode !== 'prompt' || fixedPromptSize || !resize) return
     const el = answerScrollRef.current
     if (!el) return
     // 宽度量外壳（width: max-content，已含 .ov-answer 的 padding），再补 .ov-root--prompt
@@ -196,23 +201,32 @@ export default function InterviewOverlay() {
     const shellEl = el.parentElement
     const measureWidthEl = shellEl ?? el
     const contentEl = el.querySelector<HTMLElement>('.ov-answer-stack') ?? el
-    const contentWidth = Math.ceil(Math.max(
-      measureWidthEl.scrollWidth,
-      measureWidthEl.getBoundingClientRect().width,
-    ))
-    const contentHeight = Math.ceil(Math.max(
-      contentEl.scrollHeight,
-      contentEl.getBoundingClientRect().height,
-    ))
     // 有内容时按内容宽度自适应 (上限 promptMaxWidth); 无内容时直接用 promptMaxWidth,
     // 避免开窗瞬间被空内容收窄成最小宽、再随答案流式撑开的视觉跳变。
     const widthMargin = (shellEl ? 12 : 8) + 8
     const heightMargin = 8 + 6
-    const targetWidth = hasContent ? Math.min(overlayPromptMaxWidth, contentWidth + widthMargin) : overlayPromptMaxWidth
-    const nextWidth = Math.max(180, targetWidth)
-    const nextHeight = Math.max(72, Math.min(420, contentHeight + heightMargin))
-    window.electronAPI?.resizeOverlayWindow?.({ width: nextWidth, height: nextHeight })?.catch(() => {})
-  }, [activeVisionVerifyKey, answerText, enabled, fontSize, hasContent, maxLines, overlayMode, overlayAnswerSlice.text, overlayPromptMaxWidth, overlayVisible])
+    let lastWidth = 0
+    let lastHeight = 0
+    const measure = () => {
+      const contentWidth = Math.ceil(Math.max(measureWidthEl.scrollWidth, measureWidthEl.getBoundingClientRect().width))
+      const contentHeight = Math.ceil(Math.max(contentEl.scrollHeight, contentEl.getBoundingClientRect().height))
+      const targetWidth = hasContent ? Math.min(overlayPromptMaxWidth, contentWidth + widthMargin) : overlayPromptMaxWidth
+      const width = Math.max(180, targetWidth)
+      const height = Math.max(72, Math.min(overlayPromptMaxHeight, contentHeight + heightMargin))
+      if (lastWidth === width && lastHeight === height) return
+      lastWidth = width
+      lastHeight = height
+      resize({ width, height }).catch(() => {})
+    }
+    measure()
+    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(measure)
+    observer?.observe(contentEl)
+    document.fonts?.addEventListener('loadingdone', measure)
+    return () => {
+      observer?.disconnect()
+      document.fonts?.removeEventListener('loadingdone', measure)
+    }
+  }, [activeVisionVerifyKey, answerText, enabled, fixedPromptSize, fontSize, fontFamily, fontWeight, lineHeight, hasContent, maxLines, overlayMode, overlayAnswerSlice.text, overlayPromptMaxWidth, overlayPromptMaxHeight, overlayVisible])
 
   const refreshShortcuts = useCallback(() => {
     window.electronAPI?.getShortcuts?.()
@@ -402,20 +416,12 @@ export default function InterviewOverlay() {
     return <div className="h-screen w-screen bg-transparent" />
   }
 
-  const answerFontSize = Math.max(12, fontSize)
-  const shellClass = `ov-shell ${overlayMode === 'focus' ? 'ov-shell--focus' : overlayMode === 'prompt' ? 'ov-shell--nobg' : 'ov-shell--bg'}`
-  const focusSurfaceAlpha = Math.max(0.1, Math.min(0.95, opacity))
-  const focusShellStyle = {
-    '--ov-focus-bg-alpha': String(focusSurfaceAlpha),
-    '--ov-focus-toolbar-alpha': String(Math.max(0.08, Math.min(0.42, focusSurfaceAlpha * 0.48))),
-    '--ov-focus-tabs-alpha': String(Math.max(0.12, Math.min(0.58, focusSurfaceAlpha * 0.7))),
-    '--ov-focus-key-alpha': String(Math.max(0.2, Math.min(0.76, focusSurfaceAlpha * 0.86))),
-  } as CSSProperties
+  const { shellClass, shellStyle, answerStyle } = getOverlayAppearanceStyles(overlayMode, appearance)
   const promptShellStyle = {
-    opacity,
-    color: fontColor,
+    ...shellStyle,
     // 与自适应量宽的 margin（root padding 12 + 安全边 8）对齐，避免触顶时右侧被窗口裁剪
     '--ov-prompt-max-width': `${Math.max(164, overlayPromptMaxWidth - 20)}px`,
+    '--ov-prompt-max-height': `${Math.max(60, overlayPromptMaxHeight - 12)}px`,
   } as CSSProperties
   const focusTools = [
     { key: 'screen' as const, label: '截图审题', shortcut: shortcuts.askFromServerScreen?.key },
@@ -438,7 +444,7 @@ export default function InterviewOverlay() {
       {!plain && isStreaming && <span className="ov-caret" />}
     </div>
   ) : (
-    <span className="ov-standby-hint" style={{ fontSize: `${answerFontSize}px` }}>
+    <span className="ov-standby-hint" style={{ fontSize }}>
       {standbyHint}
     </span>
   )
@@ -446,7 +452,7 @@ export default function InterviewOverlay() {
   if (overlayMode === 'focus') {
     return (
       <div className="ov-root ov-root--focus">
-        <div className={shellClass} style={focusShellStyle} onMouseDown={suppressMouseSelection}>
+        <div className={shellClass} style={shellStyle} onMouseDown={suppressMouseSelection}>
           <div className="ov-grip" aria-hidden />
           <div className="ov-focus-toolbar" aria-label="专注面板工具">
             {focusTools.map((tool) => (
@@ -510,7 +516,7 @@ export default function InterviewOverlay() {
           <div
             ref={answerScrollRef}
             className="ov-focus-content"
-            style={{ fontSize: `${answerFontSize}px`, color: FOCUS_TEXT_COLOR }}
+            style={answerStyle}
             onScroll={updateAnswerAutoFollow}
           >
             {hasContent ? (
@@ -529,7 +535,7 @@ export default function InterviewOverlay() {
                 {!plain && isStreaming && <span className="ov-caret" />}
               </div>
             ) : (
-              <span className="ov-standby-hint" style={{ fontSize: `${answerFontSize}px` }}>
+              <span className="ov-standby-hint" style={{ fontSize }}>
                 {standbyHint}
               </span>
             )}
@@ -541,15 +547,15 @@ export default function InterviewOverlay() {
 
   return (
     <div
-      className={`ov-root ${overlayMode === 'prompt' ? 'ov-root--prompt' : ''}`}
+      className={`ov-root ${overlayMode === 'prompt' ? 'ov-root--prompt' : ''}${overlayMode === 'prompt' && fixedPromptSize ? ' ov-root--prompt-fixed' : ''}`}
     >
-      <div className={shellClass} style={overlayMode === 'prompt' ? promptShellStyle : { opacity, color: fontColor }}>
+      <div className={shellClass} style={overlayMode === 'prompt' ? promptShellStyle : shellStyle}>
         <div className="ov-grip" aria-hidden />
 
         <div
           ref={answerScrollRef}
           className="ov-content ov-answer"
-          style={{ fontSize: `${answerFontSize}px` }}
+          style={answerStyle}
           onMouseDown={suppressMouseSelection}
           onScroll={updateAnswerAutoFollow}
         >

@@ -5,6 +5,7 @@ import {
   Mic,
   Palette,
   Monitor,
+  PanelsTopLeft,
   BookOpen,
   Timer,
   AudioWaveform,
@@ -18,6 +19,7 @@ import { INPUT_FIELD_STYLE, SettingsSearchContext } from './shared'
 import PreferencesTab from './PreferencesTab'
 
 const SpeechTab = lazy(() => import('./SpeechTab'))
+const OverlaySettingsTab = lazy(() => import('./OverlaySettingsTab'))
 const TimingTab = lazy(() => import('./SpeechTab'))
 const HotwordsTab = lazy(() => import('./HotwordsTab'))
 const ModelsTab = lazy(() => import('./ModelsTab'))
@@ -186,7 +188,8 @@ export default function SettingsDrawer() {
 
   const tabs: { key: typeof settingsDrawerTab; label: string; icon: React.ReactNode; desc: string }[] = [
     { key: 'general', label: '常用', icon: <LayoutGrid className="w-4 h-4" />, desc: '运行与回答偏好' },
-    { key: 'mode', label: '模式', icon: <Monitor className="w-4 h-4" />, desc: '悬浮窗与笔试' },
+    { key: 'mode', label: '模式', icon: <Monitor className="w-4 h-4" />, desc: '笔试与截图' },
+    { key: 'overlay', label: '悬浮窗设置', icon: <PanelsTopLeft className="w-4 h-4" />, desc: '位置、尺寸与外观' },
     { key: 'kb', label: '知识库', icon: <BookOpen className="w-4 h-4" />, desc: '本地笔记引用' },
     { key: 'config', label: '语音', icon: <Mic className="w-4 h-4" />, desc: 'ASR 引擎与降级' },
     { key: 'timing', label: '节奏', icon: <Timer className="w-4 h-4" />, desc: '延迟与断句' },
@@ -340,6 +343,7 @@ export default function SettingsDrawer() {
                 <Suspense fallback={<div className="flex items-center justify-center py-12 text-text-muted text-sm">加载中…</div>}>
                   {settingsDrawerTab === 'general' && <PreferencesTab variant="main" />}
                   {settingsDrawerTab === 'mode' && <PreferencesTab variant="mode" />}
+                  {settingsDrawerTab === 'overlay' && <OverlaySettingsTab />}
                   {settingsDrawerTab === 'kb' && <PreferencesTab variant="kb" />}
                   {settingsDrawerTab === 'appearance' && <PreferencesTab variant="appearance" />}
                   {settingsDrawerTab === 'config' && <SpeechTab variant="engines" />}

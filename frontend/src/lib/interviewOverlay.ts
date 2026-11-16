@@ -5,6 +5,7 @@ export const INTERVIEW_OVERLAY_PROMPT_MAX_WIDTH = 820
 export const INTERVIEW_OVERLAY_PROMPT_DEFAULT_WIDTH = 820
 
 export interface OverlayStatePayload {
+  trigger?: 'shortcut'
   initialized?: boolean
   enabled: boolean
   visible?: boolean
@@ -32,7 +33,41 @@ export const INTERVIEW_OVERLAY_STORAGE_KEYS = {
   promptMaxWidth: 'ia_overlay_prompt_max_width',
   promptAutoFollow: 'ia_overlay_prompt_auto_follow',
   maxLines: 'ia_overlay_max_lines',
+  appearance: 'ia_overlay_appearance',
 } as const
+
+export type OverlayAnchor = `${'top' | 'middle' | 'bottom'}-${'left' | 'center' | 'right'}`
+
+export interface OverlayLayout {
+  displayId: number | null
+  anchor: OverlayAnchor
+  x: number
+  y: number
+  sizeMode: 'fixed' | 'auto' | 'percent'
+  width: number
+  height: number
+  maxWidth?: number
+  maxHeight?: number
+  widthPct?: number
+  heightPct?: number
+}
+
+export interface OverlayLayoutSnapshot {
+  layouts: Record<OverlayMode, OverlayLayout>
+  displays: Array<{
+    id: number
+    label: string
+    primary: boolean
+    workArea: { x: number; y: number; width: number; height: number }
+  }>
+  promptViewport: {
+    sizeMode: OverlayLayout['sizeMode']
+    width: number
+    height: number
+  }
+}
+
+export type OverlayLayoutResult = ({ ok: true } & OverlayLayoutSnapshot) | { ok: false }
 
 export const INTERVIEW_OVERLAY_STORAGE_KEY_SET = new Set<string>(Object.values(INTERVIEW_OVERLAY_STORAGE_KEYS))
 

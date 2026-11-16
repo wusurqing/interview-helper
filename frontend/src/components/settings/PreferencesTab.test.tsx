@@ -204,22 +204,9 @@ describe('PreferencesTab', () => {
     expect(prepareExamOverlayPrompt).not.toHaveBeenCalled()
   })
 
-  it('lets prompt mode opt into auto-follow from local overlay preferences', () => {
-    useUiPrefsStore.setState({
-      interviewOverlayEnabled: true,
-      interviewOverlayMode: 'prompt',
-      interviewOverlayShowBg: false,
-      interviewOverlayPromptAutoFollow: false,
-    })
+  it('links to the dedicated overlay settings from work mode', () => {
     render(<PreferencesTab variant="mode" />)
-
-    fireEvent.click(screen.getByText('工作模式'))
-    const toggle = screen.getByLabelText('靠近底部时自动跟随最新内容') as HTMLInputElement
-    expect(toggle.checked).toBe(false)
-
-    fireEvent.click(toggle)
-
-    expect(useUiPrefsStore.getState().interviewOverlayPromptAutoFollow).toBe(true)
-    expect(localStorage.getItem('ia_overlay_prompt_auto_follow')).toBe('1')
+    fireEvent.click(screen.getByRole('button', { name: /悬浮窗设置/ }))
+    expect(useInterviewStore.getState().settingsDrawerTab).toBe('overlay')
   })
 })

@@ -1,8 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
-const { readFileSync } = require('node:fs');
-const { randomUUID } = require('node:crypto');
+const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const { runInNewContext } = require('node:vm');
@@ -10,21 +9,35 @@ const { runInNewContext } = require('node:vm');
 const mainFile = path.join(__dirname, 'main.js');
 const mainSource = readFileSync(mainFile, 'utf8');
 
-function startDesktop(t, { http } = {}) {
+const primary = { id: 1, label: 'Primary', workArea: { x: 0, y: 0, width: 1280, height: 800 } };
+const secondary = { id: 2, label: 'Secondary', workArea: { x: -1000, y: -100, width: 1000, height: 900 } };
+
+function startDesktop(t, { http, savedLayout, connected = true, main = false } = {}) {
   t.mock.timers.enable({ apis: ['Date', 'setInterval', 'setTimeout'], now: 1000 });
   const handlers = new Map();
   const shortcuts = new Map();
-  const userData = path.join(tmpdir(), `interview-overlay-test-${randomUUID()}`);
+  const userData = mkdtempSync(path.join(tmpdir(), 'interview-overlay-test-'));
+  t.after(() => rmSync(userData, { recursive: true, force: true }));
+  const layoutFile = path.join(userData, 'overlay-window.json');
+  if (savedLayout) writeFileSync(layoutFile, JSON.stringify(savedLayout));
+  let displays = connected ? [primary, secondary] : [primary];
+  const screen = Object.assign(new EventEmitter(), {
+    getPrimaryDisplay: () => primary,
+    getAllDisplays: () => displays,
+    getCursorScreenPoint: () => ({ x: 400, y: 300 }),
+    getDisplayNearestPoint: () => primary,
+  });
   let overlay;
 
   class OverlayWindow extends EventEmitter {
-    constructor() {
+    constructor({ x, y, width, height }) {
       super();
       this.webContents = new EventEmitter();
       this.webContents.send = () => {};
       this.visible = false;
       this.destroyed = false;
       this.moveTopCalls = 0;
+      this.bounds = { x, y, width, height };
       overlay = this;
     }
 
@@ -36,7 +49,9 @@ function startDesktop(t, { http } = {}) {
     setVisibleOnAllWorkspaces() {}
     setFocusable() {}
     setMinimumSize() {}
-    setBounds() {}
+    setBounds(bounds) { this.bounds = { ...bounds }; }
+    getBounds() { return this.bounds; }
+    setPosition(x, y) { this.bounds = { ...this.bounds, x, y }; }
     loadURL() {}
 
     showInactive() {
@@ -71,9 +86,7 @@ function startDesktop(t, { http } = {}) {
       on() {},
     },
     BrowserWindow: OverlayWindow,
-    screen: {
-      getPrimaryDisplay: () => ({ workArea: { x: 0, y: 0, width: 1280, height: 800 } }),
-    },
+    screen,
     globalShortcut: {
       register(key, handler) { shortcuts.set(key, handler); return true; },
       unregister(key) { shortcuts.delete(key); },
@@ -95,13 +108,24 @@ function startDesktop(t, { http } = {}) {
     clearTimeout,
   };
   runInNewContext(mainSource, context, { filename: mainFile });
+  if (main) {
+    runInNewContext(`mainWindow = {
+      isDestroyed: () => false, isVisible: () => false,
+      webContents: { send() {} },
+    }`, context);
+  }
+  context.registerOverlayDisplayListeners?.();
 
-  const invoke = (channel, ...args) => handlers.get(channel)({}, ...args);
+  const invoke = (channel, ...args) => handlers.get(channel)?.({ sender: overlay?.webContents }, ...args);
   invoke('set-shortcuts-suspended', false);
   return {
     requestAssistStop: context.requestAssistStop,
     invoke,
     toggle: () => shortcuts.get('CommandOrControl+O')(),
+    moveToMouse: () => shortcuts.get('CommandOrControl+M')(),
+    readSaved: () => JSON.parse(readFileSync(layoutFile, 'utf8')),
+    disconnect() { displays = [primary]; screen.emit('display-removed', {}, secondary); },
+    reconnect() { displays = [primary, secondary]; screen.emit('display-added', {}, secondary); },
     get overlay() { return overlay; },
     tick: (ms) => t.mock.timers.tick(ms),
     finishLoad() {
@@ -110,6 +134,111 @@ function startDesktop(t, { http } = {}) {
     },
   };
 }
+
+test('saved geometry is independent by mode and Ctrl+M only moves the visible instance', (t) => {
+  const desktop = startDesktop(t);
+  const update = (mode, patch) => desktop.invoke('update-overlay-layout', mode, patch);
+  assert.equal(update('glass', { displayId: 2, anchor: 'top-left', x: 60, y: 40, width: 610, height: 300 })?.ok, true);
+  assert.equal(update('prompt', { sizeMode: 'fixed', width: 300, height: 180 })?.ok, true);
+  assert.equal(desktop.readSaved().layouts.glass.width, 610);
+  desktop.toggle();
+  desktop.finishLoad();
+  assert.deepEqual(desktop.overlay.getBounds(), { x: -940, y: -60, width: 610, height: 300 });
+  desktop.moveToMouse();
+  assert.equal(desktop.overlay.getBounds().x, 380);
+  desktop.tick(400);
+  desktop.toggle();
+  desktop.tick(400);
+  desktop.toggle();
+  assert.equal(desktop.overlay.getBounds().x, -940);
+  desktop.invoke('sync-overlay-window', { mode: 'prompt' });
+  assert.equal(desktop.overlay.getBounds().width, 300);
+  assert.equal(desktop.invoke('resize-overlay-window', { width: 250, height: 90 }).skipped, true);
+  assert.equal(desktop.overlay.getBounds().height, 180);
+  desktop.invoke('sync-overlay-window', { mode: 'glass' });
+  assert.equal(desktop.overlay.getBounds().width, 610);
+});
+
+test('disconnect temporarily falls back to primary without losing preferred display', (t) => {
+  const desktop = startDesktop(t, {
+    savedLayout: { position: { x: -900, y: 12, w: 510, h: 220 } },
+  });
+  const layout = desktop.invoke('get-overlay-layout');
+  assert.equal(layout?.layouts.glass.displayId, secondary.id);
+  assert.equal(layout.layouts.glass.width, 510);
+  assert.equal(layout.layouts.prompt.maxWidth, 820);
+  desktop.toggle();
+  desktop.finishLoad();
+  desktop.disconnect();
+  assert.ok(desktop.overlay.getBounds().x >= 0);
+  assert.equal(desktop.invoke('get-overlay-layout').layouts.glass.displayId, secondary.id);
+  desktop.reconnect();
+  assert.ok(desktop.overlay.getBounds().x >= 0);
+  desktop.tick(400);
+  desktop.toggle();
+  desktop.tick(400);
+  desktop.toggle();
+  assert.equal(desktop.overlay.getBounds().x, -900);
+});
+
+test('auto prompt preserves its anchor and never writes its measured dimensions', (t) => {
+  const desktop = startDesktop(t);
+  desktop.invoke('sync-overlay-window', { mode: 'prompt', focusWidthPct: 76, promptMaxWidth: 700 });
+  assert.equal(desktop.invoke('get-overlay-layout')?.layouts.focus.widthPct, 76);
+  assert.equal(desktop.invoke('get-overlay-layout')?.layouts.prompt.maxWidth, 700);
+  assert.equal(desktop.invoke('update-overlay-layout', 'prompt', { anchor: 'bottom-right', x: -20, y: -30 })?.ok, true);
+  desktop.toggle();
+  desktop.finishLoad();
+  desktop.invoke('resize-overlay-window', { width: 240, height: 110 });
+  assert.deepEqual(desktop.overlay.getBounds(), { x: 1020, y: 660, width: 240, height: 110 });
+  assert.equal(desktop.readSaved().layouts.prompt.maxWidth, 700);
+  assert.equal(desktop.invoke('reset-overlay-layout', 'prompt')?.ok, true);
+  assert.equal(desktop.invoke('get-overlay-layout').layouts.prompt.maxWidth, 820);
+});
+
+test('an auto prompt offset may use space beyond its maximum-size rectangle', (t) => {
+  const desktop = startDesktop(t);
+  desktop.invoke('sync-overlay-window', { mode: 'prompt' });
+  desktop.invoke('update-overlay-layout', 'prompt', { anchor: 'top-left', x: 800, y: 680 });
+  desktop.toggle();
+  desktop.finishLoad();
+  desktop.invoke('resize-overlay-window', { width: 240, height: 110 });
+  assert.deepEqual(desktop.overlay.getBounds(), { x: 800, y: 680, width: 240, height: 110 });
+});
+
+test('legacy coordinates can be migrated after the preferred display comes online', (t) => {
+  const desktop = startDesktop(t, {
+    connected: false,
+    savedLayout: { position: { x: -900, y: 12, w: 510, h: 220 } },
+  });
+  desktop.invoke('sync-overlay-window', { mode: 'glass', focusWidthPct: 76, promptMaxWidth: 700 });
+  assert.equal(desktop.invoke('get-overlay-layout').layouts.glass.displayId, null);
+  desktop.reconnect();
+  assert.equal(desktop.readSaved().layouts.glass.displayId, secondary.id);
+  assert.equal(desktop.readSaved().layouts.prompt.maxWidth, 700);
+  desktop.toggle();
+  desktop.finishLoad();
+  assert.equal(desktop.overlay.getBounds().x, -900);
+});
+
+test('a startup shortcut opens using the renderer’s stored mode after preference sync', (t) => {
+  const desktop = startDesktop(t, { main: true });
+  desktop.toggle();
+  assert.equal(desktop.overlay, undefined);
+  desktop.invoke('sync-overlay-window', { mode: 'focus', enabled: false, focusWidthPct: 75, focusHeightPct: 80 });
+  desktop.finishLoad();
+  assert.equal(desktop.overlay.isVisible(), true);
+  assert.equal(desktop.invoke('get-overlay-state').mode, 'focus');
+  assert.equal(desktop.invoke('get-overlay-state').enabled, true);
+  assert.equal(desktop.overlay.getBounds().width, 939);
+});
+
+test('focus fixed dimensions leave room for its toolbar and answer', (t) => {
+  const desktop = startDesktop(t);
+  const saved = desktop.invoke('update-overlay-layout', 'focus', { sizeMode: 'fixed', width: 300, height: 100 });
+  assert.equal(saved.layouts.focus.width, 480);
+  assert.equal(saved.layouts.focus.height, 240);
+});
 
 test('desktop quit posts the session stop and waits for its response', async (t) => {
   let requested;

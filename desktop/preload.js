@@ -14,6 +14,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setWindowOpacity: (opacity) => ipcRenderer.invoke('set-window-opacity', opacity),
   syncOverlayWindow: (payload) => ipcRenderer.invoke('sync-overlay-window', payload),
   resizeOverlayWindow: (payload) => ipcRenderer.invoke('resize-overlay-window', payload),
+  getOverlayLayout: () => ipcRenderer.invoke('get-overlay-layout'),
+  updateOverlayLayout: (mode, patch) => ipcRenderer.invoke('update-overlay-layout', mode, patch),
+  resetOverlayLayout: (mode) => ipcRenderer.invoke('reset-overlay-layout', mode),
+  onOverlayLayout: (listener) => {
+    const wrapped = (_event, payload) => listener(payload);
+    ipcRenderer.on('overlay-layout', wrapped);
+    return () => ipcRenderer.removeListener('overlay-layout', wrapped);
+  },
   setShortcutsSuspended: (on) => ipcRenderer.invoke('set-shortcuts-suspended', on),
   destroyOverlay: () => ipcRenderer.invoke('destroy-overlay'),
   moveOverlayWindow: (dx, dy) => ipcRenderer.invoke('move-overlay-window', dx, dy),
