@@ -14,6 +14,20 @@ afterEach(() => {
 })
 
 describe('OverlaySettingsTab', () => {
+  it('persists the selected Windows prompt wheel modifier and shows helper errors', async () => {
+    window.electronAPI = {
+      isWindows: true,
+      getPromptWheelStatus: vi.fn().mockResolvedValue('unavailable'),
+      onPromptWheelStatus: vi.fn(() => () => {}),
+    } as unknown as Window['electronAPI']
+    render(<OverlaySettingsTab />)
+    fireEvent.click(screen.getByRole('button', { name: '提词模式' }))
+    const modifier = screen.getByLabelText('提词滚轮修饰键')
+    expect(modifier).toHaveValue('alt')
+    fireEvent.change(modifier, { target: { value: 'shift' } })
+    expect(localStorage.getItem('ia_overlay_prompt_wheel_modifier')).toBe('shift')
+    expect(await screen.findByText(/提词滚轮不可用/)).toBeInTheDocument()
+  })
   it('previews and persists mode-specific appearance without a native window', () => {
     render(<OverlaySettingsTab />)
     expect(screen.getByText(/位置与尺寸仅在桌面端可用/)).toBeInTheDocument()

@@ -14,6 +14,19 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setWindowOpacity: (opacity) => ipcRenderer.invoke('set-window-opacity', opacity),
   syncOverlayWindow: (payload) => ipcRenderer.invoke('sync-overlay-window', payload),
   resizeOverlayWindow: (payload) => ipcRenderer.invoke('resize-overlay-window', payload),
+  isWindows: process.platform === 'win32',
+  reportPromptScrollable: (scrollable) => ipcRenderer.invoke('report-prompt-scrollable', scrollable),
+  getPromptWheelStatus: () => ipcRenderer.invoke('get-prompt-wheel-status'),
+  onPromptWheel: (listener) => {
+    const wrapped = (_event, delta) => listener(delta);
+    ipcRenderer.on('prompt-wheel', wrapped);
+    return () => ipcRenderer.removeListener('prompt-wheel', wrapped);
+  },
+  onPromptWheelStatus: (listener) => {
+    const wrapped = (_event, status) => listener(status);
+    ipcRenderer.on('prompt-wheel-status', wrapped);
+    return () => ipcRenderer.removeListener('prompt-wheel-status', wrapped);
+  },
   getOverlayLayout: () => ipcRenderer.invoke('get-overlay-layout'),
   updateOverlayLayout: (mode, patch) => ipcRenderer.invoke('update-overlay-layout', mode, patch),
   resetOverlayLayout: (mode) => ipcRenderer.invoke('reset-overlay-layout', mode),

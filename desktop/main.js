@@ -105,6 +105,11 @@ let temporaryOverlayPosition;
 let measuredOverlaySize;
 let overlayToggleBlockedUntil = 0;
 let queuedOverlayToggle = false;
+const PROMPT_WHEEL_MESSAGE = 0x8000 + 0x179;
+let promptWheelHelper = null;
+let promptWheelGeneration = 0;
+let promptWheelScrollable = false;
+let promptWheelStatus = 'inactive';
 let lastOverlayState = {
   initialized: false,
   enabled: false,
@@ -118,8 +123,103 @@ let lastOverlayState = {
   focusHeightPct: 90,
   promptMaxWidth: PROMPT_OVERLAY_DEFAULT_WIDTH,
   promptAutoFollow: false,
+  promptWheelModifier: 'alt',
   maxLines: 0,
 };
+
+function sendPromptWheelStatus(status) {
+  if (promptWheelStatus === status) return;
+  promptWheelStatus = status;
+  for (const win of [mainWindow, overlayWindow]) {
+    if (win && !win.isDestroyed()) win.webContents.send('prompt-wheel-status', status);
+  }
+}
+
+function promptWheelActive() {
+  return process.platform === 'win32' && !isQuitting && overlayWindow
+    && !overlayWindow.isDestroyed() && overlayWindow._overlayReady
+    && overlayWindow.isVisible() && lastOverlayState.visible && getOverlayMode() === 'prompt';
+}
+
+function updatePromptWheelState(active = Boolean(promptWheelActive())) {
+  if (!promptWheelHelper || !promptWheelHelper.ready) return;
+  const win = overlayWindow;
+  const handle = win && !win.isDestroyed() ? win.getNativeWindowHandle() : null;
+  const hwnd = handle ? (handle.length === 8 ? handle.readBigUInt64LE() : BigInt(handle.readUInt32LE())).toString() : '0';
+  const state = {
+    type: 'state', active, scrollable: active && promptWheelScrollable,
+    modifier: lastOverlayState.promptWheelModifier, hwnd,
+    message: PROMPT_WHEEL_MESSAGE, generation: promptWheelGeneration,
+  };
+  try {
+    promptWheelHelper.stdin.write(`${JSON.stringify(state)}\n`);
+  } catch {
+    if (!promptWheelHelper.stopping) stopPromptWheelHelper('unavailable');
+  }
+}
+
+function stopPromptWheelHelper(status = 'inactive') {
+  const helper = promptWheelHelper;
+  if (helper) {
+    helper.stopping = true;
+    updatePromptWheelState(false);
+    promptWheelHelper = null;
+    promptWheelGeneration += 1;
+    clearTimeout(helper.startupTimer);
+    try { helper.stdin.end(); } catch { /* process may have exited */ }
+  }
+  sendPromptWheelStatus(status);
+}
+
+function startPromptWheelHelper() {
+  if (!promptWheelActive() || promptWheelHelper) return;
+  const python = process.env.IA_DESKTOP_PYTHON || (fs.existsSync(path.join(ROOT, '.venv', 'Scripts', 'python.exe'))
+    ? path.join(ROOT, '.venv', 'Scripts', 'python.exe') : 'python');
+  let helper;
+  try {
+    helper = spawn(python, ['-u', path.join(__dirname, 'prompt_mouse_hook.py'), '--parent-pid', String(process.pid)], {
+      cwd: ROOT, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  } catch {
+    sendPromptWheelStatus('unavailable');
+    return;
+  }
+  promptWheelGeneration += 1;
+  promptWheelHelper = helper;
+  helper.ready = false;
+  helper.startupTimer = setTimeout(() => {
+    if (promptWheelHelper === helper && !helper.ready) stopPromptWheelHelper('unavailable');
+  }, 5000);
+  let output = '';
+  helper.stdout.on('data', (chunk) => {
+    output += chunk.toString();
+    const lines = output.split('\n');
+    output = lines.pop();
+    for (const line of lines) {
+      try {
+        const message = JSON.parse(line);
+        if (promptWheelHelper !== helper) return;
+        if (message.type === 'ready') {
+          helper.ready = true;
+          clearTimeout(helper.startupTimer);
+          sendPromptWheelStatus('ready');
+          updatePromptWheelState();
+        } else if (message.type === 'error') {
+          stopPromptWheelHelper('unavailable');
+        }
+      } catch { /* ignore malformed helper output */ }
+    }
+  });
+  helper.stderr.on('data', (chunk) => console.warn('prompt mouse helper:', String(chunk)));
+  helper.stdin.on?.('error', () => {
+    if (promptWheelHelper === helper) stopPromptWheelHelper('unavailable');
+  });
+  const failed = () => {
+    if (promptWheelHelper === helper) stopPromptWheelHelper('unavailable');
+  };
+  helper.on('error', failed);
+  helper.on('exit', failed);
+}
 
 
 let _frontReassertTimer = null;
@@ -447,6 +547,26 @@ function createOverlayWindow() {
   }
 
   overlayWindow._overlayReady = false;
+  if (process.platform === 'win32') {
+    overlayWindow.setIgnoreMouseEvents(initialMode === 'prompt');
+    overlayWindow.hookWindowMessage(PROMPT_WHEEL_MESSAGE, (wParam, lParam) => {
+      const generation = wParam.length === 8 ? Number(wParam.readBigUInt64LE()) : wParam.readUInt32LE();
+      const delta = lParam.readInt32LE();
+      if (generation !== promptWheelGeneration || !promptWheelActive() || !promptWheelScrollable) return;
+      overlayWindow.webContents.send('prompt-wheel', delta);
+    });
+  }
+  overlayWindow.webContents.on('did-start-loading', () => {
+    if (!overlayWindow || overlayWindow.isDestroyed()) return;
+    overlayWindow._overlayReady = false;
+    promptWheelScrollable = false;
+    stopPromptWheelHelper();
+  });
+  overlayWindow.webContents.on('render-process-gone', () => {
+    if (overlayWindow && !overlayWindow.isDestroyed()) overlayWindow._overlayReady = false;
+    promptWheelScrollable = false;
+    stopPromptWheelHelper('unavailable');
+  });
 
   overlayWindow.once('ready-to-show', () => {
     if (!overlayWindow || overlayWindow.isDestroyed()) return;
@@ -470,6 +590,8 @@ function createOverlayWindow() {
       overlayWindow._overlayReady = true;
       if (consumePendingOverlayShow(overlayWindow, lastOverlayState?.visible)) {
         showOverlayWindow();
+      } else if (lastOverlayState?.visible && overlayWindow.isVisible()) {
+        startPromptWheelHelper();
       }
     }, process.platform === 'win32' ? 120 : 0);
   });
@@ -479,9 +601,14 @@ function createOverlayWindow() {
     overlayWindow.setBackgroundColor('#00000000');
     overlayWindow.setFocusable(false);
   });
-  overlayWindow.on('hide', stopFrontReassert);
+  overlayWindow.on('hide', () => {
+    stopFrontReassert();
+    promptWheelScrollable = false;
+    stopPromptWheelHelper();
+  });
 
   overlayWindow.on('closed', () => {
+    stopPromptWheelHelper();
     overlayWindow = null;
     measuredOverlaySize = undefined;
     temporaryOverlayPosition = undefined;
@@ -535,6 +662,7 @@ function showOverlayWindow() {
     overlayWindow._pendingShow = true;
     return;
   }
+  if (process.platform === 'win32') overlayWindow.setIgnoreMouseEvents(getOverlayMode() === 'prompt');
   temporaryOverlayPosition = undefined;
   applyOverlayModeBounds();
   sendOverlayLayout();
@@ -545,6 +673,7 @@ function showOverlayWindow() {
     overlayWindow.show();
   }
   overlayWindow.setContentProtection(true);
+  startPromptWheelHelper();
   keepWindowInFront(overlayWindow);
 }
 
@@ -1048,6 +1177,9 @@ ipcMain.handle('sync-overlay-window', (_event, payload = {}) => {
   if ('promptAutoFollow' in payload && typeof payload.promptAutoFollow === 'boolean') {
     style.promptAutoFollow = payload.promptAutoFollow;
   }
+  if (['alt', 'ctrl', 'shift'].includes(payload.promptWheelModifier)) {
+    style.promptWheelModifier = payload.promptWheelModifier;
+  }
   if ('maxLines' in payload) {
     const maxLines = Number(payload.maxLines);
     if (Number.isFinite(maxLines)) style.maxLines = Math.max(0, Math.min(50, Math.round(maxLines)));
@@ -1064,8 +1196,13 @@ ipcMain.handle('sync-overlay-window', (_event, payload = {}) => {
   const modeChanged = Boolean(lastOverlayState.mode) !== Boolean(state.mode)
     || (lastOverlayState.mode || '') !== (state.mode || '');
   if (visibleChanged || modeChanged) measuredOverlaySize = undefined;
+  if (modeChanged) {
+    promptWheelScrollable = false;
+    stopPromptWheelHelper();
+  }
 
   lastOverlayState = state;
+  updatePromptWheelState();
   if ('focusWidthPct' in style || 'promptMaxWidth' in style) persistOverlayLayouts();
   sendOverlayState(state);
   syncFocusOverlayShortcuts();
@@ -1113,6 +1250,13 @@ ipcMain.handle('sync-overlay-window', (_event, payload = {}) => {
   return { ok: true, visible: true };
 });
 ipcMain.handle('get-overlay-state', () => lastOverlayState);
+ipcMain.handle('get-prompt-wheel-status', () => promptWheelStatus);
+ipcMain.handle('report-prompt-scrollable', (event, scrollable) => {
+  if (!overlayWindow || event.sender !== overlayWindow.webContents || typeof scrollable !== 'boolean') return { ok: false };
+  promptWheelScrollable = scrollable;
+  updatePromptWheelState();
+  return { ok: true };
+});
 ipcMain.handle('set-shortcuts-suspended', (_event, on) => {
   // 设置页正在录制新快捷键时暂停全部全局热键：否则按下的组合键会
   // 触发旧绑定（Ctrl+B 藏主窗口 / Ctrl+. 清空会话），录制 UI 直接被带走。
@@ -1253,6 +1397,7 @@ function gracefulStopPython(timeoutMs = 20000) {
 
 app.on('before-quit', (event) => {
   isQuitting = true;
+  stopPromptWheelHelper();
   if (!pythonProcess) return;
   event.preventDefault();
   if (pythonStopPromise) return;

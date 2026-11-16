@@ -77,6 +77,73 @@ beforeEach(() => {
 })
 
 describe('InterviewOverlay', () => {
+  it('reports prompt overflow and scrolls with proportional native wheel deltas', async () => {
+    let wheel: ((delta: number) => void) | undefined
+    const reportPromptScrollable = vi.fn().mockResolvedValue({ ok: true })
+    const onPromptWheel = vi.fn((callback: (delta: number) => void) => {
+      wheel = callback
+      return () => { wheel = undefined }
+    })
+    const height = vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(100)
+    const scrollHeight = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(500)
+    window.electronAPI = { reportPromptScrollable, onPromptWheel } as unknown as Window['electronAPI']
+    useUiPrefsStore.setState({ interviewOverlayMode: 'prompt', interviewOverlayVisible: true })
+    localStorage.setItem('ia_overlay_mode', 'prompt')
+    render(<InterviewOverlay />)
+    const answer = document.querySelector('.ov-answer') as HTMLElement
+    expect(reportPromptScrollable).toHaveBeenCalledWith(true)
+    expect(wheel).toBeDefined()
+    act(() => { wheel?.(-60) })
+    expect(answer.scrollTop).toBeGreaterThan(0)
+    const first = answer.scrollTop
+    act(() => { wheel?.(60) })
+    expect(answer.scrollTop).toBeLessThan(first)
+    height.mockRestore()
+    scrollHeight.mockRestore()
+  })
+
+  it('accumulates small wheel deltas until they move a whole pixel', () => {
+    let wheel: ((delta: number) => void) | undefined
+    window.electronAPI = {
+      reportPromptScrollable: vi.fn().mockResolvedValue({ ok: true }),
+      onPromptWheel: (callback: (delta: number) => void) => { wheel = callback; return () => {} },
+    } as unknown as Window['electronAPI']
+    localStorage.setItem('ia_overlay_mode', 'prompt')
+    useUiPrefsStore.setState({ interviewOverlayMode: 'prompt', interviewOverlayVisible: true })
+    render(<InterviewOverlay />)
+    const scroller = document.querySelector('.ov-answer') as HTMLDivElement
+    Object.defineProperty(scroller, 'scrollHeight', { value: 1000, configurable: true })
+    Object.defineProperty(scroller, 'clientHeight', { value: 200, configurable: true })
+    scroller.scrollTop = 100
+    act(() => { for (let index = 0; index < 100; index += 1) wheel?.(-1) })
+    expect(scroller.scrollTop).toBeGreaterThan(100)
+  })
+
+  it('pauses and resumes streaming follow immediately after native wheel input', () => {
+    let wheel: ((delta: number) => void) | undefined
+    window.electronAPI = {
+      reportPromptScrollable: vi.fn().mockResolvedValue({ ok: true }),
+      onPromptWheel: (callback: (delta: number) => void) => { wheel = callback; return () => {} },
+    } as unknown as Window['electronAPI']
+    localStorage.setItem('ia_overlay_mode', 'prompt')
+    localStorage.setItem('ia_overlay_prompt_auto_follow', '1')
+    useUiPrefsStore.setState({ interviewOverlayMode: 'prompt', interviewOverlayVisible: true, interviewOverlayPromptAutoFollow: true })
+    useInterviewStore.setState({ qaPairs: [{ ...qa, answer: '第一段', status: 'streaming' }], streamingIds: ['qa-1'] })
+    render(<InterviewOverlay />)
+    const scroller = document.querySelector('.ov-answer') as HTMLDivElement
+    Object.defineProperty(scroller, 'scrollHeight', { value: 1000, configurable: true })
+    Object.defineProperty(scroller, 'clientHeight', { value: 200, configurable: true })
+    scroller.scrollTop = 800
+    act(() => { wheel?.(120) })
+    const position = scroller.scrollTop
+    expect(position).toBeLessThan(800)
+    act(() => useInterviewStore.setState({ qaPairs: [{ ...qa, answer: '第一段\n第二段', status: 'streaming' }] }))
+    expect(scroller.scrollTop).toBe(position)
+    act(() => { wheel?.(-1200) })
+    expect(scroller.scrollTop).toBe(800)
+    act(() => useInterviewStore.setState({ qaPairs: [{ ...qa, answer: '第一段\n第二段\n第三段', status: 'streaming' }] }))
+    expect(scroller.scrollTop).toBe(1000)
+  })
   it('renders the saved appearance of the active mode over its legacy defaults', () => {
     localStorage.setItem('ia_overlay_mode', 'focus')
     useUiPrefsStore.getState().updateOverlayAppearance('focus', {

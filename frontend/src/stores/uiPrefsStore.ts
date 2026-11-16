@@ -12,10 +12,12 @@ import {
   INTERVIEW_OVERLAY_PROMPT_MIN_WIDTH,
   INTERVIEW_OVERLAY_STORAGE_KEYS,
   isOverlayMode,
+  isPromptWheelModifier,
   overlayModeToShowBg,
   showBgToOverlayMode,
   type OverlayMode,
   type OverlayStatePayload,
+  type PromptWheelModifier,
 } from '@/lib/interviewOverlay'
 import { defaultOverlayAppearance, normalizeOverlayAppearance, type OverlayAppearance, type OverlayAppearances } from '@/lib/overlayAppearance'
 
@@ -168,6 +170,14 @@ function readOverlayPromptAutoFollow(): boolean {
   return false
 }
 
+function readPromptWheelModifier(): PromptWheelModifier {
+  try {
+    const saved = localStorage.getItem(INTERVIEW_OVERLAY_STORAGE_KEYS.promptWheelModifier)
+    if (isPromptWheelModifier(saved)) return saved
+  } catch { /* ignore */ }
+  return 'alt'
+}
+
 function readOverlayPercent(key: string, fallback: number, min: number, max: number): number {
   try {
     const raw = localStorage.getItem(key)
@@ -308,6 +318,7 @@ interface UiPrefsState {
   interviewOverlayFocusHeightPct: number
   interviewOverlayPromptMaxWidth: number
   interviewOverlayPromptAutoFollow: boolean
+  promptWheelModifier: PromptWheelModifier
   interviewOverlayMaxLines: number
   interviewOverlayVisible: boolean
   interviewOverlayAppearances: OverlayAppearances
@@ -329,6 +340,7 @@ interface UiPrefsState {
   setInterviewOverlayFocusHeightPct: (pct: number) => void
   setInterviewOverlayPromptMaxWidth: (width: number) => void
   setInterviewOverlayPromptAutoFollow: (enabled: boolean) => void
+  setPromptWheelModifier: (modifier: PromptWheelModifier) => void
   setInterviewOverlayMaxLines: (lines: number) => void
   updateOverlayAppearance: (mode: OverlayMode, patch: Partial<OverlayAppearance> | null) => void
   syncInterviewOverlayPrefs: () => void
@@ -367,6 +379,7 @@ export const useUiPrefsStore = create<UiPrefsState>((set) => ({
   interviewOverlayFocusHeightPct: readOverlayFocusHeightPct(),
   interviewOverlayPromptMaxWidth: readOverlayPromptMaxWidth(),
   interviewOverlayPromptAutoFollow: readOverlayPromptAutoFollow(),
+  promptWheelModifier: readPromptWheelModifier(),
   interviewOverlayMaxLines: readOverlayMaxLines(),
   interviewOverlayVisible: false,
   interviewOverlayAppearances: readOverlayAppearances(),
@@ -477,6 +490,11 @@ export const useUiPrefsStore = create<UiPrefsState>((set) => ({
     persistOverlayPref(INTERVIEW_OVERLAY_STORAGE_KEYS.promptAutoFollow, next ? '1' : '0')
     set({ interviewOverlayPromptAutoFollow: next })
   },
+  setPromptWheelModifier: (modifier) => {
+    const next = isPromptWheelModifier(modifier) ? modifier : 'alt'
+    persistOverlayPref(INTERVIEW_OVERLAY_STORAGE_KEYS.promptWheelModifier, next)
+    set({ promptWheelModifier: next })
+  },
   setInterviewOverlayMaxLines: (lines) => {
     const next = normalizeOverlayMaxLines(lines) ?? 0
     persistOverlayPref(INTERVIEW_OVERLAY_STORAGE_KEYS.maxLines, String(next))
@@ -505,6 +523,7 @@ export const useUiPrefsStore = create<UiPrefsState>((set) => ({
       interviewOverlayFocusHeightPct: readOverlayFocusHeightPct(),
       interviewOverlayPromptMaxWidth: readOverlayPromptMaxWidth(),
       interviewOverlayPromptAutoFollow: readOverlayPromptAutoFollow(),
+      promptWheelModifier: readPromptWheelModifier(),
       interviewOverlayMaxLines: readOverlayMaxLines(),
       interviewOverlayAppearances: readOverlayAppearances(),
     }),
@@ -523,6 +542,8 @@ export const useUiPrefsStore = create<UiPrefsState>((set) => ({
     const focusHeightPct = shouldApplyStyle ? normalizeOverlayFocusHeightPct(payload.focusHeightPct) : null
     const promptMaxWidth = shouldApplyStyle ? normalizeOverlayPromptMaxWidth(payload.promptMaxWidth) : null
     const promptAutoFollow = shouldApplyStyle ? normalizeOverlayPromptAutoFollow(payload.promptAutoFollow) : null
+    const promptWheelModifier = shouldApplyStyle && isPromptWheelModifier(payload.promptWheelModifier)
+      ? payload.promptWheelModifier : null
     const maxLines = shouldApplyStyle ? normalizeOverlayMaxLines(payload.maxLines) : null
 
     if (enabled !== null) persistOverlayPrefSilently(INTERVIEW_OVERLAY_STORAGE_KEYS.enabled, enabled ? '1' : '0')
@@ -535,6 +556,7 @@ export const useUiPrefsStore = create<UiPrefsState>((set) => ({
     if (focusHeightPct !== null) persistOverlayPrefSilently(INTERVIEW_OVERLAY_STORAGE_KEYS.focusHeightPct, String(focusHeightPct))
     if (promptMaxWidth !== null) persistOverlayPrefSilently(INTERVIEW_OVERLAY_STORAGE_KEYS.promptMaxWidth, String(promptMaxWidth))
     if (promptAutoFollow !== null) persistOverlayPrefSilently(INTERVIEW_OVERLAY_STORAGE_KEYS.promptAutoFollow, promptAutoFollow ? '1' : '0')
+    if (promptWheelModifier !== null) persistOverlayPrefSilently(INTERVIEW_OVERLAY_STORAGE_KEYS.promptWheelModifier, promptWheelModifier)
     if (maxLines !== null) persistOverlayPrefSilently(INTERVIEW_OVERLAY_STORAGE_KEYS.maxLines, String(maxLines))
 
     set((state) => ({
@@ -548,6 +570,7 @@ export const useUiPrefsStore = create<UiPrefsState>((set) => ({
       interviewOverlayFocusHeightPct: focusHeightPct ?? state.interviewOverlayFocusHeightPct,
       interviewOverlayPromptMaxWidth: promptMaxWidth ?? state.interviewOverlayPromptMaxWidth,
       interviewOverlayPromptAutoFollow: promptAutoFollow ?? state.interviewOverlayPromptAutoFollow,
+      promptWheelModifier: promptWheelModifier ?? state.promptWheelModifier,
       interviewOverlayMaxLines: maxLines ?? state.interviewOverlayMaxLines,
       interviewOverlayVisible: visible ?? state.interviewOverlayVisible,
     }))

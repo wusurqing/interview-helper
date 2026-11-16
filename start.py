@@ -432,7 +432,7 @@ def run_desktop_mode(port: int):
         sys.exit(1)
 
     # 到这里说明已经是无窗口模式了（或者不是 Windows）
-    env = {**os.environ, "PORT": str(port), HIDE_CONSOLE_ENV: "1"}
+    env = {**os.environ, "PORT": str(port), HIDE_CONSOLE_ENV: "1", "IA_DESKTOP_PYTHON": sys.executable}
     proc = subprocess.run([npx, "electron", "."], cwd=DESKTOP_DIR, env=env, **_hidden_process_kwargs())
     sys.exit(proc.returncode)
 

@@ -1,4 +1,10 @@
 export type OverlayMode = 'glass' | 'prompt' | 'focus'
+export type PromptWheelModifier = 'alt' | 'ctrl' | 'shift'
+export type PromptWheelStatus = 'ready' | 'unavailable' | 'inactive'
+
+export function isPromptWheelModifier(value: unknown): value is PromptWheelModifier {
+  return value === 'alt' || value === 'ctrl' || value === 'shift'
+}
 
 export const INTERVIEW_OVERLAY_PROMPT_MIN_WIDTH = 200
 export const INTERVIEW_OVERLAY_PROMPT_MAX_WIDTH = 820
@@ -18,6 +24,7 @@ export interface OverlayStatePayload {
   focusHeightPct?: number
   promptMaxWidth?: number
   promptAutoFollow?: boolean
+  promptWheelModifier?: PromptWheelModifier
   maxLines: number
 }
 
@@ -32,6 +39,7 @@ export const INTERVIEW_OVERLAY_STORAGE_KEYS = {
   focusHeightPct: 'ia_overlay_focus_height_pct',
   promptMaxWidth: 'ia_overlay_prompt_max_width',
   promptAutoFollow: 'ia_overlay_prompt_auto_follow',
+  promptWheelModifier: 'ia_overlay_prompt_wheel_modifier',
   maxLines: 'ia_overlay_max_lines',
   appearance: 'ia_overlay_appearance',
 } as const

@@ -191,6 +191,7 @@ def run(args: argparse.Namespace) -> int:
         "IA_DEV_BACKEND_PORT": str(args.backend_port),
         "IA_DEV_FRONTEND_PORT": str(args.frontend_port),
         "PYTHONUNBUFFERED": "1",
+        "IA_DESKTOP_PYTHON": python,
     }
 
     backend_command = [

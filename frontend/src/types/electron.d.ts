@@ -1,10 +1,11 @@
-import type { OverlayLayout, OverlayLayoutResult, OverlayLayoutSnapshot, OverlayMode, OverlayStatePayload } from '@/lib/interviewOverlay'
+import type { OverlayLayout, OverlayLayoutResult, OverlayLayoutSnapshot, OverlayMode, OverlayStatePayload, PromptWheelStatus } from '@/lib/interviewOverlay'
 
 export {}
 
 declare global {
   interface Window {
     electronAPI?: {
+      isWindows?: boolean
     hideWindow: () => Promise<void>
     minimizeWindow: () => Promise<void>
     quitApp: () => Promise<void>
@@ -22,6 +23,10 @@ declare global {
       updateOverlayLayout?: (mode: OverlayMode, patch: Partial<OverlayLayout>) => Promise<OverlayLayoutResult>
       resetOverlayLayout?: (mode: OverlayMode) => Promise<OverlayLayoutResult>
       onOverlayLayout?: (callback: (payload: OverlayLayoutSnapshot) => void) => () => void
+      reportPromptScrollable?: (scrollable: boolean) => Promise<{ ok: boolean }>
+      onPromptWheel?: (callback: (delta: number) => void) => () => void
+      getPromptWheelStatus?: () => Promise<PromptWheelStatus>
+      onPromptWheelStatus?: (callback: (status: PromptWheelStatus) => void) => () => void
       setShortcutsSuspended?: (on: boolean) => Promise<{ ok: boolean; suspended: boolean }>
       destroyOverlay?: () => Promise<{ ok: boolean }>
       moveOverlayWindow?: (dx: number, dy: number) => Promise<void>

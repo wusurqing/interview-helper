@@ -28,12 +28,14 @@ function startDesktop(t, { http, savedLayout, connected = true, main = false } =
     getDisplayNearestPoint: () => primary,
   });
   let overlay;
+  const helpers = [];
 
   class OverlayWindow extends EventEmitter {
     constructor({ x, y, width, height }) {
       super();
       this.webContents = new EventEmitter();
-      this.webContents.send = () => {};
+      this.messages = [];
+      this.webContents.send = (channel, payload) => { this.messages.push({ channel, payload }); };
       this.visible = false;
       this.destroyed = false;
       this.moveTopCalls = 0;
@@ -48,6 +50,10 @@ function startDesktop(t, { http, savedLayout, connected = true, main = false } =
     setBackgroundColor() {}
     setVisibleOnAllWorkspaces() {}
     setFocusable() {}
+    setIgnoreMouseEvents(value) { this.ignoreMouse = value; }
+    getNativeWindowHandle() { const b = Buffer.alloc(8); b.writeBigUInt64LE(123n); return b; }
+    hookWindowMessage(message, callback) { this.hookedMessage = message; this.messageCallback = callback; }
+    unhookWindowMessage() { this.messageCallback = null; }
     setMinimumSize() {}
     setBounds(bounds) { this.bounds = { ...bounds }; }
     getBounds() { return this.bounds; }
@@ -99,13 +105,28 @@ function startDesktop(t, { http, savedLayout, connected = true, main = false } =
 
   const context = {
     __dirname,
-    require: (name) => name === 'electron' ? electron : name === 'http' && http ? http : require(name),
+    require: (name) => {
+      if (name === 'electron') return electron;
+      if (name === 'http' && http) return http;
+      if (name === 'child_process') return { spawn() {
+        const child = new EventEmitter();
+        child.stdout = new EventEmitter();
+        child.stderr = new EventEmitter();
+        child.messages = [];
+        child.stdin = { write(data) { child.messages.push(JSON.parse(data)); return true; }, end() {} };
+        child.kill = () => {};
+        helpers.push(child);
+        return child;
+      } };
+      return require(name);
+    },
     process: { platform: 'win32', env: {} },
     Date,
     setInterval,
     clearInterval,
     setTimeout,
     clearTimeout,
+    Buffer,
   };
   runInNewContext(mainSource, context, { filename: mainFile });
   if (main) {
@@ -127,6 +148,7 @@ function startDesktop(t, { http, savedLayout, connected = true, main = false } =
     disconnect() { displays = [primary]; screen.emit('display-removed', {}, secondary); },
     reconnect() { displays = [primary, secondary]; screen.emit('display-added', {}, secondary); },
     get overlay() { return overlay; },
+    get helper() { return helpers[helpers.length - 1]; },
     tick: (ms) => t.mock.timers.tick(ms),
     finishLoad() {
       overlay.webContents.emit('did-finish-load');
@@ -134,6 +156,64 @@ function startDesktop(t, { http, savedLayout, connected = true, main = false } =
     },
   };
 }
+
+test('prompt window passes mouse through and only enables wheel routing when ready and scrollable', (t) => {
+  const desktop = startDesktop(t);
+  desktop.invoke('sync-overlay-window', { mode: 'prompt', promptWheelModifier: 'ctrl' });
+  desktop.toggle();
+  desktop.finishLoad();
+  assert.equal(desktop.overlay.ignoreMouse, true);
+  assert.ok(desktop.helper);
+  desktop.helper.stdout.emit('data', Buffer.from('{"type":"ready"}\n'));
+  desktop.invoke('report-prompt-scrollable', true);
+  const state = desktop.helper.messages.at(-1);
+  assert.equal(state.active, true);
+  assert.equal(state.scrollable, true);
+  assert.equal(state.modifier, 'ctrl');
+  desktop.invoke('sync-overlay-window', { mode: 'glass' });
+  assert.equal(desktop.overlay.ignoreMouse, false);
+  assert.equal(desktop.helper.messages.at(-1).active, false);
+});
+
+test('wheel routing ignores stale messages and stops when the helper exits or overlay hides', (t) => {
+  const desktop = startDesktop(t);
+  desktop.invoke('sync-overlay-window', { mode: 'prompt' });
+  desktop.toggle();
+  desktop.finishLoad();
+  const helper = desktop.helper;
+  helper.stdout.emit('data', Buffer.from('{"type":"ready"}\n'));
+  desktop.invoke('report-prompt-scrollable', true);
+  const generation = helper.messages.at(-1).generation;
+  const wParam = Buffer.alloc(8);
+  const lParam = Buffer.alloc(8);
+  wParam.writeBigUInt64LE(BigInt(generation));
+  lParam.writeInt32LE(-120);
+  desktop.overlay.messageCallback(wParam, lParam);
+  assert.equal(desktop.overlay.messages.at(-1).payload, -120);
+  helper.emit('exit', 1);
+  assert.equal(desktop.invoke('get-prompt-wheel-status'), 'unavailable');
+  const count = desktop.overlay.messages.length;
+  desktop.overlay.messageCallback(wParam, lParam);
+  assert.equal(desktop.overlay.messages.length, count);
+  desktop.tick(400);
+  desktop.toggle();
+  assert.equal(desktop.invoke('get-prompt-wheel-status'), 'inactive');
+  desktop.tick(400);
+  desktop.toggle();
+  assert.notEqual(desktop.helper, helper);
+});
+
+test('a broken helper pipe during shutdown does not recursively fail', (t) => {
+  const desktop = startDesktop(t);
+  desktop.invoke('sync-overlay-window', { mode: 'prompt' });
+  desktop.toggle();
+  desktop.finishLoad();
+  desktop.helper.stdout.emit('data', Buffer.from('{"type":"ready"}\n'));
+  desktop.helper.stdin.write = () => { throw new Error('broken pipe'); };
+  desktop.tick(400);
+  assert.doesNotThrow(() => desktop.toggle());
+  assert.equal(desktop.invoke('get-prompt-wheel-status'), 'inactive');
+});
 
 test('saved geometry is independent by mode and Ctrl+M only moves the visible instance', (t) => {
   const desktop = startDesktop(t);

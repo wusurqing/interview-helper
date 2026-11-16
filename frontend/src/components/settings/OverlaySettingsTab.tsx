@@ -1,8 +1,8 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Move, Paintbrush, PanelsTopLeft } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useOverlayLayout } from '@/hooks/useOverlayLayout'
-import type { OverlayAnchor, OverlayLayout, OverlayLayoutResult, OverlayMode } from '@/lib/interviewOverlay'
+import { isPromptWheelModifier, type OverlayAnchor, type OverlayLayout, type OverlayLayoutResult, type OverlayMode, type PromptWheelStatus } from '@/lib/interviewOverlay'
 import { getOverlayAppearanceStyles, OVERLAY_FONTS, type OverlayAppearance } from '@/lib/overlayAppearance'
 import { getShortcutDisplay } from '@/lib/shortcuts'
 import { useShortcutsStore } from '@/stores/shortcutsStore'
@@ -33,14 +33,36 @@ export default function OverlaySettingsTab() {
   const mode = useUiPrefsStore((state) => state.interviewOverlayMode)
   const setEnabled = useUiPrefsStore((state) => state.setInterviewOverlayEnabled)
   const setMode = useUiPrefsStore((state) => state.setInterviewOverlayMode)
+  const promptWheelModifier = useUiPrefsStore((state) => state.promptWheelModifier)
+  const setPromptWheelModifier = useUiPrefsStore((state) => state.setPromptWheelModifier)
   const appearance = useUiPrefsStore(useShallow((state) => getOverlayAppearance(state, state.interviewOverlayMode)))
   const updateAppearance = useUiPrefsStore((state) => state.updateOverlayAppearance)
   const shortcuts = useShortcutsStore((state) => state.shortcuts)
   const { layout: snapshot, setLayout, layoutError } = useOverlayLayout()
   const [saveError, setSaveError] = useState(false)
+  const [wheelStatus, setWheelStatus] = useState<PromptWheelStatus>('inactive')
   const api = window.electronAPI
   const geometry = snapshot?.layouts[mode]
   const desktop = Boolean(api?.getOverlayLayout && api.updateOverlayLayout && api.resetOverlayLayout)
+
+  useEffect(() => {
+    if (!api?.isWindows) return
+    let active = true
+    let eventReceived = false
+    const unsubscribe = api.onPromptWheelStatus?.((status) => {
+      eventReceived = true
+      setWheelStatus(status)
+    })
+    api.getPromptWheelStatus?.().then((status) => {
+      if (active && !eventReceived) setWheelStatus(status)
+    }).catch(() => {
+      if (active && !eventReceived) setWheelStatus('unavailable')
+    })
+    return () => {
+      active = false
+      unsubscribe?.()
+    }
+  }, [api])
 
   async function saveGeometry(result: Promise<OverlayLayoutResult>) {
     setSaveError(false)
@@ -226,7 +248,23 @@ export default function OverlaySettingsTab() {
         <Range id="overlay-max-lines" label="最大显示行数" value={appearance.maxLines} min={0} max={50}
           valueLabel={appearance.maxLines === 0 ? '不限' : undefined} onChange={(maxLines) => patchAppearance({ maxLines })} />
         {mode === 'prompt' && (
-          <Checkbox label="靠近底部时自动跟随最新内容" checked={appearance.autoFollow} onChange={(autoFollow) => patchAppearance({ autoFollow })} />
+          <>
+            <Checkbox label="靠近底部时自动跟随最新内容" checked={appearance.autoFollow} onChange={(autoFollow) => patchAppearance({ autoFollow })} />
+            {api?.isWindows && (
+              <Field label="提词滚轮修饰键" htmlFor="overlay-wheel-modifier">
+                <select id="overlay-wheel-modifier" className="input-field w-full" value={promptWheelModifier}
+                  onChange={(event) => {
+                    if (isPromptWheelModifier(event.target.value)) setPromptWheelModifier(event.target.value)
+                  }}>
+                  <option value="alt">Alt</option>
+                  <option value="ctrl">Ctrl</option>
+                  <option value="shift">Shift</option>
+                </select>
+                <p className="text-xs text-text-muted">按住所选键并在提词窗上滚轮，可阅读超出窗口的内容。</p>
+                {wheelStatus === 'unavailable' && <p role="status" className="text-xs text-accent-red">提词滚轮不可用，重新打开提词窗后重试。</p>}
+              </Field>
+            )}
+          </>
         )}
         <button type="button" className={resetClass} onClick={() => updateAppearance(mode, null)}>重置外观</button>
       </Section>

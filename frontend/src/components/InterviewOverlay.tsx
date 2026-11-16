@@ -163,6 +163,8 @@ export default function InterviewOverlay() {
   const overlayAnswerSlice = useMemo(() => sliceMaxLines(answerText, maxLines, !plain), [answerText, maxLines, plain])
 
   const answerScrollRef = useRef<HTMLDivElement | null>(null)
+  const promptScrollableRef = useRef<boolean | null>(null)
+  const promptWheelRemainder = useRef(0)
   const lastPromptSize = useRef<{ width: number; height: number } | null>(null)
   const answerAutoFollowRef = useRef(true)
   const previousAnswer = useRef({ id: '', text: '' })
@@ -174,8 +176,63 @@ export default function InterviewOverlay() {
     }
     const el = answerScrollRef.current
     if (!el) return
-    answerAutoFollowRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 28
+    const threshold = answerAutoFollowRef.current ? 28 : 1
+    answerAutoFollowRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= threshold
   }, [overlayMode, overlayPromptAutoFollow])
+
+  const reportPromptScrollability = useCallback(() => {
+    const report = window.electronAPI?.reportPromptScrollable
+    if (!report) return
+    const el = answerScrollRef.current
+    const scrollable = Boolean(enabled && overlayVisible && overlayMode === 'prompt' && el && el.scrollHeight > el.clientHeight)
+    if (promptScrollableRef.current === scrollable) return
+    promptScrollableRef.current = scrollable
+    report(scrollable).then((result) => {
+      if (!result.ok && promptScrollableRef.current === scrollable) promptScrollableRef.current = null
+    }).catch(() => { promptScrollableRef.current = null })
+  }, [enabled, overlayVisible, overlayMode])
+
+  useLayoutEffect(() => {
+    reportPromptScrollability()
+  }, [reportPromptScrollability, answerText, activeVisionVerifyKey, displayedQaKey, fontSize, fontFamily, fontWeight, lineHeight, maxLines, overlayPromptMaxWidth, overlayPromptMaxHeight, fixedPromptSize])
+
+  useEffect(() => {
+    const api = window.electronAPI
+    if (!enabled || !overlayVisible || overlayMode !== 'prompt' || !api?.reportPromptScrollable) return
+    const answer = answerScrollRef.current
+    const content = answer?.querySelector<HTMLElement>('.ov-answer-stack, .ov-standby-hint')
+    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(reportPromptScrollability)
+    if (answer) observer?.observe(answer)
+    if (content) observer?.observe(content)
+    window.addEventListener('resize', reportPromptScrollability)
+    const unsubscribe = api.onPromptWheel?.((delta) => {
+      const el = answerScrollRef.current
+      if (!el || !Number.isFinite(delta) || el.scrollHeight <= el.clientHeight) return
+      const lineHeight = Number.parseFloat(window.getComputedStyle(el).lineHeight)
+      const linePixels = Number.isFinite(lineHeight) ? lineHeight : fontSize * 1.5
+      const previousTop = el.scrollTop
+      const wanted = promptWheelRemainder.current - delta * linePixels * 3 / 120
+      const wholePixels = Math.trunc(wanted)
+      promptWheelRemainder.current = wanted - wholePixels
+      const requestedTop = previousTop + wholePixels
+      el.scrollTop = Math.max(0, Math.min(el.scrollHeight - el.clientHeight, requestedTop))
+      if (requestedTop < 0 || requestedTop > el.scrollHeight - el.clientHeight) promptWheelRemainder.current = 0
+      if (delta > 0 && el.scrollTop < previousTop) {
+        answerAutoFollowRef.current = false
+      } else {
+        updateAnswerAutoFollow()
+      }
+    })
+    reportPromptScrollability()
+    return () => {
+      observer?.disconnect()
+      window.removeEventListener('resize', reportPromptScrollability)
+      unsubscribe?.()
+      promptWheelRemainder.current = 0
+      promptScrollableRef.current = null
+      api.reportPromptScrollable?.(false).catch(() => {})
+    }
+  }, [enabled, overlayVisible, overlayMode, reportPromptScrollability, updateAnswerAutoFollow, fontSize])
 
   useEffect(() => {
     answerAutoFollowRef.current = overlayMode !== 'prompt' || overlayPromptAutoFollow
