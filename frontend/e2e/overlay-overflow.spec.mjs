@@ -25,7 +25,10 @@ async function openPrompt(page, sizeMode, viewport, cap, autoFollow = false) {
       prompt: { fontSize: 48, fontFamily: 'mono', textAlign: 'right', autoFollow },
     }))
     window.overlayMeasurements = []
+    window.promptScrollable = []
     window.electronAPI = {
+      reportPromptScrollable: async (value) => { window.promptScrollable.push(value); return { ok: true } },
+      onPromptWheel: (callback) => { window.promptWheel = callback; return () => { window.promptWheel = undefined } },
       getOverlayState: async () => ({ enabled: true, visible: true, mode: 'prompt' }),
       getOverlayLayout: async () => ({ promptViewport: { ...cap, sizeMode } }),
       resizeOverlayWindow: async (dimensions) => {
@@ -38,6 +41,30 @@ async function openPrompt(page, sizeMode, viewport, cap, autoFollow = false) {
   await expect.poll(() => Boolean(socket)).toBe(true)
   return (message) => socket.send(JSON.stringify(message))
 }
+
+test('detects delayed image overflow after standby content is replaced', async ({ page }) => {
+  let releaseImage
+  const imageGate = new Promise((resolve) => { releaseImage = resolve })
+  await page.route('**/delayed-image.svg', async (route) => {
+    await imageGate
+    await route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="900"></svg>' })
+  })
+  const send = await openPrompt(page, 'fixed', { width: 220, height: 180 }, { width: 220, height: 180 })
+  send({ type: 'answer_start', id: 'image', question: '请回答' })
+  send({ type: 'answer_done', id: 'image', question: '请回答', answer: '简答\n\n![图片](/delayed-image.svg)' })
+  try {
+    await expect(page.locator('.ov-markdown img')).toHaveCount(1)
+    await expect.poll(() => page.evaluate(() => window.promptScrollable.at(-1))).toBe(false)
+  } finally {
+    releaseImage()
+  }
+  await expect.poll(() => page.evaluate(() => window.promptScrollable.at(-1))).toBe(true)
+  const answer = page.locator('.ov-answer')
+  await page.evaluate(() => window.promptWheel(-120))
+  await expect.poll(() => answer.evaluate((element) => element.scrollTop)).toBeGreaterThan(0)
+  send({ type: 'session_cleared' })
+  await expect.poll(() => page.evaluate(() => window.promptScrollable.at(-1))).toBe(false)
+})
 
 async function expectTextFits(page, selector, text = longToken) {
   const body = page.locator(selector).first()

@@ -205,6 +205,18 @@ export default function InterviewOverlay() {
     if (answer) observer?.observe(answer)
     if (content) observer?.observe(content)
     window.addEventListener('resize', reportPromptScrollability)
+    document.fonts?.addEventListener('loadingdone', reportPromptScrollability)
+    reportPromptScrollability()
+    return () => {
+      observer?.disconnect()
+      window.removeEventListener('resize', reportPromptScrollability)
+      document.fonts?.removeEventListener('loadingdone', reportPromptScrollability)
+    }
+  }, [enabled, overlayVisible, overlayMode, hasContent, reportPromptScrollability])
+
+  useEffect(() => {
+    const api = window.electronAPI
+    if (!enabled || !overlayVisible || overlayMode !== 'prompt' || !api?.reportPromptScrollable) return
     const unsubscribe = api.onPromptWheel?.((delta) => {
       const el = answerScrollRef.current
       if (!el || !Number.isFinite(delta) || el.scrollHeight <= el.clientHeight) return
@@ -225,8 +237,6 @@ export default function InterviewOverlay() {
     })
     reportPromptScrollability()
     return () => {
-      observer?.disconnect()
-      window.removeEventListener('resize', reportPromptScrollability)
       unsubscribe?.()
       promptWheelRemainder.current = 0
       promptScrollableRef.current = null
