@@ -31,6 +31,13 @@ const qa = {
   timestamp: Date.now(),
 }
 
+function spyOnPromptShellWidth(width: number | ((shell: HTMLElement) => number)) {
+  return vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+    if (!this.classList.contains('ov-shell--nobg')) return new DOMRect()
+    return new DOMRect(0, 0, typeof width === 'number' ? width : width(this), 0)
+  })
+}
+
 beforeEach(() => {
   localStorage.clear()
   apiMock.getConfig.mockReset()
@@ -380,7 +387,7 @@ describe('InterviewOverlay', () => {
   it('auto-sizes prompt overlay bounds for watch-only display', async () => {
     const resizeOverlayWindow = vi.fn().mockResolvedValue({ ok: true, width: 260, height: 130 })
     const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(118)
-    const scrollWidthSpy = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(244)
+    const widthSpy = spyOnPromptShellWidth(244)
     ;(window as unknown as { electronAPI: unknown }).electronAPI = { resizeOverlayWindow }
     useUiPrefsStore.setState({ interviewOverlayMode: 'prompt', interviewOverlayShowBg: false })
     localStorage.setItem('ia_overlay_mode', 'prompt')
@@ -395,7 +402,7 @@ describe('InterviewOverlay', () => {
       expect(document.querySelector('.ov-root--prompt')).toBeInTheDocument()
     } finally {
       scrollHeightSpy.mockRestore()
-      scrollWidthSpy.mockRestore()
+      widthSpy.mockRestore()
     }
   })
 
@@ -404,7 +411,7 @@ describe('InterviewOverlay', () => {
     const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(function () {
       return this.classList.contains('ov-answer') ? 400 : 80
     })
-    const scrollWidthSpy = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(244)
+    const widthSpy = spyOnPromptShellWidth(244)
     ;(window as unknown as { electronAPI: unknown }).electronAPI = { resizeOverlayWindow }
     useUiPrefsStore.setState({ interviewOverlayMode: 'prompt', interviewOverlayShowBg: false })
     localStorage.setItem('ia_overlay_mode', 'prompt')
@@ -419,17 +426,15 @@ describe('InterviewOverlay', () => {
       })
     } finally {
       scrollHeightSpy.mockRestore()
-      scrollWidthSpy.mockRestore()
+      widthSpy.mockRestore()
     }
   })
 
   it('does not let an overflowing review question stretch prompt width', async () => {
     const resizeOverlayWindow = vi.fn().mockResolvedValue({ ok: true, width: 260, height: 130 })
     const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(118)
-    const scrollWidthSpy = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockImplementation(function () {
-      if (this.classList.contains('ov-answer-stack')) return 1200
-      return 244
-    })
+    const widthSpy = spyOnPromptShellWidth(244)
+    const overflowSpy = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(1200)
     ;(window as unknown as { electronAPI: unknown }).electronAPI = { resizeOverlayWindow }
     useUiPrefsStore.setState({ interviewOverlayMode: 'prompt', interviewOverlayShowBg: false })
     useInterviewStore.setState({
@@ -447,14 +452,15 @@ describe('InterviewOverlay', () => {
       })
     } finally {
       scrollHeightSpy.mockRestore()
-      scrollWidthSpy.mockRestore()
+      widthSpy.mockRestore()
+      overflowSpy.mockRestore()
     }
   })
 
   it('caps prompt overlay auto width so long content wraps', async () => {
     const resizeOverlayWindow = vi.fn().mockResolvedValue({ ok: true, width: 820, height: 130 })
     const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(118)
-    const scrollWidthSpy = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(1200)
+    const widthSpy = spyOnPromptShellWidth(1200)
     ;(window as unknown as { electronAPI: unknown }).electronAPI = { resizeOverlayWindow }
     useUiPrefsStore.setState({ interviewOverlayMode: 'prompt', interviewOverlayShowBg: false })
     localStorage.setItem('ia_overlay_mode', 'prompt')
@@ -468,13 +474,12 @@ describe('InterviewOverlay', () => {
       })
     } finally {
       scrollHeightSpy.mockRestore()
-      scrollWidthSpy.mockRestore()
+      widthSpy.mockRestore()
     }
   })
 
   it('uses promptMaxWidth as initial width when there is no content yet', async () => {
     const resizeOverlayWindow = vi.fn().mockResolvedValue({ ok: true, width: 700, height: 130 })
-    const scrollWidthSpy = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(0)
     const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(118)
     ;(window as unknown as { electronAPI: unknown }).electronAPI = { resizeOverlayWindow }
     useUiPrefsStore.setState({
@@ -491,14 +496,13 @@ describe('InterviewOverlay', () => {
         expect(resizeOverlayWindow).toHaveBeenCalledWith(expect.objectContaining({ width: 700 }))
       })
     } finally {
-      scrollWidthSpy.mockRestore()
       scrollHeightSpy.mockRestore()
     }
   })
 
   it('keeps prompt width independent from a previously narrowed viewport', async () => {
     const resizeOverlayWindow = vi.fn().mockResolvedValue({ ok: true, width: 700, height: 130 })
-    const scrollWidthSpy = vi.spyOn(HTMLElement.prototype, 'scrollWidth', 'get').mockReturnValue(684)
+    const widthSpy = spyOnPromptShellWidth((element) => element.parentElement?.style.width === '700px' ? 684 : 120)
     const scrollHeightSpy = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(118)
     ;(window as unknown as { electronAPI: unknown }).electronAPI = { resizeOverlayWindow }
     useUiPrefsStore.setState({
@@ -517,9 +521,10 @@ describe('InterviewOverlay', () => {
       await waitFor(() => {
         expect(resizeOverlayWindow).toHaveBeenCalledWith({ width: 700, height: 132 })
       })
+      expect((document.querySelector('.ov-root--prompt') as HTMLElement).style.width).toBe('')
       expect(document.querySelector('.ov-shell--nobg')).toHaveStyle({ '--ov-prompt-max-width': '680px' })
     } finally {
-      scrollWidthSpy.mockRestore()
+      widthSpy.mockRestore()
       scrollHeightSpy.mockRestore()
     }
   })

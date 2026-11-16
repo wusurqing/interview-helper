@@ -47,6 +47,7 @@ export interface OverlayLayout {
   width: number
   height: number
   maxWidth?: number
+  heightLimit?: 'screen' | 'custom'
   maxHeight?: number
   widthPct?: number
   heightPct?: number

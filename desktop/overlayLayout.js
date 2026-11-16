@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const MODES = ['glass', 'prompt', 'focus'];
 const ROWS = ['top', 'middle', 'bottom'];
 const COLUMNS = ['left', 'center', 'right'];
+const DEFAULT_PROMPT_CUSTOM_HEIGHT = 420;
 const MIN_SIZE = {
   glass: { width: 300, height: 100 },
   prompt: { width: 180, height: 72 },
@@ -19,7 +20,11 @@ function defaultLayout(mode) {
     width: mode === 'prompt' ? 820 : mode === 'focus' ? 960 : 480,
     height: mode === 'focus' ? 600 : 320,
     ...(mode === 'focus' && { widthPct: 96, heightPct: 90 }),
-    ...(mode === 'prompt' && { maxWidth: 820, maxHeight: 420 }),
+    ...(mode === 'prompt' && {
+      maxWidth: 820,
+      heightLimit: 'screen',
+      maxHeight: DEFAULT_PROMPT_CUSTOM_HEIGHT,
+    }),
   };
 }
 
@@ -32,7 +37,7 @@ function integer(value, fallback, min, max) {
 }
 
 function normalizeLayout(mode, input, fallback = defaultLayout(mode)) {
-  const { displayId, anchor, x, y, sizeMode, width, height, widthPct, heightPct, maxWidth, maxHeight } = input ?? {};
+  const { displayId, anchor, x, y, sizeMode, width, height, widthPct, heightPct, maxWidth, heightLimit, maxHeight } = input ?? {};
   const [row, column, extra] = typeof anchor === 'string' ? anchor.split('-') : [];
   const sizes = mode === 'prompt' ? ['fixed', 'auto'] : mode === 'focus' ? ['fixed', 'percent'] : ['fixed'];
   const min = MIN_SIZE[mode];
@@ -50,6 +55,7 @@ function normalizeLayout(mode, input, fallback = defaultLayout(mode)) {
     }),
     ...(mode === 'prompt' && {
       maxWidth: integer(maxWidth, fallback.maxWidth, min.width, 32768),
+      heightLimit: heightLimit === 'screen' || heightLimit === 'custom' ? heightLimit : fallback.heightLimit,
       maxHeight: integer(maxHeight, fallback.maxHeight, min.height, 32768),
     }),
   };
@@ -86,7 +92,14 @@ function canMigrateLayout(state, mode, displays) {
 }
 
 function readModeLayout(state, mode, displays, legacyPrefs) {
-  if (state.layouts?.[mode]) return normalizeLayout(mode, state.layouts[mode]);
+  const saved = state.layouts?.[mode];
+  if (saved) {
+    const layout = normalizeLayout(mode, saved);
+    if (mode === 'prompt' && saved.heightLimit == null && layout.maxHeight !== DEFAULT_PROMPT_CUSTOM_HEIGHT) {
+      layout.heightLimit = 'custom';
+    }
+    return layout;
+  }
 
   const previous = state.position;
   const display = previous && mode !== 'focus' ? displayAt(displays, previous.x, previous.y) : null;
@@ -106,6 +119,20 @@ function readModeLayout(state, mode, displays, legacyPrefs) {
   });
 }
 
+function getPromptGrowthBounds(layout, area) {
+  const minHeight = Math.min(MIN_SIZE.prompt.height, area.height);
+  const [row] = layout.anchor.split('-');
+  // Resolve the top edge from the opening size so it does not move when the answer grows.
+  const offset = Math.round((area.height - minHeight) * ROWS.indexOf(row) / 2) + layout.y;
+  const top = clamp(offset, 0, area.height - minHeight);
+  const remaining = area.height - top;
+  return {
+    y: area.y + top,
+    minHeight,
+    maxHeight: layout.heightLimit === 'custom' ? Math.min(layout.maxHeight, remaining) : remaining,
+  };
+}
+
 function resolveOverlayBounds(mode, layout, area, measured) {
   const margin = layout.sizeMode === 'percent' ? 14 : 0;
   const usableWidth = Math.max(1, area.width - margin * 2);
@@ -114,9 +141,10 @@ function resolveOverlayBounds(mode, layout, area, measured) {
   const minHeight = Math.min(MIN_SIZE[mode].height, usableHeight);
   let envelopeWidth = layout.width;
   let envelopeHeight = layout.height;
-  if (layout.sizeMode === 'auto') {
+  const growth = layout.sizeMode === 'auto' ? getPromptGrowthBounds(layout, area) : null;
+  if (growth) {
     envelopeWidth = layout.maxWidth;
-    envelopeHeight = layout.maxHeight;
+    envelopeHeight = growth.maxHeight;
   } else if (layout.sizeMode === 'percent') {
     envelopeWidth = Math.round(usableWidth * layout.widthPct / 100);
     envelopeHeight = Math.round(usableHeight * layout.heightPct / 100);
@@ -125,7 +153,7 @@ function resolveOverlayBounds(mode, layout, area, measured) {
   envelopeHeight = clamp(envelopeHeight, minHeight, usableHeight);
 
   const width = integer(measured?.width, envelopeWidth, minWidth, envelopeWidth);
-  const height = integer(measured?.height, envelopeHeight, minHeight, envelopeHeight);
+  const height = integer(measured?.height, growth?.minHeight ?? envelopeHeight, minHeight, envelopeHeight);
   const [row, column] = layout.anchor.split('-');
   const horizontal = COLUMNS.indexOf(column) / 2;
   const vertical = ROWS.indexOf(row) / 2;
@@ -133,7 +161,7 @@ function resolveOverlayBounds(mode, layout, area, measured) {
   const top = clamp(Math.round((usableHeight - height) * vertical) + layout.y, 0, usableHeight - height);
   return {
     x: area.x + margin + left,
-    y: area.y + margin + top,
+    y: growth?.y ?? area.y + margin + top,
     width,
     height,
   };
@@ -141,5 +169,5 @@ function resolveOverlayBounds(mode, layout, area, measured) {
 
 module.exports = {
   MODES, MIN_SIZE, defaultLayout, normalizeLayout, readOverlayLayout, writeOverlayLayout,
-  canMigrateLayout, readModeLayout, resolveOverlayBounds,
+  canMigrateLayout, readModeLayout, getPromptGrowthBounds, resolveOverlayBounds,
 };

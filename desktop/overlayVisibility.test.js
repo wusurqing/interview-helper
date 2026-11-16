@@ -189,8 +189,9 @@ test('auto prompt preserves its anchor and never writes its measured dimensions'
   assert.equal(desktop.invoke('update-overlay-layout', 'prompt', { anchor: 'bottom-right', x: -20, y: -30 })?.ok, true);
   desktop.toggle();
   desktop.finishLoad();
+  assert.equal(desktop.overlay.getBounds().y, 698);
   desktop.invoke('resize-overlay-window', { width: 240, height: 110 });
-  assert.deepEqual(desktop.overlay.getBounds(), { x: 1020, y: 660, width: 240, height: 110 });
+  assert.deepEqual(desktop.overlay.getBounds(), { x: 1020, y: 698, width: 240, height: 102 });
   assert.equal(desktop.readSaved().layouts.prompt.maxWidth, 700);
   assert.equal(desktop.invoke('reset-overlay-layout', 'prompt')?.ok, true);
   assert.equal(desktop.invoke('get-overlay-layout').layouts.prompt.maxWidth, 820);
@@ -204,6 +205,43 @@ test('an auto prompt offset may use space beyond its maximum-size rectangle', (t
   desktop.finishLoad();
   desktop.invoke('resize-overlay-window', { width: 240, height: 110 });
   assert.deepEqual(desktop.overlay.getBounds(), { x: 800, y: 680, width: 240, height: 110 });
+});
+
+test('an auto prompt grows down to the work-area edge, then shrinks for a short answer', (t) => {
+  const desktop = startDesktop(t, { savedLayout: { layouts: { prompt: { maxHeight: 420 } } } });
+  desktop.invoke('sync-overlay-window', { mode: 'prompt' });
+  desktop.invoke('update-overlay-layout', 'prompt', { anchor: 'top-left', x: 10, y: 120 });
+  const measure = (height) => desktop.invoke('resize-overlay-window', { width: 240, height });
+  desktop.toggle();
+  desktop.finishLoad();
+  assert.equal(desktop.overlay.getBounds().height, 72);
+  assert.equal(desktop.invoke('get-overlay-layout').promptViewport.height, 680);
+  measure(500);
+  assert.deepEqual(desktop.overlay.getBounds(), { x: 10, y: 120, width: 240, height: 500 });
+  measure(900);
+  assert.deepEqual(desktop.overlay.getBounds(), { x: 10, y: 120, width: 240, height: 680 });
+  measure(100);
+  assert.deepEqual(desktop.overlay.getBounds(), { x: 10, y: 120, width: 240, height: 100 });
+});
+
+test('auto prompt preserves a custom legacy height and recalculates room after Ctrl+M', (t) => {
+  const desktop = startDesktop(t, {
+    savedLayout: { layouts: { prompt: { displayId: 2, anchor: 'bottom-left', y: -10, maxHeight: 360 } } },
+  });
+  desktop.invoke('sync-overlay-window', { mode: 'prompt' });
+  desktop.toggle();
+  desktop.finishLoad();
+  const layout = () => desktop.invoke('get-overlay-layout');
+  const measure = () => desktop.invoke('resize-overlay-window', { width: 240, height: 750 });
+  assert.equal(layout().layouts.prompt.heightLimit, 'custom');
+  measure();
+  assert.deepEqual(desktop.overlay.getBounds(), { x: -1000, y: 718, width: 240, height: 82 });
+  desktop.moveToMouse();
+  assert.equal(layout().promptViewport.height, 360);
+  measure();
+  assert.deepEqual(desktop.overlay.getBounds(), { x: 380, y: 280, width: 240, height: 360 });
+  desktop.invoke('update-overlay-layout', 'prompt', { heightLimit: 'screen' });
+  assert.equal(layout().layouts.prompt.maxHeight, 360);
 });
 
 test('legacy coordinates can be migrated after the preferred display comes online', (t) => {

@@ -52,7 +52,7 @@ const {
 } = require('./windowOptions');
 const {
   MODES, MIN_SIZE, defaultLayout, normalizeLayout, readOverlayLayout,
-  writeOverlayLayout, canMigrateLayout, readModeLayout, resolveOverlayBounds,
+  writeOverlayLayout, canMigrateLayout, readModeLayout, getPromptGrowthBounds, resolveOverlayBounds,
 } = require('./overlayLayout');
 const { createMultiScreenBatch } = require('./multiScreenBatch');
 const { normalizeOpacity, readMainWindowOpacity, writeMainWindowOpacity } = require('./mainWindowOpacity');
@@ -195,7 +195,10 @@ function getOverlayLayoutSnapshot() {
     id, label, workArea, primary: id === primaryId,
   }));
   const { layout, display } = getOverlayPlacement('prompt', getOverlayMode() === 'prompt' && lastOverlayState.visible);
-  const { width, height } = resolveOverlayBounds('prompt', layout, display.workArea);
+  const area = display.workArea;
+  const bounds = resolveOverlayBounds('prompt', layout, area);
+  const width = bounds.width;
+  const height = layout.sizeMode === 'auto' ? getPromptGrowthBounds(layout, area).maxHeight : bounds.height;
   return { layouts: getOverlayLayouts(), displays, promptViewport: { sizeMode: layout.sizeMode, width, height } };
 }
 

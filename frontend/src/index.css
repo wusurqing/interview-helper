@@ -703,13 +703,11 @@ code, pre, .font-mono {
 }
 
 .ov-root--prompt .ov-shell--nobg {
-  /* max-content keeps measurement independent from the current (possibly tiny) window viewport. */
   width: max-content;
   min-width: 0;
   height: auto;
-  max-width: var(--ov-prompt-max-width, 804px);
+  max-width: min(100%, var(--ov-prompt-max-width, 804px));
   max-height: 100%;
-  overflow: visible;
 }
 
 .ov-shell--nobg .ov-answer {
@@ -720,13 +718,14 @@ code, pre, .font-mono {
 
 .ov-root--prompt .ov-answer {
   flex: 0 1 auto;
-  width: max-content;
+  width: 100%;
   min-width: 0;
-  max-width: var(--ov-prompt-max-width, 804px);
-  max-height: min(var(--ov-prompt-max-height, 408px), calc(100vh - 8px));
+  max-width: 100%;
+  max-height: calc(100vh - 8px);
   padding: 2px 4px;
   line-height: 1.5;
   scrollbar-gutter: stable;
+  overflow-wrap: anywhere;
 }
 
 .ov-root--prompt-fixed .ov-shell--nobg,
@@ -1126,7 +1125,7 @@ code, pre, .font-mono {
 }
 
 .ov-root--prompt .ov-plain-answer {
-  min-width: min(168px, var(--ov-prompt-max-width, 804px));
+  min-width: min(168px, 100%);
 }
 
 .ov-plain-meta span:first-child {
@@ -1135,22 +1134,17 @@ code, pre, .font-mono {
   text-overflow: ellipsis;
 }
 
-.ov-root--prompt .ov-answer-stack {
-  display: inline-flex;
-  width: max-content;
-  max-width: var(--ov-prompt-max-width, 804px);
-  flex-direction: column;
-  align-items: stretch;
-}
-
-/* A fixed prompter uses the window's content width, including for text alignment. */
-.ov-root--prompt-fixed .ov-answer-stack,
-.ov-root--prompt-fixed .ov-answer-stack .ov-markdown {
-  display: block;
+.ov-root--prompt .ov-answer-stack,
+.ov-root--prompt .ov-markdown {
+  /* Include Markdown block margins in the height measured for the native window. */
+  display: flow-root;
   width: 100%;
   max-width: 100%;
 }
 
+.ov-root--prompt .ov-review-line {
+  contain: inline-size;
+}
 .ov-verify {
   display: flex;
   max-width: 100%;
@@ -1187,6 +1181,15 @@ code, pre, .font-mono {
   color: currentColor;
   font-weight: 600;
   opacity: 0.78;
+}
+
+.ov-root--prompt .ov-verify {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.ov-root--prompt .ov-verify-reason {
+  grid-column: 2;
 }
 
 .ov-verify--pass {
@@ -1396,12 +1399,6 @@ code, pre, .font-mono {
   border-color: rgba(255, 255, 255, 0.16);
 }
 
-.ov-root--prompt .ov-markdown {
-  display: inline-block;
-  width: max-content;
-  max-width: var(--ov-prompt-max-width, 804px);
-}
-
 .ov-root--prompt .ov-markdown h1,
 .ov-root--prompt .ov-markdown h2,
 .ov-root--prompt .ov-markdown h3 {
@@ -1419,7 +1416,11 @@ code, pre, .font-mono {
 
 .ov-root--prompt .ov-markdown ul,
 .ov-root--prompt .ov-markdown ol {
-  margin-left: 1em;
+  margin-left: min(1em, 10%);
+}
+
+.ov-root--prompt .ov-markdown blockquote {
+  padding-left: min(1em, 10%);
 }
 
 .ov-root--prompt .ov-markdown li {

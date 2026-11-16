@@ -142,7 +142,16 @@ export default function OverlaySettingsTab() {
               {geometry.sizeMode === 'auto' ? (
                 <>
                   <GeometryNumber field="maxWidth" label="最大宽度" value={geometry.maxWidth ?? 820} min={180} onCommit={updateGeometry} />
-                  <GeometryNumber field="maxHeight" label="最大高度" value={geometry.maxHeight ?? 420} min={72} onCommit={updateGeometry} />
+                  <Field label="高度上限" htmlFor="overlay-height-limit" hint="提词窗从起始位置向下展开，达到上限后可纵向滚动。">
+                    <select id="overlay-height-limit" className="input-field w-full" value={geometry.heightLimit ?? 'screen'}
+                      onChange={(e) => updateGeometry({ heightLimit: e.target.value === 'custom' ? 'custom' : 'screen' })}>
+                      <option value="screen">屏幕底边</option>
+                      <option value="custom">自定义上限</option>
+                    </select>
+                  </Field>
+                  {geometry.heightLimit === 'custom' && (
+                    <GeometryNumber field="maxHeight" label="最大高度" value={geometry.maxHeight ?? 420} min={72} onCommit={updateGeometry} />
+                  )}
                 </>
               ) : geometry.sizeMode === 'percent' ? (
                 <>
