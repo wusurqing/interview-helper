@@ -86,9 +86,23 @@ function displayAt(displays, x, y) {
     x >= area.x && x < area.x + area.width && y >= area.y && y < area.y + area.height);
 }
 
+function legacyDisplayAt(displays, x, y) {
+  const exact = displayAt(displays, x, y);
+  if (exact) return exact;
+  const candidates = displays.filter(({ workArea: area }) =>
+    x >= area.x - 40 && x <= area.x + area.width - 80 &&
+    y >= area.y - 40 && y <= area.y + area.height - 60);
+  const distance = ({ workArea: area }) => {
+    const dx = Math.max(area.x - x, 0, x - (area.x + area.width));
+    const dy = Math.max(area.y - y, 0, y - (area.y + area.height));
+    return dx * dx + dy * dy;
+  };
+  return candidates.sort((a, b) => distance(a) - distance(b) || a.id - b.id)[0];
+}
+
 function canMigrateLayout(state, mode, displays) {
   const { x, y } = state.position ?? {};
-  return mode === 'focus' || !Number.isFinite(x) || !Number.isFinite(y) || Boolean(displayAt(displays, x, y));
+  return mode === 'focus' || !Number.isFinite(x) || !Number.isFinite(y) || Boolean(legacyDisplayAt(displays, x, y));
 }
 
 function readModeLayout(state, mode, displays, legacyPrefs) {
@@ -102,7 +116,7 @@ function readModeLayout(state, mode, displays, legacyPrefs) {
   }
 
   const previous = state.position;
-  const display = previous && mode !== 'focus' ? displayAt(displays, previous.x, previous.y) : null;
+  const display = previous && mode !== 'focus' ? legacyDisplayAt(displays, previous.x, previous.y) : null;
   return normalizeLayout(mode, {
     ...(display && {
       displayId: display.id,
