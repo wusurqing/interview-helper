@@ -94,7 +94,10 @@ def bind_mmpg_routes(app, manager, *, on_control, path="/ws/stt/mmpg"):
                     kind = message["type"]
                     if kind in _START_COMMANDS:
                         ids, mic = _devices(message)
-                        manager.start(ws, kind, ids, mic, preflight=on_control)
+                        single_mic_id = message.get("single_mic_id")
+                        if "single_mic_id" in message and single_mic_id is None:
+                            raise MmpgError("invalid_command")
+                        manager.start(ws, kind, ids, mic, preflight=on_control, single_mic_id=single_mic_id)
                     elif kind == "stop":
                         await manager.stop()
                     elif kind in _RTC_MESSAGES:

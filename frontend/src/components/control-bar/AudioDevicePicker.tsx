@@ -83,6 +83,7 @@ interface AudioDevicePickerProps {
   onRefresh: () => Promise<void>
   refreshing: boolean
   selectionDisabled: boolean
+  selectionDisabledTitle?: string
   ariaLabel?: string
   placeholder?: string
   selectedPrefix?: string
@@ -103,6 +104,7 @@ export function AudioDevicePicker({
   onRefresh,
   refreshing,
   selectionDisabled,
+  selectionDisabledTitle = '录音中不可切换设备，请先暂停',
   ariaLabel = '选择音频输入设备',
   placeholder = '选择音频输入',
   selectedPrefix = '当前',
@@ -154,7 +156,7 @@ export function AudioDevicePicker({
           aria-label={ariaLabel}
           aria-haspopup="dialog"
           aria-expanded={open}
-          title={selectionDisabled ? '录音中不可切换设备，请先暂停' : ariaLabel}
+          title={selectionDisabled ? selectionDisabledTitle : ariaLabel}
           className="min-w-0 flex-1 pl-2.5 pr-2 py-2 flex items-center gap-2 disabled:opacity-60 disabled:cursor-not-allowed focus:outline-none"
         >
           {selected?.is_loopback ? (

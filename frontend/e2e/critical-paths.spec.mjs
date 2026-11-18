@@ -7,6 +7,7 @@
  */
 import { test, expect } from '@playwright/test'
 import { installMocks, COMMON_WS_BOOTSTRAP } from './fixtures/setup.mjs'
+import { SAMPLE_CONFIG } from './fixtures/sample-data.mjs'
 
 test.describe('app shell', () => {
   test.beforeEach(async ({ context }) => {
@@ -76,6 +77,55 @@ test.describe('app shell', () => {
 })
 
 test.describe('assist mode with WebSocket-driven Q/A', () => {
+  test('single-mic test switches to the confirmed role and ends the session', async ({ context, page }) => {
+    await installMocks(context, {
+      messages: COMMON_WS_BOOTSTRAP,
+      apiOverrides: {
+        '/api/config': { ...SAMPLE_CONFIG, candidate_asr_enabled: true },
+        'POST /api/start': { ok: true },
+        'POST /api/single-mic/role': { ok: true },
+        'POST /api/stop': { ok: true },
+      },
+    })
+    const emitAssist = (message) => page.evaluate((payload) => window.__IA_MOCK_WS_MESSAGE__(payload), message)
+    await page.goto('/')
+    await page.getByRole('button', { name: '单人测试', exact: true }).click()
+    await expect(page.getByRole('button', { name: '选择测试麦克风' })).toHaveText(/MacBook Pro 麦克风/)
+    await expect(page.getByRole('button', { name: '选择会议音频设备' })).toHaveCount(0)
+
+    const startRequest = page.waitForRequest('**/api/start')
+    await page.getByRole('button', { name: '开始单人测试' }).click()
+    const startBody = (await startRequest).postDataJSON()
+    expect(startBody).toEqual({ device_id: 1002, candidate_mic_device_id: 1002, single_mic_id: expect.stringMatching(/^[0-9a-f]{32}$/) })
+    const state = { id: startBody.single_mic_id, device_id: 1002, role: 'interviewer', switching: false }
+    await emitAssist({ type: 'recording', value: true })
+    await emitAssist({ type: 'single_mic', value: state })
+
+    const interviewer = page.getByRole('button', { name: '面试官', exact: true })
+    const candidate = page.getByRole('button', { name: '候选人', exact: true })
+    await expect(interviewer).toHaveAttribute('aria-pressed', 'true')
+    const roleRequest = page.waitForRequest('**/api/single-mic/role')
+    await candidate.click()
+    expect((await roleRequest).postDataJSON()).toEqual({ session_id: state.id, role: 'candidate' })
+    await emitAssist({ type: 'single_mic', value: { ...state, switching: true } })
+    await expect(page.getByText('切换中，等待上一句转写完成')).toBeVisible()
+    await expect(candidate).toBeDisabled()
+    await expect(page.getByRole('button', { name: '结束单人测试' })).toBeEnabled()
+
+    await emitAssist({ type: 'single_mic', value: { ...state, role: 'candidate' } })
+    await expect(candidate).toHaveAttribute('aria-pressed', 'true')
+    await expect(interviewer).toHaveAttribute('aria-pressed', 'false')
+    await expect(interviewer).toBeEnabled()
+
+    page.once('dialog', (dialog) => dialog.accept())
+    const stopRequest = page.waitForRequest('**/api/stop')
+    await page.getByRole('button', { name: '结束单人测试' }).click()
+    await stopRequest
+    await emitAssist({ type: 'recording', value: false })
+    await expect(candidate).toHaveCount(0)
+    await expect(page.getByRole('button', { name: '开始单人测试' })).toBeEnabled()
+  })
+
   test('renders streamed transcripts and answer payload from mock WS', async ({ context, page }) => {
     const now = Math.floor(Date.now() / 1000)
 

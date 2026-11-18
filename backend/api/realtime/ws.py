@@ -199,6 +199,7 @@ async def websocket_endpoint(ws: WebSocket):
             "type": "init",
             "is_recording": snapshot["is_recording"],
             "is_paused": snapshot["is_paused"],
+            "single_mic": snapshot.get("single_mic"),
             "interviewer_streaming": streaming,
             "mmpg_answer_phase": mmpg_integration.answer_phase(),
             "stt_loaded": loaded,

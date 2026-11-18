@@ -44,21 +44,22 @@ export function mockWsInitScript({ messages }) {
         if (typeof this.onopen === 'function') this.onopen(new Event('open'))
 
         if (this._id === 1 && this.url.includes('/ws')) {
+          window.__IA_MOCK_WS_MESSAGE__ = (message) => this.emitMessage(message)
           messages.forEach((message) => {
             const delay = typeof message.delay === 'number' ? message.delay : 0
-            setTimeout(() => {
-              if (this.readyState !== MockWebSocket.OPEN) return
-              const event = new MessageEvent('message', {
-                data: JSON.stringify(message),
-              })
-              if (typeof this.onmessage === 'function') this.onmessage(event)
-            }, delay)
+            setTimeout(() => this.emitMessage(message), delay)
           })
         }
       }, 0)
     }
 
     send() {}
+
+    emitMessage(message) {
+      if (this.readyState === MockWebSocket.OPEN) {
+        this.onmessage?.(new MessageEvent('message', { data: JSON.stringify(message) }))
+      }
+    }
 
     close() {
       this.readyState = MockWebSocket.CLOSED

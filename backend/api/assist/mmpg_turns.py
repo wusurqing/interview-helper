@@ -116,6 +116,17 @@ class MmpgTurns:
             self._log("group_cleared", group=group.id)
         self._set_phase("idle")
 
+    def finish_role(self):
+        group = self._group
+        if group is None or group.speaking:
+            return
+        self._cancel_timer()
+        if group.request is None and group.utterances and not group.waiting_for_new_text:
+            self._answer(group)
+        if self._group is group:
+            self._group = None
+            self._set_phase("idle")
+
     def request_finished(self, request):
         request.finished = True
         group = self._group

@@ -16,6 +16,7 @@ import {
 } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore } from '@/stores/configStore'
+import type { SingleMicRole } from '@/stores/slices/types'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { api, getErrorMessage } from '@/lib/api'
 import { candidateMmpgController, mmpgController, mmpgStateLabels } from '@/lib/mmpg/rtcController'
@@ -25,6 +26,7 @@ import { ResumeMountInline } from '@/components/resume/ResumeMount'
 import { AudioDevicePicker } from './control-bar/AudioDevicePicker'
 import { QuickPromptsRow } from './control-bar/QuickPromptsRow'
 import { WsReconnectingBanner } from './control-bar/WsReconnectingBanner'
+import { SingleMicRolePicker } from './control-bar/SingleMicRolePicker'
 import { splitAudioDevices } from './control-bar/audioDevices'
 import {
   bumpQuickPromptRecent,
@@ -45,10 +47,32 @@ function getEnabledVisionModels(config: { models?: Array<{ name?: string; suppor
   return (config?.models ?? []).filter((model) => model.enabled !== false && model.supports_vision)
 }
 
+function connectInterviewerAudio(
+  mode: 'start' | 'resume',
+  device: number | null,
+  candidate: number | null,
+  streaming: boolean,
+  platform: string | undefined,
+  singleMicId: string | undefined,
+) {
+  if (streaming && device !== null) {
+    return singleMicId
+      ? mmpgController.start(mode, device, candidate, platform, undefined, singleMicId)
+      : mmpgController.start(mode, device, candidate, platform)
+  }
+  if (mode === 'start') {
+    return singleMicId ? api.start(device, candidate, singleMicId) : api.start(device, candidate)
+  }
+  return singleMicId
+    ? api.resume(device ?? undefined, candidate, singleMicId)
+    : api.resume(device ?? undefined, candidate)
+}
+
 export default function ControlBar() {
   // 精确订阅字段, 避免 store 任意字段(LLM token / audioLevel 等)变化触发 ControlBar 重渲染
   const {
     isRecording,
+    singleMic,
     interviewerStreaming,
     isPaused,
     devices,
@@ -75,6 +99,7 @@ export default function ControlBar() {
   } = useInterviewStore(
     useShallow((s) => ({
       isRecording: s.isRecording,
+      singleMic: s.singleMic,
       interviewerStreaming: s.interviewerStreaming,
       isPaused: s.isPaused,
       devices: s.devices,
@@ -102,6 +127,10 @@ export default function ControlBar() {
   )
   const [selectedDevice, setSelectedDevice] = useState<number | null>(null)
   const [selectedCandidateMic, setSelectedCandidateMic] = useState<number | null>(null)
+  const [singleMicSelected, setSingleMicSelected] = useState(false)
+  const [selectedTestMic, setSelectedTestMic] = useState<number | null>(null)
+  const [roleRequest, setRoleRequest] = useState<{ sessionId: string; role: SingleMicRole } | null>(null)
+  const roleRequestRef = useRef<typeof roleRequest>(null)
   const [manualQuestion, setManualQuestion] = useState('')
   const [pastedImage, setPastedImage] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
@@ -119,7 +148,8 @@ export default function ControlBar() {
     () => (config?.models ?? []).map((model, index) => ({ model, index })).filter(({ model }) => model.enabled !== false),
     [config?.models],
   )
-  const isExamMode = !interviewerStreaming && config?.written_exam_mode === true
+  const isExamMode = !singleMic && !interviewerStreaming && config?.written_exam_mode === true
+  const singleMicMode = !isExamMode && (singleMic !== null || (!isRecording && singleMicSelected))
   const usesMmpg = !isExamMode && config?.stt_provider === 'doubao_mmpg'
   const mmpg = useMmpgStatus()
   const ownsMmpgConnection = mmpg.mode && mmpg.mode !== 'test' && ['connecting', 'reconnecting'].includes(mmpg.state)
@@ -132,6 +162,7 @@ export default function ControlBar() {
   const answerModelUnavailable = noEnabledModels || allModelsUnavailable
   const showColdStartHint =
     !isExamMode &&
+    !singleMicMode &&
     !isRecording &&
     transcriptions.length === 0 &&
     qaPairs.length === 0 &&
@@ -141,6 +172,7 @@ export default function ControlBar() {
   const isComposingRef = useRef(false)
   const askingRef = useRef(false)
   const lifecycleActionRef = useRef(false)
+  const candidateConnectionAttemptRef = useRef<symbol | null>(null)
   const clearingRef = useRef(false)
   const cancellingAskRef = useRef(false)
   const cancellingAskResetTimerRef = useRef<number | null>(null)
@@ -186,6 +218,21 @@ export default function ControlBar() {
   const selectedCandidateIsMic = selectedCandidateDevice?.is_loopback === false
   const candidateCaptureEnabled = config?.candidate_asr_enabled ?? false
   const candidateUsesMmpg = candidateCaptureEnabled && config?.candidate_stt_provider === 'doubao_mmpg'
+  const testMic = singleMic?.device_id
+    ?? candidateMicDevices.find((device) => device.id === selectedTestMic)?.id
+    ?? candidateMicDevices[0]?.id
+    ?? null
+  const testModeDisabledReason = !candidateCaptureEnabled
+    ? '请先在语音设置开启「我的回答记录」。'
+    : usesMmpg && candidateUsesMmpg && config?.mmpg?.token_mode === 'manual'
+      ? '两路都使用豆包 MMPG 时，请在语音设置选择自动签发 Token。'
+      : null
+  const startDisabled = loading || (!isExamMode && (singleMicMode
+    ? testMic === null || testModeDisabledReason !== null || !wsConnected
+    : selectedDevice === null))
+  const microphoneSwitching = singleMic !== null && (singleMic.switching || roleRequest?.sessionId === singleMic.id)
+  const waitingForCandidateMmpg = candidateUsesMmpg && !candidateSttLoaded
+  const roleSwitchDisabled = !isRecording || loading || mmpgIsConnecting || microphoneSwitching || waitingForCandidateMmpg || isPaused || !wsConnected
   const candidateMicMatchesMeetingAudio = Boolean(
     !isExamMode &&
     candidateCaptureEnabled &&
@@ -207,6 +254,14 @@ export default function ControlBar() {
     : hasEnabledVisionModel
       ? `当前优先模型不支持图片，将自动使用「${enabledVisionModels[0]?.name ?? '识图模型'}」`
       : '没有已启用的识图模型，请先在设置中开启带 👁 的模型'
+
+  useEffect(() => {
+    const pending = roleRequestRef.current
+    if (!pending) return
+    if (!isPaused && singleMic?.id === pending.sessionId && (singleMic.switching || singleMic.role !== pending.role)) return
+    roleRequestRef.current = null
+    setRoleRequest(null)
+  }, [isPaused, singleMic])
 
   useEffect(() => {
     if (devices.length === 0) {
@@ -292,26 +347,74 @@ export default function ControlBar() {
     }
   }, [])
 
-  const connectCandidateMmpg = useCallback((mode: 'start' | 'resume', interviewer: Promise<unknown>) => {
-    if (!candidateUsesMmpg || effectiveCandidateMic === null) return
+  const connectCandidateMmpg = useCallback((
+    mode: 'start' | 'resume',
+    interviewer: Promise<unknown>,
+    mic: number | null,
+    singleMicId?: string,
+  ) => {
+    if (!candidateUsesMmpg || mic === null) return
+    const attempt = singleMicId ? Symbol() : null
+    candidateConnectionAttemptRef.current = attempt
     const interviewReady = interviewer.then(() => true, () => false)
-    void candidateMmpgController.start(mode, effectiveCandidateMic, null, platformInfo?.platform, () => interviewReady)
-      .catch(async (error: unknown) => {
-        if (error instanceof Error && error.name === 'AbortError') return
-        if (await interviewReady) setError(`我的麦克风 · ${getErrorMessage(error, 'MMPG 连接失败')}`)
-      })
-  }, [candidateUsesMmpg, effectiveCandidateMic, platformInfo?.platform])
+    const prepare = () => interviewReady
+    const candidate = singleMicId
+      ? candidateMmpgController.start(mode, mic, null, platformInfo?.platform, prepare, singleMicId)
+      : candidateMmpgController.start(mode, mic, null, platformInfo?.platform, prepare)
+    void candidate.catch(async (error: unknown) => {
+      if (error instanceof Error && error.name === 'AbortError') return
+      if (!(await interviewReady) || (attempt && candidateConnectionAttemptRef.current !== attempt)) return
+      const message = `我的麦克风 · ${getErrorMessage(error, 'MMPG 连接失败')}`
+      setError(message)
+      if (!singleMicId) return
+      try {
+        await api.pause(singleMicId)
+      } catch {
+        const { singleMic: latest, isPaused: paused } = useInterviewStore.getState()
+        if (candidateConnectionAttemptRef.current === attempt && latest?.id === singleMicId && !paused) {
+          setError(`${message}。暂停失败，请手动暂停或结束单人测试。`)
+        }
+      }
+    })
+  }, [candidateUsesMmpg, platformInfo?.platform])
+
+  const handleSwitchRole = useCallback(async (role: SingleMicRole) => {
+    if (!singleMic || roleSwitchDisabled || singleMic.role === role || roleRequestRef.current?.sessionId === singleMic.id) return
+    const request = { sessionId: singleMic.id, role }
+    roleRequestRef.current = request
+    setRoleRequest(request)
+    setError(null)
+    try {
+      const result = await api.switchSingleMicRole(request.sessionId, role)
+      const state = useInterviewStore.getState()
+      if (roleRequestRef.current === request && state.singleMic?.id === request.sessionId
+        && result.single_mic?.id === request.sessionId && result.single_mic.role === role) {
+        state.setSingleMic(result.single_mic)
+      }
+    } catch (error: unknown) {
+      if (roleRequestRef.current !== request) return
+      roleRequestRef.current = null
+      setRoleRequest(null)
+      if (useInterviewStore.getState().singleMic?.id === request.sessionId) {
+        setError(getErrorMessage(error, '切换发言角色失败，请重试'))
+      }
+    }
+  }, [singleMic, roleSwitchDisabled])
 
   const handleStart = useCallback(async () => {
     if (lifecycleActionRef.current) return
-    if (!isExamMode && selectedDevice === null) { setError('请先选择音频设备'); return }
+    const device = singleMicMode ? testMic : selectedDevice
+    if (!isExamMode && device === null) { setError('请先选择音频设备'); return }
+    if (singleMicMode && testModeDisabledReason) { setError(testModeDisabledReason); return }
     lifecycleActionRef.current = true
     setLoading(true); setError(null)
     try {
-      const interviewer = usesMmpg && selectedDevice !== null
-        ? mmpgController.start('start', selectedDevice, effectiveCandidateMic, platformInfo?.platform)
-        : api.start(isExamMode ? null : selectedDevice, effectiveCandidateMic)
-      connectCandidateMmpg('start', interviewer)
+      const singleMicId = singleMicMode
+        ? Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('')
+        : undefined
+      const candidate = singleMicMode ? device : effectiveCandidateMic
+      const interviewer = connectInterviewerAudio('start', isExamMode ? null : device, candidate, usesMmpg, platformInfo?.platform, singleMicId)
+      connectCandidateMmpg('start', interviewer, candidate, singleMicId)
       await interviewer
       if (isExamMode) {
         showExamOverlayPrompt()
@@ -345,26 +448,32 @@ export default function ControlBar() {
       lifecycleActionRef.current = false
       setLoading(false)
     }
-  }, [selectedDevice, effectiveCandidateMic, isExamMode, usesMmpg, platformInfo?.platform, connectCandidateMmpg])
+  }, [selectedDevice, effectiveCandidateMic, isExamMode, usesMmpg, platformInfo?.platform, connectCandidateMmpg, singleMicMode, testMic, testModeDisabledReason])
   const handleStop = useCallback(async () => {
     if (lifecycleActionRef.current) return
-    if (isRecording && !window.confirm(isExamMode ? '结束本次笔试？当前答案会保留在页面上。' : '结束本次面试？将停止录音，当前转录与答案会保留在页面上。')) return
+    const interviewName = singleMic ? '单人测试' : isExamMode ? '笔试' : '面试'
+    const confirmMessage = isExamMode
+      ? '结束本次笔试？当前答案会保留在页面上。'
+      : `结束本次${interviewName}？将停止录音，当前转录与答案会保留在页面上。`
+    if (isRecording && !window.confirm(confirmMessage)) return
     lifecycleActionRef.current = true
+    candidateConnectionAttemptRef.current = null
     setLoading(true)
     try {
       candidateMmpgController.cancelConnection()
       await api.stop()
       window.electronAPI?.syncOverlayWindow?.({ visible: false }).catch(() => {})
     } catch (e: unknown) {
-      setError(`结束${isExamMode ? '笔试' : '面试'}失败：${getErrorMessage(e)}`)
+      setError(`结束${interviewName}失败：${getErrorMessage(e)}`)
     } finally {
       lifecycleActionRef.current = false
       setLoading(false)
     }
-  }, [isExamMode, isRecording])
+  }, [isExamMode, isRecording, singleMic])
   const handlePause = useCallback(async () => {
     if (lifecycleActionRef.current) return
     lifecycleActionRef.current = true
+    candidateConnectionAttemptRef.current = null
     setLoading(true)
     try {
       candidateMmpgController.cancelConnection()
@@ -384,7 +493,8 @@ export default function ControlBar() {
   }, [])
   const handleResume = useCallback(async () => {
     if (lifecycleActionRef.current) return
-    if (!isExamMode && selectedDevice === null) {
+    const device = singleMic?.device_id ?? selectedDevice
+    if (!isExamMode && device === null) {
       setError('请先选择音频设备')
       return
     }
@@ -394,10 +504,9 @@ export default function ControlBar() {
       if (isExamMode) {
         await api.resume()
       } else {
-        const interviewer = interviewerStreaming && selectedDevice !== null
-          ? mmpgController.start('resume', selectedDevice, effectiveCandidateMic, platformInfo?.platform)
-          : api.resume(selectedDevice ?? undefined, effectiveCandidateMic)
-        connectCandidateMmpg('resume', interviewer)
+        const candidate = singleMic ? device : effectiveCandidateMic
+        const interviewer = connectInterviewerAudio('resume', device, candidate, interviewerStreaming, platformInfo?.platform, singleMic?.id)
+        connectCandidateMmpg('resume', interviewer, candidate, singleMic?.id)
         await interviewer
       }
     } catch (e: unknown) {
@@ -408,13 +517,14 @@ export default function ControlBar() {
       lifecycleActionRef.current = false
       setLoading(false)
     }
-  }, [selectedDevice, effectiveCandidateMic, isExamMode, interviewerStreaming, platformInfo?.platform, connectCandidateMmpg])
+  }, [selectedDevice, effectiveCandidateMic, isExamMode, interviewerStreaming, platformInfo?.platform, connectCandidateMmpg, singleMic])
   const handleClear = useCallback(async () => {
     if (clearingRef.current) return
     if (qaPairs.length > 0 || transcriptions.length > 0 || candidateTranscriptions.length > 0) {
       if (!window.confirm('确定要清空当前页的转录与答案吗？清空后不可恢复。')) return
     }
     clearingRef.current = true
+    candidateConnectionAttemptRef.current = null
     setClearing(true)
     try {
       await api.clear()
@@ -608,7 +718,7 @@ export default function ControlBar() {
           <span>未启用任何模型，请在设置中开启至少一个模型。</span>
         </div>
       )}
-      {!isExamMode && !hasLoopback && platformInfo?.needs_virtual_device && (
+      {!isExamMode && !singleMicMode && !hasLoopback && platformInfo?.needs_virtual_device && (
         <div className="flex items-start gap-2 text-xs text-accent-amber bg-accent-amber/10 px-3 py-2 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
           <div>
@@ -618,28 +728,41 @@ export default function ControlBar() {
           </div>
         </div>
       )}
-      {!isExamMode && selectedDevice !== null && !selectedIsLoopback && hasLoopback && (
+      {!isExamMode && !singleMicMode && selectedDevice !== null && !selectedIsLoopback && hasLoopback && (
         <div className="flex items-center gap-2 text-xs text-accent-amber bg-accent-amber/10 px-3 py-1.5 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
           <span>你选择的是麦克风，建议选择带 ⟳ 标记的系统音频设备</span>
         </div>
       )}
-      {!isExamMode && candidateCaptureEnabled && selectedCandidateMic === null && (
+      {!isExamMode && !singleMicMode && candidateCaptureEnabled && selectedCandidateMic === null && (
         <div className="flex items-center gap-2 text-xs text-accent-amber bg-accent-amber/10 px-3 py-1.5 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
           <span>未选择“我的麦克风”，实时语音上下文只包含会议音频转写。</span>
         </div>
       )}
-      {!isExamMode && candidateCaptureEnabled && selectedCandidateMic !== null && !selectedCandidateIsMic && (
+      {!isExamMode && !singleMicMode && candidateCaptureEnabled && selectedCandidateMic !== null && !selectedCandidateIsMic && (
         <div className="flex items-center gap-2 text-xs text-accent-amber bg-accent-amber/10 px-3 py-1.5 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
           <span>“我的麦克风”建议选择普通麦克风，不要选择系统音频设备</span>
         </div>
       )}
-      {candidateMicMatchesMeetingAudio && (
+      {!singleMicMode && candidateMicMatchesMeetingAudio && (
         <div className="flex items-center gap-2 text-xs text-accent-amber bg-accent-amber/10 px-3 py-1.5 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
           <span>“我的麦克风”和会议音频相同，本次不会单独记录你的回答；请选择系统音频/虚拟声卡作为会议音频。</span>
+        </div>
+      )}
+      {singleMicMode && !isRecording && testModeDisabledReason && (
+        <div className="flex items-center gap-2 rounded-lg bg-accent-amber/10 px-3 py-1.5 text-xs text-accent-amber">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span>{testModeDisabledReason}</span>
+          <button
+            type="button"
+            className="ml-auto shrink-0 rounded-md px-2 py-1 text-accent-blue hover:bg-accent-blue/10"
+            onClick={() => useInterviewStore.getState().openConfigDrawer()}
+          >
+            打开设置
+          </button>
         </div>
       )}
       {lastWSError && (
@@ -693,7 +816,33 @@ export default function ControlBar() {
 
       {/* 主控制行 */}
       <div className="grid gap-2 rounded-lg border border-bg-hover/70 bg-bg-secondary/75 p-2 shadow-sm lg:grid-cols-[minmax(0,38rem)_auto] lg:items-stretch">
-        {!isExamMode && (
+        {singleMicMode ? (
+          <div className="grid w-full min-w-0 grid-cols-1 gap-2 sm:grid-cols-2 lg:max-w-[38rem]">
+            <div className="flex min-w-0 flex-col gap-1">
+              <span className="text-[10px] font-medium leading-none text-text-muted">测试麦克风</span>
+              <AudioDevicePicker
+                devices={candidateMicDevices}
+                selectedDevice={testMic}
+                onSelect={setSelectedTestMic}
+                onRefresh={handleRefreshDevices}
+                refreshing={refreshingDevices}
+                selectionDisabled={isRecording || loading}
+                selectionDisabledTitle="请结束单人测试后切换设备"
+                ariaLabel="选择测试麦克风"
+                placeholder="选择测试麦克风"
+              />
+            </div>
+            {singleMic && (
+              <SingleMicRolePicker
+                role={singleMic.role}
+                disabled={roleSwitchDisabled}
+                switching={microphoneSwitching}
+                connecting={!isPaused && (mmpgIsConnecting || waitingForCandidateMmpg)}
+                onSelect={handleSwitchRole}
+              />
+            )}
+          </div>
+        ) : !isExamMode && (
           <div className="grid w-full min-w-0 grid-cols-1 gap-2 sm:grid-cols-2 lg:max-w-[38rem]">
             <div className="flex min-w-0 flex-col gap-1 lg:max-w-[19rem]">
               <span className="text-[10px] font-medium text-text-muted leading-none">会议音频 · 听面试官</span>
@@ -795,10 +944,10 @@ export default function ControlBar() {
                 <span>暂停</span>
               </button>
             )}
-            <button onClick={handleStop} disabled={loading}
+            <button onClick={handleStop} disabled={loading} aria-label={singleMic ? '结束单人测试' : undefined}
               className="flex min-h-[38px] items-center gap-1.5 rounded-lg px-3.5 py-2 btn-danger text-xs font-semibold disabled:opacity-50 flex-shrink-0">
               <Square className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">{isExamMode ? '结束' : '结束面试'}</span>
+              <span className="hidden sm:inline">{isExamMode ? '结束' : singleMic ? '结束单人测试' : '结束面试'}</span>
             </button>
           </>
         ) : !isExamMode && !usesMmpg && sttLoading ? (
@@ -808,16 +957,31 @@ export default function ControlBar() {
             <span>{sttActiveProvider === 'whisper' && config?.stt_provider && config.stt_provider !== 'whisper' ? '降级加载 Whisper…' : '语音加载中…'}</span>
           </button>
         ) : !isExamMode && !usesMmpg && !sttLoaded ? (
-          <button onClick={handleStart} disabled={loading || selectedDevice === null}
+          <button onClick={handleStart} disabled={startDisabled}
             className="flex min-h-[38px] items-center gap-1.5 rounded-lg px-4 py-2 text-white text-xs font-semibold flex-shrink-0" style={{ background: 'linear-gradient(135deg, rgb(var(--c-accent-amber)), rgb(var(--c-accent-amber) / 0.85))' }}>
             <AlertTriangle className="w-3.5 h-3.5" />
-            <span>语音未就绪，开始面试</span>
+            <span>{singleMicMode ? '语音未就绪，开始单人测试' : '语音未就绪，开始面试'}</span>
           </button>
         ) : (
-          <button onClick={handleStart} disabled={loading || (!isExamMode && selectedDevice === null)}
+          <button onClick={handleStart} disabled={startDisabled}
             className="flex min-h-[38px] items-center gap-1.5 rounded-lg px-4 py-2 btn-primary text-xs font-semibold disabled:opacity-50 flex-shrink-0">
             <Play className="w-3.5 h-3.5" />
-            <span>{isExamMode ? '开始笔试' : '开始面试'}</span>
+            <span>{isExamMode ? '开始笔试' : singleMicMode ? '开始单人测试' : '开始面试'}</span>
+          </button>
+        )}
+
+        {!isExamMode && !isRecording && (
+          <button
+            type="button"
+            aria-pressed={singleMicSelected}
+            disabled={loading}
+            onClick={() => {
+              setSingleMicSelected((selected) => !selected)
+              setError(null)
+            }}
+            className="min-h-[38px] shrink-0 rounded-lg border border-bg-hover px-3 py-2 text-xs font-semibold text-text-secondary hover:bg-bg-hover aria-pressed:border-accent-blue/60 aria-pressed:bg-accent-blue/10 aria-pressed:text-accent-blue disabled:opacity-50"
+          >
+            单人测试
           </button>
         )}
 

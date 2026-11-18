@@ -67,6 +67,7 @@ describe('useInterviewWS', () => {
       isPaused: false,
       wsConnected: false,
       isRecording: false,
+      singleMic: null,
       sttLoaded: false,
       sttLoading: true,
       sttActiveProvider: '',
@@ -120,6 +121,29 @@ describe('useInterviewWS', () => {
     expect(state.transcriptions).toEqual(['hello'])
     expect(state.qaPairs[0].question).toBe('Q')
     expect(state.qaPairs[1].answer).toContain('part')
+  })
+
+  it('restores the live role and follows server-confirmed switching and stops', () => {
+    render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+    const singleMic = { id: 'session-1', device_id: 11, role: 'interviewer', switching: false, revision: 0 }
+
+    act(() => {
+      ws.emitOpen()
+      ws.emitMessage({ type: 'init', is_recording: true, single_mic: singleMic })
+    })
+    expect(useInterviewStore.getState().singleMic).toEqual(singleMic)
+
+    act(() => ws.emitMessage({ type: 'single_mic', value: { ...singleMic, switching: true, revision: 1 } }))
+    expect(useInterviewStore.getState().singleMic).toEqual({ ...singleMic, switching: true, revision: 1 })
+
+    act(() => ws.emitMessage({ type: 'single_mic', value: { ...singleMic, role: 'candidate', revision: 2 } }))
+    expect(useInterviewStore.getState().singleMic?.role).toBe('candidate')
+    act(() => ws.emitMessage({ type: 'single_mic', value: { ...singleMic, switching: true, revision: 1 } }))
+    expect(useInterviewStore.getState().singleMic).toEqual({ ...singleMic, role: 'candidate', revision: 2 })
+
+    act(() => ws.emitMessage({ type: 'recording', value: false }))
+    expect(useInterviewStore.getState().singleMic).toBeNull()
   })
 
   it('labels generation and persistence answer failures accurately', () => {

@@ -1,5 +1,6 @@
 import { buildApiUrl } from './backendUrl'
 import { getAuthToken } from './auth'
+import type { SingleMicRole, SingleMicState } from '@/stores/slices/types'
 
 export type KnowledgeThinkEffort = 'off' | 'low' | 'medium' | 'high' | 'xhigh'
 
@@ -254,23 +255,33 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ summary }),
     }),
-  start: (device_id?: number | null, candidate_mic_device_id?: number | null) =>
+  start: (device_id?: number | null, candidate_mic_device_id?: number | null, single_mic_id?: string) =>
     request('/api/start', {
       method: 'POST',
       body: JSON.stringify({
         ...(device_id != null ? { device_id } : {}),
         ...(candidate_mic_device_id != null ? { candidate_mic_device_id } : {}),
+        ...(single_mic_id ? { single_mic_id } : {}),
       }),
     }),
   stop: () => request('/api/stop', { method: 'POST' }),
-  pause: () => request('/api/pause', { method: 'POST' }),
-  resume: (device_id?: number, candidate_mic_device_id?: number | null) => request('/api/unpause', {
+  pause: (single_mic_id?: string) => request('/api/pause', {
+    method: 'POST',
+    ...(single_mic_id ? { body: JSON.stringify({ single_mic_id }) } : {}),
+  }),
+  resume: (device_id?: number, candidate_mic_device_id?: number | null, single_mic_id?: string) => request('/api/unpause', {
     method: 'POST',
     body: JSON.stringify({
       ...(device_id != null ? { device_id } : {}),
       ...(candidate_mic_device_id != null ? { candidate_mic_device_id } : {}),
+      ...(single_mic_id ? { single_mic_id } : {}),
     }),
   }),
+  switchSingleMicRole: (session_id: string, role: SingleMicRole) =>
+    request<{ ok: true; single_mic?: SingleMicState }>('/api/single-mic/role', {
+      method: 'POST',
+      body: JSON.stringify({ session_id, role }),
+    }),
   clear: () => request('/api/clear', { method: 'POST' }),
   ask: (text: string, image?: string, purpose?: 'knowledge_practice') =>
     request('/api/ask', { method: 'POST', body: JSON.stringify({ text, image, purpose }) }),

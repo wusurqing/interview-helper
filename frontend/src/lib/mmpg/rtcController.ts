@@ -69,6 +69,7 @@ const errorMessages: Record<string, string> = {
   candidate_mic_required: '请为我的回答选择独立的麦克风输入设备。',
   candidate_mmpg_auto_token_required: '两路同时使用豆包 MMPG 时，请设置 RTC App Key 并选择自动签发 Token。',
   cannot_resume: '当前没有已暂停的 MMPG 面试可继续。',
+  single_mic_settings_changed: '语音配置已变更，请结束本次单人测试后重新开始。',
   interview_active: '请结束当前面试后再运行 MMPG 测试。',
   provider_not_selected: '请将主链路语音引擎选为豆包 MMPG 并保存。',
 }
@@ -146,7 +147,14 @@ class MmpgController {
     this.subscribers.forEach((listener) => listener())
   }
 
-  async start(mode: Command, deviceId: number, candidateMicId: number | null, platform?: string, prepare?: () => Promise<boolean>) {
+  async start(
+    mode: Command,
+    deviceId: number,
+    candidateMicId: number | null,
+    platform?: string,
+    prepare?: () => Promise<boolean>,
+    singleMicId?: string,
+  ) {
     if (this.owner) throw new Error(mmpgErrorMessage('mmpg_busy'))
     const unavailable = mmpgUnavailable(platform)
     if (unavailable) throw new Error(unavailable)
@@ -169,7 +177,7 @@ class MmpgController {
       this.testEvent(owner, '初始化本机音频')
       window.addEventListener('pagehide', this.onPageHide)
       owner.connectTimer = window.setTimeout(() => this.finish(owner, 'connect_timeout'), 15_000)
-      void this.connect(owner, ready, deviceId, candidateMicId, prepare)
+      void this.connect(owner, ready, deviceId, candidateMicId, prepare, singleMicId)
     })
   }
 
@@ -196,7 +204,14 @@ class MmpgController {
     if (this.owner) this.finish(this.owner)
   }
 
-  private async connect(owner: Owner, ready: Promise<void>, deviceId: number, candidateMicId: number | null, prepare?: () => Promise<boolean>) {
+  private async connect(
+    owner: Owner,
+    ready: Promise<void>,
+    deviceId: number,
+    candidateMicId: number | null,
+    prepare?: () => Promise<boolean>,
+    singleMicId?: string,
+  ) {
     try {
       const audioReady = Promise.all([
         ready, owner.context.audioWorklet.addModule(pcmWorkletUrl), owner.cleanup,
@@ -220,7 +235,12 @@ class MmpgController {
       socket.onopen = () => {
         window.clearTimeout(owner.connectTimer)
         this.testEvent(owner, '已连接本机后端')
-        this.send(owner, { type: owner.mode, device_ids: [deviceId], candidate_mic_id: candidateMicId })
+        this.send(owner, {
+          type: owner.mode,
+          device_ids: [deviceId],
+          candidate_mic_id: candidateMicId,
+          ...(singleMicId ? { single_mic_id: singleMicId } : {}),
+        })
         owner.heartbeat = window.setInterval(() => {
           if (Date.now() - owner.lastMessageAt > 45_000) this.finish(owner, 'ws_disconnected')
           else this.send(owner, { type: 'ping' })

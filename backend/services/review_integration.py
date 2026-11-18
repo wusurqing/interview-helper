@@ -14,6 +14,7 @@ from services import review_async_analysis
 logger = get_logger(__name__)
 
 _current_review_session_id: Optional[int] = None
+_existing_qa_ids: frozenset[str] = frozenset()
 
 
 def should_create_review_session(
@@ -21,6 +22,8 @@ def should_create_review_session(
     candidate_device_id: Optional[int],
     candidate_asr_enabled: bool,
     written_exam_mode: bool = False,
+    *,
+    single_mic: bool = False,
 ) -> bool:
     """
     判断是否应该创建 review session。
@@ -33,7 +36,7 @@ def should_create_review_session(
     1. interviewer 音频设备有效
     2. candidate mic 有效
     3. candidate ASR 开启
-    4. 两个设备不同
+    4. 普通面试使用不同设备，单人测试由同一设备按角色分流
 
     笔试模式没有 interviewer 音频设备, 但仍会产生截图题目和答案, 也需要落入
     面试复盘, 因此 written_exam_mode=True 时允许创建无音频采集的 session。
@@ -46,7 +49,7 @@ def should_create_review_session(
         return False
     if not candidate_asr_enabled:
         return False
-    if interviewer_device_id == candidate_device_id:
+    if not single_mic and interviewer_device_id == candidate_device_id:
         return False
     return True
 
@@ -56,18 +59,22 @@ def on_assist_start(
     candidate_device_id: Optional[int],
     candidate_asr_enabled: bool,
     written_exam_mode: bool = False,
+    *,
+    single_mic: bool = False,
+    existing_qa_ids: frozenset[str] = frozenset(),
 ) -> Optional[int]:
     """
     Assist 启动时调用，创建 review session
     返回 session_id 或 None
     """
-    global _current_review_session_id
+    global _current_review_session_id, _existing_qa_ids
 
     if not should_create_review_session(
         interviewer_device_id,
         candidate_device_id,
         candidate_asr_enabled,
         written_exam_mode=written_exam_mode,
+        single_mic=single_mic,
     ):
         logger.info("Review session not created: conditions not met")
         return None
@@ -79,11 +86,12 @@ def on_assist_start(
             candidate_enabled=(
                 candidate_device_id is not None
                 and candidate_asr_enabled
-                and candidate_device_id != interviewer_device_id
+                and (single_mic or candidate_device_id != interviewer_device_id)
             ),
             source="written_exam" if written_exam_mode else "assist",
         )
         _current_review_session_id = session_id
+        _existing_qa_ids = existing_qa_ids
         logger.info("Review session created: session_id=%d", session_id)
         return session_id
     except Exception as e:
@@ -96,17 +104,18 @@ def on_assist_stop(session: Session) -> Optional[int]:
     Assist 停止时调用，结束 review session 并保存所有 turns
     返回已结束的 session_id 或 None
     """
-    global _current_review_session_id
+    global _current_review_session_id, _existing_qa_ids
 
     if _current_review_session_id is None:
         return None
 
     session_id = _current_review_session_id
     _current_review_session_id = None
+    qa_pairs = [qa for qa in session.qa_pairs if qa.id not in _existing_qa_ids]
+    _existing_qa_ids = frozenset()
 
     try:
-        # 保存所有 QA turns
-        for idx, qa in enumerate(session.qa_pairs, start=1):
+        for idx, qa in enumerate(qa_pairs, start=1):
             candidate_answer = session.get_candidate_answer_for_qa(qa.id, max_chars=2000)
             evidence = _build_turn_evidence(qa)
             review.add_turn(
@@ -126,7 +135,7 @@ def on_assist_stop(session: Session) -> Optional[int]:
         # recorded, 保留 ended_at, 等待前端手动触发 (POST /review/sessions/{id}/generate)。
         # 笔试练习即使只有 1 题也自动生成报告；看板自动同步仍由 AUTO_REVIEW_SYNC_MIN_TURNS 控制。
         # completed 只表示分析结果已经生成。
-        turn_count = len(session.qa_pairs)
+        turn_count = len(qa_pairs)
         source = str((review.get_session_detail(session_id) or {}).get("source") or "assist")
         auto_analyze = _should_auto_analyze(
             review_enabled=bool(get_config().review_enabled),
