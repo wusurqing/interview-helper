@@ -152,3 +152,30 @@ def test_audio_device_sort_keeps_default_loopback_first():
     ordered = sorted(devices, key=_audio_device_sort_key)
 
     assert [item["id"] for item in ordered] == [20001, 20000, 1]
+
+def test_windows_microphone_initializes_com_on_stream_open_and_close(monkeypatch):
+    import ctypes
+    from types import SimpleNamespace
+    from services import audio
+
+    operations = []
+    ole = SimpleNamespace(
+        CoInitializeEx=lambda *_: operations.append("init") or 0,
+        CoUninitialize=lambda: operations.append("uninit"),
+    )
+    stream = SimpleNamespace(
+        start=lambda: operations.append("start"),
+        stop=lambda: operations.append("stop"),
+        close=lambda: operations.append("close"),
+    )
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(ole32=ole), raising=False)
+    monkeypatch.setattr(audio.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(audio.sd, "query_devices", lambda *_: {"default_samplerate": 48000, "hostapi": 0})
+    monkeypatch.setattr(audio.sd, "query_hostapis", lambda *_: {"name": "Windows WASAPI"})
+    monkeypatch.setattr(audio.sd, "InputStream", lambda **_: stream)
+
+    capture = AudioCapture()
+    capture.start(9, owner="assist")
+    capture.stop(owner="assist")
+
+    assert operations == ["init", "start", "uninit", "init", "stop", "close", "uninit"]

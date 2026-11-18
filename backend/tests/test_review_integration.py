@@ -634,3 +634,20 @@ def test_on_assist_stop_recorded_when_review_disabled(monkeypatch):
     assert detail["turn_count"] == 1
     assert len(detail["turns"]) == 1
     assert detail["ended_at"] is not None
+
+def test_single_mic_review_archives_only_new_turns(monkeypatch):
+    monkeypatch.setattr(review_integration, "get_config", lambda: _FakeConfig(review_enabled=False))
+    qa_pairs = _make_qa_pairs(2)
+    session = Session(qa_pairs=qa_pairs[:1])
+    session_id = review_integration.on_assist_start(
+        interviewer_device_id=1,
+        candidate_device_id=1,
+        candidate_asr_enabled=True,
+        single_mic=True,
+        existing_qa_ids=frozenset({qa_pairs[0].id}),
+    )
+    session.qa_pairs.append(qa_pairs[1])
+    review_integration.on_assist_stop(session)
+    result = review.get_session_detail(session_id)
+    assert result["candidate_capture_enabled"] == 1
+    assert [(turn["qa_id"], turn["seq"]) for turn in result["turns"]] == [(qa_pairs[1].id, 1)]

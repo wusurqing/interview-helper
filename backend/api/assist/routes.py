@@ -11,10 +11,12 @@ from core.config import get_config
 from core.logger import get_logger
 from core.session import get_session, snapshot_session
 from services.audio import AudioBusyError
+from services.stt.mmpg import valid_single_mic_id
 from . import candidate_mmpg
 from . import mmpg_integration as mmpg
 from .answer_worker import prompt_server_screen_code
 from .pipeline import (
+    broadcast_single_mic,
     cancel_answer_work,
     is_paused,
     is_streaming_interview,
@@ -26,9 +28,11 @@ from .pipeline import (
     unpause_interview,
     _bump_generation,
 )
+from .single_mic import Role, RoleSwitch, SingleMicConflict, SingleMicSession
 
 router = APIRouter()
 _rlog = get_logger("assist.routes")
+_role_switches: dict[RoleSwitch, asyncio.Task[tuple[int, dict | None]]] = {}
 
 
 class ManualQuestion(BaseModel):
@@ -36,6 +40,11 @@ class ManualQuestion(BaseModel):
     image: Optional[str] = None
     override_think_mode: Optional[bool] = None
     purpose: Literal["interview", "knowledge_practice"] = "interview"
+
+
+class SingleMicRoleRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=64)
+    role: Role
 
 
 class MultiServerScreenQuestion(BaseModel):
@@ -62,6 +71,14 @@ async def _api_start(body: dict):
     written_exam = bool(getattr(cfg, "written_exam_mode", False))
     if mmpg.manager.active:
         raise HTTPException(409, "豆包语义判停会话正在连接或运行")
+    single_mic_id = body.get("single_mic_id")
+    if single_mic_id is not None and not valid_single_mic_id(single_mic_id):
+        raise HTTPException(400, "无效的单人测试会话标识")
+    session = get_session()
+    if session.single_mic is not None or (single_mic_id is not None and session.is_recording):
+        raise HTTPException(409, "请先结束当前面试")
+    if single_mic_id is not None and written_exam:
+        raise HTTPException(400, "单人测试适用于语音面试")
     uses_mmpg = getattr(cfg, "stt_provider", None) == mmpg.PROVIDER
     if not written_exam and uses_mmpg:
         raise HTTPException(409, "请从桌面主窗口或本机浏览器开始豆包语义判停")
@@ -85,7 +102,12 @@ async def _api_start(body: dict):
         candidate_dev = None
     try:
         await candidate_mmpg.stop("stopped")
-        if dev is not None and not written_exam:
+        if single_mic_id is not None:
+            await run_in_threadpool(
+                start_nonblocking, dev, config_snapshot=cfg, single_mic_id=single_mic_id,
+            )
+            mmpg.watch_single_mic(get_session().single_mic)
+        elif dev is not None and not written_exam:
             await run_in_threadpool(start_nonblocking, dev, candidate_dev, config_snapshot=cfg)
         elif candidate_dev is None:
             await run_in_threadpool(start_nonblocking, dev)
@@ -94,6 +116,8 @@ async def _api_start(body: dict):
         return {"ok": True}
     except AudioBusyError as e:
         raise HTTPException(409, str(e))
+    except SingleMicConflict as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
         _rlog.error("api_start failed: %s", e, exc_info=True)
         raise HTTPException(500, "启动失败，请重试")
@@ -102,14 +126,31 @@ async def _api_start(body: dict):
 @router.post("/stop")
 async def api_stop():
     async with mmpg.http_lifecycle_lock:
-        await asyncio.gather(mmpg.manager.stop("stopped"), candidate_mmpg.stop("stopped", drain=True))
+        single_mic = get_session().single_mic
+        if single_mic is not None:
+            await mmpg.drain_single_mic_transports(single_mic, "stopped")
+        await asyncio.gather(
+            mmpg.manager.stop("stopped"),
+            candidate_mmpg.stop("stopped", drain=single_mic is None),
+        )
         await run_in_threadpool(stop_interview_loop)
     return {"ok": True}
 
 
 @router.post("/pause")
-async def api_pause():
+async def api_pause(body: dict | None = None):
     async with mmpg.http_lifecycle_lock:
+        session = get_session()
+        single_mic_id = (body or {}).get("single_mic_id")
+        if single_mic_id is not None and (session.single_mic is None or session.single_mic.id != single_mic_id):
+            raise HTTPException(409, "单人测试会话已变化")
+        if session.single_mic is not None:
+            if not session.is_recording or session.is_paused:
+                raise HTTPException(400, "单人测试未在收音")
+            await mmpg.drain_single_mic_transports(session.single_mic, "paused")
+            await run_in_threadpool(pause_interview)
+            await asyncio.gather(mmpg.manager.stop("paused"), candidate_mmpg.stop("paused"))
+            return {"ok": True}
         if is_streaming_interview() or mmpg.manager.active:
             await asyncio.gather(mmpg.manager.stop("paused"), candidate_mmpg.stop("paused", drain=True))
             return {"ok": True}
@@ -136,6 +177,18 @@ async def _api_resume_interview(body: Optional[dict] = None):
         raise HTTPException(400, "\u9762\u8bd5\u672a\u5728\u8fdb\u884c\u4e2d")
     if not is_paused():
         raise HTTPException(400, "\u9762\u8bd5\u672a\u5904\u4e8e\u6682\u505c\u72b6\u6001")
+    single_mic_id = (body or {}).get("single_mic_id")
+    if session.single_mic is not None or single_mic_id is not None:
+        if session.single_mic is None or session.single_mic.id != single_mic_id:
+            raise HTTPException(409, "单人测试会话已变化")
+        try:
+            await run_in_threadpool(unpause_interview)
+        except (AudioBusyError, SingleMicConflict) as e:
+            raise HTTPException(409, str(e))
+        except Exception:
+            _rlog.exception("single microphone resume failed")
+            raise HTTPException(500, "麦克风启动失败，请检查设备后重试")
+        return {"ok": True}
     device_id = (body or {}).get("device_id")
     candidate_mic_device_id = (body or {}).get("candidate_mic_device_id")
     if device_id is not None:
@@ -165,10 +218,63 @@ async def _api_resume_interview(body: Optional[dict] = None):
     return {"ok": True}
 
 
+async def _complete_role_switch(single_mic: SingleMicSession, operation: RoleSwitch) -> tuple[int, dict | None]:
+    try:
+        try:
+            timeout = max(6.0, get_config().assist_interviewer_asr_drain_timeout_sec)
+            ready = await mmpg.finish_single_mic_role(single_mic, operation, timeout)
+        except Exception:
+            _rlog.exception("single microphone ASR did not finish")
+            ready = False
+        async with mmpg.http_lifecycle_lock:
+            if get_session().single_mic is not single_mic or not single_mic.owns_switch(operation):
+                return 409, None
+            if ready and operation.streaming and operation.from_role == "interviewer":
+                try:
+                    mmpg.finish_interviewer_role(single_mic)
+                except Exception:
+                    _rlog.exception("single microphone interviewer role did not finish")
+                    ready = False
+            if not single_mic.finish_switch(operation, ready):
+                return 409, None
+            broadcast_single_mic(single_mic)
+            return (200 if ready else 504), single_mic.snapshot()
+    finally:
+        _role_switches.pop(operation, None)
+
+
+@router.post("/single-mic/role")
+async def api_single_mic_role(body: SingleMicRoleRequest):
+    async with mmpg.http_lifecycle_lock:
+        session = get_session()
+        single_mic = session.single_mic
+        if single_mic is None or single_mic.id != body.session_id or not session.is_recording:
+            raise HTTPException(409, "单人测试会话已变化")
+        try:
+            operation = single_mic.begin_switch(body.role)
+        except SingleMicConflict as e:
+            raise HTTPException(409, str(e))
+        if operation is None:
+            return {"ok": True, "single_mic": single_mic.snapshot()}
+        task = _role_switches.get(operation)
+        if task is None:
+            broadcast_single_mic(single_mic)
+            task = _role_switches[operation] = asyncio.create_task(_complete_role_switch(single_mic, operation))
+    status, snapshot = await asyncio.shield(task)
+    if status == 409:
+        raise HTTPException(409, "切换已取消，请确认当前角色后重试")
+    if status == 504:
+        raise HTTPException(504, "上一句转写未能及时完成，请重试切换")
+    return {"ok": True, "single_mic": snapshot}
+
+
 @router.post("/clear")
 async def api_clear():
     from api.realtime.ws import broadcast
     async with mmpg.http_lifecycle_lock:
+        single_mic = get_session().single_mic
+        if single_mic is not None:
+            single_mic.pause()
         mmpg.clear_turns()
         candidate_mmpg.manager.discard_turns()
         cancel_answer_work(invalidate_capture=True)

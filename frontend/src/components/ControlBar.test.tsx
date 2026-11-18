@@ -13,6 +13,7 @@ const apiMock = vi.hoisted(() => ({
   stop: vi.fn(),
   pause: vi.fn(),
   resume: vi.fn(),
+  switchSingleMicRole: vi.fn(),
   clear: vi.fn(),
   cancelAsk: vi.fn(),
   audioOutputTest: vi.fn(),
@@ -67,6 +68,7 @@ describe('ControlBar', () => {
     apiMock.stop.mockResolvedValue({ ok: true })
     apiMock.pause.mockResolvedValue({ ok: true })
     apiMock.resume.mockResolvedValue({ ok: true })
+    apiMock.switchSingleMicRole.mockResolvedValue({ ok: true })
     apiMock.clear.mockResolvedValue({ ok: true })
     apiMock.cancelAsk.mockResolvedValue({ ok: true })
     apiMock.audioOutputTest.mockResolvedValue({ ok: true, elapsed_sec: 1.0 })
@@ -140,6 +142,7 @@ describe('ControlBar', () => {
       sttActiveProvider: '',
       sttFallbackLoaded: false,
       isRecording: false,
+      singleMic: null,
       interviewerStreaming: false,
       mmpgPhase: null,
       isPaused: false,
@@ -591,6 +594,188 @@ describe('ControlBar', () => {
     await waitFor(() => {
       expect(apiMock.start).toHaveBeenCalledWith(10, 11)
     })
+  })
+
+  it('starts a single-mic test with one selected physical input', async () => {
+    useInterviewStore.setState((state) => ({
+      config: { ...state.config!, candidate_asr_enabled: true },
+      devices: [
+        { id: 10, name: 'Meeting Audio', channels: 2, is_loopback: true, host_api: 'WASAPI' },
+        { id: 11, name: 'Microphone', channels: 1, is_loopback: false, host_api: 'WASAPI' },
+      ],
+    }))
+    render(<ControlBar />)
+
+    fireEvent.click(screen.getByRole('button', { name: '单人测试' }))
+    expect(screen.getByRole('button', { name: '选择测试麦克风' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '选择会议音频设备' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '选择我的麦克风' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '开始单人测试' }))
+    await waitFor(() => expect(apiMock.start).toHaveBeenCalledWith(11, 11, expect.stringMatching(/^[0-9a-f]{32}$/)))
+  })
+
+  it('locks role controls until the backend confirms a switch and keeps end available', async () => {
+    const initial = { id: 'test-session', device_id: 11, role: 'interviewer', switching: false } as const
+    useInterviewStore.setState((state) => ({
+      config: { ...state.config!, candidate_asr_enabled: true },
+      singleMic: initial,
+      isRecording: true,
+    }))
+    const switchRequest = deferred<{ ok: true }>()
+    apiMock.switchSingleMicRole.mockReturnValueOnce(switchRequest.promise)
+    render(<ControlBar />)
+
+    const candidate = screen.getByRole('button', { name: '候选人' })
+    const interviewer = screen.getByRole('button', { name: '面试官' })
+    fireEvent.click(candidate)
+    fireEvent.click(candidate)
+    expect(apiMock.switchSingleMicRole).toHaveBeenCalledExactlyOnceWith(initial.id, 'candidate')
+    expect(candidate).toBeDisabled()
+    expect(interviewer).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByText('切换中，等待上一句转写完成')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '结束单人测试' })).toBeEnabled()
+
+    act(() => useInterviewStore.setState({ singleMic: { ...initial, switching: true } }))
+    await act(async () => switchRequest.resolve({ ok: true }))
+    expect(candidate).toBeDisabled()
+    expect(candidate).toHaveAttribute('aria-pressed', 'false')
+
+    act(() => useInterviewStore.setState({ singleMic: { ...initial, role: 'candidate' } }))
+    expect(interviewer).toBeEnabled()
+    expect(candidate).toHaveAttribute('aria-pressed', 'true')
+  })
+
+  it('resumes a reconnected test with its original microphone and session id', async () => {
+    useInterviewStore.setState((state) => ({
+      config: { ...state.config!, candidate_asr_enabled: true },
+      devices: [
+        { id: 11, name: 'Default Mic', channels: 1, is_loopback: false, host_api: 'WASAPI' },
+        { id: 12, name: 'Test Mic', channels: 1, is_loopback: false, host_api: 'WASAPI' },
+      ],
+      singleMic: { id: 'existing', device_id: 12, role: 'candidate', switching: false },
+      isRecording: true,
+      isPaused: true,
+    }))
+    render(<ControlBar />)
+
+    expect(screen.getByRole('button', { name: '选择测试麦克风' })).toHaveTextContent('Test Mic')
+    expect(screen.getByRole('button', { name: '候选人' })).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(screen.getByRole('button', { name: '继续' }))
+    await waitFor(() => expect(apiMock.resume).toHaveBeenCalledWith(12, 12, 'existing'))
+  })
+
+  it('configures both MMPG transports with the same microphone and test session', async () => {
+    const interviewer = deferred<void>()
+    const primaryStart = vi.spyOn(mmpgController, 'start').mockReturnValue(interviewer.promise)
+    const prepareCandidate = vi.fn()
+    const candidateStart = vi.spyOn(candidateMmpgController, 'start').mockImplementation(async (_mode, _device, _mic, _platform, prepare) => {
+      prepareCandidate(await prepare?.())
+    })
+    try {
+      useInterviewStore.setState((state) => ({
+        config: { ...state.config!, stt_provider: 'doubao_mmpg', candidate_asr_enabled: true, candidate_stt_provider: 'doubao_mmpg' },
+        devices: [
+          { id: 11, name: 'Microphone', channels: 1, is_loopback: false, host_api: 'WASAPI' },
+        ],
+      }))
+      render(<ControlBar />)
+      fireEvent.click(screen.getByRole('button', { name: '单人测试' }))
+      fireEvent.click(screen.getByRole('button', { name: '开始单人测试' }))
+
+      const sessionId = primaryStart.mock.calls[0][5]
+      expect(sessionId).toMatch(/^[0-9a-f]{32}$/)
+      expect(primaryStart).toHaveBeenCalledWith('start', 11, 11, undefined, undefined, sessionId)
+      expect(candidateStart).toHaveBeenCalledWith('start', 11, null, undefined, expect.any(Function), sessionId)
+      expect(prepareCandidate).not.toHaveBeenCalled()
+      await act(async () => interviewer.resolve())
+      expect(prepareCandidate).toHaveBeenCalledWith(true)
+    } finally {
+      candidateStart.mockRestore()
+      primaryStart.mockRestore()
+    }
+  })
+
+  it('shows a role-switch failure and allows retry from the original role', async () => {
+    useInterviewStore.setState({
+      singleMic: { id: 'same-session', device_id: 11, role: 'interviewer', switching: false },
+      isRecording: true,
+    })
+    apiMock.switchSingleMicRole.mockRejectedValueOnce(new Error('上一句转写超时，请重试'))
+    render(<ControlBar />)
+
+    const candidate = screen.getByRole('button', { name: '候选人' })
+    fireEvent.click(candidate)
+    expect(await screen.findByText('上一句转写超时，请重试')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '面试官' })).toHaveAttribute('aria-pressed', 'true')
+    expect(candidate).toBeEnabled()
+    fireEvent.click(candidate)
+    expect(apiMock.switchSingleMicRole).toHaveBeenCalledTimes(2)
+  })
+
+  it('uses the server response when the final role WebSocket message is missed', async () => {
+    const state = { id: 'current', device_id: 11, role: 'interviewer', switching: false } as const
+    useInterviewStore.setState({ singleMic: state, isRecording: true })
+    apiMock.switchSingleMicRole.mockResolvedValueOnce({
+      ok: true,
+      single_mic: { ...state, role: 'candidate' },
+    })
+    render(<ControlBar />)
+
+    fireEvent.click(screen.getByRole('button', { name: '候选人' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '候选人' })).toHaveAttribute('aria-pressed', 'true'))
+    expect(screen.getByRole('button', { name: '面试官' })).toBeEnabled()
+  })
+
+  it('pauses the matching single-mic session when candidate MMPG cannot open', async () => {
+    const candidateStart = vi.spyOn(candidateMmpgController, 'start').mockRejectedValueOnce(new Error('无法初始化页面音频'))
+    try {
+      useInterviewStore.setState((state) => ({
+        config: { ...state.config!, candidate_asr_enabled: true, candidate_stt_provider: 'doubao_mmpg' },
+        devices: [{ id: 11, name: 'Microphone', channels: 1, is_loopback: false, host_api: 'WASAPI' }],
+      }))
+      render(<ControlBar />)
+      fireEvent.click(screen.getByRole('button', { name: '单人测试' }))
+      fireEvent.click(screen.getByRole('button', { name: '开始单人测试' }))
+      await waitFor(() => {
+        const sessionId = apiMock.start.mock.calls[0][2]
+        expect(apiMock.pause).toHaveBeenCalledWith(sessionId)
+      })
+      expect(screen.getByText('我的麦克风 · 无法初始化页面音频')).toBeInTheDocument()
+    } finally {
+      candidateStart.mockRestore()
+    }
+  })
+
+  it('ignores a late candidate MMPG startup failure after ending the test', async () => {
+    const candidate = deferred<void>()
+    const candidateStart = vi.spyOn(candidateMmpgController, 'start').mockReturnValueOnce(candidate.promise)
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    try {
+      useInterviewStore.setState((state) => ({
+        config: { ...state.config!, candidate_asr_enabled: true, candidate_stt_provider: 'doubao_mmpg' },
+        devices: [{ id: 11, name: 'Microphone', channels: 1, is_loopback: false, host_api: 'WASAPI' }],
+      }))
+      render(<ControlBar />)
+      fireEvent.click(screen.getByRole('button', { name: '单人测试' }))
+      fireEvent.click(screen.getByRole('button', { name: '开始单人测试' }))
+      const sessionId = apiMock.start.mock.calls[0][2]
+      act(() => useInterviewStore.setState({
+        isRecording: true,
+        singleMic: { id: sessionId, device_id: 11, role: 'interviewer', switching: false },
+      }))
+      const end = screen.getByRole('button', { name: '结束单人测试' })
+      await waitFor(() => expect(end).toBeEnabled())
+      fireEvent.click(end)
+      await waitFor(() => expect(apiMock.stop).toHaveBeenCalledTimes(1))
+      await act(async () => candidate.reject(new Error('旧尝试失败')))
+
+      expect(apiMock.pause).not.toHaveBeenCalled()
+      expect(screen.queryByText(/旧尝试失败/)).not.toBeInTheDocument()
+    } finally {
+      candidateStart.mockRestore()
+      confirm.mockRestore()
+    }
   })
 
   it.each(['start', 'resume'] as const)('gates candidate MMPG %s on a separate interviewer connection', async (mode) => {

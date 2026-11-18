@@ -8,6 +8,7 @@ Device ID scheme (all integers, frontend-compatible):
   0 – 9 999   : sounddevice microphone devices
   20 000+N    : soundcard WASAPI loopback speakers (N = index in speaker list)
 """
+import ctypes
 import numpy as np
 import threading
 import platform
@@ -15,6 +16,7 @@ import queue
 import time
 import warnings
 import wave
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -23,6 +25,22 @@ import sounddevice as sd
 from core.logger import get_logger
 
 _alog = get_logger("audio")
+
+@contextmanager
+def _microphone_com():
+    if platform.system() != "Windows":
+        yield
+        return
+
+    # WASAPI stream operations can run on different server worker threads.
+    ole = ctypes.windll.ole32
+    initialized = ole.CoInitializeEx(None, 0) >= 0  # COINIT_MULTITHREADED
+    try:
+        yield
+    finally:
+        if initialized:
+            ole.CoUninitialize()
+
 
 # Windows WDM-KS devices crash PortAudio with -9999; exclude them entirely
 _WDM_KS_API = "Windows WDM-KS"
@@ -349,7 +367,8 @@ class AudioCapture:
                 self._start_soundcard(int(device_id))
             else:
                 self._use_agc = False
-                self._start_sounddevice(int(device_id), mic_compatibility_mode=mic_compatibility_mode)
+                with _microphone_com():
+                    self._start_sounddevice(int(device_id), mic_compatibility_mode=mic_compatibility_mode)
 
     def _iter_queueable_chunks(self, audio: np.ndarray):
         limit = max(1, int(getattr(self, "MAX_QUEUE_CHUNK_SAMPLES", self.BLOCK_SIZE * 4) or 1))
@@ -613,8 +632,11 @@ class AudioCapture:
             self._sc_stop.set()
             if self._stream:
                 try:
-                    self._stream.stop()
-                    self._stream.close()
+                    with _microphone_com():
+                        try:
+                            self._stream.stop()
+                        finally:
+                            self._stream.close()
                 except Exception:
                     pass
                 self._stream = None

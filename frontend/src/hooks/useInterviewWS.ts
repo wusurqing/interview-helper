@@ -110,6 +110,9 @@ export function useInterviewWS(active = true) {
       case 'recording':
         s.setRecording(msg.value as boolean, msg.interviewer_streaming === true)
         break
+      case 'single_mic':
+        s.setSingleMic(msg.value)
+        break
       case 'paused':
         s.setPaused(msg.value as boolean)
         break
@@ -210,7 +213,10 @@ export function useInterviewWS(active = true) {
         if (msg.error && msg.provider === 'doubao_mmpg') {
           if (msg.state === 'error') s.pushToast(`我的麦克风 MMPG · ${mmpgErrorMessage(String(msg.error))}`, 'warn')
         } else if (msg.error) {
-          s.pushToast(`会议软件可能独占麦克风，候选人口述记录已关闭，不影响面试录音: ${msg.error as string}`, 'warn')
+          const prefix = s.singleMic
+            ? '测试麦克风识别失败'
+            : '会议软件可能独占麦克风，候选人口述记录已关闭，不影响面试录音'
+          s.pushToast(`${prefix}: ${msg.error as string}`, 'warn')
         }
         break
       case 'model_health':

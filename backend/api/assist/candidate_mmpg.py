@@ -23,7 +23,7 @@ def enabled(cfg):
     )
 
 
-async def prepare(mode, device_ids, _candidate_mic_id):
+async def prepare(mode, device_ids, _candidate_mic_id, *, single_mic_id=None):
     cfg = get_config()
     session = get_session()
     if mode not in ("start", "resume"):
@@ -32,15 +32,19 @@ async def prepare(mode, device_ids, _candidate_mic_id):
         raise MmpgError("candidate_provider_not_selected")
     if not session.is_recording or session.is_paused:
         raise MmpgError("candidate_interview_inactive")
-    if (len(device_ids) != 1 or not pipeline._is_valid_device_id(device_ids[0])
-            or device_ids[0] != session.last_candidate_mic_device_id
-            or device_ids[0] == session.last_device_id):
+    single_mic = session.single_mic
+    if single_mic is not None or single_mic_id is not None:
+        if single_mic is None or single_mic.id != single_mic_id or device_ids != [single_mic.device_id]:
+            raise MmpgError("candidate_interview_inactive")
+    elif (len(device_ids) != 1 or not pipeline._is_valid_device_id(device_ids[0])
+          or device_ids[0] != session.last_candidate_mic_device_id
+          or device_ids[0] == session.last_device_id):
         raise MmpgError("device_required")
     if pipeline.is_streaming_interview() and cfg.mmpg.token_mode == "manual":
         raise MmpgError("candidate_mmpg_auto_token_required")
 
 
-async def _start_capture(_mode, device_ids, _candidate_mic_id):
+async def _start_capture(_mode, device_ids, _candidate_mic_id, *, single_mic_id=None):
     global _capture_epoch
     cfg = get_config()
     session = get_session()
@@ -50,6 +54,14 @@ async def _start_capture(_mode, device_ids, _candidate_mic_id):
     epoch = session.transcript_epoch
     if await run_in_threadpool(pipeline._device_is_loopback, device_id):
         raise MmpgError("candidate_mic_required")
+    if single_mic_id is not None:
+        single_mic = session.single_mic
+        if single_mic is None or single_mic.id != single_mic_id or session.is_paused:
+            raise MmpgError("candidate_interview_inactive")
+        with conversation_lock:
+            _pending.clear()
+            _capture_epoch = epoch
+        return
     try:
         await run_in_threadpool(
             pipeline._candidate_audio_capture.start,
@@ -65,14 +77,19 @@ async def _start_capture(_mode, device_ids, _candidate_mic_id):
         _capture_epoch = epoch
 
 
-async def _stop_capture(_mode, _reason):
+async def _stop_capture(_mode, _reason, *, single_mic_id=None):
+    if single_mic_id is not None:
+        from .mmpg_integration import detach_single_mic_stream
+
+        detach_single_mic_stream(single_mic_id, "candidate")
+        return
     await run_in_threadpool(pipeline._candidate_audio_capture.stop, owner=_CAPTURE_OWNER)
 
 
 async def stop(reason, *, drain=False):
     if drain and manager.status()["state"] == "listening":
         try:
-            await _stop_capture(None, reason)
+            await _stop_capture(None, reason, single_mic_id=manager.single_mic_id)
             await manager.drain_transcripts()
         finally:
             await manager.stop(reason)
@@ -128,8 +145,15 @@ def status(state=None):
     }
 
 
+def _broadcast_state(state):
+    from .mmpg_integration import sync_single_mic_transport
+
+    broadcast(status(state))
+    sync_single_mic_transport("candidate", manager, state)
+
+
 manager = MmpgManager(
     lambda: get_config().mmpg, _on_transcript, on_turn=_on_turn,
-    on_state=lambda state: broadcast(status(state)),
+    on_state=_broadcast_state,
     on_capture_start=_start_capture, on_capture_stop=_stop_capture,
 )

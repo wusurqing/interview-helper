@@ -722,3 +722,148 @@ def test_candidate_mmpg_does_not_share_the_interviewer_manual_token(monkeypatch)
 
     monkeypatch.setattr(pipeline, "is_streaming_interview", lambda: False)
     asyncio.run(candidate_mmpg.prepare("start", [20], None))
+
+
+
+@pytest.mark.parametrize("mode, value", [
+    ("start", None),
+    ("resume", True),
+    ("start", ""),
+    ("start", "with spaces"),
+    ("start", "a" * 65),
+    ("test", "single-mic-run"),
+])
+def test_mmpg_ws_rejects_invalid_single_mic_id(monkeypatch, mode, value):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from api.realtime import mmpg
+    from services.stt.mmpg import MmpgManager
+
+    class Platform:
+        platform = "win32"
+
+    monkeypatch.setattr(mmpg, "sys", Platform())
+    manager = MmpgManager(lambda: CONFIG, str)
+    app = FastAPI()
+    mmpg.bind_mmpg_routes(app, manager, on_control=None)
+    url = "ws://127.0.0.1:18080/ws/stt/mmpg"
+    client = TestClient(app, base_url="http://127.0.0.1:18080", client=("127.0.0.1", 10_001))
+    with client.websocket_connect(url, headers={"origin": "http://127.0.0.1:18080"}) as owner:
+        assert owner.receive_json()["state"] == "idle"
+        owner.send_json({"type": mode, "device_ids": [8], "single_mic_id": value})
+        assert owner.receive_json() == {"type": "error", "code": "invalid_command"}
+        assert not manager.active
+
+
+def test_mmpg_single_mic_switch_waits_for_delayed_finals_without_restarting(monkeypatch):
+    from services.stt import mmpg
+
+    monkeypatch.setattr(mmpg, "ROLE_DRAIN_PLAYBACK_GRACE_SECONDS", 0.02)
+
+    async def check():
+        cloud = CloudSocket()
+        controls, audio, finals, lifecycle, started = [], [], [], [], []
+        session_id = "one-mic-session"
+
+        async def connector(_):
+            cloud.push("session.created")
+            return cloud
+
+        async def send(message):
+            (audio if isinstance(message, bytes) else controls).append(message)
+
+        async def prepare(mode, devices, candidate, *, single_mic_id):
+            lifecycle.append(("prepare", mode, devices, candidate, single_mic_id))
+
+        async def start(mode, devices, candidate, *, single_mic_id):
+            lifecycle.append(("start", mode, devices, candidate, single_mic_id))
+
+        async def stop(mode, reason, *, single_mic_id):
+            lifecycle.append(("stop", mode, reason, single_mic_id))
+
+        manager = mmpg.MmpgManager(
+            lambda: {**CONFIG, "silence_ms": 500},
+            lambda text, _: finals.append(text),
+            on_turn=lambda kind, trace: started.append(trace) if kind == "started" else None,
+            on_capture_start=start, on_capture_stop=stop, connector=connector,
+        )
+        owner = object()
+        assert manager.attach(owner, send)
+        manager.start(owner, "start", [8], 8, preflight=prepare, single_mic_id=session_id)
+        assert manager.single_mic_id == session_id
+        try:
+            await wait_until(lambda: any(msg["type"] == "rtc_join" for msg in controls))
+            generation = manager.status()["generation"]
+            await manager.rtc_event(owner, {"type": "rtc_ready", "generation": generation})
+            await wait_until(lambda: manager.status()["state"] == "listening")
+            assert lifecycle == [("prepare", "start", [8], 8, session_id), ("start", "start", [8], 8, session_id)]
+            pcm = np.ones(640, dtype=np.float32).tobytes()
+            assert manager.offer_audio(pcm)
+
+            switching = asyncio.create_task(manager.finish_role_input(session_id, timeout=4))
+            await asyncio.sleep(0)
+            await wait_until(lambda: audio == [pcm])
+            assert not switching.done()
+
+            # The provider can report speech only after the server sent the last spoken PCM.
+            cloud.push("user.conversation.created", conv_id="late-turn")
+            await wait_until(lambda: len(started) == 1)
+            silence = bytes(8_000 * 4)
+            assert manager.offer_audio(silence)
+            await wait_until(lambda: audio == [pcm, silence])
+            # Once enough silence is sent, the open provider turn still blocks the switch.
+            await asyncio.sleep(0.1)
+            assert not switching.done()
+
+            cloud.push("user.audio.transcription.done", conv_id="late-turn", transcript="候选人最后几个字")
+            assert await asyncio.wait_for(switching, timeout=3)
+            assert finals == ["候选人最后几个字"]
+            assert audio == [pcm, silence]
+            assert manager.status()["generation"] == generation
+            assert manager.status()["state"] == "listening"
+        finally:
+            await manager.detach(owner)
+        assert lifecycle[-1] == ("stop", "start", "owner_disconnected", session_id)
+        assert manager.single_mic_id is None
+
+    asyncio.run(check())
+
+
+def test_mmpg_single_mic_switch_rejects_stale_id_timeout_and_recovered_audio_gate():
+    from services.stt.mmpg import MmpgManager
+
+    async def check():
+        cloud, controls = CloudSocket(), []
+
+        async def connector(_):
+            cloud.push("session.created")
+            return cloud
+
+        async def send(message):
+            if isinstance(message, dict):
+                controls.append(message)
+
+        owner = object()
+        manager = MmpgManager(lambda: CONFIG, str, connector=connector)
+        assert manager.attach(owner, send)
+        manager.start(owner, "resume", [8], single_mic_id="current")
+        try:
+            await wait_until(lambda: any(msg["type"] == "rtc_join" for msg in controls))
+            generation = manager.status()["generation"]
+            await manager.rtc_event(owner, {"type": "rtc_ready", "generation": generation})
+            await wait_until(lambda: manager.status()["state"] == "listening")
+            assert not await manager.finish_role_input("stale", timeout=0.1)
+            assert not await manager.finish_role_input("current", timeout=0.03)
+            assert manager.status()["state"] == "listening"
+
+            switching = asyncio.create_task(manager.finish_role_input("current", timeout=2))
+            await asyncio.sleep(0)
+            await manager.rtc_event(owner, {"type": "rtc_reconnecting", "generation": generation})
+            await manager.rtc_event(owner, {"type": "rtc_recovered", "generation": generation})
+            assert manager.status()["state"] == "listening"
+            assert not await asyncio.wait_for(switching, timeout=0.2)
+        finally:
+            await manager.detach(owner)
+
+    asyncio.run(check())

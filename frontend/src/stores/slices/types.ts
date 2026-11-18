@@ -144,6 +144,16 @@ export interface AppConfig {
   review_model_index?: number
 }
 
+export type SingleMicRole = 'interviewer' | 'candidate'
+
+export interface SingleMicState {
+  id: string
+  device_id: number
+  role: SingleMicRole
+  switching: boolean
+  revision?: number
+}
+
 export type QAStatus = 'streaming' | 'done' | 'cancelled' | 'error'
 
 export interface QAPair {

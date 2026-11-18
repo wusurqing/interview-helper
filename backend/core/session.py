@@ -1,10 +1,13 @@
 import time
 import threading
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 from dataclasses import asdict, dataclass, field
 from collections.abc import Iterable
 
 from core.live_transcript import LiveTranscript, Speaker, TranscriptUtterance
+
+if TYPE_CHECKING:
+    from api.assist.single_mic import SingleMicSession
 
 
 @dataclass
@@ -53,6 +56,7 @@ class Session:
     last_device_id: int = -1
     last_candidate_mic_device_id: int = -1
     capture_is_loopback: bool = True
+    single_mic: "SingleMicSession | None" = field(default=None, repr=False, compare=False)
     created_at: float = field(default_factory=time.time)
     system_summary: str = ""
     _compaction_running: bool = False
@@ -396,6 +400,7 @@ class Session:
         self.last_device_id = -1
         self.last_candidate_mic_device_id = -1
         self.capture_is_loopback = True
+        self.single_mic = None
         self.created_at = time.time()
         self.system_summary = ""
         self._compaction_running = False
@@ -405,6 +410,7 @@ class Session:
         return {
             "is_recording": self.is_recording,
             "is_paused": self.is_paused,
+            "single_mic": self.single_mic.snapshot() if self.single_mic else None,
             "transcriptions": list(self.transcription_history[-50:]),
             "candidate_transcriptions": list(self.candidate_transcription_history[-50:]),
             "candidate_answer_segments": [

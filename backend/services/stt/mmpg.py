@@ -35,8 +35,13 @@ AUDIO_STALL_TIMEOUT = 2
 DIAGNOSTIC_TIMEOUT = 60
 BROWSER_UNDERRUN_WINDOW = 5
 BROWSER_UNDERRUN_LIMIT = 3
-MAX_AUDIO_BYTES = 16_000 * 4  # One second of mono float32 PCM.
+PCM_BYTES_PER_SECOND = 16_000 * 4  # 16 kHz mono float32 PCM.
+MAX_AUDIO_BYTES = PCM_BYTES_PER_SECOND
+# The browser worklet can queue one second of PCM before RTC playback. Allow
+# that queue and a short cloud event grace after the required silence is sent.
+ROLE_DRAIN_PLAYBACK_GRACE_SECONDS = 1.24
 _RTC_ID = re.compile(r"[a-zA-Z0-9_@.\-]{1,128}\Z")
+_SINGLE_MIC_ID = re.compile(r"[a-zA-Z0-9_-]{1,64}\Z")
 _SAFE_CODE = re.compile(r"[a-z][a-z0-9_]{0,47}\Z")
 _RTC_FAULTS = {
     "rtc_error", "rtc_join_failed", "rtc_token_update_failed",
@@ -75,6 +80,10 @@ class MmpgError(ValueError):
         self.code = code if isinstance(code, str) and _SAFE_CODE.fullmatch(code) else "mmpg_error"
         self.fields = list(fields or ())
         super().__init__(self.code)
+
+
+def valid_single_mic_id(value: object) -> bool:
+    return isinstance(value, str) and _SINGLE_MIC_ID.fullmatch(value) is not None
 
 
 def _expiry_timestamp(value):
@@ -268,10 +277,14 @@ class _Run:
     mode: str
     device_ids: list[int]
     candidate_mic_id: int | None
+    single_mic_id: str | None = None
     trace_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     stop_reason: str | None = None
     started: bool = False
     deadline: asyncio.TimerHandle | None = None
+
+    def capture_options(self) -> dict[str, str]:
+        return {"single_mic_id": self.single_mic_id} if self.single_mic_id is not None else {}
 
 
 @dataclass
@@ -335,6 +348,8 @@ class MmpgManager:
         self._queued_bytes = self._inflight_bytes = 0
         self._audio_dropped = 0
         self._audio_generation = None
+        self._audio_gate_revision = 0
+        self._audio_sent_bytes = 0
         self._last_audio = None
         self._audio_failed = False
         self._wake_pending = False
@@ -344,6 +359,10 @@ class MmpgManager:
     @property
     def active(self):
         return self._run is not None
+
+    @property
+    def single_mic_id(self) -> str | None:
+        return self._run.single_mic_id if self._run is not None else None
 
     def status(self):
         current = self._current
@@ -369,15 +388,17 @@ class MmpgManager:
             await self.stop("owner_disconnected")
             self._owner = None
 
-    def start(self, owner, mode, device_ids, candidate_mic_id=None, *, preflight=None):
+    def start(self, owner, mode, device_ids, candidate_mic_id=None, *, preflight=None, single_mic_id=None):
         """Reserve the lifecycle immediately while the WS reads RTC acknowledgments."""
         if self._closed or owner is not self._owner:
             raise MmpgError("owner_unavailable")
         if self.active:
             raise MmpgError("mmpg_busy")
+        if single_mic_id is not None and (mode == "test" or not valid_single_mic_id(single_mic_id)):
+            raise MmpgError("invalid_command")
         self._loop = asyncio.get_running_loop()
         self._audio_ready = asyncio.Event()
-        run = self._run = _Run(mode, list(device_ids), candidate_mic_id)
+        run = self._run = _Run(mode, list(device_ids), candidate_mic_id, single_mic_id)
         self._mode = mode
         self._browser_underruns = self._browser_overrun_samples = 0
         with self._audio_lock:
@@ -437,6 +458,7 @@ class MmpgManager:
 
     def _set_audio_gate(self, generation):
         with self._audio_lock:
+            self._audio_gate_revision += 1
             self._audio_generation = generation
             self._last_audio = time.monotonic() if generation is not None else None
             self._audio.clear()
@@ -447,6 +469,7 @@ class MmpgManager:
         """Queue one 16 kHz mono chunk from a capture thread without blocking on I/O."""
         with self._audio_lock:
             generation = self._audio_generation
+            gate_revision = self._audio_gate_revision
         if generation is None:
             return False
         if isinstance(samples, bytes):
@@ -460,7 +483,7 @@ class MmpgManager:
         if not size or size % 4:
             return False
         with self._audio_lock:
-            if self._audio_generation != generation or self._audio_failed:
+            if self._audio_gate_revision != gate_revision or self._audio_failed:
                 return False
             if self._queued_bytes + self._inflight_bytes + size > MAX_AUDIO_BYTES:
                 self._audio_dropped += (self._queued_bytes + size) // 4
@@ -498,6 +521,8 @@ class MmpgManager:
                     self._inflight_bytes = len(payload)
                 try:
                     await self._emit(payload)
+                    with self._audio_lock:
+                        self._audio_sent_bytes += len(payload)
                 finally:
                     with self._audio_lock:
                         self._inflight_bytes = 0
@@ -528,6 +553,53 @@ class MmpgManager:
             if not self.offer_audio(silence):
                 break
             await asyncio.sleep(0.04)
+
+    async def drain_single_mic_input(self, session_id: str, *, timeout: float) -> bool:
+        """Feed silence while a paused physical source has a final turn to finish."""
+        if self.single_mic_id != session_id or self._state != "listening":
+            return False
+        drain = asyncio.create_task(self.finish_role_input(session_id, timeout=timeout))
+        silence = bytes(640 * 4)  # 40 ms of 16 kHz float32 PCM.
+        try:
+            while not drain.done() and self.offer_audio(silence):
+                await asyncio.wait({drain}, timeout=0.04)
+            return drain.done() and drain.result()
+        finally:
+            if not drain.done():
+                drain.cancel()
+                await asyncio.gather(drain, return_exceptions=True)
+
+    async def finish_role_input(self, single_mic_id: str, *, timeout: float) -> bool:
+        """Wait for routed silence and final ASR events without closing RTC."""
+        run, generation = self._run, self._current
+        if not single_mic_id or run is None or run.single_mic_id != single_mic_id or generation is None:
+            return False
+        with self._audio_lock:
+            if self._audio_generation != generation.number:
+                return False
+            gate_revision = self._audio_gate_revision
+            # The caller has already stopped feeding spoken PCM for this role.
+            # Bytes after this fence are silence, even if more are still queued.
+            pcm_fence = self._audio_sent_bytes + self._queued_bytes + self._inflight_bytes
+        silence_bytes = generation.config["silence_ms"] * (PCM_BYTES_PER_SECOND // 1000)
+        deadline = self._loop.time() + timeout
+        silence_sent_at = None
+        while (self._run is run and self._current is generation
+               and run.stop_reason is None and not generation.fault.is_set()
+               and self._state == "listening"):
+            now = self._loop.time()
+            if now >= deadline:
+                break
+            with self._audio_lock:
+                if self._audio_gate_revision != gate_revision or self._audio_failed:
+                    return False
+                if silence_sent_at is None and self._audio_sent_bytes >= pcm_fence + silence_bytes:
+                    silence_sent_at = now
+            if (silence_sent_at is not None and now - silence_sent_at >= ROLE_DRAIN_PLAYBACK_GRACE_SECONDS
+                    and not generation.open_conversations):
+                return True
+            await asyncio.sleep(min(0.02, deadline - now))
+        return False
 
     def discard_turns(self):
         if self._current is not None:
@@ -786,7 +858,9 @@ class MmpgManager:
                 break
         if self._capture_start is not None:
             generation.capture_entered = True
-            start = asyncio.create_task(self._capture_start(run.mode, run.device_ids, run.candidate_mic_id))
+            start = asyncio.create_task(self._capture_start(
+                run.mode, run.device_ids, run.candidate_mic_id, **run.capture_options(),
+            ))
             try:
                 await asyncio.shield(start)
             except asyncio.CancelledError:
@@ -876,7 +950,7 @@ class MmpgManager:
                 with suppress(MmpgError):
                     await self._emit({"type": "rtc_leave", "generation": generation.number, "reason": reason})
                 if generation.capture_entered and self._capture_stop is not None:
-                    await self._capture_stop(run.mode, reason)
+                    await self._capture_stop(run.mode, reason, **run.capture_options())
             finally:
                 if cloud:
                     with suppress(Exception):
@@ -893,7 +967,7 @@ class MmpgManager:
                 return
             await self._publish("connecting")
             if preflight is not None:
-                await preflight(run.mode, run.device_ids, run.candidate_mic_id)
+                await preflight(run.mode, run.device_ids, run.candidate_mic_id, **run.capture_options())
             config = validate_config(self._get_config())
             _log.info(
                 "session=%s event=config device=%s token_mode=%s aivad=%s silence_ms=%s "

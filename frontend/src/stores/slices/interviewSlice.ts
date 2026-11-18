@@ -1,6 +1,6 @@
 import type { StateCreator } from 'zustand'
 import type { RootState } from './rootState'
-import type { QAPair, QAStatus } from './types'
+import type { QAPair, QAStatus, SingleMicState } from './types'
 import { mmpgAnswerLabel } from '@/lib/mmpg/settings'
 
 const CHUNK_THROTTLE_MS = 50
@@ -59,6 +59,7 @@ function _scheduleChunkFlush(set: (fn: (s: RootState) => Partial<RootState>) => 
 
 export interface InterviewSliceState {
   isRecording: boolean
+  singleMic: SingleMicState | null
   interviewerStreaming: boolean
   mmpgAnswerLabel: string | null
   isPaused: boolean
@@ -73,6 +74,7 @@ export interface InterviewSliceState {
 
 export interface InterviewSliceActions {
   setRecording: (v: boolean, interviewerStreaming?: boolean) => void
+  setSingleMic: (value: unknown) => void
   setPaused: (v: boolean) => void
   setMmpgAnswerPhase: (phase: unknown) => void
   setAudioLevel: (v: number) => void
@@ -106,8 +108,20 @@ export interface InterviewSliceActions {
 
 export type InterviewSlice = InterviewSliceState & InterviewSliceActions
 
+function readSingleMic(value: unknown): SingleMicState | null {
+  if (!value || typeof value !== 'object') return null
+  const { id, device_id, role, switching, revision } = value as Partial<SingleMicState>
+  if (typeof id !== 'string' || typeof device_id !== 'number' || !Number.isInteger(device_id) || device_id < 0) return null
+  if ((role !== 'interviewer' && role !== 'candidate') || typeof switching !== 'boolean') return null
+  return {
+    id, device_id, role, switching,
+    ...(typeof revision === 'number' && Number.isSafeInteger(revision) && revision >= 0 ? { revision } : {}),
+  }
+}
+
 export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlice> = (set, get) => ({
   isRecording: false,
+  singleMic: null,
   interviewerStreaming: false,
   mmpgAnswerLabel: null,
   isPaused: false,
@@ -121,8 +135,18 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
 
   setRecording: (v, interviewerStreaming) => set({
     isRecording: v, interviewerStreaming: v && interviewerStreaming === true,
-    ...(!v ? { mmpgAnswerLabel: null } : {}),
+    ...(!v ? { mmpgAnswerLabel: null, singleMic: null } : {}),
   }),
+  setSingleMic: (value) => {
+    const next = readSingleMic(value)
+    if (!next && value !== null) return
+    set((state) => {
+      const current = state.singleMic
+      if (current && next && current.id === next.id && current.revision !== undefined
+        && (next.revision === undefined || next.revision < current.revision)) return state
+      return { singleMic: next }
+    })
+  },
   setMmpgAnswerPhase: (phase) => set({ mmpgAnswerLabel: mmpgAnswerLabel(phase) }),
   setPaused: (v) => set({ isPaused: v }),
   setAudioLevel: (v) => set({ audioLevel: v }),
@@ -388,6 +412,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
       currentStreamingId: null,
       streamingIds: [],
       isRecording: data.is_recording ?? false,
+      singleMic: readSingleMic(data.single_mic),
       interviewerStreaming: data.is_recording === true && data.interviewer_streaming === true,
       mmpgAnswerLabel: mmpgAnswerLabel(data.mmpg_answer_phase),
       isPaused: data.is_paused ?? false,
@@ -413,6 +438,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
       currentStreamingId: null,
       streamingIds: [],
       isRecording: false,
+      singleMic: null,
       interviewerStreaming: false,
       isPaused: false,
       isTranscribing: false,
