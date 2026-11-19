@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useInterviewStore } from '@/stores/configStore'
 import { useKbStore } from '@/stores/kbStore'
+import { receiveArchiveStatus } from '@/stores/archiveStatusStore'
 import { buildWsUrl } from '@/lib/backendUrl'
 import { subscribeLeader } from '@/lib/wsLeader'
 import { isMmpgState, mmpgErrorMessage } from '@/lib/mmpg/rtcController'
@@ -106,6 +107,10 @@ export function useInterviewWS(active = true) {
     switch (msg.type) {
       case 'init':
         s.setInitData(msg as Parameters<typeof s.setInitData>[0])
+        receiveArchiveStatus(msg.archive, true)
+        break
+      case 'review_archive_status':
+        receiveArchiveStatus(msg)
         break
       case 'recording':
         s.setRecording(msg.value as boolean, msg.interviewer_streaming === true)

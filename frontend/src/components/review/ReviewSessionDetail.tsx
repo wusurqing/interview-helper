@@ -25,6 +25,7 @@ import type { Application } from '../job-tracker/types'
 import { parseApplication } from '../job-tracker/types'
 import { STAGE_LABELS, isTerminalStage } from '../job-tracker/stageConfig'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
+import { ArchiveTurnContent } from './ArchiveTurnContent'
 
 interface Props {
   sessionId: number
@@ -127,7 +128,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
   }, [sessionId])
 
   useEffect(() => {
-    if (detail?.status !== 'analyzing') return undefined
+    if (detail?.status !== 'analyzing' && detail?.archive_status !== 'recording' && detail?.archive_status !== 'draining') return undefined
 
     let cancelled = false
     const targetSessionId = sessionId
@@ -151,7 +152,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
       cancelled = true
       window.clearInterval(timer)
     }
-  }, [detail?.status, sessionId])
+  }, [detail?.status, detail?.archive_status, sessionId])
 
   useEffect(() => {
     let cancelled = false
@@ -324,7 +325,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
   const followUpDrills = buildFollowUpDrills(detail)
   const hasTakeaways = (detail.strong_points?.length ?? 0) > 0 || (detail.weak_points?.length ?? 0) > 0
   const summaryMissing = !detail.summary_markdown
-  const autoExpandTurns = summaryMissing && detail.turns.length > 0 && detail.turns.length <= 3
+  const autoExpandTurns = !!detail.archive_version || (summaryMissing && detail.turns.length > 0 && detail.turns.length <= 3)
   const applicationQuery = applicationSearch.trim().toLowerCase()
   const linkedApplicationSummary = detail.application
     ? applications.find((app) => app.id === detail.application?.id) ?? null
@@ -559,10 +560,11 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
               </SectionPanel>
             ) : null}
 
+            {detail.archive_warning && <p role="status" className="text-xs text-yellow-600">{detail.archive_warning}</p>}
             {detail.turns.length > 0 ? (
               <CollapsibleSection
-                title={`逐题分析 · ${detail.turns.length} 题`}
-                subtitle={autoExpandTurns ? '短记录，已展开。' : undefined}
+                title={`${detail.archive_version ? '面试记录' : '逐题分析'} · ${detail.turns.length} 题`}
+                subtitle={!detail.archive_version && autoExpandTurns ? '短记录，已展开。' : undefined}
                 defaultOpen={autoExpandTurns}
               >
                 <div className="space-y-3">
@@ -925,7 +927,7 @@ function TurnCard({
       {expanded && (
         <div className="space-y-3 border-t border-bg-hover/40 py-3">
           {visionVerify && <TurnVisionVerifyNotice verify={visionVerify} />}
-          <div>
+          {turn.archive_version ? <ArchiveTurnContent turn={turn} /> : <div>
             <h4 className="mb-2 text-xs font-semibold text-text-muted">{sourceMeta.answerHeading}</h4>
             {hasAsrCorrection && (
               <details className="mb-2 rounded-md border border-accent-blue/20 bg-accent-blue/5 px-3 py-2 text-xs">
@@ -940,7 +942,7 @@ function TurnCard({
             <div className="whitespace-pre-wrap text-sm leading-relaxed text-text-primary">
               {answerText || sourceMeta.emptyAnswer}
             </div>
-          </div>
+          </div>}
 
           {turn.code_text && (
             <div>

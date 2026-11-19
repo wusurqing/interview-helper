@@ -18,6 +18,7 @@ import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore } from '@/stores/configStore'
 import type { SingleMicRole } from '@/stores/slices/types'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
+import { useArchiveStatusStore } from '@/stores/archiveStatusStore'
 import { api, getErrorMessage } from '@/lib/api'
 import { candidateMmpgController, mmpgController, mmpgStateLabels } from '@/lib/mmpg/rtcController'
 import { useMmpgStatus } from '@/lib/mmpg/useMmpgStatus'
@@ -69,6 +70,7 @@ function connectInterviewerAudio(
 }
 
 export default function ControlBar() {
+  const archive = useArchiveStatusStore((state) => state.value)
   // 精确订阅字段, 避免 store 任意字段(LLM token / audioLevel 等)变化触发 ControlBar 重渲染
   const {
     isRecording,
@@ -706,6 +708,13 @@ export default function ControlBar() {
         </div>
       )}
       {!wsConnected && <WsReconnectingBanner />}
+      {archive && (archive.warning || archive.pending_round_count > 0 || archive.persisted_turn_count > 0) && (
+        <div role="status" className="px-3 pb-1 text-xs text-text-muted">
+          {archive.persisted_turn_count > 0 ? `已保存 ${archive.persisted_turn_count} 轮` : ''}
+          {archive.pending_round_count > 0 && <span className="ml-2">{archive.pending_round_count} 轮保存中</span>}
+          {archive.warning && <span className="ml-2 text-accent-red">{archive.warning}</span>}
+        </div>
+      )}
       {allModelsUnavailable && (
         <div className="flex items-center gap-2 text-xs text-accent-red bg-accent-red/10 px-3 py-1.5 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />

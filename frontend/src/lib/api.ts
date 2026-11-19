@@ -390,6 +390,15 @@ export const api = {
     request(`/api/review/sessions?page=${page}&page_size=${pageSize}`),
   reviewSessionDetail: (sessionId: number) =>
     request(`/api/review/sessions/${sessionId}`),
+  reviewTurnArchive: (sessionId: number, turnId: number, signal?: AbortSignal) =>
+    request<import('@/components/review/types').ArchiveDetails>(`/api/review/sessions/${sessionId}/turns/${turnId}/archive`, { signal }),
+  reviewAudio: async (sessionId: number, turnId: number, assetId: string, signal?: AbortSignal) => {
+    const response = await fetchBackend(buildApiUrl(`/api/review/sessions/${sessionId}/turns/${turnId}/audio/${encodeURIComponent(assetId)}`), {
+      signal, headers: buildHeaders(),
+    })
+    if (!response.ok) throw new Error(await buildResponseErrorMessage(response))
+    return response.arrayBuffer()
+  },
   reviewUpdateSession: (sessionId: number, data: { title?: string; company?: string; role?: string; application_id?: number | null }) =>
     request(`/api/review/sessions/${sessionId}`, { method: 'PATCH', body: JSON.stringify(data) }),
   reviewTriggerAnalysis: (sessionId: number) =>
