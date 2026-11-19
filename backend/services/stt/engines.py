@@ -1,22 +1,18 @@
-"""STT engine implementations: Whisper / FunASR (local), Doubao, and generic HTTP ASR."""
+"""Segmented cloud ASR connections for Doubao and OpenAI-compatible services."""
 
 import io
 import gzip
 import json
-import logging
-import re
 import struct
-import time
 import uuid
 import wave
 import numpy as np
-import threading
 from typing import Optional, Any
 
 import requests
 
 from core.logger import get_logger
-from .text_utils import TECH_VOCAB, _postprocess, _build_initial_prompt, build_tech_hotwords, custom_hotwords_from_config
+from .text_utils import _postprocess
 
 _log = get_logger("stt.engines")
 
@@ -26,11 +22,19 @@ except ImportError:
     websocket = None
 
 
+class STTError(RuntimeError):
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
+
+
 # ---------------------------------------------------------------------------
 # Shared audio helpers
 # ---------------------------------------------------------------------------
 
 def _audio_to_pcm_int16(audio: np.ndarray) -> np.ndarray:
+    if not audio.size:
+        return np.empty(0, dtype=np.int16)
     if audio.dtype == np.float32 or audio.dtype == np.float64:
         if audio.max() <= 1.0 and audio.min() >= -1.0:
             return (audio * 32767).astype(np.int16)
@@ -49,41 +53,6 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int = 16000) -> bytes:
         wf.setframerate(int(sample_rate or 16000))
         wf.writeframes(pcm.tobytes())
     return buf.getvalue()
-
-
-def _looks_like_whisper_hallucination(seg, text: str) -> bool:
-    """识别 whisper 家族在静音/噪声上的典型幻觉段。
-
-    过滤三类：
-    - no_speech / 低置信（avg_logprob 很低）
-    - 压缩比异常（重复 token 循环，如 "a new version of a new version of ..."）
-    - 短语 n-gram 重复 >=3 次（中文按字符 n-gram）
-    """
-    no_speech = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
-    if no_speech > 0.5:
-        return True
-    avg_logprob = float(getattr(seg, "avg_logprob", 0.0) or 0.0)
-    if avg_logprob < -1.0:
-        return True
-    compression = float(getattr(seg, "compression_ratio", 0.0) or 0.0)
-    if compression > 2.4:
-        return True
-    if len(text) >= 24 and _has_repeated_ngram(text):
-        return True
-    return False
-
-
-# 幻觉循环 = 同一片段「连续」重复 >=3 次（如 "a new version of a new version of ..."）。
-# 只看连续重复：正常 speech 里散布的重复词（"of the" x3）不算，避免整段误杀。
-_CJK_LOOP_RE = re.compile(r"([\u4e00-\u9fff]{2,12}?)\1{2,}")
-_WORD_LOOP_RE = re.compile(r"(\b\w+(?:\s+\w+){0,5}?)(?:\s*\1\s*){2,}", re.IGNORECASE)
-
-
-def _has_repeated_ngram(text: str, min_repeat: int = 3) -> bool:
-    compact = re.sub(r"[\s,，.。!！?？、]+", "", text)
-    if len(compact) >= 12 and _CJK_LOOP_RE.search(compact):
-        return True
-    return bool(_WORD_LOOP_RE.search(text))
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +75,7 @@ CHUNK_SAMPLES = 16000 * CHUNK_MS // 1000
 
 
 def _doubao_language(language: str) -> str:
-    """把 whisper 风格语言码映射成豆包 language 参数；auto/默认按 zh-CN。"""
+    """把配置中的语言码映射成火山原生豆包的 language 参数。"""
     lang = (language or "").strip().lower()
     if lang.startswith("zh"):
         return "zh-CN"
@@ -218,17 +187,7 @@ class DoubaoSTT:
 
     @property
     def is_loaded(self) -> bool:
-        return bool(self.api_key or self.access_token)
-
-    @property
-    def is_loading(self) -> bool:
-        return False
-
-    def load_model(self) -> None:
-        pass
-
-    def change_model(self, _model_size: str) -> None:
-        pass
+        return bool(self.api_key or (self.app_id and self.access_token))
 
     def _build_headers(self) -> dict:
         if self.api_key:
@@ -247,10 +206,10 @@ class DoubaoSTT:
 
     def transcribe(self, audio: np.ndarray, sample_rate: int = 16000,
                    position: str = "后端开发", language: str = "Python") -> str:
-        if not self.api_key and not self.access_token:
-            return ""
+        if not self.is_loaded:
+            raise STTError("请输入火山原生豆包的 API Key 或 App ID 与 Access Token")
         if websocket is None:
-            return ""
+            raise STTError("火山原生豆包的 WebSocket 客户端不可用")
         app_key = self.app_id or self.access_token or self.api_key
         pcm = _audio_to_pcm_int16(audio)
         if sample_rate != 16000:
@@ -281,57 +240,48 @@ class DoubaoSTT:
             pad = np.zeros(CHUNK_SAMPLES, dtype=np.int16)
             chunks = [_build_ws_frame_audio(pad.tobytes(), 2, is_last=True)]
 
+        ws = websocket.create_connection(
+            DOUBAO_ASR_WS_URL,
+            header=[f"{k}: {v}" for k, v in self._build_headers().items()],
+            timeout=10,
+        )
         try:
-            ws = websocket.create_connection(
-                DOUBAO_ASR_WS_URL,
-                header=[f"{k}: {v}" for k, v in self._build_headers().items()],
-                timeout=10,
-            )
-            try:
-                # 整段连发：不按 100-200ms 间隔空等，最后一包负序号即结束包
-                ws.send_binary(first_frame)
-                for frame in chunks:
-                    ws.send_binary(frame)
-                final_text = ""
-                ws.settimeout(5)
-                first_packet = True
-                while True:
-                    try:
-                        raw = ws.recv()
-                    except Exception:
-                        break
-                    if first_packet:
-                        ws.settimeout(15)
-                        first_packet = False
-                    if raw is None:
-                        break
-                    if isinstance(raw, str):
-                        raw = raw.encode("utf-8")
-                    msg_type, payload, is_last = _parse_ws_response(raw)
-                    if msg_type == MSG_ERROR:
-                        # error 帧也可能带 sequence（flags 0b0001），字段整体后移 4 字节
-                        err_off = 8 if (len(raw) > 4 and raw[1] & FLAG_SEQUENCE) else 4
-                        code = struct.unpack(">I", raw[err_off:err_off + 4])[0] if len(raw) >= err_off + 4 else 0
-                        err_size = struct.unpack(">I", raw[err_off + 4:err_off + 8])[0] if len(raw) >= err_off + 8 else 0
-                        msg_start = err_off + 8
-                        err_msg = raw[msg_start:msg_start + err_size].decode("utf-8", errors="replace") if err_size else ""
-                        raise RuntimeError(f"豆包 ASR 错误: {code} {err_msg}")
-                    if msg_type == MSG_FULL_SERVER_RESPONSE and payload:
-                        res = payload.get("result") or {}
-                        text = (res.get("text") or "").strip()
-                        if text:
-                            final_text = text
-                    if is_last:
-                        # 服务端结束包（flags 0b0010/0b0011）：立即返回，不再空等到超时
-                        break
-                return _postprocess(final_text) if final_text else ""
-            finally:
-                ws.close()
-        except Exception as e:
-            _log.warning("Doubao ASR error: %s", e, exc_info=True)
-            if "websocket" in str(type(e).__name__).lower():
-                raise RuntimeError(f"豆包 ASR 连接异常: {e}") from e
-            raise
+            # 整段连发：不按 100-200ms 间隔空等，最后一包负序号即结束包
+            ws.send_binary(first_frame)
+            for frame in chunks:
+                ws.send_binary(frame)
+            final_text = ""
+            ws.settimeout(5)
+            first_packet = True
+            while True:
+                raw = ws.recv()
+                if first_packet:
+                    ws.settimeout(15)
+                    first_packet = False
+                if not raw:
+                    raise ConnectionError("豆包 ASR 在最终结果前断开")
+                if isinstance(raw, str):
+                    raw = raw.encode("utf-8")
+                msg_type, payload, is_last = _parse_ws_response(raw)
+                if msg_type == MSG_ERROR:
+                    # error 帧也可能带 sequence（flags 0b0001），字段整体后移 4 字节
+                    err_off = 8 if (len(raw) > 4 and raw[1] & FLAG_SEQUENCE) else 4
+                    code = struct.unpack_from(">I", raw, err_off)[0] if len(raw) >= err_off + 4 else 0
+                    raise STTError(f"火山原生豆包 ASR 返回错误（{code}）")
+                if msg_type == MSG_FULL_SERVER_RESPONSE and payload:
+                    res = payload.get("result") or {}
+                    text = (res.get("text") or "").strip()
+                    if text:
+                        final_text = text
+                if is_last:
+                    # 服务端结束包（flags 0b0010/0b0011）：立即返回，不再空等到超时
+                    if msg_type == MSG_FULL_SERVER_RESPONSE and payload is None:
+                        raise STTError("火山原生豆包 ASR 返回了无效的最终结果")
+                    break
+            return _postprocess(final_text) if final_text else ""
+        finally:
+            ws.close()
+
 
 
 # ---------------------------------------------------------------------------
@@ -355,16 +305,6 @@ class GenericHTTPSTT:
     @property
     def is_loaded(self) -> bool:
         return bool(self.api_base_url and self.api_key and self.model)
-
-    @property
-    def is_loading(self) -> bool:
-        return False
-
-    def load_model(self) -> None:
-        pass
-
-    def change_model(self, _model_size: str) -> None:
-        pass
 
     def _extract_text(self, data: Any) -> str:
         if isinstance(data, str):
@@ -411,7 +351,11 @@ class GenericHTTPSTT:
         try:
             resp = requests.post(url, headers=headers, files=files, data=data, timeout=(10, 60))
             if resp.status_code >= 400:
-                raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+                status = resp.status_code
+                raise STTError(
+                    f"OpenAI 兼容 ASR 请求失败（HTTP {status}）",
+                    retryable=status in (408, 429) or status >= 500,
+                )
             ctype = resp.headers.get("content-type", "")
             if "json" in ctype.lower():
                 payload = resp.json()
@@ -422,309 +366,9 @@ class GenericHTTPSTT:
                     payload = resp.text
             text = self._extract_text(payload)
             return _postprocess(text) if text else ""
-        except requests.exceptions.Timeout as e:
-            raise RuntimeError(f"通用 ASR 请求超时: {e}") from e
-        except requests.exceptions.RequestException as e:
-            raise RuntimeError(f"通用 ASR 请求失败: {e}") from e
-
-
-# ---------------------------------------------------------------------------
-# FunASRSTT – local FunASR (paraformer / SenseVoice)
-# ---------------------------------------------------------------------------
-
-# 短名 -> ModelScope 仓库 id
-FUNASR_MODEL_REPOS = {
-    "paraformer-zh": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-pytorch",
-    "sensevoice-small": "iic/SenseVoiceSmall",
-    "paraformer-zh-streaming": "iic/speech_paraformer-large_asr_nat-zh-cn-16k-common-vocab8404-online",
-}
-
-# SenseVoice 富文本转写会带 <|zh|><|NEUTRAL|><|withitn|> 之类的控制标签
-_FUNASR_TAG_RE = re.compile(r"<\|[^|<>]{0,32}\|>")
-
-
-class FunASRSTT:
-    """本地 FunASR 引擎（中文面试场景：准确率高、CPU 快、paraformer 支持热词）。
-
-    首次使用需显式下载模型（设置页「下载模型」按钮 / scripts/download_funasr_models.py）。
-    """
-
-    def __init__(self, model_name: str = "paraformer-zh"):
-        self.model_name = model_name if model_name in FUNASR_MODEL_REPOS else "paraformer-zh"
-        self._model = None
-        self._lock = threading.Lock()
-        self._loading = False
-        self._load_failed_until = 0.0
-        self._last_load_error = ""
-
-    @property
-    def model_size(self) -> str:
-        return self.model_name
-
-    @property
-    def is_loaded(self) -> bool:
-        return self._model is not None
-
-    @property
-    def is_loading(self) -> bool:
-        return self._loading
-
-    def _repo_id(self) -> str:
-        return FUNASR_MODEL_REPOS[self.model_name]
-
-    def _auto_model_kwargs(self) -> dict:
-        from .local_runtime import funasr_model_reference
-        kwargs: dict[str, Any] = {
-            "model": funasr_model_reference(self._repo_id()),
-            "disable_update": True,
-            "disable_pbar": True,
-            "disable_log": True,
-        }
-        if self.model_name == "sensevoice-small":
-            kwargs["trust_remote_code"] = True
-        elif self.model_name == "paraformer-zh":
-            # 短音频片段上游已做 VAD；只挂标点模型，不重复挂 VAD
-            kwargs["vad_model"] = None
-            punc_repo = "iic/punc_ct-transformer_zh-cn-common-vocab272727-pytorch"
-            cached_punc = funasr_model_reference(punc_repo)
-            kwargs["punc_model"] = cached_punc if cached_punc != punc_repo else "ct-punc-c"
-        elif self.model_name == "paraformer-zh-streaming":
-            kwargs["vad_model"] = None
-            kwargs["punc_model"] = None
-        return kwargs
-
-    def load_model(self) -> None:
-        with self._lock:
-            if self._model is not None:
-                return
-            # 失败冷却：断网时每个 VAD 段都会重付一次下载尝试，60s 内直接复用上次错误
-            now = time.monotonic()
-            if self._load_failed_until and now < self._load_failed_until:
-                raise RuntimeError(self._last_load_error or "FunASR 模型加载失败")
-            self._loading = True
-            try:
-                from core.config import get_config
-                from .local_runtime import configure_funasr_cache
-                configure_funasr_cache(get_config())
-                try:
-                    from funasr import AutoModel
-                except ImportError as e:
-                    raise RuntimeError(
-                        "FunASR 未安装：请先运行 pip install funasr（或参考 docs/stt/README.md）"
-                    ) from e
-                device = "cpu"
-                try:
-                    import torch
-
-                    if torch.cuda.is_available():
-                        device = "cuda"
-                    else:
-                        # 线程可配置（stt_infer_threads，0=自动 min(8,核数-2)）：
-                        # 留核给实时链路、降低推理时风扇/发热
-                        import os
-
-                        from core.config import get_config
-
-                        configured = int(getattr(get_config(), "stt_infer_threads", 0) or 0)
-                        torch.set_num_threads(configured if configured > 0 else min(8, os.cpu_count() or 4))
-                except ImportError:
-                    pass
-                kwargs = self._auto_model_kwargs()
-                kwargs["device"] = device
-                self._model = AutoModel(**kwargs)
-                self.device = device
-                self._load_failed_until = 0.0
-                self._last_load_error = ""
-            except Exception as e:
-                self._load_failed_until = now + 60.0
-                self._last_load_error = str(e)[:200]
-                raise
-            finally:
-                self._loading = False
-
-    def change_model(self, model_name: str) -> None:
-        if model_name == self.model_name and self._model is not None:
-            return
-        with self._lock:
-            self._model = None
-            self.model_name = model_name if model_name in FUNASR_MODEL_REPOS else "paraformer-zh"
-        self.load_model()
-
-    def _hotword_string(self, position: str, language: str) -> str:
-        words = build_tech_hotwords(position, language, limit=400, custom=custom_hotwords_from_config())
-        return " ".join(words)
-
-    def transcribe(self, audio: np.ndarray, sample_rate: int = 16000,
-                   position: str = "后端开发", language: str = "Python") -> str:
-        if self._model is None:
-            self.load_model()
-
-        # FunASR 的 kaldi fbank 前端要求 float 波形（int16 会触发 torch Short 未实现）
-        audio_f = audio.astype(np.float32)
-        if audio_f.size and (np.abs(audio_f).max(initial=0.0) > 1.0):
-            audio_f = audio_f / 32768.0
-        if sample_rate != 16000:
-            n_orig = len(audio_f)
-            n_new = max(1, int(round(n_orig * 16000 / sample_rate)))
-            indices = np.linspace(0, n_orig - 1, n_new).astype(np.int32)
-            audio_f = audio_f[indices]
-
-        generate_kwargs: dict[str, Any] = {"input": audio_f}
-        if self.model_name == "paraformer-zh-streaming":
-            # Each VAD segment is submitted in one call, so flush the final
-            # streaming chunk; otherwise the last words are held in cache.
-            generate_kwargs.update(cache={}, is_final=True, chunk_size=[0, 10, 5],
-                                   encoder_chunk_look_back=4, decoder_chunk_look_back=1)
-        if self.model_name.startswith("paraformer"):
-            hotwords = self._hotword_string(position, language)
-            if hotwords:
-                generate_kwargs["hotword"] = hotwords
-        if self.model_name == "sensevoice-small":
-            generate_kwargs["language"] = "auto"
-            generate_kwargs["use_itn"] = True
-
-        try:
-            results = self._model.generate(**generate_kwargs)
-        except TypeError:
-            generate_kwargs.pop("hotword", None)
-            results = self._model.generate(**generate_kwargs)
-
-        text = ""
-        for item in results or []:
-            if isinstance(item, dict) and item.get("text"):
-                text = str(item["text"])
-                break
-        text = _FUNASR_TAG_RE.sub("", text).strip()
-        return _postprocess(text) if text else ""
-
-
-# ---------------------------------------------------------------------------
-# STTEngine – Whisper (local)
-# ---------------------------------------------------------------------------
-
-class STTEngine:
-    """Speech-to-text engine using faster-whisper."""
-
-    TEMPERATURE_FALLBACK = [0.0, 0.2]
-
-    def __init__(self, model_size: str = "base", language: str = "zh"):
-        self.model_size = model_size
-        self.language = language
-        self._model = None
-        self._lock = threading.Lock()
-        self._loading = False
-
-    @staticmethod
-    def _best_device() -> tuple[str, str]:
-        try:
-            import torch
-            if torch.cuda.is_available():
-                return "cuda", "float16"
-        except ImportError:
-            pass
-        return "cpu", "int8"
-
-    @staticmethod
-    def _cpu_threads() -> int:
-        # 留 2 个核给音频采集/VAD/LLM 流式等实时链路线程：
-        # whisper 推理默认吃满全部核时，drain 线程会被饿死导致原始音频被丢
-        # （日志曾出现单会话丢 7125 块 ≈ 7.6 分钟音频）。
-        import os
-
-        cores = os.cpu_count() or 4
-        return max(1, min(cores, cores - 2))
-
-    def load_model(self):
-        with self._lock:
-            if self._model is not None:
-                return
-            self._loading = True
-            try:
-                from core.config import get_config
-                from .local_runtime import configure_whisper_cuda11, whisper_cache_path
-                cfg = get_config()
-                device, compute_type = self._best_device()
-                configure_whisper_cuda11(cfg)
-                from faster_whisper import WhisperModel
-                if device == "cuda" and getattr(cfg, "whisper_cuda11_compat", False):
-                    # On the GTX 1650, tiny produces repeated tokens in FP16;
-                    # FP32 is stable and its small weights still fit easily.
-                    # Larger models use quantization to fit a 4 GiB card.
-                    compute_type = "float32" if self.model_size == "tiny" else "int8_float16"
-                model_kwargs: dict = {"device": device, "compute_type": compute_type}
-                cache_path = whisper_cache_path(cfg)
-                if cache_path:
-                    model_kwargs["download_root"] = cache_path
-                if device == "cpu":
-                    from core.config import get_config
-
-                    configured = int(getattr(get_config(), "stt_infer_threads", 0) or 0)
-                    model_kwargs["cpu_threads"] = configured if configured > 0 else self._cpu_threads()
-                self._model = WhisperModel(self.model_size, **model_kwargs)
-                self.device = device
-                self.compute_type = compute_type
-            finally:
-                self._loading = False
-
-    def change_model(self, model_size: str):
-        if model_size == self.model_size and self._model is not None:
-            return
-        with self._lock:
-            self._model = None
-            self.model_size = model_size
-        self.load_model()
-
-    def transcribe(self, audio: np.ndarray, sample_rate: int = 16000,
-                   position: str = "后端开发", language: str = "Python") -> str:
-        if self._model is None:
-            self.load_model()
-
-        audio_f = audio.astype(np.float32)
-        if audio_f.max() > 1.0:
-            audio_f = audio_f / 32768.0
-
-        whisper_lang: Optional[str] = None if self.language in ("auto", "zh-en") else self.language
-        initial_prompt = _build_initial_prompt(position, language)
-        hotwords_str = " ".join(
-            build_tech_hotwords(position, language, limit=900, custom=custom_hotwords_from_config())
-        )
-
-        kwargs = dict(
-            language=whisper_lang,
-            beam_size=3,
-            temperature=self.TEMPERATURE_FALLBACK,
-            initial_prompt=initial_prompt,
-            condition_on_previous_text=False,
-            vad_filter=True,
-            vad_parameters=dict(
-                min_silence_duration_ms=300,
-                speech_pad_ms=200,
-            ),
-            word_timestamps=False,
-            no_speech_threshold=0.6,
-            log_prob_threshold=-1.0,
-        )
-
-        try:
-            segments, _ = self._model.transcribe(audio_f, hotwords=hotwords_str, **kwargs)
-        except TypeError:
-            segments, _ = self._model.transcribe(audio_f, **kwargs)
-
-        texts = []
-        for seg in segments:
-            text = seg.text.strip()
-            if not text:
-                continue
-            if _looks_like_whisper_hallucination(seg, text):
-                continue
-            texts.append(text)
-
-        return _postprocess(" ".join(texts))
-
-    @property
-    def is_loaded(self) -> bool:
-        return self._model is not None
-
-    @property
-    def is_loading(self) -> bool:
-        return self._loading
+        except requests.exceptions.Timeout:
+            raise STTError("OpenAI 兼容 ASR 请求超时", retryable=True) from None
+        except requests.exceptions.ConnectionError:
+            raise STTError("OpenAI 兼容 ASR 连接失败", retryable=True) from None
+        except requests.exceptions.RequestException:
+            raise STTError("OpenAI 兼容 ASR 请求失败") from None

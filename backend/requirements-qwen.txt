@@ -1,9 +1,0 @@
-# Install a CUDA build of torch separately; see docs/qwen-local.md.
-# Keep the host application's NumPy 1.x compatibility.
-numpy>=1.24,<2.0
-scipy==1.15.3
-numba==0.61.2
-scikit-learn==1.6.1
-transformers==5.13.1
-librosa==0.11.0
-soundfile==0.13.1

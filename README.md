@@ -28,7 +28,7 @@ https://github.com/user-attachments/assets/1013b772-c59d-4ec4-8256-f932caa8ea3c
 | 场景 | 能力 |
 | --- | --- |
 | **实时面试** | 会议音频识别面试官发言；可选麦克风转写自己的回答，为追问和复盘提供上下文 |
-| **语音与模型接入** | Whisper、FunASR、Qwen3-ASR、豆包、豆包 MMPG、通用 ASR 六种引擎；支持 Chat、Messages、Responses 三种 LLM 接口 |
+| **语音与模型接入** | 火山原生豆包、OpenAI 兼容 ASR、豆包 MMPG；支持 Chat、Messages、Responses 三种 LLM 接口 |
 | **手动与截图答题** | 手动输入或粘贴图片；截图审题、多图提交和笔试模式 |
 | **个人材料接入** | 简历上传、简历优化、本地知识库检索与回答引用 |
 | **桌面端使用体验** | 共享隐身、Boss Key、托盘、悬浮窗，以及位置、字体、颜色和透明度设置 |
@@ -146,7 +146,7 @@ sequenceDiagram
 | --- | --- |
 | **前端** | React 18 · TypeScript · Vite · Zustand · Tailwind CSS · Playwright |
 | **后端** | Python 3.10+ · FastAPI · Uvicorn · WebSocket |
-| **语音识别** | faster-whisper · FunASR · Qwen3-ASR · 豆包流式 ASR / MMPG · 通用 ASR |
+| **语音识别** | 火山原生豆包 · OpenAI 兼容 ASR · 豆包 MMPG |
 | **LLM** | OpenAI 兼容接口 · 多模型并行 · Think 推理 · 识图 |
 | **存储** | SQLite · 本地简历历史 · 知识库索引 |
 | **桌面** | Electron |
@@ -185,18 +185,15 @@ cd ..
 
 Base URL 带不带 `/v1` 都可适配；模型队列支持并行竞速、健康检查与故障降级。按需在「设置 → 系统提示词」分别编辑语音回答、手动提问、截图、笔试、复盘和简历优化等场景的指令。
 
-在「设置 → 语音」选择转写引擎：
+在「设置 → 语音配置」填写转写服务的凭据并测试连接，再到「实时辅助」分别给会议音频和「我的回答」选择 ASR。
 
 | 引擎 | 运行位置与配置 |
 | --- | --- |
-| **Whisper** | 本地 `faster-whisper`，支持多语种；首次使用需准备模型文件。 |
-| **FunASR** | 本地识别，支持中文和岗位热词；执行 `python -m pip install funasr torch`，然后在语音设置中下载模型。 |
-| **Qwen3-ASR** | 本地 GPU 识别，需要 CUDA 和单独安装的可选依赖；安装及 GPU 检查见 [Qwen3-ASR 本地部署](docs/qwen-local.md)。 |
-| **豆包** | 火山引擎云端流式 ASR，需要开通服务并配置凭据。 |
+| **火山原生豆包** | 火山引擎分段 ASR，需要开通服务并配置凭据。 |
 | **豆包 MMPG** | 火山 RTC 会话式 ASR，支持智能判停与续说；需 Windows 本机后端，以及桌面应用或通过 localhost 打开的本机浏览器。在语音设置中配置 RTC、火山引擎和豆包 ASR 凭据，并可先运行「保存并测试 MMPG」。 |
-| **通用 ASR** | 云端 OpenAI 兼容音频转写接口，需要配置服务地址与凭据。 |
+| **OpenAI 兼容 ASR** | 云端音频转写接口，需要配置服务地址、凭据和模型名。 |
 
-豆包 MMPG 会将所选设备的音频发送到火山引擎，使用云服务可能产生费用。会议音频和候选人麦克风两路同时使用 MMPG 时，须配置 RTC App Key 并选择自动签发 Token。若主链路使用本地引擎，候选人链路的本地引擎跟随主链路。
+识别服务会接收所选设备的音频，使用云服务可能产生费用。两路都使用 MMPG 时，须配置 RTC App Key 并选择自动签发 Token。升级后，旧本地引擎所在的链路等待用户重新选择云端引擎。
 
 其他参考：
 
@@ -286,8 +283,7 @@ interview-helper/
 - **Node / npm 报错**：请确认 Node.js 版本为 `18+`。
 - **Electron 下载慢**：可先设置 `ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/`，再进入 `desktop/` 执行 `npm install`。
 - **macOS 下 sounddevice 安装失败**：先执行 `brew install portaudio`。
-- **Whisper 模型下载慢**：可设置 `export HF_ENDPOINT=https://hf-mirror.com`。
-- **中文/术语识别不准（如 RAG 被听错）**：主链路切到 FunASR 并下载模型，配合设置 → 热词里的岗位自定义词；Whisper 用户也可在热词页配置提示偏置。
+- **专业术语识别不准**：火山原生豆包可以在「语音配置」里填入已上传的热词表 ID。
 - **转写时风扇狂转**：设置 → 节奏 → 性能，调低「本地 ASR 推理线程数」（默认自动 = min(8, 核数-2)）。
 - **端口冲突**：可改用 `python start.py --port 9090`。
 

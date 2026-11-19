@@ -26,7 +26,7 @@ from services.llm.prompts import (
     format_interview_utterance,
     max_tokens_for_assist_prompt,
 )
-from services.stt import transcribe_with_fallback
+from services.stt import transcribe_segment
 
 PREFLIGHT_SCENARIOS = [
     {
@@ -264,13 +264,13 @@ def replay_preflight_capture_stt(
                     except Exception:
                         capture_stats = {}
                 stt_started = time.monotonic()
-                transcript = transcribe_with_fallback(
+                transcript = transcribe_segment(
                     audio,
                     AudioCapture.SAMPLE_RATE,
                     position=getattr(cfg, "position", ""),
                     language=getattr(cfg, "language", ""),
                     scope="interviewer",
-                    fallback_on_empty_remote=True,
+                    config_snapshot=cfg,
                 ) or ""
                 stt_ms = int((time.monotonic() - stt_started) * 1000)
             ok, detail = match_phrase(target_phrase, transcript)
@@ -286,7 +286,7 @@ def replay_preflight_capture_stt(
                     "playback_sec": playback_elapsed,
                     "stt_ms": stt_ms,
                     "total_ms": total_ms,
-                    "provider": getattr(cfg, "stt_provider", "whisper"),
+                    "provider": cfg.stt_provider,
                     "capture": capture_stats,
                 }
             )
@@ -311,7 +311,7 @@ def replay_preflight_capture_stt(
         "repeats": normalized_repeats,
         "success_count": success_count,
         "failure_count": len(rounds) - success_count,
-        "provider": getattr(cfg, "stt_provider", "whisper"),
+        "provider": cfg.stt_provider,
         "expected_phrase": target_phrase,
         "audio_path": str(Path(audio_path)) if audio_path else str(PREFLIGHT_AUDIO_PATH),
         "summary": {
@@ -566,13 +566,13 @@ def _run_preflight(device_id: Optional[int], scenario_id: str):
         _set_step("capture", "pass", f"已捕获真实音频（RMS {energy:.4f}）")
 
         _set_step("stt", "running", "正在识别测试音频…")
-        transcript = transcribe_with_fallback(
+        transcript = transcribe_segment(
             captured.astype(np.float32),
             AudioCapture.SAMPLE_RATE,
             position=getattr(cfg, "position", ""),
             language=getattr(cfg, "language", ""),
             scope="interviewer",
-            fallback_on_empty_remote=True,
+            config_snapshot=cfg,
         ) or ""
         _set_status(captured_transcript=transcript)
         ok, detail = match_phrase(expected_phrase, transcript)

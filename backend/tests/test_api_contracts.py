@@ -185,6 +185,9 @@ def test_api_ask_from_server_screen_skips_cancel_in_written_exam(monkeypatch: py
 
 
 def test_api_preflight_replay_validates_params_and_returns_result(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(assist_routes, "get_config", lambda: SimpleNamespace(
+        stt_provider="doubao", doubao_stt_api_key="test-key",
+    ))
     monkeypatch.setattr(
         assist_routes,
         "get_session",

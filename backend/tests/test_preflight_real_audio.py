@@ -158,10 +158,11 @@ def test_run_preflight_updates_status_and_completes(monkeypatch: pytest.MonkeyPa
         def compute_energy(audio):
             return 0.1
 
-    cfg = SimpleNamespace(stt_provider='whisper', get_active_model=lambda: SimpleNamespace(name='demo', model='demo-model'))
+    model = SimpleNamespace(name='demo', model='demo-model', api_key='test', supports_vision=False)
+    cfg = SimpleNamespace(stt_provider='generic', models=[model], active_model=0, get_active_model=lambda: model)
     monkeypatch.setattr(sound_test, 'get_config', lambda: cfg)
     monkeypatch.setattr(sound_test, 'AudioCapture', FakeCapture)
-    monkeypatch.setattr(sound_test, 'transcribe_with_fallback', lambda *args, **kwargs: sound_test.PREFLIGHT_EXPECTED_PHRASE)
+    monkeypatch.setattr(sound_test, 'transcribe_segment', lambda *args, **kwargs: sound_test.PREFLIGHT_EXPECTED_PHRASE)
     monkeypatch.setattr(
         sound_test,
         'generate_preflight_answer',
@@ -262,7 +263,7 @@ def test_replay_preflight_capture_stt_collects_round_stats(monkeypatch: pytest.M
     )
     monkeypatch.setattr(
         sound_test,
-        "transcribe_with_fallback",
+        "transcribe_segment",
         lambda *args, **kwargs: next(transcripts),
     )
 

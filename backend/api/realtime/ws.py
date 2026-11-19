@@ -4,12 +4,11 @@ import time
 from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
-from fastapi.concurrency import run_in_threadpool
 
 from core.auth import is_auth_disabled, loopback_bypass_allowed, verify_token
 from core.logger import get_logger
 from core.session import snapshot_session
-from services.stt import get_stt_engine
+from services.stt import stt_configuration_error
 
 _log = get_logger("ws")
 
@@ -172,28 +171,15 @@ async def websocket_endpoint(ws: WebSocket):
     ws._ia_connected_at = now  # type: ignore[attr-defined]
     ws._ia_last_pong = now  # type: ignore[attr-defined]
     try:
-        from core.config import get_config
         from api.assist import candidate_mmpg, mmpg_integration
-        cfg = get_config()
+        cfg = mmpg_integration.pipeline.get_capture_config()
         provider = cfg.stt_provider
         streaming = mmpg_integration.pipeline.is_streaming_interview()
-        if provider == mmpg_integration.PROVIDER or streaming:
+        if provider == mmpg_integration.PROVIDER:
             current_stt = mmpg_integration.stt_status()
-            loaded = current_stt["loaded"]
         else:
-            current_stt = None
-            try:
-                loaded = (await run_in_threadpool(
-                    get_stt_engine, provider=provider,
-                    model_size=cfg.whisper_model, language=cfg.whisper_language,
-                )).is_loaded
-            except Exception:
-                _log.warning("Unable to inspect STT engine during WS initialization")
-                loaded = False
-        streaming = mmpg_integration.pipeline.is_streaming_interview()
-        if streaming or get_config().stt_provider == mmpg_integration.PROVIDER:
-            current_stt = mmpg_integration.stt_status()
-            loaded = current_stt["loaded"]
+            detail = stt_configuration_error(cfg, provider)
+            current_stt = {"loaded": not detail, "loading": False, "provider": provider, "detail": detail}
         snapshot = snapshot_session()
         await ws.send_json({
             "type": "init",
@@ -201,16 +187,16 @@ async def websocket_endpoint(ws: WebSocket):
             "is_paused": snapshot["is_paused"],
             "single_mic": snapshot.get("single_mic"),
             "interviewer_streaming": streaming,
+            "candidate_capture_provider": mmpg_integration.pipeline.candidate_capture_provider(),
             "mmpg_answer_phase": mmpg_integration.answer_phase(),
-            "stt_loaded": loaded,
+            "stt_loaded": current_stt["loaded"],
             "transcriptions": snapshot["transcriptions"],
             "candidate_transcriptions": snapshot.get("candidate_transcriptions", []),
             "candidate_answer_segments": snapshot.get("candidate_answer_segments", []),
             "qa_pairs": snapshot["qa_pairs"],
         })
-        if current_stt is not None:
-            await ws.send_json({"type": "stt_status", **current_stt})
-        if candidate_mmpg.enabled(get_config()) or candidate_mmpg.manager.active:
+        await ws.send_json({"type": "stt_status", **current_stt})
+        if candidate_mmpg.enabled(cfg) or candidate_mmpg.manager.active:
             await ws.send_json(candidate_mmpg.status())
         ws_clients.add(ws)
         _log.info("WS connect clients=%d", len(ws_clients))

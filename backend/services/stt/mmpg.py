@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
+from core.config import Mmpg
 from core.logger import get_logger
 
 
@@ -140,6 +141,21 @@ def _manual_expiry(config):
         return supplied or expires or None
     except (ValueError, binascii.Error, struct.error):
         raise MmpgError("rtc_token_invalid", ["rtc_token"]) from None
+
+
+def refresh_manual_rtc_token(snapshot: Mmpg, current: Mmpg) -> Mmpg:
+    """Keep the session's RTC identity and recognition options when renewing its Token."""
+    if (
+        snapshot.token_mode == current.token_mode == "manual"
+        and snapshot.rtc_app_id == current.rtc_app_id
+        and snapshot.rtc_room_id == current.rtc_room_id
+        and snapshot.rtc_user_id == current.rtc_user_id
+    ):
+        return snapshot.model_copy(update={
+            "rtc_token": current.rtc_token,
+            "rtc_token_expires_at": current.rtc_token_expires_at,
+        })
+    return snapshot
 
 
 def validate_config(config):

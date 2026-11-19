@@ -522,7 +522,7 @@ def test_update_config_rejects_unknown_stt_provider(monkeypatch):
         update_called = True
 
     monkeypatch.setattr(common_router, "update_config", fake_update_config)
-    monkeypatch.setattr(common_router, "STT_PROVIDER_OPTIONS", ("whisper", "doubao", "generic"))
+    monkeypatch.setattr(common_router, "STT_PROVIDER_OPTIONS", ("doubao", "generic", "doubao_mmpg"))
 
     async def fake_run_in_threadpool(fn, *args, **kwargs):
         return fn(*args, **kwargs)
@@ -545,7 +545,7 @@ def test_stt_test_rejects_legacy_iflytek_provider(monkeypatch):
     result = _run(common_router.api_stt_test())
 
     assert result["ok"] is False
-    assert "已下线" in result["detail"]
+    assert "选择 ASR" in result["detail"]
 
 
 def test_stt_test_rejects_empty_transcription(monkeypatch):
@@ -555,7 +555,7 @@ def test_stt_test_rejects_empty_transcription(monkeypatch):
         def transcribe(self, audio, sample_rate=16000):
             return ""
 
-    monkeypatch.setattr(common_router, "get_stt_engine", lambda: _FakeEngine())
+    monkeypatch.setattr(common_router, "get_stt_engine", lambda *_args, **_kwargs: _FakeEngine())
     monkeypatch.setattr(common_router.Path, "exists", lambda self: False)
 
     result = _run(common_router.api_stt_test())

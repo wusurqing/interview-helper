@@ -53,6 +53,7 @@ def normalize_llm_max_tokens(value: Any) -> int:
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.environ.get("IA_CONFIG_PATH") or os.path.join(_BACKEND_DIR, "config.json")
 CONFIG_EXAMPLE = os.path.join(_BACKEND_DIR, "config.example.json")
+_ASR_CONFIG_VERSION = 1
 
 
 class ModelConfig(BaseModel):
@@ -112,6 +113,9 @@ def _default_model_config() -> ModelConfig:
 
 
 MMPG_STT_PROVIDER = "doubao_mmpg"
+SEGMENT_STT_PROVIDERS = ("doubao", "generic")
+STT_PROVIDER_OPTIONS = [*SEGMENT_STT_PROVIDERS, MMPG_STT_PROVIDER]
+CANDIDATE_STT_PROVIDER_OPTIONS = STT_PROVIDER_OPTIONS.copy()
 MMPG_SECRET_FIELDS = frozenset({
     "volc_access_key", "volc_secret_key", "rtc_app_key", "rtc_token", "doubao_api_key",
 })
@@ -178,29 +182,9 @@ class AppConfig(BaseModel):
     # 推理强度: off=关闭, low/medium/high/xhigh 分别对应低/中/高/超高强度推理
     think_effort: Literal["off", "low", "medium", "high", "xhigh"] = "off"
 
-    # 语音识别：whisper=本地 faster-whisper，funasr=本地 FunASR（paraformer/SenseVoice），
-    # doubao=豆包语音识别 API，doubao_mmpg=豆包会话式 ASR，generic=OpenAI-compatible HTTP ASR
-    stt_provider: str = "whisper"
+    # 两路各自选择云端引擎。空值表示用户尚未选择。
+    stt_provider: str = ""
     mmpg: Mmpg = Field(default_factory=Mmpg)
-    whisper_model: str = "base"
-    # 可选的本地模型缓存，以及旧 Windows 显卡驱动的 CUDA 11 隔离运行库。
-    stt_model_cache_root: str = ""
-    whisper_cuda11_compat: bool = False
-    # "auto" is more robust for Chinese interview speech mixed with English terms.
-    whisper_language: str = "auto"
-    # 启动时预加载 whisper 降级模型（远程 ASR 为主引擎时，~300MB 内存换更快降级）
-    whisper_preload: bool = False
-    # FunASR 本地模型（stt_provider=funasr 时使用）：首次使用需显式下载（设置页有下载按钮）
-    funasr_model: str = "paraformer-zh"
-    # 本地 ASR 自定义热词（岗位 -> 空格分隔词串；"通用" 键对所有岗位生效）。
-    # 与内置 TECH_VOCAB 合并后传给 FunASR(paraformer)/Whisper 做偏置。
-    stt_hotwords: dict[str, str] = Field(default_factory=dict)
-    # 远程 ASR（豆包/通用）失败时的降级引擎：whisper（默认）/funasr/none（不降级）。
-    # 主链路本身是本地引擎时此配置不生效（本地引擎失败无需再降级）。
-    stt_fallback_provider: str = "whisper"
-    # 本地 ASR 推理线程数：0=自动（min(8, 核数-2)）；调小降温降噪，调大更快。
-    # 改动重启后端生效。
-    stt_infer_threads: int = 0
     # 豆包语音识别 API（当 stt_provider=doubao 时使用），使用小时版 + WebSocket 双流式
     doubao_stt_app_id: str = ""
     doubao_stt_access_token: str = ""
@@ -216,19 +200,14 @@ class AppConfig(BaseModel):
     generic_stt_model: str = ""
     # 自定义 HTTP header，JSON 格式如 {"X-Custom":"value"} 或每行 Key: Value
     generic_stt_custom_headers: str = ""
-    # 实时辅助候选人麦克风 ASR：默认关闭；开启后默认本地 Whisper，避免额外远程识别成本。
+    # 我的回答需要用户显式选择引擎并启用。
     candidate_asr_enabled: bool = False
-    candidate_stt_provider: str = "whisper"
-    candidate_whisper_model: str = ""
-    candidate_whisper_language: str = ""
-    candidate_remote_stt_enabled: bool = False
+    candidate_stt_provider: str = ""
     # 候选人真实回答上下文：下一轮问题可携带，追问时强优先，非追问时作为可忽略背景。
     candidate_context_enabled: bool = True
     candidate_context_wait_ms: int = 200
     candidate_context_max_chars: int = 900
     candidate_context_min_chars: int = 6
-    candidate_streaming_asr_enabled: bool = True
-    candidate_streaming_asr_interval_ms: int = 1500
     # 只用于“我的麦克风”：始终共享读取；开启后冲突时会尝试更保守的采样与默认输入设备。
     candidate_mic_compatibility_mode: bool = True
 
@@ -325,25 +304,22 @@ class AppConfig(BaseModel):
     def _normalize_max_tokens_field(cls, value: Any) -> int:
         return normalize_llm_max_tokens(value)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _retire_legacy_candidate_route(cls, data):
+        # Old builds used a separate permission flag before routing a segment to the cloud.
+        if (isinstance(data, dict) and data.get("candidate_remote_stt_enabled") is False
+                and data.get("candidate_stt_provider") in SEGMENT_STT_PROVIDERS):
+            return {**data, "candidate_asr_enabled": False, "candidate_stt_provider": ""}
+        return data
+
     @model_validator(mode="after")
     def _ensure_valid_models(self):
-        if self.stt_provider == "iflytek":
-            logger.warning(
-                "检测到已废弃的 stt_provider=iflytek；请在设置中改为 generic 或 whisper"
-            )
-        if self.candidate_stt_provider == "iflytek":
-            logger.warning(
-                "检测到已废弃的 candidate_stt_provider=iflytek；已重置为 whisper"
-            )
-            self.candidate_stt_provider = "whisper"
+        if self.stt_provider not in STT_PROVIDER_OPTIONS:
+            self.stt_provider = ""
         if self.candidate_stt_provider not in CANDIDATE_STT_PROVIDER_OPTIONS:
-            logger.warning(
-                "candidate_stt_provider=%r 不支持，已重置为 whisper",
-                self.candidate_stt_provider,
-            )
-            self.candidate_stt_provider = "whisper"
-        if self.candidate_stt_provider in ("doubao", "generic") and not self.candidate_remote_stt_enabled:
-            self.candidate_stt_provider = "whisper"
+            self.candidate_stt_provider = ""
+            self.candidate_asr_enabled = False
         self.temperature = normalize_llm_temperature(self.temperature)
         self.max_tokens = normalize_llm_max_tokens(self.max_tokens)
         self.candidate_context_wait_ms = max(0, min(2000, int(self.candidate_context_wait_ms or 0)))
@@ -354,41 +330,7 @@ class AppConfig(BaseModel):
             128,
             min(self.assist_realtime_max_tokens, int(self.assist_realtime_high_churn_max_tokens or 320)),
         )
-        self.candidate_streaming_asr_interval_ms = max(800, min(5000, int(self.candidate_streaming_asr_interval_ms or 1500)))
         self.candidate_mic_compatibility_mode = bool(self.candidate_mic_compatibility_mode)
-        wl = (self.whisper_language or "").strip()
-        if wl and wl != "auto":
-            import re as _re
-            if not _re.match(r"^[a-z]{2}(-[A-Z]{2})?$", wl):
-                logger.warning(
-                    "whisper_language=%r 格式不正确，已重置为 auto (应为 ISO 639-1 码如 en/zh)", wl
-                )
-                self.whisper_language = "auto"
-        cwl = (self.candidate_whisper_language or "").strip()
-        if cwl and cwl != "auto":
-            import re as _re
-            if not _re.match(r"^[a-z]{2}(-[A-Z]{2})?$", cwl):
-                logger.warning(
-                    "candidate_whisper_language=%r 格式不正确，已重置为空（沿用 whisper_language）",
-                    cwl,
-                )
-                self.candidate_whisper_language = ""
-        self.stt_infer_threads = max(0, min(64, int(self.stt_infer_threads or 0)))
-        fbp = (self.stt_fallback_provider or "").strip().lower()
-        if fbp not in STT_FALLBACK_PROVIDER_OPTIONS:
-            logger.warning("stt_fallback_provider=%r 不支持，已重置为 whisper", fbp)
-            self.stt_fallback_provider = "whisper"
-        fm = (self.funasr_model or "").strip()
-        if fm not in FUNASR_MODEL_OPTIONS:
-            logger.warning("funasr_model=%r 不支持，已重置为 paraformer-zh", fm)
-            self.funasr_model = "paraformer-zh"
-        if not isinstance(self.stt_hotwords, dict):
-            self.stt_hotwords = {}
-        self.stt_hotwords = {
-            str(k).strip(): str(v).strip()
-            for k, v in self.stt_hotwords.items()
-            if str(k).strip() and str(v).strip()
-        }
         if not self.models:
             self.models = [_default_model_config()]
         self.screen_capture_max_long_edge = max(0, min(4000, int(self.screen_capture_max_long_edge or 0)))
@@ -595,7 +537,13 @@ def _load_config() -> AppConfig:
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return AppConfig(**json.load(f))
+                data = json.load(f)
+            if data.pop("asr_config_version", None) == _ASR_CONFIG_VERSION:
+                data.pop("candidate_remote_stt_enabled", None)
+            else:
+                # In older releases, omitting this flag meant the candidate still used local ASR.
+                data["candidate_remote_stt_enabled"] = data.get("candidate_remote_stt_enabled") is True
+            return AppConfig(**data)
         except ValidationError as e:
             logger.warning("配置包含 %s 项无效设置，使用默认配置", e.error_count())
         except Exception as e:
@@ -606,6 +554,7 @@ def _load_config() -> AppConfig:
 def _save_config(cfg: AppConfig) -> None:
     target = Path(CONFIG_FILE)
     data = cfg.model_dump()
+    data["asr_config_version"] = _ASR_CONFIG_VERSION
     data.pop("resume_text", None)
     temp_path = None
     try:
@@ -632,13 +581,7 @@ LANGUAGE_OPTIONS = [
     "Python", "Java", "C++", "JavaScript", "TypeScript",
     "Go", "SQL",
 ]
-WHISPER_MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3"]
 # 远程 ASR 失败降级目标：本地引擎或关闭
-STT_FALLBACK_PROVIDER_OPTIONS = ["whisper", "funasr", "none"]
 # FunASR 本地模型（中文面试场景推荐 paraformer-zh：准确率高、CPU 快、支持热词）
-FUNASR_MODEL_OPTIONS = ["paraformer-zh", "sensevoice-small", "paraformer-zh-streaming"]
-# 语音识别引擎：whisper=本地，funasr=本地 FunASR，doubao=豆包 API，generic=OpenAI-compatible HTTP ASR
-STT_PROVIDER_OPTIONS = ["whisper", "funasr", "qwen3_asr", "doubao", "generic", MMPG_STT_PROVIDER]
-CANDIDATE_STT_PROVIDER_OPTIONS = STT_PROVIDER_OPTIONS.copy()
 # 电脑截图区域
 SCREEN_CAPTURE_REGION_OPTIONS = ["full", "left_half", "right_half", "top_half", "bottom_half"]

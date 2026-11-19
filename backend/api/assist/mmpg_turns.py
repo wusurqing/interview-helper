@@ -55,12 +55,14 @@ class _Question:
 
 class MmpgTurns:
     def __init__(self, *, submit, cancel, publish, enabled, clock, call_later,
-                 answer_delay_ms, followup_window_ms, log=None, cancel_on_clear=None, record_final=None):
+                 answer_delay_ms, followup_window_ms, log=None, cancel_on_clear=None, record_final=None,
+                 allow_answer=lambda: True):
         self._submit = submit
         self._cancel = cancel
         self._cancel_on_clear = cancel_on_clear or cancel
         self._publish = publish
         self._enabled = enabled
+        self._allow_answer = allow_answer
         self._record_final = record_final
         self._clock = clock
         self._call_later = call_later
@@ -116,6 +118,12 @@ class MmpgTurns:
             self._log("group_cleared", group=group.id)
         self._set_phase("idle")
 
+    def disable_automatic_answers(self):
+        # Detach the pending group without cancelling submitted work or marking active speech as seen.
+        self._group = None
+        self._cancel_timer()
+        self._set_phase("idle")
+
     def finish_role(self):
         group = self._group
         if group is None or group.speaking:
@@ -143,6 +151,8 @@ class MmpgTurns:
             self._seen.add(trace)
             return
         if trace in self._seen:
+            return
+        if not self._allow_answer():
             return
         group = self._group
         if group and trace in group.speaking:
@@ -175,6 +185,11 @@ class MmpgTurns:
 
     def final(self, trace, text):
         if trace in self._seen:
+            return
+        if not self._allow_answer():
+            self._seen.add(trace)
+            if text and self._record_final is not None and self._enabled():
+                self._record_final(text, trace, None)
             return
         group = self._group
         if group is None or trace not in group.speaking:
@@ -214,6 +229,9 @@ class MmpgTurns:
             return
         if not self._enabled():
             self.clear()
+            return
+        if not self._allow_answer():
+            self.disable_automatic_answers()
             return
         group.revision += 1
         traces = tuple(sorted(group.utterances, key=lambda key: group.utterances[key][0]))

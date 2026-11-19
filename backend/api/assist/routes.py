@@ -11,6 +11,7 @@ from core.config import get_config
 from core.logger import get_logger
 from core.session import get_session, snapshot_session
 from services.audio import AudioBusyError
+from services.stt import STTError, stt_configuration_error
 from services.stt.mmpg import valid_single_mic_id
 from . import candidate_mmpg
 from . import mmpg_integration as mmpg
@@ -100,6 +101,8 @@ async def _api_start(body: dict):
             raise HTTPException(400, "candidate_mic_device_id \u5fc5\u987b\u662f\u6574\u6570")
     else:
         candidate_dev = None
+    if not written_exam and (detail := stt_configuration_error(cfg, cfg.stt_provider)):
+        raise HTTPException(422, detail)
     try:
         await candidate_mmpg.stop("stopped")
         if single_mic_id is not None:
@@ -118,6 +121,8 @@ async def _api_start(body: dict):
         raise HTTPException(409, str(e))
     except SingleMicConflict as e:
         raise HTTPException(400, str(e))
+    except STTError as e:
+        raise HTTPException(422, str(e))
     except Exception as e:
         _rlog.error("api_start failed: %s", e, exc_info=True)
         raise HTTPException(500, "启动失败，请重试")
@@ -386,7 +391,6 @@ async def api_preflight_scenarios():
 
 @router.post("/preflight/run")
 async def api_preflight_run(body: dict):
-    _check_segment_preflight()
     from .sound_test import start_preflight
     scenario_id = body.get("scenario_id", "self_intro")
     device_id = body.get("device_id")
@@ -395,6 +399,7 @@ async def api_preflight_run(body: dict):
             device_id = int(device_id)
         except (TypeError, ValueError):
             raise HTTPException(400, "device_id 必须是整数")
+    _check_segment_preflight()
     ok = start_preflight(
         device_id=device_id,
         scenario_id=scenario_id,
@@ -412,7 +417,6 @@ async def api_preflight_status():
 
 @router.post("/preflight/replay")
 async def api_preflight_replay(body: dict):
-    _check_segment_preflight()
     session = get_session()
     if session.is_recording and not session.is_paused:
         raise HTTPException(409, "请先暂停或结束面试，再做高频回放检测")
@@ -435,6 +439,7 @@ async def api_preflight_replay(body: dict):
         gap_sec = float(gap_sec)
     except (TypeError, ValueError):
         raise HTTPException(400, "gap_sec 必须是数字")
+    _check_segment_preflight()
     try:
         from .sound_test import replay_preflight_capture_stt
         return await run_in_threadpool(
@@ -468,10 +473,13 @@ async def api_exam_preflight_run():
 
 
 def _check_segment_preflight():
-    if get_config().stt_provider == mmpg.PROVIDER:
-        raise HTTPException(409, "豆包语义判停请在语音设置中使用「保存并测试」")
     if mmpg.manager.active:
         raise HTTPException(409, "请先结束豆包语义判停会话或检测")
+    cfg = get_config()
+    if cfg.stt_provider == mmpg.PROVIDER:
+        raise HTTPException(409, "豆包语义判停请在语音配置中使用「保存并测试」")
+    if detail := stt_configuration_error(cfg, cfg.stt_provider):
+        raise HTTPException(422, detail)
 
 
 @router.get("/exam-preflight/status")

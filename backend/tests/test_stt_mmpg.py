@@ -600,7 +600,7 @@ def test_candidate_mmpg_routes_final_transcripts_to_qa_and_drains_on_pause(monke
                     candidate_asr_enabled=True, mmpg=Mmpg(**CONFIG))
     session = Session(is_recording=True, last_device_id=10, last_candidate_mic_device_id=20)
     saved, interviewer_texts, statuses = [], [], []
-    monkeypatch.setattr(candidate_mmpg, "get_config", lambda: cfg)
+    monkeypatch.setattr(candidate_mmpg.pipeline, "get_capture_config", lambda: cfg)
     monkeypatch.setattr(candidate_mmpg, "get_session", lambda: session)
     monkeypatch.setattr(candidate_mmpg, "_pending", {})
     monkeypatch.setattr(pipeline, "is_streaming_interview", lambda: True)
@@ -712,7 +712,7 @@ def test_candidate_mmpg_does_not_share_the_interviewer_manual_token(monkeypatch)
 
     cfg = AppConfig(candidate_stt_provider="doubao_mmpg", candidate_asr_enabled=True,
                     mmpg=Mmpg(**{**CONFIG, "token_mode": "manual"}))
-    monkeypatch.setattr(candidate_mmpg, "get_config", lambda: cfg)
+    monkeypatch.setattr(candidate_mmpg.pipeline, "get_capture_config", lambda: cfg)
     monkeypatch.setattr(candidate_mmpg, "get_session", lambda: Session(
         is_recording=True, last_device_id=10, last_candidate_mic_device_id=20,
     ))

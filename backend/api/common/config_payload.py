@@ -1,5 +1,6 @@
 from core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, Mmpg, model_health_fingerprint
 from services.storage.resume_history import get_filename_for_id
+from services.stt import configured_stt_routes
 
 
 def build_config_payload(cfg) -> dict:
@@ -42,14 +43,8 @@ def build_config_payload(cfg) -> dict:
         "think_mode": cfg.think_mode,
         "think_effort": cfg.think_effort,
         "stt_provider": cfg.stt_provider,
+        "stt_configured": configured_stt_routes(cfg),
         "mmpg": mmpg,
-        "whisper_model": cfg.whisper_model,
-        "whisper_language": cfg.whisper_language,
-        "whisper_preload": cfg.whisper_preload,
-        "funasr_model": getattr(cfg, "funasr_model", "paraformer-zh") or "paraformer-zh",
-        "stt_hotwords": getattr(cfg, "stt_hotwords", {}) or {},
-        "stt_fallback_provider": getattr(cfg, "stt_fallback_provider", "whisper") or "whisper",
-        "stt_infer_threads": int(getattr(cfg, "stt_infer_threads", 0) or 0),
         "doubao_stt_app_id": cfg.doubao_stt_app_id or "",
         "doubao_stt_access_token": cfg.doubao_stt_access_token or "",
         "doubao_stt_api_key": getattr(cfg, "doubao_stt_api_key", "") or "",
@@ -60,16 +55,11 @@ def build_config_payload(cfg) -> dict:
         "generic_stt_model": getattr(cfg, "generic_stt_model", "") or "",
         "generic_stt_custom_headers": getattr(cfg, "generic_stt_custom_headers", "") or "",
         "candidate_asr_enabled": bool(getattr(cfg, "candidate_asr_enabled", False)),
-        "candidate_stt_provider": getattr(cfg, "candidate_stt_provider", "whisper") or "whisper",
-        "candidate_whisper_model": getattr(cfg, "candidate_whisper_model", "") or "",
-        "candidate_whisper_language": getattr(cfg, "candidate_whisper_language", "") or "",
-        "candidate_remote_stt_enabled": bool(getattr(cfg, "candidate_remote_stt_enabled", False)),
+        "candidate_stt_provider": getattr(cfg, "candidate_stt_provider", "") or "",
         "candidate_context_enabled": bool(getattr(cfg, "candidate_context_enabled", True)),
         "candidate_context_wait_ms": max(0, min(2000, int(getattr(cfg, "candidate_context_wait_ms", 200) or 0))),
         "candidate_context_max_chars": max(100, min(4000, int(getattr(cfg, "candidate_context_max_chars", 900) or 900))),
         "candidate_context_min_chars": max(1, min(100, int(getattr(cfg, "candidate_context_min_chars", 6) or 6))),
-        "candidate_streaming_asr_enabled": bool(getattr(cfg, "candidate_streaming_asr_enabled", True)),
-        "candidate_streaming_asr_interval_ms": max(800, min(5000, int(getattr(cfg, "candidate_streaming_asr_interval_ms", 1500) or 1500))),
         "candidate_mic_compatibility_mode": bool(getattr(cfg, "candidate_mic_compatibility_mode", True)),
         "position": cfg.position,
         "language": cfg.language,

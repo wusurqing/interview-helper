@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.generate_interviewer_mix_fixture import DEFAULT_VOICE_NAME, SCENARIOS, main as generate_fixture_main  # noqa: E402
 from scripts.replay_interviewer_pipeline import run_interviewer_pipeline_replay  # noqa: E402
-from core.config import get_config, update_config  # noqa: E402
+from core.config import SEGMENT_STT_PROVIDERS, get_config, update_config  # noqa: E402
+from api.assist.scheduler import dispatch_model_order  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -26,26 +27,14 @@ def _temporary_stt_provider(provider: str):
     if not selected:
         yield
         return
-    cfg = get_config()
-    original = {
-        "stt_provider": getattr(cfg, "stt_provider", "whisper"),
-        "whisper_preload": bool(getattr(cfg, "whisper_preload", False)),
-        "assist_interviewer_asr_drain_timeout_sec": float(
-            getattr(cfg, "assist_interviewer_asr_drain_timeout_sec", 6.0) or 6.0
-        ),
-    }
-    updates = {"stt_provider": selected}
-    if selected == "whisper":
-        updates["whisper_preload"] = False
-        updates["assist_interviewer_asr_drain_timeout_sec"] = max(
-            12.0,
-            float(getattr(cfg, "assist_interviewer_asr_drain_timeout_sec", 6.0) or 6.0),
-        )
-    update_config(updates)
+    if selected not in SEGMENT_STT_PROVIDERS:
+        raise ValueError("高频回放只支持火山原生豆包或 OpenAI 兼容 ASR")
+    original = get_config().stt_provider
+    update_config({"stt_provider": selected})
     try:
         yield
     finally:
-        update_config(original)
+        update_config({"stt_provider": original})
 
 
 def _find_model_index_by_name(model_name: str) -> int | None:
@@ -222,9 +211,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scenario", action="append", default=[], help="Optional scenario id filter. Repeat for multiple values.")
     parser.add_argument(
         "--stt-provider",
-        choices=["", "whisper", "doubao", "generic"],
+        choices=["", *SEGMENT_STT_PROVIDERS],
         default="",
-        help="Temporarily force STT provider during the suite. Use whisper for free local validation.",
+        help="Temporarily choose a configured segmented cloud ASR provider.",
     )
     parser.add_argument(
         "--answer-model-name",

@@ -12,7 +12,7 @@ from typing import Any, Callable, Literal, Optional
 from uuid import uuid4
 
 from core.background import BoundedTaskWorker
-from core.config import MMPG_STT_PROVIDER, get_config
+from core.config import MMPG_STT_PROVIDER, SEGMENT_STT_PROVIDERS, get_config
 from core.logger import get_interview_logger, get_logger
 from core.session import get_session, reset_session, conversation_lock
 from services import review_integration
@@ -21,13 +21,14 @@ _ilog = get_interview_logger()
 _elog = get_logger("pipeline")
 from services.audio import AudioCapture, VADBuffer, _is_sc_id, audio_capture
 from services.stt import (
+    STTError,
     build_asr_question_group_text,
-    get_stt_engine,
-    transcribe_with_fallback,
+    stt_configuration_error,
+    transcribe_segment,
     transcription_for_publish,
     postprocess_interview_transcription,
 )
-from services.stt.factory import LOCAL_STT_PROVIDERS
+from services.stt.mmpg import refresh_manual_rtc_token
 from api.common import get_model_health
 from api.realtime.ws import broadcast
 from api.assist.answer_worker import (
@@ -74,8 +75,6 @@ _candidate_audio_capture = AudioCapture()
 _stop_event = threading.Event()
 _pause_event = threading.Event()
 _candidate_flush_event = threading.Event()
-_candidate_whisper_preload_lock = threading.Lock()
-_candidate_whisper_preload_inflight: set[tuple[str, str]] = set()
 
 # H4: 添加独立 flush 线程，避免阻塞音频采集主循环
 _flush_thread: Optional[threading.Thread] = None
@@ -106,6 +105,7 @@ _commit_lock = threading.Lock()
 _knowledge_worker: Optional[BoundedTaskWorker] = None
 _asr_state = AssistAsrStateMachine(
     broadcast=lambda data: broadcast(data),
+    allow_answer=lambda: bool(getattr(get_config(), "auto_detect", True)),
     submit_answer_task=lambda task: submit_answer_task(task),
     begin_asr_turn=lambda: _begin_asr_turn(),
     append_late_constraint_tail=lambda text, source, now_mono, anchor: _append_late_asr_constraint_tail(
@@ -986,11 +986,33 @@ def _is_valid_device_id(value: Any) -> bool:
         return False
 
 
+def get_capture_config():
+    """Use the session's ASR selection and credentials until that session ends."""
+    return _interviewer_config if _interviewer_config is not None else get_config()
+
+
+def candidate_capture_provider() -> str:
+    cfg = _interviewer_config
+    return cfg.candidate_stt_provider if cfg is not None and getattr(cfg, "candidate_asr_enabled", False) else ""
+
+
+def discard_pending_auto_answer() -> None:
+    with _asr_state_lock:
+        _asr_state.reset_pending_group()
+
+
+def report_stt_error(provider: str, role: Literal["interviewer", "candidate"], message: str) -> None:
+    _elog.warning("ASR failed provider=%s role=%s: %s", provider, role, message)
+    broadcast({"type": "stt_error", "provider": provider, "role": role, "message": message})
+
+
 def validate_single_mic_start(device_id: int, cfg) -> None:
     if bool(getattr(cfg, "written_exam_mode", False)):
         raise SingleMicConflict("单人测试适用于语音面试")
     if not bool(getattr(cfg, "candidate_asr_enabled", False)):
-        raise SingleMicConflict("请先在语音设置中开启「我的回答记录（麦克风）」")
+        raise SingleMicConflict("请先在实时辅助中开启「我的回答」")
+    if detail := stt_configuration_error(cfg, cfg.candidate_stt_provider):
+        raise SingleMicConflict(detail)
     if not _is_valid_device_id(device_id) or _device_is_loopback(device_id):
         raise SingleMicConflict("请选择麦克风作为单人测试的音频输入")
     if (getattr(cfg, "stt_provider", None) == MMPG_STT_PROVIDER
@@ -1055,6 +1077,8 @@ def drain_single_mic_worker(single_mic: SingleMicSession, operation: RoleSwitch,
 
 def _start_candidate_capture(device_id: int, cfg, *, single_mic: SingleMicSession | None = None) -> None:
     global _candidate_thread
+    if detail := stt_configuration_error(cfg, cfg.candidate_stt_provider):
+        raise STTError(detail)
     if getattr(cfg, "candidate_stt_provider", None) == MMPG_STT_PROVIDER:
         # The independent RTC publisher owns this capture once its transport is ready.
         return
@@ -1065,10 +1089,10 @@ def _start_candidate_capture(device_id: int, cfg, *, single_mic: SingleMicSessio
             mic_compatibility_mode=bool(getattr(cfg, "candidate_mic_compatibility_mode", True)),
         )
     if not _candidate_thread or not _candidate_thread.is_alive():
-        args = (get_session().transcript_epoch,)
-        if single_mic is not None:
-            args += (single_mic, cfg)
-        _candidate_thread = threading.Thread(target=_candidate_worker, args=args, daemon=True)
+        _candidate_thread = threading.Thread(
+            target=_candidate_worker,
+            args=(get_session().transcript_epoch, single_mic, cfg), daemon=True,
+        )
         _candidate_thread.start()
 
 
@@ -1082,6 +1106,9 @@ def start_nonblocking(
 ):
     global _interview_thread, _interviewer_streaming, _interviewer_config
     start_cfg = config_snapshot if config_snapshot is not None else get_config()
+    if device_id is not None:
+        if detail := stt_configuration_error(start_cfg, start_cfg.stt_provider):
+            raise STTError(detail)
     single_mic = None
     if single_mic_id is not None:
         validate_single_mic_start(device_id, start_cfg)
@@ -1129,14 +1156,14 @@ def start_nonblocking(
         _ilog.info("INTERVIEW_START no_device (written_exam_mode)")
 
     _interviewer_streaming = stream_audio is not None and device_id is not None
-    _interviewer_config = start_cfg if device_id is not None and not _interviewer_streaming else None
+    _interviewer_config = copy.deepcopy(start_cfg) if device_id is not None else None
     with _asr_state_lock, conversation_lock:
         session.begin_transcript_capture()
         session.single_mic = single_mic
         session.is_recording = True
         session.is_paused = False
 
-    recording = {"type": "recording", "value": True}
+    recording = {"type": "recording", "value": True, "candidate_capture_provider": candidate_capture_provider()}
     if _interviewer_streaming:
         recording["interviewer_streaming"] = True
     broadcast(recording)
@@ -1145,7 +1172,7 @@ def start_nonblocking(
     if device_id is not None and not _interviewer_streaming:
         _start_interview_worker_thread_if_needed()
 
-    cfg = start_cfg if single_mic is not None else get_config()
+    cfg = get_capture_config()
     if (
         device_id is not None
         and candidate_mic_device_id is not None
@@ -1263,8 +1290,10 @@ def stop_interview_loop():
 
     if not _interviewer_streaming:
         try:
-            _try_flush_asr_merge_buffer(get_config(), session, time.monotonic(), True)
-            _try_flush_asr_question_group(get_config(), session, time.monotonic(), True)
+            cfg = get_capture_config()
+            now = time.monotonic()
+            _try_flush_asr_merge_buffer(cfg, session, now, True)
+            _try_flush_asr_question_group(cfg, session, now, True)
         except Exception:
             _elog.debug("final ASR flush during stop skipped", exc_info=True)
     _interviewer_streaming = False
@@ -1291,7 +1320,7 @@ def stop_interview_loop():
             session.transcription_history = session.transcription_history[-30:]
         if hasattr(session, "candidate_transcription_history") and len(session.candidate_transcription_history) > 30:
             session.candidate_transcription_history = session.candidate_transcription_history[-30:]
-    broadcast({"type": "recording", "value": False})
+    broadcast({"type": "recording", "value": False, "candidate_capture_provider": ""})
     broadcast({"type": "paused", "value": False})
     if single_mic is not None:
         broadcast_single_mic(None)
@@ -1321,8 +1350,18 @@ def unpause_interview(
     *,
     stream_audio: Optional[Callable[[np.ndarray], None]] = None,
 ):
+    global _interviewer_config
     session = get_session()
-    cfg = get_config()
+    cfg = get_capture_config()
+    if (
+        _interviewer_config is not None
+        and getattr(cfg, "candidate_asr_enabled", False)
+        and cfg.candidate_stt_provider == MMPG_STT_PROVIDER
+        and cfg.mmpg.token_mode == "manual"
+    ):
+        refreshed_mmpg = refresh_manual_rtc_token(cfg.mmpg, get_config().mmpg)
+        if refreshed_mmpg is not cfg.mmpg:
+            cfg = _interviewer_config = cfg.model_copy(update={"mmpg": refreshed_mmpg})
     single_mic = session.single_mic
     if single_mic is not None:
         validate_single_mic_resume(single_mic, cfg)
@@ -1445,7 +1484,7 @@ def is_streaming_interview() -> bool:
 
 
 def publish_streaming_asr_turn(
-    text: str, *, trace: str, started_at: float, question_group: str, transcript_epoch: int | None,
+    text: str, *, trace: str, started_at: float, question_group: str | None, transcript_epoch: int | None,
 ) -> str | None:
     session = get_session()
     with conversation_lock:
@@ -1453,7 +1492,7 @@ def publish_streaming_asr_turn(
             return None
         anchor = session.record_transcript(
             "interviewer", text, started_at=started_at, utterance_key=trace, epoch=transcript_epoch,
-            question_group=question_group if is_transcript_question(get_config(), text) else None,
+            question_group=question_group if is_transcript_question(get_capture_config(), text) else None,
         )
         if not anchor:
             return None
@@ -1469,7 +1508,7 @@ def submit_mmpg_question(request, *, transcript_epoch: int | None = None) -> boo
         if (not is_streaming_interview() or session.is_paused or not request.transcript_anchor
                 or transcript_epoch != session.transcript_epoch):
             return False
-        cfg = get_config()
+        cfg = get_capture_config()
         if is_transcript_question(cfg, request.text):
             session.group_transcript_question(request.transcript_anchors, split_after_reply=True)
         outcome = _asr_state.submit_final_question(cfg, session, request.text, trace, request)
@@ -1498,6 +1537,7 @@ def _flush_worker():
 
 
 def _interviewer_asr_worker(runtime: _InterviewerRuntime, session, cfg) -> None:
+    last_error = ""
     while True:
         if runtime.drain_event.is_set() and _interviewer_segment_backlog(runtime) == 0:
             break
@@ -1506,26 +1546,31 @@ def _interviewer_asr_worker(runtime: _InterviewerRuntime, session, cfg) -> None:
         except queue.Empty:
             continue
         try:
+            if session.transcript_epoch != runtime.transcript_epoch:
+                continue
             queue_delay_ms = max(0.0, (time.monotonic() - segment.ended_mono) * 1000.0)
             broadcast({"type": "transcribing", "value": True})
             t0 = time.monotonic()
-            current_cfg = get_config()
-            text = transcribe_with_fallback(
+            provider = cfg.stt_provider
+            text = transcribe_segment(
                 segment.audio,
                 segment.sample_rate,
-                position=current_cfg.position,
-                language=current_cfg.language,
-                provider=getattr(cfg, "stt_provider", "whisper"),
-                whisper_model=getattr(cfg, "whisper_model", None),
-                whisper_language=getattr(cfg, "whisper_language", None),
-                scope="interviewer",
-                fallback_on_empty_remote=True,
+                position=cfg.position,
+                language=cfg.language,
+                provider=provider,
+                config_snapshot=cfg,
+                is_current=lambda: session.transcript_epoch == runtime.transcript_epoch,
             )
+            if session.transcript_epoch != runtime.transcript_epoch:
+                continue
+            if last_error:
+                last_error = ""
+                broadcast({"type": "stt_status", "loaded": True, "loading": False, "provider": provider})
             text = postprocess_interview_transcription(text)
             stt_ms = (time.monotonic() - t0) * 1000
             pub = transcription_for_publish(
                 text,
-                getattr(current_cfg, "transcription_min_sig_chars", 2),
+                getattr(cfg, "transcription_min_sig_chars", 2),
             )
             captured = pub or transcription_for_publish(text, 1)
             _ilog.info(
@@ -1541,17 +1586,23 @@ def _interviewer_asr_worker(runtime: _InterviewerRuntime, session, cfg) -> None:
                 if pub:
                     _ilog.info("ASR publish=%r", pub[:120])
                 _append_transcription_fragment(
-                    current_cfg, session, captured, time.monotonic(), False, started_at=segment.started_mono,
+                    cfg, session, captured, time.monotonic(), False, started_at=segment.started_mono,
                     transcript_key=segment.transcript_key, transcript_epoch=runtime.transcript_epoch,
                     publish=bool(pub),
                 )
+        except STTError as error:
+            runtime.segment_failures += 1
+            if session.transcript_epoch == runtime.transcript_epoch and last_error != str(error):
+                last_error = str(error)
+                report_stt_error(cfg.stt_provider, "interviewer", last_error)
         except Exception as e:
             runtime.segment_failures += 1
             _elog.error("interviewer ASR segment error: %s", e, exc_info=True)
         finally:
             session.discard_unfinished_transcript(segment.transcript_reservation)
             runtime.segment_queue.task_done()
-            broadcast({"type": "transcribing", "value": False})
+            if session.transcript_epoch == runtime.transcript_epoch:
+                broadcast({"type": "transcribing", "value": False})
 
 
 def _flush_interviewer_tail(runtime, vad, cfg, session, reason):
@@ -1573,31 +1624,13 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
     if transcript_epoch != session.transcript_epoch:
         return
     cfg = config_snapshot if config_snapshot is not None else get_config()
-    provider = getattr(cfg, "stt_provider", None)
-    engine = (get_stt_engine() if config_snapshot is None or not provider else get_stt_engine(
-        provider=provider, model_size=getattr(cfg, "whisper_model", None),
-        language=getattr(cfg, "whisper_language", None),
-    ))
     # 每次开新会话都用全新 runtime：上次异常退出遗留的 last_chunk_mono 会把
     # 跨会话的间隔当成音频空洞，打出 gap_ms=几千万 的假警报（日志已多次出现）。
     runtime = _new_interviewer_runtime()
     runtime.transcript_epoch = transcript_epoch
     _set_interviewer_runtime(runtime)
 
-    if not engine.is_loaded:
-        broadcast({"type": "stt_status", "loaded": False, "loading": True, "provider": getattr(cfg, "stt_provider", "whisper")})
-        try:
-            engine.load_model()
-        except Exception as e:
-            with conversation_lock:
-                if session.transcript_epoch == transcript_epoch:
-                    session.is_recording = False
-                    broadcast({"type": "error", "message": f"Whisper \u6a21\u578b\u52a0\u8f7d\u5931\u8d25: {e}"})
-                    broadcast({"type": "recording", "value": False})
-            return
-    if transcript_epoch != session.transcript_epoch:
-        return
-    broadcast({"type": "stt_status", "loaded": bool(engine.is_loaded), "loading": False, "provider": getattr(cfg, "stt_provider", "whisper")})
+    broadcast({"type": "stt_status", "loaded": True, "loading": False, "provider": cfg.stt_provider})
 
     def new_vad():
         return VADBuffer(
@@ -1661,7 +1694,7 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
                     pause_flushed = True
                 now = time.monotonic()
                 try:
-                    _flush_queue.put_nowait((get_config(), session, now, transcript_epoch))
+                    _flush_queue.put_nowait((cfg, session, now, transcript_epoch))
                 except queue.Full:
                     pass
                 time.sleep(0.1)
@@ -1684,7 +1717,7 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
             _refresh_interviewer_raw_drop_count(runtime, audio_input)
             # H4: 将 flush 逻辑移到独立线程，避免阻塞音频采集
             try:
-                _flush_queue.put_nowait((get_config(), session, now, transcript_epoch))
+                _flush_queue.put_nowait((cfg, session, now, transcript_epoch))
             except queue.Full:
                 pass  # 如果队列满，跳过本次 flush
 
@@ -1777,91 +1810,6 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
         _refresh_interviewer_raw_drop_count(runtime, audio_input)
 
 
-def _candidate_provider_config(cfg) -> tuple[str, str, str, bool]:
-    provider = (getattr(cfg, "candidate_stt_provider", "whisper") or "whisper").strip()
-    allow_remote = bool(getattr(cfg, "candidate_remote_stt_enabled", False))
-    if provider in ("doubao", "generic") and not allow_remote:
-        provider = "whisper"
-    # 本地引擎互斥：候选人链路跟随主链路的本地引擎，避免 funasr 与 whisper
-    # 两个模型同时驻留内存（合计 ~1GB+）把 CPU 机器拖卡。
-    primary = (getattr(cfg, "stt_provider", "whisper") or "whisper").strip()
-    if primary in LOCAL_STT_PROVIDERS and provider in LOCAL_STT_PROVIDERS:
-        provider = primary
-    model = (getattr(cfg, "candidate_whisper_model", "") or getattr(cfg, "whisper_model", "base") or "base").strip()
-    candidate_lang_raw = (getattr(cfg, "candidate_whisper_language", "") or "").strip()
-    language = candidate_lang_raw or (getattr(cfg, "whisper_language", "auto") or "auto").strip() or "auto"
-    return provider, model, language, allow_remote
-
-
-def _candidate_streaming_config(cfg, provider: str) -> tuple[bool, int]:
-    enabled = bool(getattr(cfg, "candidate_streaming_asr_enabled", True)) and provider in LOCAL_STT_PROVIDERS
-    interval_ms = max(800, min(5000, int(getattr(cfg, "candidate_streaming_asr_interval_ms", 1500) or 1500)))
-    return enabled, interval_ms
-
-
-def _preload_candidate_whisper_async(provider: str, model: str, language: str) -> None:
-    if provider != "whisper":
-        return
-    preload_key = (model or "base", language or "auto")
-    with _candidate_whisper_preload_lock:
-        if preload_key in _candidate_whisper_preload_inflight:
-            return
-        _candidate_whisper_preload_inflight.add(preload_key)
-
-    def _load() -> None:
-        try:
-            try:
-                engine = get_stt_engine(
-                    provider="whisper",
-                    model_size=model,
-                    language=language,
-                )
-            except TypeError:
-                engine = get_stt_engine(model_size=model, language=language)
-            if not engine.is_loaded:
-                engine.load_model()
-            broadcast(
-                {
-                    "type": "candidate_asr_status",
-                    "loaded": bool(engine.is_loaded),
-                    "loading": False,
-                    "provider": "whisper",
-                }
-            )
-        except Exception as exc:
-            _elog.warning(
-                "CANDIDATE_ASR_PRELOAD_FAIL model=%s language=%s err=%s",
-                model,
-                language,
-                exc,
-            )
-            broadcast(
-                {
-                    "type": "candidate_asr_status",
-                    "loaded": False,
-                    "loading": False,
-                    "provider": "whisper",
-                    "error": str(exc)[:160],
-                }
-            )
-        finally:
-            with _candidate_whisper_preload_lock:
-                _candidate_whisper_preload_inflight.discard(preload_key)
-
-    threading.Thread(target=_load, daemon=True, name="candidate-whisper-preload").start()
-
-
-def preload_candidate_asr_if_enabled() -> None:
-    cfg = get_config()
-    if not bool(getattr(cfg, "candidate_asr_enabled", False)):
-        return
-    provider, model, language, _allow_remote = _candidate_provider_config(cfg)
-    if provider != "whisper":
-        return
-    broadcast({"type": "candidate_asr_status", "loaded": False, "loading": True, "provider": "whisper"})
-    _preload_candidate_whisper_async(provider, model, language)
-
-
 def _publish_candidate_transcription(
     session,
     text: str,
@@ -1934,29 +1882,21 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
     if transcript_epoch is None:
         transcript_epoch = session.transcript_epoch
     audio_input = single_mic.candidate_input if single_mic is not None else _candidate_audio_capture
-    cfg = config_snapshot or get_config()
-    provider, model, language, allow_remote = _candidate_provider_config(cfg)
-    if provider == MMPG_STT_PROVIDER:
-        _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=True)
+    cfg = config_snapshot if config_snapshot is not None else get_capture_config()
+    provider = cfg.candidate_stt_provider
+    if provider not in SEGMENT_STT_PROVIDERS:
         return
-    streaming_enabled, streaming_interval_ms = _candidate_streaming_config(cfg, provider)
-    _ilog.info(
-        "CANDIDATE_ASR_WORKER_START provider=%s model=%s language=%s remote=%s streaming=%s interval_ms=%d",
-        provider,
-        model,
-        language,
-        allow_remote,
-        streaming_enabled,
-        streaming_interval_ms,
-    )
-    broadcast({"type": "candidate_asr_status", "loaded": False, "loading": provider == "whisper", "provider": provider})
-    _preload_candidate_whisper_async(provider, model, language)
+    _ilog.info("CANDIDATE_ASR_WORKER_START provider=%s", provider)
+    broadcast({"type": "candidate_asr_status", "loaded": True, "loading": False, "provider": provider})
+
+    def is_current():
+        return session.transcript_epoch == transcript_epoch
 
     def new_vad():
         return VADBuffer(
             sample_rate=AudioCapture.SAMPLE_RATE,
-            silence_threshold=getattr(cfg, "silence_threshold", 0.01),
-            silence_duration=getattr(cfg, "silence_duration", 1.2),
+            silence_threshold=cfg.silence_threshold,
+            silence_duration=cfg.silence_duration,
             min_speech_duration=0.3,
         )
 
@@ -1964,81 +1904,57 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
     current_segment_id = ""
     segment_started_at = 0.0
     segment_qa_id = ""
-    last_partial_anchor = None
-    last_partial_at = 0.0
-    last_partial_text = ""
+    candidate_final_failed = False
+    last_error = ""
 
-    def _finalize_candidate_audio(final_audio, log_kind: str) -> bool:
-        nonlocal current_segment_id, last_partial_anchor, last_partial_text, last_partial_at
-        local_cfg = config_snapshot or get_config()
-        final_provider, final_model, final_language, final_allow_remote = _candidate_provider_config(local_cfg)
+    def finalize_candidate_audio(final_audio, log_kind: str) -> bool:
+        nonlocal current_segment_id, last_error
         try:
-            if (final_provider == MMPG_STT_PROVIDER or final_audio is None
-                    or len(final_audio) <= AudioCapture.SAMPLE_RATE * 0.3):
+            if final_audio is None or len(final_audio) <= AudioCapture.SAMPLE_RATE * 0.3:
                 return True
             with conversation_lock:
-                if session.transcript_epoch != transcript_epoch:
+                if not is_current():
                     return False
                 session.mark_candidate_asr_busy(segment_qa_id)
             t0 = time.monotonic()
-            text = transcribe_with_fallback(
+            text = transcribe_segment(
                 final_audio,
                 AudioCapture.SAMPLE_RATE,
-                position=local_cfg.position,
-                language=final_language,
-                provider=final_provider,
-                whisper_model=final_model,
-                whisper_language=final_language,
-                allow_remote=final_allow_remote,
-                status_event_type="candidate_asr_status",
+                position=cfg.position,
+                language=cfg.language,
+                provider=provider,
                 scope="candidate",
-                whisper_lock_timeout_sec=0.0,
+                config_snapshot=cfg,
+                is_current=is_current,
             )
-            pub = transcription_for_publish(
-                postprocess_interview_transcription(text),
-                1,
-            )
+            if not is_current():
+                return False
+            if last_error:
+                last_error = ""
+                broadcast({"type": "candidate_asr_status", "loaded": True, "loading": False, "provider": provider})
+            pub = transcription_for_publish(postprocess_interview_transcription(text), 1)
             if pub:
-                replaced_partial = bool(current_segment_id and last_partial_text)
                 _ilog.info(
-                    "CANDIDATE_ASR_%s segment=%s qa_id=%s provider=%s raw=%.1fs stt=%.0fms chars=%d replaced_partial=%s text=%r",
-                    log_kind,
-                    current_segment_id,
-                    segment_qa_id,
-                    final_provider,
-                    len(final_audio) / AudioCapture.SAMPLE_RATE,
-                    (time.monotonic() - t0) * 1000,
-                    len(pub),
-                    replaced_partial,
-                    pub[:120],
+                    "CANDIDATE_ASR_%s segment=%s qa_id=%s provider=%s raw=%.1fs stt=%.0fms chars=%d",
+                    log_kind, current_segment_id, segment_qa_id, provider,
+                    len(final_audio) / AudioCapture.SAMPLE_RATE, (time.monotonic() - t0) * 1000, len(pub),
                 )
                 _publish_candidate_transcription(
-                    session,
-                    pub,
-                    final_provider,
-                    qa_id=segment_qa_id,
-                    segment_id=current_segment_id,
-                    is_final=True,
-                    started_at=segment_started_at,
+                    session, pub, provider, qa_id=segment_qa_id,
+                    segment_id=current_segment_id, started_at=segment_started_at,
                     transcript_epoch=transcript_epoch,
                 )
-                broadcast({"type": "candidate_asr_status", "loaded": True, "loading": False, "provider": final_provider})
             return True
-        except Exception as e:
-            _elog.error("Candidate ASR transcribe error: %s", e, exc_info=True)
-            broadcast({"type": "candidate_asr_status", "loaded": False, "loading": False, "provider": final_provider, "error": str(e)[:160]})
+        except STTError as error:
+            if is_current() and last_error != str(error):
+                last_error = str(error)
+                report_stt_error(provider, "candidate", last_error)
             return False
         finally:
             with conversation_lock:
-                session.discard_unfinished_transcript(last_partial_anchor)
-                if session.transcript_epoch == transcript_epoch:
+                if is_current():
                     session.mark_candidate_asr_idle()
             current_segment_id = ""
-            last_partial_anchor = None
-            last_partial_text = ""
-            last_partial_at = 0.0
-
-    candidate_final_failed = False
 
     def feed_candidate_chunks(chunks):
         nonlocal current_segment_id, segment_qa_id, segment_started_at, candidate_final_failed
@@ -2050,37 +1966,34 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
                 pending = getattr(vad, "has_pending_audio", False)
                 if not current_segment_id and (pending or flushed is not None):
                     with conversation_lock:
-                        if session.transcript_epoch != transcript_epoch:
+                        if not is_current():
                             return False
                         segment_qa_id = session.current_candidate_qa_id
                     current_segment_id = f"cand-{uuid4().hex}"
                     segment_started_at = chunk_started_at
                     _ilog.info("CANDIDATE_ASR_SEGMENT_START segment=%s qa_id=%s", current_segment_id, segment_qa_id)
                 if flushed is not None:
-                    if not _finalize_candidate_audio(flushed, "FINAL"):
+                    if not finalize_candidate_audio(flushed, "FINAL"):
                         candidate_final_failed = True
                 elif not pending and current_segment_id:
-                    _finalize_candidate_audio(None, "EMPTY")
+                    finalize_candidate_audio(None, "EMPTY")
                 chunk_started_at += len(vad_chunk) / sample_rate
         return True
 
     def drain_candidate_input():
-        while session.transcript_epoch == transcript_epoch:
+        while is_current():
             chunks = audio_input.drain_audio_chunks(timeout=0.0, max_chunks=6)
             if not chunks or not feed_candidate_chunks(chunks):
                 break
 
     try:
-        while not _stop_event.is_set() and session.transcript_epoch == transcript_epoch:
-            cfg = config_snapshot or get_config()
-            if getattr(cfg, "candidate_stt_provider", None) == MMPG_STT_PROVIDER:
-                break
+        while not _stop_event.is_set() and is_current():
             if _pause_event.is_set():
                 if _candidate_flush_event.is_set():
                     _candidate_flush_event.clear()
                     if single_mic is not None:
                         drain_candidate_input()
-                    _finalize_candidate_audio(vad.flush(), "PAUSE_FINAL")
+                    finalize_candidate_audio(vad.flush(), "PAUSE_FINAL")
                     if single_mic is not None:
                         vad = new_vad()
                         candidate_final_failed = False
@@ -2089,114 +2002,34 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
             if single_mic is not None:
                 operation = audio_input.take_barrier()
                 if operation is not None:
-                    success = _finalize_candidate_audio(vad.flush(), "ROLE_SWITCH")
+                    success = finalize_candidate_audio(vad.flush(), "ROLE_SWITCH")
                     vad = new_vad()
                     operation.complete(success and not candidate_final_failed)
                     candidate_final_failed = False
             chunks = audio_input.drain_audio_chunks(timeout=0.1, max_chunks=6)
             if not chunks:
-                time.sleep(0.05)
                 continue
-
-            if not bool(getattr(cfg, "candidate_asr_enabled", False)):
-                vad.flush()
-                _finalize_candidate_audio(None, "DISABLED")
-                continue
-
             if not feed_candidate_chunks(chunks):
                 return
             if getattr(vad, "has_pending_audio", False):
                 with conversation_lock:
-                    if session.transcript_epoch != transcript_epoch:
+                    if not is_current():
                         return
                     session.mark_candidate_asr_busy(segment_qa_id)
-                provider, model, language, allow_remote = _candidate_provider_config(cfg)
-                streaming_enabled, streaming_interval_ms = _candidate_streaming_config(cfg, provider)
-                now_mono = time.monotonic()
-                pending_audio = vad.pending_audio() if hasattr(vad, "pending_audio") else None
-                if (
-                    streaming_enabled
-                    and pending_audio is not None
-                    and len(pending_audio) >= AudioCapture.SAMPLE_RATE * 1.0
-                    and now_mono - last_partial_at >= streaming_interval_ms / 1000.0
-                ):
-                    last_partial_at = now_mono
-                    try:
-                        partial_t0 = time.monotonic()
-                        partial_text = transcribe_with_fallback(
-                            pending_audio,
-                            AudioCapture.SAMPLE_RATE,
-                            position=cfg.position,
-                            language=language,
-                            provider=provider,
-                            whisper_model=model,
-                            whisper_language=language,
-                            allow_remote=False,
-                            status_event_type="candidate_asr_status",
-                            scope="candidate",
-                            whisper_lock_timeout_sec=0.0,
-                            whisper_require_loaded=True,
-                        )
-                        partial_pub = transcription_for_publish(
-                            postprocess_interview_transcription(partial_text),
-                            1,
-                        )
-                        if partial_pub and partial_pub != last_partial_text:
-                            last_partial_text = partial_pub
-                            _ilog.info(
-                                "CANDIDATE_ASR_PARTIAL segment=%s qa_id=%s provider=%s raw=%.1fs stt=%.0fms chars=%d text=%r",
-                                current_segment_id,
-                                segment_qa_id,
-                                provider,
-                                len(pending_audio) / AudioCapture.SAMPLE_RATE,
-                                (time.monotonic() - partial_t0) * 1000,
-                                len(partial_pub),
-                                partial_pub[:120],
-                            )
-                            partial_anchor = _publish_candidate_transcription(
-                                session,
-                                partial_pub,
-                                provider,
-                                qa_id=segment_qa_id,
-                                segment_id=current_segment_id,
-                                is_final=False,
-                                started_at=segment_started_at,
-                                transcript_epoch=transcript_epoch,
-                            )
-                            if partial_anchor:
-                                last_partial_anchor = partial_anchor
-                        elif partial_pub:
-                            _ilog.debug(
-                                "CANDIDATE_ASR_PARTIAL_DUP segment=%s qa_id=%s chars=%d",
-                                current_segment_id,
-                                segment_qa_id,
-                                len(partial_pub),
-                            )
-                        else:
-                            _ilog.debug(
-                                "CANDIDATE_ASR_PARTIAL_EMPTY segment=%s qa_id=%s raw=%.1fs",
-                                current_segment_id,
-                                segment_qa_id,
-                                len(pending_audio) / AudioCapture.SAMPLE_RATE,
-                            )
-                    except Exception as exc:
-                        _elog.debug("Candidate streaming ASR partial failed: %s", exc)
 
-        if single_mic is not None and session.transcript_epoch == transcript_epoch:
+        if single_mic is not None and is_current():
             drain_candidate_input()
-        remaining = vad.flush()
-        if remaining is not None:
-            _finalize_candidate_audio(remaining, "FLUSH_FINAL")
-    except Exception as e:
-        _elog.error("Candidate ASR worker crashed: %s", e, exc_info=True)
-        broadcast({"type": "candidate_asr_status", "loaded": False, "loading": False, "provider": provider, "error": str(e)[:160]})
+        finalize_candidate_audio(vad.flush(), "FLUSH_FINAL")
+    except Exception:
+        _elog.exception("Candidate ASR worker crashed")
+        if is_current():
+            report_stt_error(provider, "candidate", "我的回答转写中断，请检查麦克风和语音配置")
     finally:
-        session.discard_unfinished_transcript(last_partial_anchor)
-        try:
-            if single_mic is None and session.transcript_epoch == transcript_epoch:
+        if single_mic is None and is_current():
+            try:
                 _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=True)
-        except Exception:
-            _elog.error("candidate audio_capture.stop failed", exc_info=True)
+            except Exception:
+                _elog.exception("candidate audio_capture.stop failed")
 
 
 # ---------------------------------------------------------------------------

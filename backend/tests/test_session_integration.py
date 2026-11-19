@@ -189,7 +189,6 @@ def test_websocket_init_uses_session_snapshot(monkeypatch: pytest.MonkeyPatch):
         async def receive_text(self):
             raise ws_mod.WebSocketDisconnect()
 
-    monkeypatch.setattr(ws_mod, 'get_stt_engine', lambda: SimpleNamespace(is_loaded=True))
 
     asyncio.run(ws_mod.websocket_endpoint(FakeWS()))
 

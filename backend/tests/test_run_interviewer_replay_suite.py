@@ -74,7 +74,7 @@ def test_run_replay_suite_aggregates_scenario_results(monkeypatch, tmp_path):
     assert result["summary"]["answer_models"] == ["doubao2.1Pro", "lite-ark"]
 
 
-def test_run_replay_suite_can_temporarily_force_whisper_and_lite_ark(monkeypatch, tmp_path):
+def test_run_replay_suite_can_temporarily_select_generic_and_lite_ark(monkeypatch, tmp_path):
     scenario_ids = ["a"]
     monkeypatch.setattr(suite_script, "SCENARIOS", {key: {} for key in scenario_ids})
 
@@ -84,7 +84,6 @@ def test_run_replay_suite_can_temporarily_force_whisper_and_lite_ark(monkeypatch
     ]
     state = {
         "stt_provider": "doubao",
-        "whisper_preload": True,
         "active_model": 0,
         "max_parallel_answers": 2,
         "assist_stop_answer_wait_sec": 3.0,
@@ -149,22 +148,18 @@ def test_run_replay_suite_can_temporarily_force_whisper_and_lite_ark(monkeypatch
         repeats=1,
         scenario_ids=scenario_ids,
         isolate_answers=False,
-        stt_provider="whisper",
+        stt_provider="generic",
         answer_model_name="lite-ark",
         max_parallel_answers=3,
         answer_wait_sec=12.0,
     )
 
-    assert result["stt_provider"] == "whisper"
+    assert result["stt_provider"] == "generic"
     assert result["answer_model"] == "lite-ark"
     assert result["max_parallel_answers"] == 3
     assert result["isolate_answers"] is False
     assert replay_seen["isolate_answers"] is False
-    assert {
-        "stt_provider": "whisper",
-        "whisper_preload": False,
-        "assist_interviewer_asr_drain_timeout_sec": 12.0,
-    } in updates_seen
+    assert {"stt_provider": "generic"} in updates_seen
     assert {
         "active_model": 1,
         "max_parallel_answers": 3,

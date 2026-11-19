@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -22,7 +21,6 @@ from core.auth import (
 from core.config import get_config
 from core.env import env_int
 from core.logger import setup_logging, get_logger
-from services.stt import get_stt_engine
 from api.realtime import ws
 from api.realtime.mmpg import bind_mmpg_routes
 from api.assist import candidate_mmpg, mmpg_integration
@@ -87,8 +85,6 @@ async def lifespan(app: FastAPI):
     dispatch_task = asyncio.create_task(ws.ws_dispatcher())
     heartbeat_task = asyncio.create_task(ws.ws_heartbeat())
     assist.init_background_workers()
-    threading.Thread(target=_preload_stt, daemon=True).start()
-    assist.preload_candidate_asr_if_enabled()
     try:
         from services.storage.resume_history import restore_active_resume
         if restore_active_resume():
@@ -102,31 +98,6 @@ async def lifespan(app: FastAPI):
     assist.shutdown_background_workers()
     dispatch_task.cancel()
     heartbeat_task.cancel()
-
-
-def _preload_stt():
-    try:
-        cfg = get_config()
-        if cfg.stt_provider == mmpg_integration.PROVIDER:
-            ws.broadcast({"type": "stt_status", **mmpg_integration.stt_status()})
-            return
-        engine = get_stt_engine()
-        _log.info("STT preload start provider=%s", cfg.stt_provider)
-        is_remote = cfg.stt_provider in ("doubao", "generic")
-        if not is_remote:
-            ws.broadcast({"type": "stt_status", "loaded": False, "loading": True, "provider": cfg.stt_provider})
-        engine.load_model()
-        loaded = bool(engine.is_loaded) if not is_remote else True
-        _log.info("STT preload done provider=%s loaded=%s", cfg.stt_provider, loaded)
-        ws.broadcast({"type": "stt_status", "loaded": loaded, "loading": False, "provider": cfg.stt_provider})
-    except Exception as e:
-        _log.error("STT preload failed: %s", e, exc_info=True)
-        ws.broadcast({"type": "stt_status", "loaded": False, "loading": False, "provider": get_config().stt_provider, "error": str(e)})
-    try:
-        from services.stt.factory import preload_whisper_fallback
-        preload_whisper_fallback()
-    except Exception as e:
-        _log.debug("Whisper fallback preload skipped: %s", e)
 
 
 app = FastAPI(title="学习助手", lifespan=lifespan)

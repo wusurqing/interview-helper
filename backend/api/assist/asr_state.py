@@ -40,6 +40,7 @@ class AssistAsrStateMachine:
         logger,
         append_late_constraint_tail: Callable[[str, str, float, str | None], bool] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        allow_answer: Callable[[], bool] | None = None,
     ):
         self.broadcast = broadcast
         self.submit_answer_task = submit_answer_task
@@ -49,6 +50,7 @@ class AssistAsrStateMachine:
         )
         self.logger = logger
         self.clock = clock
+        self._allow_answer = allow_answer
         self.merge_parts: list[str] = []
         self.merge_mono_first: Optional[float] = None
         self.merge_mono_last: Optional[float] = None
@@ -66,6 +68,11 @@ class AssistAsrStateMachine:
     def reset_pending_group(self):
         self.pending_group = None
 
+    def _automatic_answers_enabled(self, cfg) -> bool:
+        if self._allow_answer is not None:
+            return self._allow_answer()
+        return cfg.auto_detect
+
     def accept_final_turn(self, cfg, session, text: str, mmpg_trace: str | None = None) -> str:
         """Publish a complete cloud turn and evaluate it without a local timer."""
         text = text.strip()
@@ -76,7 +83,7 @@ class AssistAsrStateMachine:
         return self.submit_final_question(cfg, session, text, mmpg_trace)
 
     def submit_final_question(self, cfg, session, text, mmpg_trace=None, request=None) -> str:
-        if not cfg.auto_detect:
+        if not self._automatic_answers_enabled(cfg):
             return "auto_answer_disabled"
         if not is_transcript_question(cfg, text):
             return "filtered"
@@ -97,6 +104,8 @@ class AssistAsrStateMachine:
         if group is None:
             return
         self.pending_group = None
+        if not self._automatic_answers_enabled(cfg):
+            return
         if not is_viable_asr_question_group(
             group.utterances,
             getattr(cfg, "transcription_min_sig_chars", 2),
@@ -135,6 +144,9 @@ class AssistAsrStateMachine:
         group = self.pending_group
         if group is None:
             return
+        if not self._automatic_answers_enabled(cfg):
+            self.reset_pending_group()
+            return
         confirm = _asr_confirm_window_sec(cfg)
         fast_confirm = _asr_fast_confirm_sec(cfg)
         max_wait = _asr_group_max_wait_sec(cfg)
@@ -155,6 +167,9 @@ class AssistAsrStateMachine:
         self, cfg, session, pub: str, source: str, now_mono: float,
         transcript_anchor: str | None = None, transcript_anchors: tuple[str, ...] = (),
     ) -> None:
+        if not self._automatic_answers_enabled(cfg):
+            self.reset_pending_group()
+            return
         kind, cleaned = classify_asr_question_candidate(
             pub,
             getattr(cfg, "transcription_min_sig_chars", 2),
@@ -215,7 +230,7 @@ class AssistAsrStateMachine:
             return
         session.add_transcription(pub)
         self.broadcast({"type": "transcription", "text": pub})
-        if cfg.auto_detect:
+        if self._automatic_answers_enabled(cfg):
             source = (
                 "conversation_loopback"
                 if session.capture_is_loopback
@@ -267,7 +282,7 @@ class AssistAsrStateMachine:
         if gap <= 0:
             session.add_transcription(pub)
             self.broadcast({"type": "transcription", "text": pub})
-            if cfg.auto_detect:
+            if self._automatic_answers_enabled(cfg):
                 source = (
                     "conversation_loopback"
                     if session.capture_is_loopback

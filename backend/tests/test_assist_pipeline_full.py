@@ -67,6 +67,9 @@ def _cfg():
         active_model=0,
         max_parallel_answers=2,
         written_exam_mode=False,
+        stt_provider="doubao",
+        candidate_stt_provider="doubao",
+        doubao_stt_api_key="test-asr",
         written_exam_think=False,
         screen_capture_region="left_half",
         kb_enabled=False,
@@ -97,7 +100,7 @@ def reset_pipeline_state(monkeypatch: pytest.MonkeyPatch):
     pipeline._pause_event.clear()
     pipeline._candidate_flush_event.clear()
     pipeline._flush_stop_event.clear()
-    pipeline._candidate_whisper_preload_inflight.clear()
+    monkeypatch.setattr(pipeline, "_interviewer_config", None)
     _DeferredThread.started = []
     _DeferredTimer.started = []
 
@@ -464,105 +467,6 @@ def test_late_asr_constraint_tail_updates_deferred_pending_task(monkeypatch: pyt
     ]
 
 
-def test_candidate_whisper_preload_runs_in_background(monkeypatch: pytest.MonkeyPatch):
-    broadcasts: list[dict] = []
-    calls = {"load": 0}
-
-    class _FakeWhisper:
-        @property
-        def is_loaded(self):
-            return calls["load"] > 0
-
-        def load_model(self):
-            calls["load"] += 1
-
-    def fake_get_stt_engine(**kwargs):
-        assert kwargs == {
-            "provider": "whisper",
-            "model_size": "base",
-            "language": "auto",
-        }
-        return _FakeWhisper()
-
-    monkeypatch.setattr(pipeline, "broadcast", broadcasts.append)
-    monkeypatch.setattr(pipeline, "get_stt_engine", fake_get_stt_engine)
-
-    pipeline._preload_candidate_whisper_async("whisper", "base", "auto")
-
-    assert len(_DeferredThread.started) == 1
-    _DeferredThread.started[0].run()
-
-    assert calls["load"] == 1
-    assert broadcasts[-1] == {
-        "type": "candidate_asr_status",
-        "loaded": True,
-        "loading": False,
-        "provider": "whisper",
-    }
-
-
-def test_candidate_whisper_preload_failure_only_reports_candidate_status(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    broadcasts: list[dict] = []
-    monkeypatch.setattr(pipeline, "broadcast", broadcasts.append)
-    monkeypatch.setattr(
-        pipeline,
-        "get_stt_engine",
-        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("candidate model bad")),
-    )
-
-    pipeline._preload_candidate_whisper_async("whisper", "base", "auto")
-    _DeferredThread.started[0].run()
-
-    assert broadcasts[-1]["type"] == "candidate_asr_status"
-    assert broadcasts[-1]["provider"] == "whisper"
-    assert broadcasts[-1]["loaded"] is False
-    assert "candidate model bad" in broadcasts[-1]["error"]
-
-
-def test_startup_preloads_candidate_whisper_when_enabled(monkeypatch: pytest.MonkeyPatch):
-    broadcasts: list[dict] = []
-    cfg = _cfg()
-    cfg.candidate_asr_enabled = True
-    cfg.candidate_stt_provider = "whisper"
-    cfg.candidate_whisper_model = "tiny"
-    cfg.candidate_whisper_language = "zh"
-
-    calls: list[tuple[str, str, str]] = []
-
-    monkeypatch.setattr(pipeline, "get_config", lambda: cfg)
-    monkeypatch.setattr(pipeline, "broadcast", broadcasts.append)
-    monkeypatch.setattr(
-        pipeline,
-        "_preload_candidate_whisper_async",
-        lambda provider, model, language: calls.append((provider, model, language)),
-    )
-
-    pipeline.preload_candidate_asr_if_enabled()
-
-    assert broadcasts == [{"type": "candidate_asr_status", "loaded": False, "loading": True, "provider": "whisper"}]
-    assert calls == [("whisper", "tiny", "zh")]
-
-
-def test_startup_candidate_preload_skips_when_disabled(monkeypatch: pytest.MonkeyPatch):
-    cfg = _cfg()
-    cfg.candidate_asr_enabled = False
-    cfg.candidate_stt_provider = "whisper"
-    calls: list[tuple[str, str, str]] = []
-
-    monkeypatch.setattr(pipeline, "get_config", lambda: cfg)
-    monkeypatch.setattr(
-        pipeline,
-        "_preload_candidate_whisper_async",
-        lambda provider, model, language: calls.append((provider, model, language)),
-    )
-
-    pipeline.preload_candidate_asr_if_enabled()
-
-    assert calls == []
-
-
 def test_stop_waits_for_worker_flush_before_review_archive(monkeypatch: pytest.MonkeyPatch):
     session = get_session()
     session.is_recording = True
@@ -592,24 +496,6 @@ def test_stop_waits_for_worker_flush_before_review_archive(monkeypatch: pytest.M
     pipeline.stop_interview_loop()
 
     assert archived_counts == [1]
-
-
-def test_candidate_whisper_preload_deduplicates_inflight_model(monkeypatch: pytest.MonkeyPatch):
-    class _LoadedWhisper:
-        is_loaded = True
-
-        def load_model(self):
-            raise AssertionError("already loaded")
-
-    monkeypatch.setattr(pipeline, "get_stt_engine", lambda **_kwargs: _LoadedWhisper())
-
-    pipeline._preload_candidate_whisper_async("whisper", "base", "auto")
-    pipeline._preload_candidate_whisper_async("whisper", "base", "auto")
-
-    assert len(_DeferredThread.started) == 1
-    assert ("base", "auto") in pipeline._candidate_whisper_preload_inflight
-    _DeferredThread.started[0].run()
-    assert pipeline._candidate_whisper_preload_inflight == set()
 
 
 def test_candidate_audio_start_failure_does_not_block_interviewer_chain(

@@ -2,7 +2,6 @@ import asyncio
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import numpy as np
@@ -19,7 +18,10 @@ SESSION_ID = "a" * 32
 
 @pytest.fixture
 def single_mic_client(monkeypatch):
-    settings = config.AppConfig(candidate_asr_enabled=True, assist_stop_answer_wait_sec=0)
+    settings = config.AppConfig(
+        stt_provider="doubao", doubao_stt_api_key="test-asr", candidate_stt_provider="doubao",
+        candidate_asr_enabled=True, assist_stop_answer_wait_sec=0,
+    )
     monkeypatch.setattr(config, "_config", settings)
     monkeypatch.setattr(pipeline, "_device_is_loopback", lambda device_id: device_id == 20000)
     capture = Mock(is_running=True, dropped_chunks_count=0)
@@ -29,13 +31,11 @@ def single_mic_client(monkeypatch):
     monkeypatch.setattr(pipeline, "_candidate_audio_capture", candidate_capture)
     review = Mock()
     monkeypatch.setattr(pipeline, "review_integration", review)
-    monkeypatch.setattr(pipeline, "get_stt_engine", lambda **_: SimpleNamespace(is_loaded=True))
-    monkeypatch.setattr(pipeline, "_preload_candidate_whisper_async", lambda *_: None)
 
     def transcribe(_samples, _rate, **kwargs):
         return "我把幂等表的代号定为紫河七号" if kwargs.get("scope") == "candidate" else "请介绍一下你的项目"
 
-    monkeypatch.setattr(pipeline, "transcribe_with_fallback", transcribe)
+    monkeypatch.setattr(pipeline, "transcribe_segment", transcribe)
     monkeypatch.setattr(pipeline, "_submit_candidate_knowledge_update", Mock(return_value=True))
 
     def turn(question, *_args, **_kwargs):
@@ -172,12 +172,9 @@ def test_single_mic_pause_identity_and_resume_configuration(single_mic_client):
     assert client.post("/api/pause", json={"single_mic_id": "stale"}).status_code == 409
     assert client.post("/api/pause", json={"single_mic_id": SESSION_ID}).status_code == 200
     settings.candidate_stt_provider = "doubao_mmpg"
-    assert client.post("/api/unpause", json={"single_mic_id": SESSION_ID}).status_code == 409
-    assert capture.start.call_count == 1
-
-    settings.candidate_stt_provider = "whisper"
     assert client.post("/api/unpause", json={"single_mic_id": SESSION_ID}).status_code == 200
     assert capture.start.call_count == 2
+    assert pipeline.candidate_capture_provider() == "doubao"
     assert client.get("/api/session").json()["single_mic"]["role"] == "interviewer"
 
 def test_single_mic_watchdog_pauses_and_releases_stalled_microphone(single_mic_client, monkeypatch):
