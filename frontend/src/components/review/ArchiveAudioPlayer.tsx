@@ -145,13 +145,13 @@ export default function ArchiveAudioPlayer({ clips, sessionId, turnId, label }: 
 
   if (!duration) return null
   return (
-    <div className="flex flex-wrap items-center gap-2 text-xs text-text-muted">
-      <button type="button" aria-label={`${playing ? '暂停' : '播放'}${label}录音`} className="rounded p-1.5 hover:bg-bg-hover"
+    <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-text-secondary">
+      <button type="button" aria-label={`${playing ? '暂停' : '播放'}${label}录音`} className="shrink-0 rounded p-1.5 hover:bg-bg-hover"
         onClick={() => playing ? pause() : void play(position >= duration ? 0 : position)}>
         {playing ? <Pause className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
       </button>
       <input type="range" min={0} max={duration} step={0.01} value={position} aria-label={`${label}播放进度`}
-        className="min-w-16 max-w-64 flex-1 accent-accent-blue" onPointerDown={(event) => {
+        className="min-w-8 max-w-64 flex-1 accent-accent-blue" onPointerDown={(event) => {
           resumeAfterDrag.current = playing
           if (playing) pause()
           event.currentTarget.setPointerCapture?.(event.pointerId)
@@ -164,8 +164,8 @@ export default function ArchiveAudioPlayer({ clips, sessionId, turnId, label }: 
           if (playing && !resumeAfterDrag.current && next < duration) void play(next)
           else if (playing) pause()
         }} />
-      <span className="tabular-nums">{clock(position)} / {clock(duration)}</span>
-      {error && <span role="alert" className="text-accent-red">{error}</span>}
+      <span className="shrink-0 whitespace-nowrap tabular-nums">{clock(position)} / {clock(duration)}</span>
+      {error && <span role="alert" className="basis-full break-words text-accent-red">{error}</span>}
     </div>
   )
 }

@@ -3,6 +3,45 @@ import { fileURLToPath } from 'node:url'
 
 import { installMocks } from './fixtures/setup.mjs'
 
+async function expectArchiveCardLayout(card, turn) {
+  const headings = ['面试官录音', '候选人回答', 'AI 参考答案']
+  const sections = headings.map((name) => card.locator('section').filter({
+    has: card.page().getByRole('heading', { name, exact: true }),
+  }))
+  const speakers = ['面试官', '候选人']
+  const rowBottoms = []
+  for (const [index, speaker] of speakers.entries()) {
+    const section = sections[index]
+    const labels = [
+      section.getByRole('heading', { name: headings[index], exact: true }),
+      section.getByRole('button', { name: `播放${speaker}录音` }),
+      section.getByRole('slider', { name: `${speaker}播放进度` }),
+      section.getByText(index === 0 ? '0:00 / 0:02' : '0:00 / 0:01', { exact: true }),
+    ]
+    const boxes = await Promise.all(labels.map((label) => label.boundingBox()))
+    const centerY = (box) => box.y + box.height / 2
+    for (let i = 1; i < boxes.length; i++) {
+      expect(boxes[i].x).toBeGreaterThan(boxes[i - 1].x + boxes[i - 1].width)
+      expect(Math.abs(centerY(boxes[i]) - centerY(boxes[0]))).toBeLessThan(6)
+    }
+    rowBottoms.push(Math.max(...boxes.map((box) => box.y + box.height)))
+  }
+
+  const transcript = await sections[1].getByText(turn.candidate_answer_text, { exact: true }).boundingBox()
+  const reference = await sections[2].getByText(turn.reference_answer_text, { exact: true }).boundingBox()
+  expect(transcript.y).toBeGreaterThan(rowBottoms[1])
+  expect(reference.y).toBeGreaterThan(transcript.y + transcript.height)
+
+  const bounds = await Promise.all(sections.map((section) => section.boundingBox()))
+  expect(bounds[1].y - (bounds[0].y + bounds[0].height)).toBeGreaterThanOrEqual(4)
+  expect(bounds[2].y - (bounds[1].y + bounds[1].height)).toBeGreaterThanOrEqual(4)
+  for (const section of sections) {
+    await expect(section).toHaveCSS('border-top-width', '1px')
+    const overflow = await section.evaluate((element) => element.scrollWidth - element.clientWidth)
+    expect(overflow).toBeLessThanOrEqual(1)
+  }
+}
+
 test('复盘按需读取原声与生成历史，并可跨片段拖动', async ({ context, page }) => {
   const sid = 126
   const tid = 207
@@ -65,6 +104,7 @@ test('复盘按需读取原声与生成历史，并可跨片段拖动', async ({
   expect(text.x).toBeGreaterThan(badge.x + badge.width)
   expect(Math.abs(text.y - badge.y)).toBeLessThan(6)
   expect((await firstHeader.getByText('8.4', { exact: true }).boundingBox()).x).toBeGreaterThan(text.x + text.width)
+  await expectArchiveCardLayout(firstCard, turn)
 
   await page.setViewportSize({ width: 390, height: 844 })
   await secondHeader.focus()
@@ -80,6 +120,7 @@ test('复盘按需读取原声与生成历史，并可跨片段拖动', async ({
   await page.locator('html').evaluate((element) => element.setAttribute('data-theme', 'vscode-dark-plus'))
   await expect(firstHeader.getByText('第 1 题')).toHaveCSS('background-color', 'rgb(42, 42, 68)')
   await expect(firstCard).toHaveCSS('background-color', 'rgb(26, 26, 36)')
+  await expectArchiveCardLayout(firstCard, turn)
 
   // Seek while paused to the start of the second segment, then decode/play it.
   const slider = page.getByRole('slider', { name: '面试官播放进度' })

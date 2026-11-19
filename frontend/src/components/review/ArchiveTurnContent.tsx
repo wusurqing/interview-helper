@@ -16,20 +16,29 @@ const audioFailure: Record<string, string> = {
   unmatched: '无法确认原声归属', samples_missing: '部分采样未收到', capture_gap: '设备采集检测到断点',
 }
 const milliseconds = (value?: number | null) => value == null ? '—' : `${Math.round(value)} ms`
+const recordingSectionClass = 'rounded-lg border border-bg-hover/80 bg-bg-tertiary/30 px-3 py-2'
 
-function ArchiveRecording({ turn, speaker, label }: { turn: ReviewTurn; speaker: ArchiveSpeaker; label: string }) {
+function ArchiveRecording({ turn, speaker, heading, label }: {
+  turn: ReviewTurn
+  speaker: ArchiveSpeaker
+  heading: string
+  label: string
+}) {
   const clips = turn.media?.[speaker]
   const coverage = turn.audio_status?.[speaker]
   const issue = archiveAudioIssue(coverage?.state)
   const reason = audioFailure[coverage?.reason ?? '']
   return (
     <>
-      {coverage?.state === 'approximate' && <p className="text-xs text-text-muted">本轮原声 · 近似定位</p>}
-      {issue && <p className="text-xs text-accent-amber">{label}{issue}{reason && ` · ${reason}`}</p>}
-      {clips?.length ? <ArchiveAudioPlayer clips={clips} sessionId={turn.session_id} turnId={turn.id} label={label} />
-        : !issue && (speaker === 'interviewer' || (turn.candidate_answer_text && !coverage))
-          ? <p className="text-xs text-text-muted">{coverage ? '无录音' : '历史记录未保存此录音'}</p>
-          : null}
+      <div className="flex min-w-0 items-start gap-3">
+        <h4 className="shrink-0 font-semibold leading-7">{heading}</h4>
+        {clips?.length ? <ArchiveAudioPlayer clips={clips} sessionId={turn.session_id} turnId={turn.id} label={label} />
+          : !issue && (speaker === 'interviewer' || (turn.candidate_answer_text && !coverage))
+            ? <p className="self-center text-xs text-text-muted">{coverage ? '无录音' : '历史记录未保存此录音'}</p>
+            : null}
+      </div>
+      {coverage?.state === 'approximate' && <p className="mt-1 text-xs text-text-muted">本轮原声 · 近似定位</p>}
+      {issue && <p className="mt-1 text-xs text-accent-amber">{label}{issue}{reason && ` · ${reason}`}</p>}
     </>
   )
 }
@@ -53,19 +62,17 @@ export function ArchiveTurnContent({ turn }: { turn: ReviewTurn }) {
   const model = turn.model_summary
   const timing = model ? `${model.name || model.model || '模型'} · 首字 ${milliseconds(model.first_token_ms)} · 完成 ${milliseconds(model.total_ms)}` : '模型和对话详情'
   return (
-    <div className="space-y-3 text-sm text-text-primary">
-      <section>
-        <h4 className="mb-1 text-xs font-semibold text-text-muted">面试官录音</h4>
-        <ArchiveRecording turn={turn} speaker="interviewer" label="面试官" />
+    <div className="space-y-2.5 text-sm text-text-primary">
+      <section className={recordingSectionClass}>
+        <ArchiveRecording turn={turn} speaker="interviewer" heading="面试官录音" label="面试官" />
       </section>
-      <section>
-        <h4 className="mb-1 text-xs font-semibold text-text-muted">候选人回答</h4>
-        <p className="whitespace-pre-wrap">{turn.candidate_answer_text || candidateStatus[turn.candidate_status ?? ''] || '未获取到回答'}</p>
-        <ArchiveRecording turn={turn} speaker="candidate" label="候选人" />
+      <section className={recordingSectionClass}>
+        <ArchiveRecording turn={turn} speaker="candidate" heading="候选人回答" label="候选人" />
+        <p className="mt-1.5 whitespace-pre-wrap break-words leading-relaxed">{turn.candidate_answer_text || candidateStatus[turn.candidate_status ?? ''] || '未获取到回答'}</p>
       </section>
-      <section>
+      <section className="rounded-lg border border-accent-blue/20 bg-accent-blue/5 px-3 py-2">
         <div className="mb-1 flex items-center gap-2">
-          <h4 className="text-xs font-semibold text-text-muted">AI 参考答案</h4>
+          <h4 className="font-semibold leading-7">AI 参考答案</h4>
           <button type="button" title={timing} aria-label="查看对话和 AI 调用详情" aria-expanded={open}
             className="rounded p-1 text-text-muted hover:bg-bg-hover" onClick={() => setOpen(!open)}><Info className="h-4 w-4" /></button>
         </div>
