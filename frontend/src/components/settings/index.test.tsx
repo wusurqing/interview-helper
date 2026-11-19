@@ -27,6 +27,7 @@ describe('SettingsDrawer', () => {
       settingsDrawerTab: 'realtime',
       config: {
         stt_provider: 'generic',
+        stt_configured: { generic: true, doubao: true },
         whisper_model: 'base',
         whisper_language: 'auto',
         whisper_preload: false,

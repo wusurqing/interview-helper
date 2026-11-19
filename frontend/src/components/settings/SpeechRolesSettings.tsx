@@ -79,17 +79,32 @@ function rolePatch(edits: Partial<RoleSettings>) {
   return body
 }
 
-function EngineSelect({ id, label, value, onChange }: {
+function isConfigured(configured: AppConfig['stt_configured'], provider: SpeechProvider | '') {
+  return provider !== '' && configured?.[provider] === true
+}
+
+function EngineSelect({ id, label, value, configured, onChange }: {
   id: string
   label: string
   value: SpeechProvider | ''
+  configured: AppConfig['stt_configured']
   onChange: (provider: SpeechProvider | '') => void
 }) {
+  const unavailable = value && !isConfigured(configured, value)
+    ? speechProviders.find((provider) => provider.id === value)
+    : undefined
   return (
     <Field label={label} htmlFor={id}>
-      <select id={id} className="input-field" value={value} onChange={(event) => onChange(speechProvider(event.target.value))}>
+      <select id={id} className="input-field" value={value} onChange={(event) => {
+        const nextValue = event.target.value
+        const provider = speechProvider(nextValue)
+        if (nextValue === '' || isConfigured(configured, provider)) onChange(provider)
+      }}>
         <option value="">待选择引擎</option>
-        {speechProviders.map((provider) => <option key={provider.id} value={provider.id}>{provider.label}</option>)}
+        {unavailable && <option value={unavailable.id} disabled hidden>{unavailable.label}（待配置）</option>}
+        {speechProviders.filter(({ id: provider }) => isConfigured(configured, provider)).map((provider) => (
+          <option key={provider.id} value={provider.id}>{provider.label}</option>
+        ))}
       </select>
     </Field>
   )
@@ -108,7 +123,7 @@ function EngineReadiness({ provider, configured, running, onOpen }: {
       ) : (
         <StatusBadge status={configured ? 'ok' : 'idle'} label={configured ? '引擎已配置' : provider ? '引擎待配置' : '待选择引擎'} />
       )}
-      {provider && !configured && onOpen && (
+      {!configured && onOpen && (
         <button type="button" onClick={onOpen} className="text-xs text-accent-blue">打开语音配置</button>
       )}
     </div>
@@ -124,9 +139,24 @@ function SpeechSettingsForm({ config, onOpenSpeechConfig }: { config: AppConfig;
   const platformInfo = useInterviewStore((state) => state.platformInfo)
   const interviewer = form.stt_provider
   const candidate = form.candidate_stt_provider
+  const configured = config.stt_configured
+  const candidateConfigured = isConfigured(configured, candidate)
   const interviewerSegmented = isSegmentedSpeech(interviewer)
   const candidateSegmented = form.candidate_asr_enabled && isSegmentedSpeech(candidate)
   const dualMmpgManual = interviewer === 'doubao_mmpg' && form.candidate_asr_enabled && candidate === 'doubao_mmpg' && config.mmpg?.token_mode === 'manual'
+
+  const saveRoles = () => draft.save((edits) => {
+    const latest = useInterviewStore.getState().config
+    const readiness = latest?.stt_configured
+    if (edits.stt_provider && !isConfigured(readiness, edits.stt_provider)) {
+      throw new Error('面试官 ASR 引擎尚未配置。')
+    }
+    const nextCandidate = edits.candidate_stt_provider ?? speechProvider(latest?.candidate_stt_provider)
+    if ((edits.candidate_stt_provider || edits.candidate_asr_enabled === true) && !isConfigured(readiness, nextCandidate)) {
+      throw new Error('我的回答 ASR 引擎尚未配置。')
+    }
+    return rolePatch(edits)
+  })
 
   const timing = (key: NumberKey, hint?: string) => {
     const field: NumberField = fields[key]
@@ -150,8 +180,8 @@ function SpeechSettingsForm({ config, onOpenSpeechConfig }: { config: AppConfig;
     <div className="space-y-4">
       <Section title="面试官 / 会议音频" icon={<MonitorSpeaker size={14} />} keywords="语音 ASR VAD 节奏 问句 确认 自动检测 自动答题 合并 等待 续说 MMPG">
         <fieldset disabled={draft.saving} className="space-y-3">
-          <EngineSelect id="interviewer-speech-provider" label="面试官 ASR 引擎" value={interviewer} onChange={(provider) => edit({ stt_provider: provider })} />
-          <EngineReadiness provider={interviewer} configured={Boolean(interviewer && config.stt_configured?.[interviewer])} running={isRecording && interviewerReady} onOpen={onOpenSpeechConfig} />
+          <EngineSelect id="interviewer-speech-provider" label="面试官 ASR 引擎" value={interviewer} configured={configured} onChange={(provider) => edit({ stt_provider: provider })} />
+          <EngineReadiness provider={interviewer} configured={isConfigured(configured, interviewer)} running={isRecording && interviewerReady} onOpen={onOpenSpeechConfig} />
           {platformInfo?.needs_virtual_device && <p className="whitespace-pre-line text-xs text-text-secondary">{platformInfo.instructions}</p>}
           <div className="flex items-center justify-between gap-2 text-xs text-text-secondary">
             <span>自动检测问题并生成答案</span>
@@ -176,14 +206,14 @@ function SpeechSettingsForm({ config, onOpenSpeechConfig }: { config: AppConfig;
 
       <Section title="我的回答" icon={<Mic size={14} />} keywords="候选人 口述 麦克风 ASR 语音 设备 兼容 上下文">
         <fieldset disabled={draft.saving} className="space-y-3">
-          <EngineSelect id="candidate-speech-provider" label="我的回答 ASR 引擎" value={candidate} onChange={(provider) => edit({
+          <EngineSelect id="candidate-speech-provider" label="我的回答 ASR 引擎" value={candidate} configured={configured} onChange={(provider) => edit({
             candidate_stt_provider: provider,
             ...(provider ? {} : { candidate_asr_enabled: false }),
           })} />
-          <EngineReadiness provider={candidate} configured={Boolean(candidate && config.stt_configured?.[candidate])} running={isRecording && candidateReady && form.candidate_asr_enabled} onOpen={onOpenSpeechConfig} />
+          <EngineReadiness provider={candidate} configured={candidateConfigured} running={isRecording && candidateReady && form.candidate_asr_enabled} onOpen={onOpenSpeechConfig} />
           <div className="flex items-center justify-between gap-2 text-xs text-text-secondary">
             <span>我的回答记录（麦克风）</span>
-            <ToggleSwitch disabled={!candidate} checked={form.candidate_asr_enabled} onChange={(candidate_asr_enabled) => edit({ candidate_asr_enabled })} labelOn="我的回答记录（麦克风）" />
+            <ToggleSwitch disabled={!candidateConfigured && !form.candidate_asr_enabled} checked={form.candidate_asr_enabled} onChange={(candidate_asr_enabled) => edit({ candidate_asr_enabled })} labelOn="我的回答记录（麦克风）" />
           </div>
           <p className="text-xs text-text-muted">启用后，在会场里选择独立的麦克风设备。口述转写用于复盘和实时语音上下文。</p>
           {dualMmpgManual && <p role="status" className="text-xs text-accent-amber">两路都选用豆包 MMPG 时，请在语音配置启用 RTC Token 自动签发。</p>}
@@ -229,7 +259,7 @@ function SpeechSettingsForm({ config, onOpenSpeechConfig }: { config: AppConfig;
           type="button"
           className="rounded-lg border border-accent-blue/30 bg-accent-blue/15 px-3 py-1.5 text-xs font-medium text-accent-blue disabled:opacity-50"
           disabled={!draft.dirty || draft.saving}
-          onClick={() => void draft.save(rolePatch)}
+          onClick={() => void saveRoles()}
         >
           {draft.saving ? '保存中…' : '保存语音使用设置'}
         </button>
