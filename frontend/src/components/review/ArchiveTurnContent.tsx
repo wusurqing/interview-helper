@@ -3,7 +3,7 @@ import { Info } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { api, getErrorMessage } from '@/lib/api'
 import ArchiveAudioPlayer from './ArchiveAudioPlayer'
-import type { ArchiveDetails, ReviewTurn } from './types'
+import { ARCHIVE_SPEAKERS, archiveAudioIssue, type ArchiveDetails, type ArchiveSpeaker, type ReviewTurn } from './types'
 
 const candidateStatus: Record<string, string> = {
   disabled: '未开启候选人采集', unanswered: '未回答', transcription_failed: '转写失败', unavailable: '候选人麦克风不可用',
@@ -11,7 +11,28 @@ const candidateStatus: Record<string, string> = {
 const answerStatus: Record<string, string> = {
   failed: 'AI 生成失败', cancelled: 'AI 生成已取消', timed_out: 'AI 生成超时', not_requested: '未触发 AI 回答', completed: '已生成',
 }
+const audioFailure: Record<string, string> = {
+  buffer_full: '音频缓存已达上限', queue_full: '编码队列已满', encode_failed: '音频编码失败',
+  unmatched: '无法确认原声归属', samples_missing: '部分采样未收到', capture_gap: '设备采集检测到断点',
+}
 const milliseconds = (value?: number | null) => value == null ? '—' : `${Math.round(value)} ms`
+
+function ArchiveRecording({ turn, speaker, label }: { turn: ReviewTurn; speaker: ArchiveSpeaker; label: string }) {
+  const clips = turn.media?.[speaker]
+  const coverage = turn.audio_status?.[speaker]
+  const issue = archiveAudioIssue(coverage?.state)
+  const reason = audioFailure[coverage?.reason ?? '']
+  return (
+    <>
+      {coverage?.state === 'approximate' && <p className="text-xs text-text-muted">本轮原声 · 近似定位</p>}
+      {issue && <p className="text-xs text-accent-amber">{label}{issue}{reason && ` · ${reason}`}</p>}
+      {clips?.length ? <ArchiveAudioPlayer clips={clips} sessionId={turn.session_id} turnId={turn.id} label={label} />
+        : !issue && (speaker === 'interviewer' || (turn.candidate_answer_text && !coverage))
+          ? <p className="text-xs text-text-muted">{coverage ? '无录音' : '历史记录未保存此录音'}</p>
+          : null}
+    </>
+  )
+}
 
 export function ArchiveTurnContent({ turn }: { turn: ReviewTurn }) {
   const [open, setOpen] = useState(false)
@@ -35,13 +56,12 @@ export function ArchiveTurnContent({ turn }: { turn: ReviewTurn }) {
     <div className="space-y-3 text-sm text-text-primary">
       <section>
         <h4 className="mb-1 text-xs font-semibold text-text-muted">面试官录音</h4>
-        {turn.media?.interviewer.length ? <ArchiveAudioPlayer clips={turn.media.interviewer} sessionId={turn.session_id} turnId={turn.id} label="面试官" />
-          : <p className="text-xs text-text-muted">无录音</p>}
+        <ArchiveRecording turn={turn} speaker="interviewer" label="面试官" />
       </section>
       <section>
         <h4 className="mb-1 text-xs font-semibold text-text-muted">候选人回答</h4>
         <p className="whitespace-pre-wrap">{turn.candidate_answer_text || candidateStatus[turn.candidate_status ?? ''] || '未获取到回答'}</p>
-        {!!turn.media?.candidate.length && <ArchiveAudioPlayer clips={turn.media.candidate} sessionId={turn.session_id} turnId={turn.id} label="候选人" />}
+        <ArchiveRecording turn={turn} speaker="candidate" label="候选人" />
       </section>
       <section>
         <div className="mb-1 flex items-center gap-2">
@@ -56,8 +76,12 @@ export function ArchiveTurnContent({ turn }: { turn: ReviewTurn }) {
         {error ? <p role="alert">{error}</p> : !details ? <p role="status">正在加载详情…</p> : <>
           <div>
             <h5 className="mb-2 font-semibold">对话顺序</h5>
+            {ARCHIVE_SPEAKERS.map(([speaker, label]) => details.transcription_timeouts?.includes(speaker) && (
+              <p key={speaker} className="mb-1 text-accent-amber">{label}末尾转写超时</p>
+            ))}
             {details.utterances.map((item) => <p key={item.id} className="mb-1 whitespace-pre-wrap">
-              <span className="text-text-muted">{item.speaker === 'interviewer' ? '面试官 · ' : '候选人 · '}</span>{item.text || '无转写文本'}
+              <span className="text-text-muted">{item.speaker === 'interviewer' ? '面试官 · ' : '候选人 · '}</span>
+              {item.text || (item.transcription_failed ? '转写失败' : '无转写文本')}
             </p>)}
           </div>
           <div>

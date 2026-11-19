@@ -1,5 +1,22 @@
 import { parseReviewScore } from '@/lib/reviewScore'
 
+export const ARCHIVE_SPEAKERS = [['interviewer', '面试官'], ['candidate', '候选人']] as const
+export type ArchiveSpeaker = typeof ARCHIVE_SPEAKERS[number][0]
+const AUDIO_STATES = ['ready', 'approximate', 'partial', 'missing', 'none'] as const
+type AudioState = typeof AUDIO_STATES[number]
+
+interface ArchiveAudioCoverage {
+  state: AudioState
+  duration_ms: number
+  reason?: string
+}
+
+export function archiveAudioIssue(state?: AudioState) {
+  if (state === 'partial') return '部分录音缺失'
+  if (state === 'missing') return '录音缺失'
+  return null
+}
+
 export interface ArchiveClip {
   asset_id: string
   offset: number
@@ -12,7 +29,11 @@ export interface ArchiveClip {
 export interface ArchiveDetails {
   round_id: string
   policy_version: string
-  utterances: Array<{ id: string; speaker: string; text: string; started_mono: number; is_final: boolean; alignment: string }>
+  transcription_timeouts?: ArchiveSpeaker[]
+  utterances: Array<{
+    id: string; speaker: string; text: string; started_mono: number; is_final: boolean; alignment: string
+    transcription_failed?: boolean
+  }>
   generations: Array<{
     id: string; status: string; answer: string; thinking: string; error?: string
     started_at: number; finished_at?: number; first_token_at: number | null; first_token_ms: number | null; total_ms: number | null
@@ -84,6 +105,7 @@ export interface ReviewTurn {
   candidate_status?: string | null
   ai_status?: string | null
   media?: { interviewer: ArchiveClip[]; candidate: ArchiveClip[] } | null
+  audio_status?: Record<ArchiveSpeaker, ArchiveAudioCoverage | null> | null
   model_summary?: { name?: string; model?: string; first_token_ms?: number | null; total_ms?: number | null } | null
 }
 
@@ -184,6 +206,7 @@ export function parseReviewTurn(raw: Record<string, unknown>): ReviewTurn {
     candidate_status: raw.candidate_status == null ? null : String(raw.candidate_status),
     ai_status: raw.ai_status == null ? null : String(raw.ai_status),
     media: parseArchiveMedia(raw.media),
+    audio_status: parseAudioCoverage(raw.audio_status),
     model_summary: raw.model_summary && typeof raw.model_summary === 'object' ? raw.model_summary as ReviewTurn['model_summary'] : null,
     id: parseNumber(raw.id),
     session_id: parseNumber(raw.session_id),
@@ -259,6 +282,18 @@ function parseArchiveMedia(raw: unknown): ReviewTurn['media'] {
       ? [{ asset_id: clip.asset_id, offset, duration }] : []
   }) : []
   return { interviewer: clips(source.interviewer), candidate: clips(source.candidate) }
+}
+
+function parseAudioCoverage(value: unknown): ReviewTurn['audio_status'] {
+  if (!value || typeof value !== 'object') return null
+  const raw = asRecord(value)
+  const coverage = (speaker: ArchiveSpeaker): ArchiveAudioCoverage | null => {
+    const item = asRecord(raw[speaker])
+    const state = item.state as AudioState
+    if (!AUDIO_STATES.includes(state)) return null
+    return { state, duration_ms: parseNonNegativeInteger(item.duration_ms), reason: typeof item.reason === 'string' ? item.reason : undefined }
+  }
+  return { interviewer: coverage('interviewer'), candidate: coverage('candidate') }
 }
 
 export function parseReviewSessionsResponse(raw: unknown): ReviewSessionsResponse {
