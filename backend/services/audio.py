@@ -353,6 +353,7 @@ class AudioCapture:
             self._running = True
             self._owner = owner
             self._audio_queue = queue.Queue(maxsize=940)
+            self._archive_capture_id = None
             self._resample_state = [None]
             self._agc_peak = 0.0
             self._sc_stop = threading.Event()
@@ -401,6 +402,22 @@ class AudioCapture:
             audio = audio.astype(np.float32)
         if self._use_agc:
             audio = self._apply_agc(audio)
+        sink = getattr(self, "archive_sink", None)
+        role = getattr(self, "archive_role", None)
+        if sink:
+            from services.interview_archive.audio import CapturedAudio
+            if not getattr(self, "_archive_capture_id", None):
+                from uuid import uuid4
+                self._archive_capture_id = uuid4().hex
+                self._archive_sample = 0
+                self._archive_anchor = time.monotonic() - len(audio) / self.SAMPLE_RATE
+            audio = CapturedAudio(audio, self._archive_capture_id, self._archive_sample, self._archive_anchor)
+            self._archive_sample += len(audio)
+        if sink and role:
+            try:
+                sink(audio, role)
+            except Exception:
+                _alog.exception("archive capture observer failed")
         if self._queue_audio:
             for chunk in self._iter_queueable_chunks(audio):
                 self._enqueue_chunk(chunk)
@@ -710,6 +727,15 @@ class AudioCapture:
 # ---------------------------------------------------------------------------
 
 class VADBuffer:
+    def _joined_audio(self):
+        result = np.concatenate(self._buffer)
+        first, last = self._buffer[0], self._buffer[-1]
+        if getattr(first, "capture_id", ""):
+            from services.interview_archive.audio import CapturedAudio
+            result = CapturedAudio(result, first.capture_id, first.sample_start, first.capture_anchor)
+            result.source_end_mono = getattr(last, "started_mono", first.started_mono) + len(last) / self.sample_rate
+        return result
+
     """Voice Activity Detection: accumulate speech, trigger after silence."""
 
     def __init__(self, sample_rate: int = 16000, silence_threshold: float = 0.01,
@@ -810,7 +836,7 @@ class VADBuffer:
                 self.max_speech_duration is not None
                 and self._speech_audio_samples / self.sample_rate >= self.max_speech_duration
             ):
-                result = np.concatenate(self._buffer)
+                result = self._joined_audio()
                 self._last_flush_reason = "max_speech"
                 self._last_segment_ended_at = now
                 self._seed_next_segment_from_rollover()
@@ -836,7 +862,7 @@ class VADBuffer:
             if should_flush:
                 speech_duration = self._speech_audio_samples / self.sample_rate
                 if speech_duration >= self.min_speech_duration and self._buffer:
-                    result = np.concatenate(self._buffer)
+                    result = self._joined_audio()
                     self._last_flush_reason = "silence"
                     self._last_segment_ended_at = now
                     self._reset()
@@ -851,7 +877,7 @@ class VADBuffer:
 
     def flush(self) -> Optional[np.ndarray]:
         if self._buffer:
-            result = np.concatenate(self._buffer)
+            result = self._joined_audio()
             self._last_flush_reason = "stop_flush"
             self._last_segment_ended_at = time.time()
             self._reset()
