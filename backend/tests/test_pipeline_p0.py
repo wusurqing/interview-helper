@@ -275,7 +275,7 @@ def test_start_nonblocking_skips_audio_in_exam_mode(monkeypatch):
 
 
 def test_start_nonblocking_with_device_in_exam_mode(monkeypatch):
-    """笔试模式仍允许传 device_id 走正常音频路径（用户想同时录音）."""
+    """笔试始终不采集音频，即使调用方保留了上次面试的设备。"""
 
     audio = _RecordingAudioCapture()
     session = _FakeSession()
@@ -288,9 +288,8 @@ def test_start_nonblocking_with_device_in_exam_mode(monkeypatch):
 
     pipeline.start_nonblocking(device_id=1)
 
-    assert audio.start_calls == [(1, "assist", {})], (
-        f"传了 device_id 时应走音频路径; 实际 start_calls={audio.start_calls}"
-    )
+    assert audio.start_calls == []
+    assert session.last_device_id == -1
 
     pipeline.stop_interview_loop()
 

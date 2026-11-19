@@ -31,12 +31,14 @@ const ResumeOptimizer = lazy(() => import('@/components/ResumeOptimizer'))
 const JobTracker = lazy(() => import('@/components/JobTracker'))
 
 const APP_MODE_TABS = [
-  ['assist', '实时辅助'],
+  ['assist', '面试辅助'],
+  ['exam', '笔试辅助'],
   ['review', '面试复盘'],
   ['knowledge', '能力分析'],
   ['resume-opt', '简历优化'],
   ['job-tracker', '求职看板'],
 ] as const
+type WorkspaceTab = typeof APP_MODE_TABS[number][0]
 
 export default function App() {
   useInterviewWS()
@@ -57,7 +59,6 @@ export default function App() {
   const mmpgAnswerLabel = useInterviewStore((s) => s.mmpgAnswerLabel)
   const backendMmpgError = useInterviewStore((s) => s.mmpgError)
   const mmpg = useMmpgStatus()
-  const currentStreamingId = useInterviewStore((s) => s.currentStreamingId)
   const isExamMode = !interviewerStreaming && config?.written_exam_mode === true
   const usesMmpg = !isExamMode && (isRecording ? interviewerStreaming : config?.stt_provider === 'doubao_mmpg')
   const localMmpgActive = mmpg.mode && mmpg.mode !== 'test' && !['idle', 'error'].includes(mmpg.state)
@@ -73,9 +74,9 @@ export default function App() {
     : sttLoaded
   const speechStatus = sttLoading ? '连接中' : sttLoaded ? '就绪' : '未就绪'
   const [mobileTab, setMobileTab] = useState<'transcript' | 'answer'>('transcript')
-  const lastMobileStreamingIdRef = useRef<string | null>(null)
   const appMode = useUiPrefsStore((s) => s.appMode)
   const setAppMode = useUiPrefsStore((s) => s.setAppMode)
+  const activeTab = appMode === 'assist' && isExamMode ? 'exam' : appMode
   const assistTranscriptCollapsed = useUiPrefsStore((s) => s.assistTranscriptCollapsed)
   const toggleAssistTranscriptCollapsed = useUiPrefsStore((s) => s.toggleAssistTranscriptCollapsed)
   useOverlayWindowSync(isRecording, appMode)
@@ -83,6 +84,8 @@ export default function App() {
   const [serverScreenLoading, setServerScreenLoading] = useState(false)
   const [sessionPopoverOpen, setSessionPopoverOpen] = useState(false)
   const [moduleMenuOpen, setModuleMenuOpen] = useState(false)
+  const [workspaceSwitching, setWorkspaceSwitching] = useState(false)
+  const workspaceSwitchRef = useRef(false)
   const serverScreenAskRef = useRef(false)
   const modelChangeSavingRef = useRef(false)
   const pendingModelChangeRef = useRef<string | number | null>(null)
@@ -99,6 +102,37 @@ export default function App() {
 
   const { initError } = useAppBootstrap()
 
+  const selectWorkspace = useCallback(async (tab: WorkspaceTab) => {
+    if (workspaceSwitchRef.current) return
+    setModuleMenuOpen(false)
+    if (tab !== 'assist' && tab !== 'exam') {
+      setAppMode(tab)
+      return
+    }
+    const state = useInterviewStore.getState()
+    if (!state.config) return
+    const exam = tab === 'exam'
+    if (Boolean(state.config.written_exam_mode) === exam) {
+      setAppMode('assist')
+      return
+    }
+    if (state.isRecording || localMmpgActive) {
+      state.setToastMessage(exam ? '请先结束当前面试，再切换到笔试辅助。' : '请先结束当前笔试，再切换到面试辅助。')
+      return
+    }
+    workspaceSwitchRef.current = true
+    setWorkspaceSwitching(true)
+    try {
+      await updateConfigAndRefresh({ written_exam_mode: exam })
+      setAppMode('assist')
+    } catch (error) {
+      state.setToastMessage(error instanceof Error ? error.message : '切换失败，请重试。')
+    } finally {
+      workspaceSwitchRef.current = false
+      setWorkspaceSwitching(false)
+    }
+  }, [localMmpgActive, setAppMode])
+
   useEffect(() => {
     if (!moduleMenuOpen) return
     const onPointerDown = (event: MouseEvent) => {
@@ -113,28 +147,6 @@ export default function App() {
   useEffect(() => {
     setModuleMenuOpen(false)
   }, [appMode])
-
-  // 笔试题提交后优先展示答案流，避免手机端仍停留在「答题记录」而看不到
-  // 正在生成的结果。用户仍可手动切回记录页；同一题的后续 token 不会强制抢回焦点。
-  useEffect(() => {
-    if (!isExamMode) {
-      lastMobileStreamingIdRef.current = currentStreamingId
-      return
-    }
-    // During the very first layout pass some embedded/browser surfaces briefly
-    // report width 0. Treat that as unknown rather than mobile; otherwise a
-    // desktop answer panel can be mounted twice and duplicate its cards.
-    const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : 0
-    const isMobileViewport = viewportWidth > 0 && viewportWidth < 768
-    if (
-      isMobileViewport
-      && currentStreamingId
-      && currentStreamingId !== lastMobileStreamingIdRef.current
-    ) {
-      setMobileTab('answer')
-    }
-    lastMobileStreamingIdRef.current = currentStreamingId
-  }, [currentStreamingId, isExamMode])
 
   useEffect(() => {
     if (!window.electronAPI?.getShortcuts) return
@@ -182,7 +194,7 @@ export default function App() {
   // 注: Chrome 等浏览器把 Cmd+J / Ctrl+J 保留给「下载」, 故叠加 Shift 降低冲突.
   // 仅桌面端 assist 模式下生效; 输入框/contenteditable 内按键忽略.
   useEffect(() => {
-    if (appMode !== 'assist') return
+    if (activeTab !== 'assist') return
     const onKeyDown = (e: KeyboardEvent) => {
       const isToggle =
         (e.metaKey || e.ctrlKey) &&
@@ -198,7 +210,7 @@ export default function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [appMode, toggleAssistTranscriptCollapsed])
+  }, [activeTab, toggleAssistTranscriptCollapsed])
 
   const handleModelChange = useCallback(async (modelId: string | number) => {
     pendingModelChangeRef.current = modelId
@@ -270,7 +282,7 @@ export default function App() {
   const toasts = useInterviewStore((s) => s.toasts)
   const dismissToast = useInterviewStore((s) => s.dismissToast)
   const wsIsLeader = useInterviewStore((s) => s.wsIsLeader)
-  const currentAppModeLabel = APP_MODE_TABS.find(([key]) => key === appMode)?.[1] ?? '模块'
+  const currentAppModeLabel = APP_MODE_TABS.find(([key]) => key === activeTab)?.[1] ?? '模块'
 
   useEffect(() => {
     if (!fallbackToast) return
@@ -347,18 +359,16 @@ export default function App() {
                       key={key}
                       type="button"
                       role="menuitem"
-                      onClick={() => {
-                        setAppMode(key)
-                        setModuleMenuOpen(false)
-                      }}
+                      disabled={workspaceSwitching}
+                      onClick={() => void selectWorkspace(key)}
                       className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm transition-colors ${
-                        appMode === key
+                        activeTab === key
                           ? 'bg-accent-blue text-white'
                           : 'text-text-secondary hover:bg-bg-hover hover:text-text-primary'
                       }`}
                     >
                       <span>{label}</span>
-                      {appMode === key ? <span className="text-[11px] font-semibold">当前</span> : null}
+                      {activeTab === key ? <span className="text-[11px] font-semibold">当前</span> : null}
                     </button>
                   ))}
                 </div>
@@ -368,8 +378,8 @@ export default function App() {
 
           <div className="hidden overflow-x-auto bg-bg-tertiary/60 rounded-xl p-0.5 ml-1 border border-bg-hover/30 scrollbar-none md:flex" role="tablist" aria-label="功能模块">
             {APP_MODE_TABS.map(([key, label]) => (
-              <button key={key} role="tab" aria-selected={appMode === key} onClick={() => setAppMode(key)}
-                className={`px-2.5 md:px-3 py-1.5 text-xs rounded-[10px] transition-all duration-200 whitespace-nowrap flex-shrink-0 font-medium ${appMode === key ? 'bg-accent-blue text-white shadow-sm shadow-accent-blue/20' : 'text-text-muted hover:text-text-primary hover:bg-bg-hover/50'}`}>
+              <button key={key} role="tab" aria-selected={activeTab === key} disabled={workspaceSwitching} onClick={() => void selectWorkspace(key)}
+                className={`px-2.5 md:px-3 py-1.5 text-xs rounded-[10px] transition-all duration-200 whitespace-nowrap flex-shrink-0 font-medium ${activeTab === key ? 'bg-accent-blue text-white shadow-sm shadow-accent-blue/20' : 'text-text-muted hover:text-text-primary hover:bg-bg-hover/50'}`}>
                 {label}
               </button>
             ))}
@@ -471,7 +481,7 @@ export default function App() {
             />
           </div>
 
-          {appMode === 'assist' && (
+          {activeTab === 'assist' && (
             <button
               type="button"
               onClick={toggleAssistTranscriptCollapsed}
@@ -526,22 +536,22 @@ export default function App() {
       {appMode === 'assist' && (
         <>
           {/* Mobile tab switcher */}
-          <div className="flex md:hidden border-b border-bg-tertiary flex-shrink-0">
+          {!isExamMode && <div className="flex md:hidden border-b border-bg-tertiary flex-shrink-0">
             <button onClick={() => setMobileTab('transcript')}
               className={`flex-1 py-2 text-xs font-medium text-center transition-colors ${mobileTab === 'transcript' ? 'text-accent-blue border-b-2 border-accent-blue' : 'text-text-muted'}`}>
-              {isExamMode ? '答题记录' : '实时转录'}
+              实时转录
             </button>
             <button onClick={() => setMobileTab('answer')}
               className={`flex-1 py-2 text-xs font-medium text-center transition-colors ${mobileTab === 'answer' ? 'text-accent-blue border-b-2 border-accent-blue' : 'text-text-muted'}`}>
               AI 答案
             </button>
-          </div>
+          </div>}
 
           <div
             ref={assistSplitContainerRef}
-            className="flex-1 hidden md:flex overflow-hidden min-h-0"
+            className={`flex-1 ${isExamMode ? 'flex' : 'hidden md:flex'} overflow-hidden min-h-0`}
           >
-            {!assistTranscriptCollapsed && (
+            {!isExamMode && !assistTranscriptCollapsed && (
               <>
             <div
               className="flex flex-col min-w-0 flex-shrink-0 border-r border-bg-tertiary"
@@ -603,29 +613,30 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex-1 flex md:hidden overflow-hidden min-h-0">
-            {mobileTab === 'transcript' ? <TranscriptionPanel /> : <AnswerPanel />}
-          </div>
-
-          {/* 仅手机端：由服务端截本机主屏左半幅送 VL，手机不调用系统截图 */}
-          {mobileTab === 'answer' && (
-            <div className="md:hidden flex-shrink-0 px-3 py-3 border-t border-bg-tertiary bg-bg-secondary/95 backdrop-blur-sm">
-              <button
-                type="button"
-                disabled={serverScreenLoading}
-                onClick={handleServerScreenAsk}
-                className="w-full flex items-center justify-center gap-3 min-h-[52px] py-3.5 rounded-xl bg-accent-blue text-white text-base font-semibold shadow-sm disabled:opacity-60 active:scale-[0.99] transition-transform"
-              >
-                <MonitorSmartphone className="w-5 h-5 flex-shrink-0" />
-                {serverScreenLoading ? '截图审题提交中…' : '服务端截图审题'}
-              </button>
-              <p className="text-[10px] text-text-muted text-center mt-1.5 leading-snug px-0.5">
-                在后台子进程截主屏左半幅，该请求不写访问日志以减少终端抢焦点。若仍被终端打断，可用 <code className="text-[9px] bg-bg-tertiary px-0.5 rounded">IA_ACCESS_LOG=0</code> 启动后端关闭全部 HTTP 访问日志。须配置识图模型与屏幕录制权限。
-              </p>
+          {!isExamMode && (
+            <div className="flex-1 flex md:hidden overflow-hidden min-h-0">
+              {mobileTab === 'transcript' ? <TranscriptionPanel /> : <AnswerPanel />}
             </div>
           )}
 
-          <ControlBar />
+          {/* 当前截图区域由服务端配置。 */}
+          {(isExamMode || mobileTab === 'answer') && (
+            <div className={`shrink-0 border-t border-bg-tertiary bg-bg-secondary/95 px-3 py-3 ${isExamMode ? 'md:px-5 md:py-2' : 'md:hidden'}`}>
+              <button
+                type="button"
+                disabled={serverScreenLoading || workspaceSwitching}
+                onClick={handleServerScreenAsk}
+                className="flex min-h-[42px] w-full items-center justify-center gap-2 rounded-xl bg-accent-blue px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 md:w-auto"
+              >
+                <MonitorSmartphone className="w-5 h-5 flex-shrink-0" />
+                {serverScreenLoading ? '截图审题提交中…' : isExamMode ? '截图答题' : '服务端截图审题'}
+              </button>
+            </div>
+          )}
+
+          <fieldset disabled={workspaceSwitching} className="min-w-0 shrink-0">
+            <ControlBar />
+          </fieldset>
         </>
       )}
 

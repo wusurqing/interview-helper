@@ -26,7 +26,7 @@ test.describe('app shell', () => {
   test('module tabs switch between assist / review / knowledge / resume / job-tracker', async ({ page }) => {
     await page.goto('/')
 
-    const assistTab = page.getByRole('tab', { name: '实时辅助' })
+    const assistTab = page.getByRole('tab', { name: '面试辅助' })
     const reviewTab = page.getByRole('tab', { name: '面试复盘' })
     const knowledgeTab = page.getByRole('tab', { name: '能力分析' })
     const resumeTab = page.getByRole('tab', { name: '简历优化' })

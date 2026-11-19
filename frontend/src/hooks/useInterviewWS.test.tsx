@@ -60,6 +60,7 @@ describe('useInterviewWS', () => {
     vi.useFakeTimers()
     vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
     useInterviewStore.setState({
+      config: null,
       qaPairs: [],
       streamingIds: [],
       currentStreamingId: null,
@@ -159,6 +160,51 @@ describe('useInterviewWS', () => {
     expect(useInterviewStore.getState().candidateCaptureProvider).toBeNull()
     act(() => ws.emitMessage({ type: 'recording', value: true, candidate_capture_provider: 'generic' }))
     expect(useInterviewStore.getState().candidateCaptureProvider).toBe('generic')
+  })
+
+  it('uses the shared workspace from init and applies later mode changes independently', () => {
+    useInterviewStore.setState({ config: { models: [], position: '测试', written_exam_mode: false } as any })
+    render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+    act(() => ws.emitMessage({ type: 'init', written_exam_mode: true }))
+    expect(useInterviewStore.getState().config?.written_exam_mode).toBe(true)
+    act(() => ws.emitMessage({ type: 'workspace_mode', written_exam_mode: false }))
+    expect(useInterviewStore.getState().config).toMatchObject({ position: '测试', written_exam_mode: false })
+  })
+
+  it('relays only the mode flag to follower tabs and releases their channel', () => {
+    const channels = new Map<string, MockChannel>()
+    class MockChannel {
+      onmessage: ((event: MessageEvent) => void) | null = null
+      postMessage = vi.fn()
+      close = vi.fn()
+
+      constructor(name: string) {
+        channels.set(name, this)
+      }
+    }
+    vi.stubGlobal('BroadcastChannel', MockChannel)
+    useInterviewStore.setState({ config: { models: [], written_exam_mode: false } as any })
+    const screen = render(<Harness />)
+    const channel = channels.get('ia-workspace-mode')!
+    act(() => FakeWebSocket.instances[0].emitMessage({ type: 'workspace_mode', written_exam_mode: true }))
+    expect(channel.postMessage).toHaveBeenCalledWith(true)
+    act(() => {
+      useInterviewStore.getState().setWsIsLeader(false)
+      channel.onmessage?.(new MessageEvent('message', { data: false }))
+    })
+    expect(useInterviewStore.getState().config?.written_exam_mode).toBe(false)
+    screen.unmount()
+    expect(channel.close).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the latest workspace event when initial HTTP config is still in flight', () => {
+    render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+    act(() => ws.emitMessage({ type: 'workspace_mode', written_exam_mode: true }))
+    expect(useInterviewStore.getState().config).toBeNull()
+    act(() => useInterviewStore.getState().setConfig({ models: [], written_exam_mode: false } as any))
+    expect(useInterviewStore.getState().config?.written_exam_mode).toBe(true)
   })
 
   it('reports a segment recognition failure on the affected role', () => {

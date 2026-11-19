@@ -83,8 +83,8 @@ async def _api_start(body: dict):
     uses_mmpg = getattr(cfg, "stt_provider", None) == mmpg.PROVIDER
     if not written_exam and uses_mmpg:
         raise HTTPException(409, "请从桌面主窗口或本机浏览器开始豆包语义判停")
-    device_id = None if written_exam and uses_mmpg else body.get("device_id")
-    candidate_mic_device_id = body.get("candidate_mic_device_id")
+    device_id = None if written_exam else body.get("device_id")
+    candidate_mic_device_id = None if written_exam else body.get("candidate_mic_device_id")
     if not written_exam and device_id is None:
         raise HTTPException(400, "\u8bf7\u9009\u62e9\u97f3\u9891\u8bbe\u5907")
     if device_id is not None:
@@ -193,6 +193,9 @@ async def _api_resume_interview(body: Optional[dict] = None):
         except Exception:
             _rlog.exception("single microphone resume failed")
             raise HTTPException(500, "麦克风启动失败，请检查设备后重试")
+        return {"ok": True}
+    if getattr(get_config(), "written_exam_mode", False):
+        await run_in_threadpool(unpause_interview)
         return {"ok": True}
     device_id = (body or {}).get("device_id")
     candidate_mic_device_id = (body or {}).get("candidate_mic_device_id")

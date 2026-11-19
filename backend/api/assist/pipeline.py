@@ -1156,6 +1156,9 @@ def start_nonblocking(
 ):
     global _interview_thread, _interviewer_streaming, _interviewer_config
     start_cfg = config_snapshot if config_snapshot is not None else get_config()
+    if getattr(start_cfg, "written_exam_mode", False):
+        device_id = None
+        candidate_mic_device_id = None
     if device_id is not None:
         if detail := stt_configuration_error(start_cfg, start_cfg.stt_provider):
             raise STTError(detail)

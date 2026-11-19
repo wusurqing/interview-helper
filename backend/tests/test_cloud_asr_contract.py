@@ -90,6 +90,56 @@ def test_unassigned_provider_cannot_start_capture(monkeypatch):
     assert "选择 ASR" in exc.value.detail
 
 
+@pytest.mark.parametrize("provider", ["generic", "doubao", "doubao_mmpg"])
+def test_exam_ignores_both_stale_devices_on_start_and_resume(monkeypatch, provider):
+    cfg = AppConfig(written_exam_mode=True, stt_provider=provider)
+    monkeypatch.setattr(routes, "get_config", lambda: cfg)
+    monkeypatch.setattr(routes, "get_session", lambda: SimpleNamespace(is_recording=True, single_mic=None))
+    monkeypatch.setattr(routes, "is_paused", lambda: True)
+    monkeypatch.setattr(routes, "is_streaming_interview", lambda: False)
+    calls = []
+
+    def capture(device_id=None, candidate_mic_device_id=None, **_kwargs):
+        calls.append((device_id, candidate_mic_device_id))
+
+    monkeypatch.setattr(routes, "start_nonblocking", capture)
+    monkeypatch.setattr(routes, "unpause_interview", capture)
+    assert asyncio.run(routes.api_start({"device_id": 5, "candidate_mic_device_id": 6})) == {"ok": True}
+    assert asyncio.run(routes.api_resume_interview({"device_id": 5, "candidate_mic_device_id": 6})) == {"ok": True}
+    assert calls == [(None, None), (None, None)]
+
+
+def test_workspace_cannot_change_during_an_active_recording(monkeypatch):
+    from core import session
+
+    monkeypatch.setattr(router, "get_config", lambda: AppConfig(written_exam_mode=False))
+    monkeypatch.setattr(session, "get_session", lambda: SimpleNamespace(is_recording=True))
+    monkeypatch.setattr(router, "update_config", lambda *_args, **_kwargs: pytest.fail("Unexpected config update"))
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(router.api_update_config(router.ConfigUpdate(written_exam_mode=True)))
+    assert exc.value.status_code == 409
+
+
+def test_workspace_change_only_broadcasts_the_saved_mode(monkeypatch):
+    from api.realtime import ws
+    from core import session
+
+    cfg = AppConfig(written_exam_mode=False)
+    sent = []
+    monkeypatch.setattr(session, "get_session", lambda: SimpleNamespace(is_recording=False))
+    monkeypatch.setattr(router, "get_config", lambda: cfg)
+    monkeypatch.setattr(router, "update_config", lambda updates: setattr(cfg, "written_exam_mode", updates["written_exam_mode"]))
+    monkeypatch.setattr(ws, "broadcast", sent.append)
+
+    for mode in (True, True, False):
+        asyncio.run(router.api_update_config(router.ConfigUpdate(written_exam_mode=mode)))
+
+    assert sent == [
+        {"type": "workspace_mode", "written_exam_mode": True},
+        {"type": "workspace_mode", "written_exam_mode": False},
+    ]
+
+
 def test_disabling_automatic_answers_drops_pending_question_but_keeps_transcription():
     events = []
     submissions = []

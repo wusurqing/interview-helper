@@ -917,7 +917,7 @@ def test_start_accepts_no_device_in_written_exam_mode(monkeypatch):
     assert start_called["v"] is True
 
 
-def test_start_passes_device_id_when_provided_in_exam_mode(monkeypatch):
+def test_start_ignores_device_id_when_provided_in_exam_mode(monkeypatch):
     assist_router = importlib.import_module("api.assist.routes")
 
     monkeypatch.setattr(
@@ -938,4 +938,4 @@ def test_start_passes_device_id_when_provided_in_exam_mode(monkeypatch):
 
     result = _run(assist_router.api_start({"device_id": 5}))
     assert result == {"ok": True}
-    assert start_args["device_id"] == 5
+    assert start_args["device_id"] is None

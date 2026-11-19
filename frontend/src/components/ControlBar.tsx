@@ -224,7 +224,8 @@ export default function ControlBar() {
   const selectedCandidateIsMic = selectedCandidateDevice?.is_loopback === false
   const hasCaptureSnapshot = isRecording && candidateCaptureProvider !== null
   const currentCandidateProvider = hasCaptureSnapshot ? candidateCaptureProvider : config?.candidate_stt_provider
-  const candidateCaptureEnabled = hasCaptureSnapshot ? Boolean(candidateCaptureProvider) : config?.candidate_asr_enabled === true
+  const candidateCaptureEnabled = !isExamMode &&
+    (hasCaptureSnapshot ? Boolean(candidateCaptureProvider) : config?.candidate_asr_enabled === true)
   const candidateUsesMmpg = candidateCaptureEnabled && currentCandidateProvider === 'doubao_mmpg'
   const testMic = singleMic?.device_id
     ?? candidateMicDevices.find((device) => device.id === selectedTestMic)?.id
@@ -422,7 +423,7 @@ export default function ControlBar() {
       const singleMicId = singleMicMode
         ? Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('')
         : undefined
-      const candidate = singleMicMode ? device : effectiveCandidateMic
+      const candidate = isExamMode ? null : singleMicMode ? device : effectiveCandidateMic
       const interviewer = connectInterviewerAudio('start', isExamMode ? null : device, candidate, usesMmpg, platformInfo?.platform, singleMicId)
       connectCandidateMmpg('start', interviewer, candidate, singleMicId)
       await interviewer
@@ -531,7 +532,8 @@ export default function ControlBar() {
   const handleClear = useCallback(async () => {
     if (clearingRef.current) return
     if (qaPairs.length > 0 || transcriptions.length > 0 || candidateTranscriptions.length > 0) {
-      if (!window.confirm('确定要清空当前页的转录与答案吗？清空后不可恢复。')) return
+      const contents = isExamMode ? '答案' : '转录与答案'
+      if (!window.confirm(`确定要清空当前页的${contents}吗？清空后不可恢复。`)) return
     }
     clearingRef.current = true
     candidateConnectionAttemptRef.current = null
@@ -545,7 +547,7 @@ export default function ControlBar() {
       clearingRef.current = false
       setClearing(false)
     }
-  }, [qaPairs.length, transcriptions.length, candidateTranscriptions.length, clearSession, setToastMessage])
+  }, [qaPairs.length, transcriptions.length, candidateTranscriptions.length, clearSession, isExamMode, setToastMessage])
 
   const handleCancelAsk = useCallback(async () => {
     if (cancellingAskRef.current) return
@@ -1016,7 +1018,7 @@ export default function ControlBar() {
           onClick={handleClear}
           disabled={clearing}
           title={qaPairs.length > 30 ? `当前会话较长 (${qaPairs.length} 条), 建议清空以保持流畅` : isExamMode ? '清空当前页的 AI 答案 (不影响历史)' : '清空当前页的实时转录与 AI 答案 (不影响历史)'}
-          aria-label={qaPairs.length > 30 ? `清空当前 ${qaPairs.length} 条转录与答案` : '清空当前转录与答案'}
+          aria-label={`清空当前${qaPairs.length > 30 ? ` ${qaPairs.length} 条` : ''}${isExamMode ? '答案' : '转录与答案'}`}
           className={`relative flex items-center gap-1 min-h-[36px] min-w-[36px] justify-center px-2 py-2 text-xs rounded-lg transition-colors flex-shrink-0 disabled:opacity-50 ${
             qaPairs.length > 30
               ? 'bg-accent-amber/20 hover:bg-accent-amber/30 text-accent-amber'

@@ -7,6 +7,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from core.auth import is_auth_disabled, loopback_bypass_allowed, verify_token
 from core.logger import get_logger
+from core.config import get_config
 from core.session import snapshot_session
 from services.stt import stt_configuration_error
 
@@ -181,8 +182,10 @@ async def websocket_endpoint(ws: WebSocket):
             detail = stt_configuration_error(cfg, provider)
             current_stt = {"loaded": not detail, "loading": False, "provider": provider, "detail": detail}
         snapshot = snapshot_session()
+        written_exam_mode = get_config().written_exam_mode
         await ws.send_json({
             "type": "init",
+            "written_exam_mode": written_exam_mode,
             "is_recording": snapshot["is_recording"],
             "is_paused": snapshot["is_paused"],
             "single_mic": snapshot.get("single_mic"),
@@ -199,6 +202,10 @@ async def websocket_endpoint(ws: WebSocket):
         if candidate_mmpg.enabled(cfg) or candidate_mmpg.manager.active:
             await ws.send_json(candidate_mmpg.status())
         ws_clients.add(ws)
+        # A switch can finish while the initial frames are being sent.
+        current_mode = get_config().written_exam_mode
+        if current_mode != written_exam_mode:
+            await ws.send_json({"type": "workspace_mode", "written_exam_mode": current_mode})
         _log.info("WS connect clients=%d", len(ws_clients))
         while True:
             data = await ws.receive_text()

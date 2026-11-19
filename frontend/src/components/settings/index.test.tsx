@@ -150,4 +150,16 @@ describe('SettingsDrawer', () => {
     expect(await screen.findByRole('button', { name: /卡片/ })).toBeInTheDocument()
     expect(screen.queryByText('简短回答')).not.toBeInTheDocument()
   })
+
+  it('opens 笔试配置 and keeps the separate overlay settings entry', async () => {
+    render(<SettingsDrawer />)
+
+    const navigation = within(screen.getByRole('navigation'))
+    expect(navigation.queryByRole('button', { name: /^模式/ })).not.toBeInTheDocument()
+    expect(navigation.getByRole('button', { name: /悬浮窗设置/ })).toBeInTheDocument()
+    fireEvent.click(navigation.getByRole('button', { name: /笔试配置/ }))
+
+    expect(navigation.getByRole('button', { name: /笔试配置/ })).toHaveAttribute('aria-current', 'page')
+    expect(await screen.findByRole('checkbox', { name: '深度思考 (Think)' })).toBeInTheDocument()
+  })
 })

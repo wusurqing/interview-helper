@@ -65,6 +65,7 @@ describe('App bootstrap', () => {
       currentStreamingId: null,
       transcriptions: [],
       isPaused: false,
+      isRecording: false,
       wsConnected: true,
     } as any)
     useUiPrefsStore.setState({ appMode: 'assist' })
@@ -111,10 +112,44 @@ describe('App bootstrap', () => {
     render(<App />)
 
     await waitFor(() => {
-      expect(screen.getByRole('tab', { name: '实时辅助' })).toBeInTheDocument()
+      expect(screen.getByRole('tab', { name: '面试辅助' })).toBeInTheDocument()
     })
 
     expect(screen.queryByText('连接后端失败')).not.toBeInTheDocument()
+  })
+
+  it('switches between dedicated interview and exam tabs while keeping manual and screenshot tools', async () => {
+    const current = await apiMock.getConfig()
+    apiMock.getConfig.mockImplementation(async () => ({ ...current }))
+    apiMock.updateConfig.mockImplementation(async (patch) => {
+      Object.assign(current, patch)
+      return { ok: true }
+    })
+    render(<App />)
+    await screen.findByRole('tab', { name: '面试辅助', selected: true })
+    expect(screen.getAllByRole('tab').slice(0, 3).map((item) => item.textContent)).toEqual([
+      '面试辅助', '笔试辅助', '面试复盘',
+    ])
+    fireEvent.click(screen.getByRole('tab', { name: '笔试辅助' }))
+    await screen.findByRole('tab', { name: '笔试辅助', selected: true })
+    expect(apiMock.updateConfig).toHaveBeenCalledWith({ written_exam_mode: true })
+    expect(screen.queryByText('transcript')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^截图答题$/ })).toBeInTheDocument()
+    expect(screen.getByText('controls')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: '面试辅助' }))
+    await screen.findByRole('tab', { name: '面试辅助', selected: true })
+    expect(apiMock.updateConfig).toHaveBeenCalledWith({ written_exam_mode: false })
+    expect(screen.getAllByText('transcript').length).toBeGreaterThan(0)
+  })
+
+  it('keeps the current workflow if an interview is still recording', async () => {
+    useInterviewStore.setState({ isRecording: true })
+    render(<App />)
+    await screen.findByRole('tab', { name: '面试辅助', selected: true })
+    fireEvent.click(screen.getByRole('tab', { name: '笔试辅助' }))
+    expect(await screen.findByText('请先结束当前面试，再切换到笔试辅助。')).toBeInTheDocument()
+    expect(apiMock.updateConfig).not.toHaveBeenCalled()
+    expect(screen.getByRole('tab', { name: '面试辅助', selected: true })).toBeInTheDocument()
   })
 
   it('does not allow disabled models to be picked as the priority answer model', async () => {
@@ -252,7 +287,7 @@ describe('App bootstrap', () => {
     })
   })
 
-  it('switches mobile written-exam view to the answer tab when a question starts', async () => {
+  it('shows a single answer panel and submits screenshots in the mobile written-exam workspace', async () => {
     const originalInnerWidth = window.innerWidth
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 })
     apiMock.getConfig.mockResolvedValue({
@@ -268,24 +303,11 @@ describe('App bootstrap', () => {
     try {
       render(<App />)
 
-      await waitFor(() => {
-        expect(screen.getByRole('button', { name: '答题记录' })).toBeInTheDocument()
-        expect(screen.getByRole('button', { name: 'AI 答案' })).toBeInTheDocument()
-      })
-      expect(screen.getByRole('button', { name: '答题记录' })).toHaveClass('border-accent-blue')
-      expect(screen.getByRole('button', { name: 'AI 答案' })).not.toHaveClass('border-accent-blue')
-
-      act(() => {
-        useInterviewStore.getState().startAnswer('qa-exam-1', '截图题', {
-          source: 'server_screen_single',
-          modelName: 'demo',
-        })
-      })
-
-      await waitFor(() => {
-        expect(screen.getByRole('button', { name: 'AI 答案' })).toHaveClass('border-accent-blue')
-        expect(screen.getByRole('button', { name: '答题记录' })).not.toHaveClass('border-accent-blue')
-      })
+      const screenshotButton = await screen.findByRole('button', { name: '截图答题' })
+      expect(screen.queryByText('transcript')).not.toBeInTheDocument()
+      expect(screen.getByText('answer')).toBeInTheDocument()
+      fireEvent.click(screenshotButton)
+      await waitFor(() => expect(apiMock.askFromServerScreen).toHaveBeenCalledTimes(1))
     } finally {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth })
     }
@@ -357,7 +379,7 @@ describe('Window control buttons', () => {
     render(<App />)
 
     await waitFor(() => {
-      expect(screen.getByRole('tab', { name: '实时辅助' })).toBeInTheDocument()
+      expect(screen.getByRole('tab', { name: '面试辅助' })).toBeInTheDocument()
     })
 
     expect(screen.queryByRole('button', { name: '最小化窗口' })).not.toBeInTheDocument()

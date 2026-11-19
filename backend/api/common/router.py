@@ -493,10 +493,23 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
         if "kb_asr_deadline_ms" in d:
             d["kb_asr_deadline_ms"] = max(20, min(1000, int(d["kb_asr_deadline_ms"])))
 
-        if model_snapshot is None:
-            await run_in_threadpool(update_config, d)
+        save_options = {} if model_snapshot is None else {
+            "model_origins": model_origins, "model_snapshot": model_snapshot,
+        }
+        if "written_exam_mode" in d:
+            from api.assist.mmpg_integration import http_lifecycle_lock, manager
+            from api.realtime.ws import broadcast
+            from core.session import get_session
+
+            async with http_lifecycle_lock:
+                changing_workspace = d["written_exam_mode"] != get_config().written_exam_mode
+                if changing_workspace and (get_session().is_recording or manager.active):
+                    raise HTTPException(409, "请先结束当前会话，再切换答题模式。")
+                await run_in_threadpool(update_config, d, **save_options)
+                if changing_workspace:
+                    broadcast({"type": "workspace_mode", "written_exam_mode": d["written_exam_mode"]})
         else:
-            await run_in_threadpool(update_config, d, model_origins=model_origins, model_snapshot=model_snapshot)
+            await run_in_threadpool(update_config, d, **save_options)
         if d.get("auto_detect") is False:
             from api.assist.mmpg_integration import disable_automatic_answers
 

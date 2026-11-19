@@ -190,7 +190,7 @@ export default function SettingsDrawer() {
 
   const tabs: { key: typeof settingsDrawerTab; label: string; icon: React.ReactNode; desc: string }[] = [
     { key: 'realtime', label: '实时辅助', icon: <LayoutGrid className="w-4 h-4" />, desc: '答题与语音使用' },
-    { key: 'mode', label: '模式', icon: <Monitor className="w-4 h-4" />, desc: '笔试与截图' },
+    { key: 'mode', label: '笔试配置', icon: <Monitor className="w-4 h-4" />, desc: '截图与思考' },
     { key: 'overlay', label: '悬浮窗设置', icon: <PanelsTopLeft className="w-4 h-4" />, desc: '位置、尺寸与外观' },
     { key: 'kb', label: '知识库', icon: <BookOpen className="w-4 h-4" />, desc: '本地笔记引用' },
     { key: 'config', label: '语音配置', icon: <Mic className="w-4 h-4" />, desc: 'ASR 接入与测试' },

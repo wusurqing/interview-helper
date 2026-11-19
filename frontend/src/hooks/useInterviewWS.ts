@@ -24,6 +24,17 @@ export function useInterviewWS(active = true) {
   const reconnectAttempts = useRef(0)
   const shouldReconnect = useRef(true)
   const lastServerPongAt = useRef(0)
+  const pendingWorkspace = useRef<boolean | undefined>(undefined)
+  const workspaceChannel = useRef<BroadcastChannel | null>(null)
+
+  const applyWorkspace = (exam: boolean) => {
+    const { config, setConfig } = useInterviewStore.getState()
+    if (!config) {
+      pendingWorkspace.current = exam
+    } else if (config.written_exam_mode !== exam) {
+      setConfig({ ...config, written_exam_mode: exam })
+    }
+  }
 
   const scheduleReconnect = () => {
     if (!shouldReconnect.current) return
@@ -103,6 +114,10 @@ export function useInterviewWS(active = true) {
 
   const handleMessage = (msg: WsMsg) => {
     const s = useInterviewStore.getState()
+    if ((msg.type === 'init' || msg.type === 'workspace_mode') && typeof msg.written_exam_mode === 'boolean') {
+      applyWorkspace(msg.written_exam_mode)
+      workspaceChannel.current?.postMessage(msg.written_exam_mode)
+    }
     switch (msg.type) {
       case 'init':
         s.setInitData(msg as Parameters<typeof s.setInitData>[0])
@@ -305,6 +320,20 @@ export function useInterviewWS(active = true) {
       return teardown
     }
 
+    // Follower tabs share the leader's socket. Relay only the workspace flag.
+    const channel = typeof window.BroadcastChannel === 'function'
+      ? new window.BroadcastChannel('ia-workspace-mode') : null
+    workspaceChannel.current = channel
+    if (channel) channel.onmessage = (event) => {
+      if (!useInterviewStore.getState().wsIsLeader && typeof event.data === 'boolean') applyWorkspace(event.data)
+    }
+    const unsubscribeBootstrap = useInterviewStore.subscribe((state) => {
+      if (!state.config || pendingWorkspace.current === undefined) return
+      const exam = pendingWorkspace.current
+      pendingWorkspace.current = undefined
+      applyWorkspace(exam)
+    })
+
     unsubscribe = subscribeLeader((isLeader) => {
       useInterviewStore.getState().setWsIsLeader(isLeader)
       if (isLeader) {
@@ -334,6 +363,10 @@ export function useInterviewWS(active = true) {
 
     return () => {
       unsubscribe?.()
+      unsubscribeBootstrap()
+      pendingWorkspace.current = undefined
+      workspaceChannel.current = null
+      channel?.close()
       if (pingTimer) clearInterval(pingTimer)
       teardown()
     }

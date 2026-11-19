@@ -128,7 +128,7 @@ test.describe('shared resume mount', () => {
     await page.getByRole('button', { name: '选用' }).first().click()
     await expect(page.getByText('李四_后端.pdf').first()).toBeVisible()
 
-    await page.getByRole('tab', { name: '实时辅助' }).click()
+    await page.getByRole('tab', { name: '面试辅助' }).click()
     await expect(page.getByRole('heading', { name: '学习助手' })).toBeVisible()
   })
 })

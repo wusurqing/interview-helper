@@ -193,6 +193,7 @@ def test_websocket_init_uses_session_snapshot(monkeypatch: pytest.MonkeyPatch):
     asyncio.run(ws_mod.websocket_endpoint(FakeWS()))
 
     assert sent[0]['type'] == 'init'
+    assert isinstance(sent[0]['written_exam_mode'], bool)
     assert sent[0]['transcriptions'] == ['one']
     assert sent[0]['candidate_transcriptions'] == ['候选人真实回答']
     assert sent[0]['candidate_answer_segments'][0]['segment_id'] == 'cand-1'
