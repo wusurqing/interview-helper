@@ -1,18 +1,17 @@
 import { useEffect, useState } from 'react'
 import { useInterviewStore } from '@/stores/configStore'
-import { type MmpgConfig, type MmpgForm, type MmpgSecret } from '@/lib/mmpg/settings'
+import { type MmpgConfig, type MmpgEngineForm, type MmpgSecret } from '@/lib/mmpg/settings'
 import { mmpgController, mmpgStateLabels, mmpgUnavailable } from '@/lib/mmpg/rtcController'
 import { useMmpgStatus } from '@/lib/mmpg/useMmpgStatus'
 import { Field } from './shared'
 
 type Props = {
-  form: MmpgForm
+  form: MmpgEngineForm
   stored?: MmpgConfig
-  onChange: (form: MmpgForm) => void
+  onChange: (form: Partial<MmpgEngineForm>) => void
   onImport: () => Promise<void>
   onSave: () => Promise<boolean>
   saving: boolean
-  testEnabled: boolean
 }
 
 const secretLabels: Record<MmpgSecret, string> = {
@@ -40,7 +39,7 @@ function dateTimeLocal(seconds: number | null) {
   return Number.isFinite(calendar.valueOf()) ? calendar.toISOString().slice(0, 19) : ''
 }
 
-export default function MmpgSettings({ form, stored, onChange, onImport, onSave, saving, testEnabled }: Props) {
+export default function MmpgSettings({ form, stored, onChange, onImport, onSave, saving }: Props) {
   const devices = useInterviewStore((state) => state.devices)
   const platform = useInterviewStore((state) => state.platformInfo?.platform)
   const recording = useInterviewStore((state) => state.isRecording)
@@ -53,10 +52,10 @@ export default function MmpgSettings({ form, stored, onChange, onImport, onSave,
   const testRunning = test && !['idle', 'error'].includes(status.state)
   const unavailable = mmpgUnavailable(platform)
 
-  // Closing settings or selecting a different engine ends the settings-only test.
+  // Closing settings ends the settings-only test.
   useEffect(() => mmpgController.stopTest, [])
 
-  const set = <K extends keyof MmpgForm>(key: K, value: MmpgForm[K]) => onChange({ ...form, [key]: value })
+  const set = <K extends keyof MmpgEngineForm>(key: K, value: MmpgEngineForm[K]) => onChange({ [key]: value })
   const secret = (key: MmpgSecret) => {
     const label = secretLabels[key]
     const configured = Boolean(stored?.[`${key}_configured`])
@@ -71,10 +70,10 @@ export default function MmpgSettings({ form, stored, onChange, onImport, onSave,
             value={form[key] ?? ''}
             placeholder={cleared ? '保存后清除' : configured ? '已配置 · 留空保留' : '未配置'}
             className="input-field"
-            onChange={(event) => set(key, event.target.value)}
+            onChange={(event) => set(key, event.target.value || undefined)}
           />
           {(configured || form[key]) && (
-            <button type="button" className="text-xs text-accent-blue shrink-0" aria-label={cleared ? `撤销清除 ${label}` : `清除 ${label}`} onClick={() => set(key, cleared ? '' : null)}>
+            <button type="button" className="text-xs text-accent-blue shrink-0" aria-label={cleared ? `撤销清除 ${label}` : `清除 ${label}`} onClick={() => set(key, cleared ? undefined : null)}>
               {cleared ? '撤销' : '清除'}
             </button>
           )}
@@ -124,7 +123,7 @@ export default function MmpgSettings({ form, stored, onChange, onImport, onSave,
         {secret('volc_secret_key')}
         {secret('doubao_api_key')}
         <Field label="RTC Token 方式">
-          <select aria-label="RTC Token 方式" className="input-field" value={form.token_mode} onChange={(event) => set('token_mode', event.target.value as MmpgForm['token_mode'])}>
+          <select aria-label="RTC Token 方式" className="input-field" value={form.token_mode} onChange={(event) => set('token_mode', event.target.value as MmpgEngineForm['token_mode'])}>
             <option value="auto">使用 RTC App Key 自动签发与续期</option>
             <option value="manual">手动填入 RTC Token</option>
           </select>
@@ -143,12 +142,6 @@ export default function MmpgSettings({ form, stored, onChange, onImport, onSave,
             <Field label="判停静音时间（ms）" hint="允许 500–2999 毫秒。">
               <input aria-label="判停静音时间" className="input-field" type="number" min={500} max={2999} value={Number.isFinite(form.silence_ms) ? form.silence_ms : ''} onChange={(event) => set('silence_ms', event.target.valueAsNumber)} />
             </Field>
-            <Field label="答题前等待时长（毫秒）" hint="判停后等待续说。续说结束后合并文字并重新计时。设为 0 可立即提交。">
-              <input aria-label="答题前等待时长" className="input-field" type="number" min={0} step={1} value={Number.isFinite(form.answer_delay_ms) ? form.answer_delay_ms : ''} onChange={(event) => set('answer_delay_ms', event.target.valueAsNumber)} />
-            </Field>
-            <Field label="回答启动后的续说窗口（毫秒）" hint="从发起回答开始计时。窗口内续说会停止正在生成的回答，合并后重新回答。设为 0 可关闭。">
-              <input aria-label="回答启动后的续说窗口" className="input-field" type="number" min={0} step={1} value={Number.isFinite(form.followup_window_ms) ? form.followup_window_ms : ''} onChange={(event) => set('followup_window_ms', event.target.valueAsNumber)} />
-            </Field>
             <Field label="识别过期时间（ms，可选）">
               <input aria-label="识别过期时间" type="number" min={1} value={form.expire_time_ms ?? ''} className="input-field" onChange={(event) => set('expire_time_ms', event.target.value ? event.target.valueAsNumber : null)} />
             </Field>
@@ -162,7 +155,6 @@ export default function MmpgSettings({ form, stored, onChange, onImport, onSave,
         </details>
       </fieldset>
 
-      {testEnabled && (
       <div className="space-y-2 rounded-lg bg-bg-primary/40 p-3 text-xs text-text-secondary">
         <Field label="MMPG 测试音频设备">
           <select aria-label="MMPG 测试音频设备" className="input-field" value={device} disabled={testRunning} onChange={(event) => setDevice(event.target.value)}>
@@ -195,7 +187,6 @@ export default function MmpgSettings({ form, stored, onChange, onImport, onSave,
           </div>
         )}
       </div>
-      )}
       {(error || (test && status.error)) && <p role="alert" className="text-xs text-accent-red">{error || status.error}</p>}
     </div>
   )

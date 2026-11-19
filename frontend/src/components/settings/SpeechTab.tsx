@@ -1,1139 +1,165 @@
-import { useState, useEffect, useRef } from 'react'
-import {
-  Save,
-  Mic,
-  Zap,
-  Sparkles,
-  Volume2,
-  Loader2,
-  HelpCircle,
-  Settings2,
-  CheckCircle2,
-  XCircle,
-  AudioWaveform,
-  Download,
-  Gauge,
-} from 'lucide-react'
-import { useInterviewStore } from '@/stores/configStore'
-import type { AppConfig } from '@/stores/slices/types'
+import { useRef, useState } from 'react'
+import { AudioWaveform, Cloud, Zap } from 'lucide-react'
 import { api } from '@/lib/api'
-import { refreshConfig, updateConfigAndRefresh } from '@/lib/configSync'
-import { mmpgConfigPatch, mmpgCredentialsPresent, mmpgFormFromConfig, type MmpgForm } from '@/lib/mmpg/settings'
-import {
-  Section,
-  Field,
-  GradientCard,
-  SaveStateBadge,
-  StatusBadge,
-  ToggleSwitch,
-  InfoHint,
-  useDirtySnapshot,
-  useSettingsDirtyRegistration,
-  useSettingsSearch,
-  type SaveState,
-} from './shared'
-import SttGuideCard from './SttGuideCard'
+import { refreshConfig } from '@/lib/configSync'
+import { mmpgEngineFormFromConfig, type MmpgEngineForm } from '@/lib/mmpg/settings'
+import type { SegmentedSpeechProvider } from '@/lib/speechProviders'
+import { useInterviewStore, type AppConfig } from '@/stores/configStore'
+import { Field, SaveStateBadge, Section, StatusBadge } from './shared'
+import { useSpeechSettingsDraft } from './useSpeechSettingsDraft'
 import MmpgSettings from './MmpgSettings'
 
-function clampNumberInput(value: unknown, min: number, max: number, fallback: number): number {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed)) return fallback
-  return Math.max(min, Math.min(max, parsed))
+const doubaoFields = [
+  { key: 'doubao_stt_api_key', label: 'API Key（新版控制台）', secret: true, hint: '新版凭据优先，留空时可使用旧版凭据。' },
+  { key: 'doubao_stt_app_id', label: 'App ID（旧版控制台）' },
+  { key: 'doubao_stt_access_token', label: 'Access Token（旧版控制台）', secret: true },
+  { key: 'doubao_stt_resource_id', label: 'Resource ID', defaultValue: 'volc.seedasr.sauc.duration' },
+  { key: 'doubao_stt_boosting_table_id', label: '热词表 ID（可选）' },
+] as const
+
+const genericFields = [
+  { key: 'generic_stt_api_base_url', label: 'Base URL', hint: '填写 OpenAI 兼容接口地址，例如 https://api.example.com/v1。' },
+  { key: 'generic_stt_api_key', label: 'API Key', secret: true },
+  { key: 'generic_stt_model', label: 'Model' },
+  { key: 'generic_stt_custom_headers', label: '自定义 Header（可选）', multiline: true, hint: '使用 JSON 对象，或每行填写一组 Key: Value。' },
+] as const
+
+type EngineField = {
+  key: typeof doubaoFields[number]['key'] | typeof genericFields[number]['key']
+  label: string
+  hint?: string
+  secret?: boolean
+  multiline?: boolean
+  defaultValue?: string
 }
 
-function clampIntegerInput(value: unknown, min: number, max: number, fallback: number): number {
-  return Math.floor(clampNumberInput(value, min, max, fallback))
+const saveButton = 'rounded-lg border border-accent-blue/30 bg-accent-blue/15 px-3 py-1.5 text-xs font-medium text-accent-blue disabled:opacity-50'
+
+function ProviderStatus({ configured }: { configured: boolean }) {
+  return <StatusBadge status={configured ? 'ok' : 'idle'} label={configured ? '已配置' : '待配置'} />
 }
 
-type SpeechForm = {
-  stt_provider: string
-  mmpg: MmpgForm
-  whisper_model: string
-  whisper_language: string
-  whisper_preload: boolean
-  stt_fallback_provider: string
-  stt_infer_threads: number
-  funasr_model: string
-  doubao_stt_app_id: string
-  doubao_stt_access_token: string
-  doubao_stt_api_key: string
-  doubao_stt_resource_id: string
-  doubao_stt_boosting_table_id: string
-  generic_stt_api_base_url: string
-  generic_stt_api_key: string
-  generic_stt_model: string
-  generic_stt_custom_headers: string
-  candidate_asr_enabled: boolean
-  candidate_stt_provider: string
-  candidate_whisper_model: string
-  candidate_whisper_language: string
-  candidate_remote_stt_enabled: boolean
-  candidate_context_enabled: boolean
-  candidate_context_wait_ms: number
-  candidate_context_max_chars: number
-  candidate_context_min_chars: number
-  candidate_streaming_asr_enabled: boolean
-  candidate_streaming_asr_interval_ms: number
-  candidate_mic_compatibility_mode: boolean
-  silence_threshold: number
-  silence_duration: number
-  transcription_min_sig_chars: number
-  assist_transcription_merge_gap_sec: number
-  assist_transcription_merge_max_sec: number
-  assist_vad_max_speech_sec: number
-  assist_asr_confirm_window_sec: number
-  assist_asr_group_max_wait_sec: number
-  assist_high_churn_short_answer: boolean
-  auto_detect: boolean
-}
+function SegmentedEngineSettings({
+  provider, title, fields, config,
+}: { provider: SegmentedSpeechProvider; title: string; fields: readonly EngineField[]; config: AppConfig }) {
+  const saved = Object.fromEntries(fields.map(({ key, defaultValue }) => [key, config[key] ?? defaultValue ?? ''])) as Partial<Record<EngineField['key'], string>>
+  const draft = useSpeechSettingsDraft('speech-' + provider, saved)
+  const [testResult, setTestResult] = useState<{ ok: boolean; detail?: string; text?: string } | null>(null)
+  const [testing, setTesting] = useState(false)
+  const testRef = useRef(false)
 
-const LOCAL_STT_PROVIDERS = ['whisper', 'funasr', 'qwen3_asr']
-const REMOTE_CANDIDATE_PROVIDERS = ['doubao', 'generic', 'doubao_mmpg']
-
-const DEFAULT_SPEECH_FORM: SpeechForm = {
-  stt_provider: 'whisper',
-  mmpg: mmpgFormFromConfig(),
-  whisper_model: 'base',
-  whisper_language: 'auto',
-  whisper_preload: false,
-  stt_fallback_provider: 'whisper',
-  stt_infer_threads: 0,
-  funasr_model: 'paraformer-zh',
-  doubao_stt_app_id: '',
-  doubao_stt_access_token: '',
-  doubao_stt_api_key: '',
-  doubao_stt_resource_id: 'volc.seedasr.sauc.duration',
-  doubao_stt_boosting_table_id: '',
-  generic_stt_api_base_url: '',
-  generic_stt_api_key: '',
-  generic_stt_model: '',
-  generic_stt_custom_headers: '',
-  candidate_asr_enabled: false,
-  candidate_stt_provider: 'whisper',
-  candidate_whisper_model: '',
-  candidate_whisper_language: '',
-  candidate_remote_stt_enabled: false,
-  candidate_context_enabled: true,
-  candidate_context_wait_ms: 200,
-  candidate_context_max_chars: 900,
-  candidate_context_min_chars: 6,
-  candidate_streaming_asr_enabled: true,
-  candidate_streaming_asr_interval_ms: 1500,
-  candidate_mic_compatibility_mode: true,
-  silence_threshold: 0.01,
-  silence_duration: 1.2,
-  transcription_min_sig_chars: 2,
-  assist_transcription_merge_gap_sec: 2.0,
-  assist_transcription_merge_max_sec: 12.0,
-  assist_vad_max_speech_sec: 18.0,
-  assist_asr_confirm_window_sec: 0.45,
-  assist_asr_group_max_wait_sec: 1.2,
-  assist_high_churn_short_answer: false,
-  auto_detect: true,
-}
-
-  // 延迟预设：一键调整转写合并/确认窗口等关键节奏参数（应用后仍可手调）
-  const LATENCY_PRESETS: Record<string, { label: string; desc: string; values: Record<string, number> }> = {
-balanced: {
-  label: '均衡',
-  desc: '默认节奏，稳定跟题',
-  values: {
-    assist_transcription_merge_gap_sec: 2.0,
-    assist_asr_confirm_window_sec: 0.45,
-    assist_asr_group_max_wait_sec: 1.2,
-    assist_vad_max_speech_sec: 18.0,
-    silence_duration: 1.2,
-  },
-},
-low: {
-  label: '低延迟',
-  desc: '更快出答案，适合口齿清晰/本地 FunASR',
-  values: {
-    assist_transcription_merge_gap_sec: 1.2,
-    assist_asr_confirm_window_sec: 0.3,
-    assist_asr_group_max_wait_sec: 0.8,
-    assist_vad_max_speech_sec: 12.0,
-    silence_duration: 1.0,
-  },
-},
-steady: {
-  label: '稳态',
-  desc: '嘈杂环境，减少碎片误触发',
-  values: {
-    assist_transcription_merge_gap_sec: 2.5,
-    assist_asr_confirm_window_sec: 0.6,
-    assist_asr_group_max_wait_sec: 1.8,
-    assist_vad_max_speech_sec: 18.0,
-    silence_duration: 1.2,
-  },
-},
-  }
-
-
-function speechFormFromConfig(config: AppConfig): SpeechForm {
-  return {
-    stt_provider: config.stt_provider ?? DEFAULT_SPEECH_FORM.stt_provider,
-    mmpg: mmpgFormFromConfig(config.mmpg),
-    whisper_model: config.whisper_model ?? DEFAULT_SPEECH_FORM.whisper_model,
-    whisper_language: config.whisper_language ?? DEFAULT_SPEECH_FORM.whisper_language,
-    whisper_preload: config.whisper_preload ?? DEFAULT_SPEECH_FORM.whisper_preload,
-    stt_fallback_provider: config.stt_fallback_provider ?? DEFAULT_SPEECH_FORM.stt_fallback_provider,
-    stt_infer_threads: config.stt_infer_threads ?? DEFAULT_SPEECH_FORM.stt_infer_threads,
-    funasr_model: config.funasr_model ?? DEFAULT_SPEECH_FORM.funasr_model,
-    doubao_stt_app_id: config.doubao_stt_app_id ?? DEFAULT_SPEECH_FORM.doubao_stt_app_id,
-    doubao_stt_access_token: config.doubao_stt_access_token ?? DEFAULT_SPEECH_FORM.doubao_stt_access_token,
-    doubao_stt_api_key: config.doubao_stt_api_key ?? DEFAULT_SPEECH_FORM.doubao_stt_api_key,
-    doubao_stt_resource_id: config.doubao_stt_resource_id ?? DEFAULT_SPEECH_FORM.doubao_stt_resource_id,
-    doubao_stt_boosting_table_id: config.doubao_stt_boosting_table_id ?? DEFAULT_SPEECH_FORM.doubao_stt_boosting_table_id,
-    generic_stt_api_base_url: config.generic_stt_api_base_url ?? DEFAULT_SPEECH_FORM.generic_stt_api_base_url,
-    generic_stt_api_key: config.generic_stt_api_key ?? DEFAULT_SPEECH_FORM.generic_stt_api_key,
-    generic_stt_model: config.generic_stt_model ?? DEFAULT_SPEECH_FORM.generic_stt_model,
-    generic_stt_custom_headers: config.generic_stt_custom_headers ?? DEFAULT_SPEECH_FORM.generic_stt_custom_headers,
-    candidate_asr_enabled: config.candidate_asr_enabled ?? DEFAULT_SPEECH_FORM.candidate_asr_enabled,
-    candidate_stt_provider: config.candidate_stt_provider ?? DEFAULT_SPEECH_FORM.candidate_stt_provider,
-    candidate_whisper_model: config.candidate_whisper_model ?? DEFAULT_SPEECH_FORM.candidate_whisper_model,
-    candidate_whisper_language: config.candidate_whisper_language ?? DEFAULT_SPEECH_FORM.candidate_whisper_language,
-    candidate_remote_stt_enabled: config.candidate_remote_stt_enabled ?? DEFAULT_SPEECH_FORM.candidate_remote_stt_enabled,
-    candidate_context_enabled: config.candidate_context_enabled ?? DEFAULT_SPEECH_FORM.candidate_context_enabled,
-    candidate_context_wait_ms: clampIntegerInput(config.candidate_context_wait_ms, 0, 2000, DEFAULT_SPEECH_FORM.candidate_context_wait_ms),
-    candidate_context_max_chars: clampIntegerInput(config.candidate_context_max_chars, 100, 4000, DEFAULT_SPEECH_FORM.candidate_context_max_chars),
-    candidate_context_min_chars: clampIntegerInput(config.candidate_context_min_chars, 1, 100, DEFAULT_SPEECH_FORM.candidate_context_min_chars),
-    candidate_streaming_asr_enabled: config.candidate_streaming_asr_enabled ?? DEFAULT_SPEECH_FORM.candidate_streaming_asr_enabled,
-    candidate_streaming_asr_interval_ms: clampIntegerInput(config.candidate_streaming_asr_interval_ms, 800, 5000, DEFAULT_SPEECH_FORM.candidate_streaming_asr_interval_ms),
-    candidate_mic_compatibility_mode: config.candidate_mic_compatibility_mode ?? DEFAULT_SPEECH_FORM.candidate_mic_compatibility_mode,
-    silence_threshold: clampNumberInput(config.silence_threshold, 0.001, 0.1, DEFAULT_SPEECH_FORM.silence_threshold),
-    silence_duration: clampNumberInput(config.silence_duration, 0.5, 10, DEFAULT_SPEECH_FORM.silence_duration),
-    transcription_min_sig_chars: clampIntegerInput(config.transcription_min_sig_chars, 1, 50, DEFAULT_SPEECH_FORM.transcription_min_sig_chars),
-    assist_transcription_merge_gap_sec: clampNumberInput(config.assist_transcription_merge_gap_sec, 0, 15, DEFAULT_SPEECH_FORM.assist_transcription_merge_gap_sec),
-    assist_transcription_merge_max_sec: clampNumberInput(config.assist_transcription_merge_max_sec, 1, 120, DEFAULT_SPEECH_FORM.assist_transcription_merge_max_sec),
-    assist_vad_max_speech_sec: clampNumberInput(config.assist_vad_max_speech_sec, 6, 60, DEFAULT_SPEECH_FORM.assist_vad_max_speech_sec),
-    assist_asr_confirm_window_sec: clampNumberInput(config.assist_asr_confirm_window_sec, 0, 5, DEFAULT_SPEECH_FORM.assist_asr_confirm_window_sec),
-    assist_asr_group_max_wait_sec: clampNumberInput(config.assist_asr_group_max_wait_sec, 0.2, 8, DEFAULT_SPEECH_FORM.assist_asr_group_max_wait_sec),
-    assist_high_churn_short_answer: config.assist_high_churn_short_answer ?? DEFAULT_SPEECH_FORM.assist_high_churn_short_answer,
-    auto_detect: config.auto_detect ?? DEFAULT_SPEECH_FORM.auto_detect,
-  }
-}
-
-function speechFormSnapshot(value: SpeechForm): string {
-  return JSON.stringify(value)
-}
-
-export default function SpeechTab({ variant = 'engines' }: { variant?: 'engines' | 'timing' } = {}) {
-  const config = useInterviewStore((s) => s.config)
-  const options = useInterviewStore((s) => s.options)
-  const [form, setForm] = useState<SpeechForm>(() => (config ? speechFormFromConfig(config) : DEFAULT_SPEECH_FORM))
-  const [saving, setSaving] = useState(false)
-  const [saveState, setSaveState] = useState<SaveState>('idle')
-  const [saveError, setSaveError] = useState<string | null>(null)
-  const [sttTesting, setSttTesting] = useState(false)
-  const [sttTestResult, setSttTestResult] = useState<{ ok: boolean; detail?: string; text?: string } | null>(null)
-  const [hotwordPosition, setHotwordPosition] = useState('通用')
-  const [funasrInfo, setFunasrInfo] = useState<{
-    installed: boolean
-    model: string
-    loaded: boolean
-    loading: boolean
-    downloading: boolean
-    error: string
-  }>({ installed: true, model: 'paraformer-zh', loaded: false, loading: false, downloading: false, error: '' })
-  const savingRef = useRef(false)
-  const sttTestingRef = useRef(false)
-  const mmpgBaseline = useRef(mmpgFormFromConfig(config?.mmpg))
-
-  const refreshFunasrStatus = async () => {
+  async function testEngine() {
+    if (testRef.current || draft.saving) return
+    testRef.current = true
+    setTesting(true)
+    setTestResult(null)
     try {
-      const s = await api.funasrStatus()
-      setFunasrInfo({
-        installed: s.installed,
-        model: s.model,
-        loaded: s.loaded,
-        loading: s.loading,
-        downloading: s.downloading,
-        error: s.download_error || '',
-      })
-      return s
-    } catch {
-      return null
-    }
-  }
-
-  useEffect(() => {
-    void refreshFunasrStatus()
-  }, [])
-
-  // 下载/加载中每 3s 轮询一次状态
-  useEffect(() => {
-    if (!funasrInfo.downloading && !funasrInfo.loading) return
-    const timer = window.setInterval(() => { void refreshFunasrStatus() }, 3000)
-    return () => window.clearInterval(timer)
-  }, [funasrInfo.downloading, funasrInfo.loading])
-
-  const handleFunasrDownload = async () => {
-    try {
-      // 先保存表单（含 funasr_model），再按该模型下载：否则配置与已加载模型脱节，
-      // 下一次取引擎会再换回旧模型导致 ~1GB 双载
-      const saved = await handleSave()
-      if (!saved) {
-        setFunasrInfo((prev) => ({ ...prev, error: '语音配置保存失败，无法开始下载' }))
-        return
-      }
-      const res = await api.funasrDownload(form.funasr_model)
-      if (!res.ok) {
-        setFunasrInfo((prev) => ({ ...prev, error: res.detail || '下载启动失败' }))
-        return
-      }
-      setFunasrInfo((prev) => ({ ...prev, downloading: true, error: '' }))
-    } catch (e: any) {
-      setFunasrInfo((prev) => ({ ...prev, error: e?.message ?? '下载启动失败' }))
-    }
-  }
-  const { dirty, markSaved, resetBaseline } = useDirtySnapshot(form)
-  useSettingsDirtyRegistration('speech', dirty)
-  const formRef = useRef(form)
-  const dirtyRef = useRef(dirty)
-  formRef.current = form
-  dirtyRef.current = dirty
-
-  useEffect(() => {
-    if (!config || dirtyRef.current) return
-    const nextForm = speechFormFromConfig(config)
-    mmpgBaseline.current = nextForm.mmpg
-    if (speechFormSnapshot(formRef.current) === speechFormSnapshot(nextForm)) return
-    setForm(nextForm)
-    resetBaseline(nextForm)
-    setSttTestResult(null)
-  }, [config, dirty, resetBaseline])
-
-  const handleSave = async () => {
-    if (savingRef.current) return false
-    savingRef.current = true
-    setSaving(true)
-    setSaveState('saving')
-    setSaveError(null)
-    try {
-      const normalizedCandidateProvider = primaryLocalEngine && LOCAL_STT_PROVIDERS.includes(form.candidate_stt_provider)
-        ? primaryLocalEngine
-        : form.candidate_stt_provider
-      const savedForm = {
-        ...form,
-        candidate_stt_provider: normalizedCandidateProvider,
-        candidate_remote_stt_enabled: form.candidate_asr_enabled && REMOTE_CANDIDATE_PROVIDERS.includes(normalizedCandidateProvider),
-        candidate_context_wait_ms: clampIntegerInput(form.candidate_context_wait_ms, 0, 2000, 200),
-        candidate_context_max_chars: clampIntegerInput(form.candidate_context_max_chars, 100, 4000, 900),
-        candidate_context_min_chars: clampIntegerInput(form.candidate_context_min_chars, 1, 100, 6),
-        candidate_streaming_asr_interval_ms: clampIntegerInput(form.candidate_streaming_asr_interval_ms, 800, 5000, 1500),
-        silence_threshold: clampNumberInput(form.silence_threshold, 0.001, 0.1, 0.01),
-        silence_duration: clampNumberInput(form.silence_duration, 0.5, 10, 1.2),
-        transcription_min_sig_chars: clampIntegerInput(form.transcription_min_sig_chars, 1, 50, 2),
-        assist_transcription_merge_gap_sec: clampNumberInput(form.assist_transcription_merge_gap_sec, 0, 15, 2.0),
-        assist_transcription_merge_max_sec: clampNumberInput(form.assist_transcription_merge_max_sec, 1, 120, 12.0),
-      }
-      const { mmpg, ...speechPayload } = savedForm
-      const mmpgPatch = mmpgConfigPatch(mmpg, mmpgBaseline.current)
-      if ([mmpgPatch?.answer_delay_ms, mmpgPatch?.followup_window_ms].some(
-        (value) => value !== undefined && (!Number.isSafeInteger(value) || value < 0),
-      )) {
-        throw new Error('答题前等待时长和回答启动后的续说窗口须填写非负整数。')
-      }
-      if (mmpgPatch?.silence_ms !== undefined && (!Number.isInteger(mmpgPatch.silence_ms) || mmpgPatch.silence_ms < 500 || mmpgPatch.silence_ms > 2999)) {
-        throw new Error('MMPG 判停静音时间必须为 500–2999 毫秒内的整数。')
-      }
-      if (mmpgPatch?.expire_time_ms != null && (!Number.isInteger(mmpgPatch.expire_time_ms) || mmpgPatch.expire_time_ms < 1)) {
-        throw new Error('MMPG 识别过期时间必须为正整数或留空。')
-      }
-      const savedConfig = await updateConfigAndRefresh({ ...speechPayload, ...(mmpgPatch ? { mmpg: mmpgPatch } : {}) })
-      const nextForm = { ...savedForm, mmpg: mmpgFormFromConfig(savedConfig?.mmpg ?? config?.mmpg) }
-      mmpgBaseline.current = nextForm.mmpg
-      setForm(nextForm)
-      markSaved(nextForm)
-      setSaveState('saved')
-      useInterviewStore.getState().setToastMessage('语音配置已保存')
-      return true
-    } catch (e: any) {
-      const message = e?.message ?? '保存失败'
-      setSaveError(message)
-      setSaveState('error')
-      useInterviewStore.getState().setToastMessage(message)
-      return false
+      if (!(await draft.save())) return
+      setTestResult(await api.sttTest({ provider }))
+    } catch (error) {
+      setTestResult({ ok: false, detail: error instanceof Error ? error.message : '测试失败' })
     } finally {
-      savingRef.current = false
-      setSaving(false)
+      testRef.current = false
+      setTesting(false)
     }
   }
 
-  const handleMmpgImport = async () => {
-    if (savingRef.current) return
-    savingRef.current = true
-    try {
-      await api.importMmpgProbe()
-      const next = await refreshConfig()
-      mmpgBaseline.current = mmpgFormFromConfig(next.mmpg)
-      const baseline = speechFormFromConfig(next)
-      setForm((current) => ({ ...current, mmpg: baseline.mmpg }))
-      resetBaseline(baseline)
-      useInterviewStore.getState().setToastMessage('探针配置已导入')
-    } finally {
-      savingRef.current = false
-    }
-  }
-
-  const handleSttTest = async () => {
-    if (sttTestingRef.current || savingRef.current) return
-    sttTestingRef.current = true
-    setSttTesting(true)
-    setSttTestResult(null)
-    try {
-      const saved = await handleSave()
-      if (!saved) {
-        setSttTestResult({ ok: false, detail: '当前语音配置保存失败，请先修复后再测试。' })
-        return
-      }
-      const result = await api.sttTest()
-      setSttTestResult(result)
-      useInterviewStore.getState().setToastMessage(result.ok ? 'STT 连接成功' : `STT 测试失败: ${result.detail}`)
-    } catch (e: any) {
-      setSttTestResult({ ok: false, detail: e.message })
-    } finally {
-      sttTestingRef.current = false
-      setSttTesting(false)
-    }
-  }
-
-  const providers = options?.stt_providers ?? ['whisper', 'funasr', 'qwen3_asr', 'doubao', 'doubao_mmpg', 'generic']
-  const candidateProviders = options?.candidate_stt_providers ?? providers
-
-  const activeLatencyPreset = Object.entries(LATENCY_PRESETS).find(([, preset]) =>
-    Object.entries(preset.values).every(([key, value]) => Number((form as any)[key]) === value),
-  )?.[0]
-  const providerSupported = providers.includes(form.stt_provider)
-
-  const providerMeta: Record<string, { label: string; desc: string; icon: React.ReactNode; brandClass: string }> = {
-    whisper: { label: 'Whisper', desc: '本地运行，免费无限', icon: <Volume2 className="w-5 h-5" />, brandClass: 'sky' },
-    funasr: { label: 'FunASR', desc: '本地·中文更强·支持热词', icon: <AudioWaveform className="w-5 h-5" />, brandClass: 'violet' },
-    qwen3_asr: { label: 'Qwen3-ASR', desc: '0.6B · 本地 GPU', icon: <AudioWaveform className="w-5 h-5" />, brandClass: 'violet' },
-    doubao: { label: '豆包', desc: '火山引擎云端 API', icon: <Zap className="w-5 h-5" />, brandClass: 'orange' },
-    doubao_mmpg: { label: '豆包 MMPG', desc: '火山 RTC · 智能判停', icon: <AudioWaveform className="w-5 h-5" />, brandClass: 'orange' },
-    generic: { label: '通用 ASR', desc: 'OpenAI-compatible multipart', icon: <Sparkles className="w-5 h-5" />, brandClass: 'blue' },
-  }
-
-  const brandBorder: Record<string, string> = {
-    whisper: 'border-sky-400/40',
-    funasr: 'border-accent-violet/40',
-    qwen3_asr: 'border-accent-violet/40',
-    doubao: 'border-orange-400/40',
-    doubao_mmpg: 'border-orange-400/40',
-    generic: 'border-blue-400/40',
-  }
-
-  const credentialConfigured = (provider: string): boolean => {
-    if (provider === 'whisper') return true
-    if (provider === 'funasr') return true
-    if (provider === 'qwen3_asr') return true
-    if (provider === 'doubao') return !!(form.doubao_stt_api_key || (form.doubao_stt_app_id && form.doubao_stt_access_token))
-    if (provider === 'doubao_mmpg') return mmpgCredentialsPresent(form.mmpg, config?.mmpg)
-    if (provider === 'generic') return !!(form.generic_stt_api_base_url && form.generic_stt_api_key && form.generic_stt_model)
-    return false
-  }
-
-  const mainSttLabel = providerMeta[form.stt_provider]?.label ?? form.stt_provider
-  // 本地引擎互斥：主链路为本地引擎时，候选人链路的本地选项跟随主链路，
-  // 避免 funasr 与 whisper 双模型同时驻留（后端会做同样收敛，这里保持 UI 一致）
-  const primaryLocalEngine = LOCAL_STT_PROVIDERS.includes(form.stt_provider) ? form.stt_provider : null
-  const effectiveCandidateProvider = primaryLocalEngine && LOCAL_STT_PROVIDERS.includes(form.candidate_stt_provider)
-    ? primaryLocalEngine
-    : form.candidate_stt_provider
-  const candidateSttLabel = effectiveCandidateProvider === 'qwen3_asr'
-    ? 'Qwen3-ASR GPU'
-    : effectiveCandidateProvider === 'whisper'
-    ? 'Whisper 本地'
-    : effectiveCandidateProvider === 'funasr'
-      ? 'FunASR 本地'
-      : form.candidate_stt_provider === 'doubao'
-        ? '豆包云端'
-        : effectiveCandidateProvider === 'doubao_mmpg' ? '豆包 MMPG' : '通用云端'
-  const candidateUsesMmpg = form.candidate_asr_enabled && effectiveCandidateProvider === 'doubao_mmpg'
-  const candidateRemoteSelected = form.candidate_asr_enabled && ['doubao', 'generic'].includes(form.candidate_stt_provider)
-  const candidateRemoteCredentialReady = !candidateRemoteSelected || credentialConfigured(form.candidate_stt_provider)
-  const candidateRemoteProviderLabel = providerMeta[form.candidate_stt_provider]?.label ?? form.candidate_stt_provider
-  const candidateContextActive = form.candidate_asr_enabled && form.candidate_context_enabled
-  const candidateUsageLabel = !form.candidate_asr_enabled
-    ? '实时语音只使用会议音频转写'
-    : candidateContextActive
-      ? `${candidateSttLabel}，用于复盘、实时语音和手动提问上下文`
-      : `${candidateSttLabel}，用于复盘和实时语音上下文`
-  const searchQuery = useSettingsSearch()
-  const inSearch = searchQuery.trim().length > 0
-  const effectiveSaveState: SaveState = saveState === 'saving' || saveState === 'error'
-    ? saveState
-    : dirty
-      ? 'dirty'
-      : saveState === 'saved'
-        ? 'saved'
-      : 'idle'
-
+  const busy = draft.saving || testing
   return (
-    <div className="p-5 space-y-5 pb-8" data-in-search={inSearch ? '1' : undefined}>
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-bg-hover/60 bg-bg-primary/35 px-4 py-3">
-        <div>
-          <p className="text-sm font-semibold text-text-primary">
-            {variant === 'timing' ? '识别节奏与断句' : '语音识别引擎'}
-          </p>
-          <p className="mt-0.5 text-[11px] leading-relaxed text-text-muted">
-            {variant === 'timing'
-              ? '延迟预设、VAD 断句与转写合并参数，保存后生效。'
-              : 'STT 引擎、降级与麦克风链路，保存后生效。'}
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <SaveStateBadge mode="explicit" state={effectiveSaveState} error={saveError} />
-          <button
-            type="button"
-            onClick={handleSave}
-            disabled={saving || sttTesting}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent-blue/15 hover:bg-accent-blue/25 border border-accent-blue/30 text-accent-blue text-xs font-medium transition-colors disabled:opacity-60"
-          >
-            <Save className="w-3.5 h-3.5" />
-            {saving ? '保存中…' : '保存'}
-          </button>
-        </div>
+    <Section title={title} icon={<Cloud size={14} />} keywords="云端 语音 识别 分段 STT 凭据 API Key 热词 测试">
+      <ProviderStatus configured={Boolean(config.stt_configured?.[provider])} />
+      <fieldset disabled={busy} className="grid gap-3 sm:grid-cols-2">
+        {fields.map(({ key, label, hint, secret, multiline }) => (
+          <Field label={label} htmlFor={key} hint={hint} key={key}>
+            {multiline ? (
+              <textarea
+                id={key}
+                className="input-field min-h-20 font-mono"
+                value={draft.form[key]}
+                onChange={(event) => { draft.edit({ [key]: event.target.value }); setTestResult(null) }}
+              />
+            ) : (
+              <input
+                id={key}
+                className="input-field"
+                type={secret ? 'password' : 'text'}
+                autoComplete={secret ? 'off' : undefined}
+                value={draft.form[key]}
+                onChange={(event) => { draft.edit({ [key]: event.target.value }); setTestResult(null) }}
+              />
+            )}
+          </Field>
+        ))}
+      </fieldset>
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <SaveStateBadge mode="explicit" state={draft.state} error={draft.error} />
+        <button type="button" className={saveButton} disabled={!draft.dirty || busy} onClick={() => void draft.save()}>
+          {draft.saving ? '保存中…' : '保存'}
+        </button>
+        <button type="button" className={saveButton} disabled={busy} onClick={() => void testEngine()}>
+          {testing ? '测试中…' : '保存并测试'}
+        </button>
       </div>
-
-      {variant === 'timing' && (<>
-      <Section title="延迟预设" icon={<Gauge className="w-3.5 h-3.5" />} keywords="延迟 latency preset merge gap confirm 节奏 低延迟 实时">
-        <GradientCard className="p-4 space-y-3">
-          <div className="flex flex-wrap items-center gap-2">
-            {Object.entries(LATENCY_PRESETS).map(([key, preset]) => (
-              <button
-                key={key}
-                type="button"
-                onClick={() => setForm({ ...form, ...preset.values } as typeof form)}
-                className={`px-3 py-2 rounded-lg text-xs font-medium transition-all border ${
-                  activeLatencyPreset === key
-                    ? 'bg-accent-blue text-white border-transparent shadow-lg shadow-accent-blue/20'
-                    : 'bg-bg-tertiary/80 text-text-secondary border-bg-hover hover:bg-bg-hover'
-                }`}
-              >
-                {preset.label}
-              </button>
-            ))}
-            <span className="text-[10px] leading-relaxed text-text-muted ml-auto inline-flex items-center gap-1">
-              {activeLatencyPreset
-                ? `当前：${LATENCY_PRESETS[activeLatencyPreset].label} · ${LATENCY_PRESETS[activeLatencyPreset].desc}`
-                : '当前：自定义参数组合'}
-              <InfoHint text="调整转写合并间隔、问句确认窗口、VAD 分段上限等节奏参数；应用后保存生效，仍可在下方高级项手动微调。" />
-            </span>
-          </div>
-        </GradientCard>
-      </Section>
-
-      </>)}
-      {variant === 'engines' && (<>
-      <Section title="实时辅助语音链路" icon={<Mic className="w-3.5 h-3.5" />} keywords="实时辅助 双路 asr 面试官 候选人 麦克风 追问">
-        <GradientCard className="p-4 border-accent-blue/25">
-          <div className="grid gap-3 md:grid-cols-2">
-            <div className="rounded-lg border border-bg-hover bg-bg-tertiary/30 px-3 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <h3 className="text-sm font-semibold text-text-primary">1. 面试官 / 会议音频 ASR</h3>
-                <StatusBadge status="ok" label="主链路" />
-              </div>
-              <p className="mt-2 text-xs leading-relaxed text-text-secondary">
-                识别控制条里的“会议音频”。识别到面试官问题后，会继续走自动判题、追问判断和生成答案链路。
-              </p>
-              <p className="mt-2 text-[11px] text-text-muted">当前：{mainSttLabel}，这是下面“主链路 ASR”的配置。</p>
-            </div>
-            <div className="rounded-lg border border-bg-hover bg-bg-tertiary/30 px-3 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <h3 className="text-sm font-semibold text-text-primary">2. 我的麦克风 ASR</h3>
-                <StatusBadge status={form.candidate_asr_enabled ? 'ok' : 'idle'} label={form.candidate_asr_enabled ? '回答记录' : '已关闭'} />
-              </div>
-              <p className="mt-2 text-xs leading-relaxed text-text-secondary">
-                转写你实际说出口的话，用于复盘和实时语音上下文。只有面试官的提问会触发自动答题。
-              </p>
-              <p className="mt-2 text-[11px] text-text-muted">
-                当前：{candidateUsageLabel}。
-              </p>
-            </div>
-          </div>
-        </GradientCard>
-      </Section>
-
-      <Section title="主链路 ASR（面试官 / 会议音频）" icon={<Mic className="w-3.5 h-3.5" />} keywords="stt asr whisper funasr paraformer 识别引擎 model device 转写 sense-voice 面试官 会议音频">
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-2">
-          {providers.map((p) => {
-            const meta = providerMeta[p] || { label: p, desc: '', icon: <Mic className="w-5 h-5" />, brandClass: 'blue' }
-            const sel = form.stt_provider === p
-            const cred = credentialConfigured(p)
-            return (
-              <button
-                key={p}
-                type="button"
-                onClick={() => {
-                  setForm({ ...form, stt_provider: p })
-                  setSttTestResult(null)
-                }}
-                className={`relative flex flex-col items-center gap-1.5 p-3 rounded-xl border text-center transition-all duration-200 ${
-                  sel
-                    ? `${brandBorder[p] ?? 'border-accent-blue'} bg-accent-blue/10 ring-1 ring-accent-blue/30 shadow-md`
-                    : 'border-bg-hover bg-bg-tertiary/30 hover:border-bg-hover hover:bg-bg-tertiary/50'
-                }`}
-              >
-                <span className={sel ? 'text-accent-blue' : 'text-text-muted'}>{meta.icon}</span>
-                <span className="text-xs font-semibold text-text-primary">{meta.label}</span>
-                <span className="text-[9px] text-text-muted leading-snug">{meta.desc}</span>
-                {/* credential status dot */}
-                <span className={`absolute top-2 right-2 flex items-center gap-1`}>
-                  {cred
-                    ? <CheckCircle2 className="w-3 h-3 text-accent-green" />
-                    : <XCircle className="w-3 h-3 text-accent-red/60" />}
-                </span>
-              </button>
-            )
-          })}
-        </div>
-      </Section>
-
-      {!providerSupported && (
-        <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
-          当前配置中的 STT provider 为 `{form.stt_provider}`，该 provider 已不再受支持。
-          请切换到“通用 ASR”或“Whisper”后保存，再重新测试连接。
+      {testResult && (
+        <div role="status" className="flex flex-wrap items-center gap-2 text-xs text-text-secondary">
+          <StatusBadge status={testResult.ok ? 'ok' : 'error'} label={testResult.ok ? '连接成功' : '测试失败'} />
+          {testResult.text || testResult.detail}
         </div>
       )}
+    </Section>
+  )
+}
 
-      <SttGuideCard provider={form.stt_provider} />
+function validateMmpg(patch: Partial<MmpgEngineForm>) {
+  const { silence_ms, expire_time_ms } = patch
+  if (silence_ms !== undefined && (!Number.isInteger(silence_ms) || silence_ms < 500 || silence_ms > 2999)) {
+    throw new Error('MMPG 判停静音时间必须为 500–2999 毫秒内的整数。')
+  }
+  if (expire_time_ms != null && (!Number.isSafeInteger(expire_time_ms) || expire_time_ms < 1)) {
+    throw new Error('MMPG 识别过期时间必须为正整数或留空。')
+  }
+}
 
-      {/* Engine-specific config with brand color border */}
-      <GradientCard className={`p-4 space-y-3 transition-all duration-200 ${brandBorder[form.stt_provider] ?? ''}`}>
-        <div className="flex items-center justify-between gap-3">
-          <div>
-            <h3 className="text-sm font-semibold text-text-primary">面试官 ASR 引擎配置</h3>
-            <p className="text-[11px] text-text-muted mt-0.5">
-              这一路识别面试官声音，识别出的题目会触发自动生成答案。
-            </p>
-          </div>
-          <StatusBadge
-            status={credentialConfigured(form.stt_provider) ? 'ok' : 'error'}
-            label={credentialConfigured(form.stt_provider) ? '配置完整' : '待补全'}
-          />
-        </div>
+function MmpgEngineSettings({ stored, configured }: { stored: AppConfig['mmpg']; configured: boolean }) {
+  const saved = mmpgEngineFormFromConfig(stored)
+  const draft = useSpeechSettingsDraft('speech-mmpg', saved)
 
-        {form.stt_provider === 'whisper' && (
-          <>
-            <Field label="Whisper 模型" hint="模型越大越准确但越慢，base 适合大多数场景">
-              <select value={form.whisper_model} onChange={(e) => setForm({ ...form, whisper_model: e.target.value })} className="input-field">
-                {(options?.whisper_models ?? ['tiny', 'base', 'small', 'medium', 'large-v3']).map((m) => (
-                  <option key={m} value={m}>{m}</option>
-                ))}
-              </select>
-            </Field>
-            <Field label="识别语言" hint="auto = 自动检测（推荐），适合中英混合面试">
-              <select value={form.whisper_language} onChange={(e) => setForm({ ...form, whisper_language: e.target.value })} className="input-field">
-                <option value="auto">自动检测 (auto)</option>
-                <option value="zh">中文 (zh)</option>
-                <option value="en">English (en)</option>
-                <option value="ja">日本語 (ja)</option>
-              </select>
-            </Field>
-          </>
-        )}
+  const save = () => draft.save((changes) => {
+    validateMmpg(changes)
+    return { mmpg: changes }
+  })
+  async function importProbe() {
+    await api.importMmpgProbe()
+    await refreshConfig()
+    draft.reset()
+  }
 
-        {form.stt_provider === 'qwen3_asr' && (
-          <p className="text-xs leading-relaxed text-text-secondary">
-            Qwen3-ASR-0.6B · CUDA GPU。GTX 1650 使用混合精度：音频 FP32、文字解码 FP16。
-            自动识别语言，使用岗位热词作为上下文。
-            首次加载会下载模型；可用下方「保存并测试」检查实际转写。
-          </p>
-        )}
+  return (
+    <Section title="豆包 MMPG" icon={<AudioWaveform size={14} />} keywords="火山 RTC 智能判停 AIVAD 二遍识别 Token 凭据 语音 测试">
+      <ProviderStatus configured={configured} />
+      <MmpgSettings form={draft.form} stored={stored} onChange={draft.edit} onImport={importProbe} onSave={save} saving={draft.saving} />
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <SaveStateBadge mode="explicit" state={draft.state} error={draft.error} />
+        <button type="button" className={saveButton} disabled={!draft.dirty || draft.saving} onClick={() => void save()}>
+          {draft.saving ? '保存中…' : '保存'}
+        </button>
+      </div>
+    </Section>
+  )
+}
 
-        {form.stt_provider === 'funasr' && (
-          <>
-            <Field label="FunASR 模型" hint="paraformer-zh：准确率最高、支持热词（约1GB）；sensevoice-small：更快更轻（约250MB）">
-              <select value={form.funasr_model} onChange={(e) => setForm({ ...form, funasr_model: e.target.value })} className="input-field">
-                <option value="paraformer-zh">paraformer-zh（推荐，支持热词）</option>
-                <option value="sensevoice-small">sensevoice-small（轻量高速）</option>
-                <option value="paraformer-zh-streaming">paraformer-zh-streaming（流式）</option>
-              </select>
-            </Field>
-            <p className="text-[10px] leading-relaxed text-text-muted">
-              热词在下方「岗位热词」卡片统一配置（paraformer 直接生效，whisper 作为提示偏置）。
-            </p>
-            <div className="rounded-xl border border-bg-hover/60 bg-bg-tertiary/30 px-3 py-3 space-y-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleFunasrDownload}
-                  disabled={funasrInfo.downloading || funasrInfo.loading || !funasrInfo.installed}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-accent-violet/40 bg-accent-violet/15 px-3 py-1.5 text-xs font-medium text-accent-violet transition-colors hover:bg-accent-violet/25 disabled:opacity-60"
-                >
-                  {(funasrInfo.downloading || funasrInfo.loading)
-                    ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    : <Download className="h-3.5 w-3.5" />}
-                  {(funasrInfo.downloading || funasrInfo.loading)
-                    ? '下载/加载中…'
-                    : funasrInfo.loaded
-                      ? `已就绪（${funasrInfo.model}）· 重新加载`
-                      : '下载模型（约 0.3-1GB）'}
-                </button>
-                {funasrInfo.loaded && (
-                  <span className="text-[10px] text-accent-green">模型已加载，可直接使用</span>
-                )}
-                {!funasrInfo.installed && (
-                  <span className="text-[10px] text-accent-amber">
-                    FunASR 未安装：pip install funasr 后重启后端
-                  </span>
-                )}
-              </div>
-              {funasrInfo.error && (
-                <p role="alert" className="text-[11px] leading-relaxed text-accent-red">{funasrInfo.error}</p>
-              )}
-              <span className="text-[10px] leading-relaxed text-text-muted inline-flex items-center gap-1">
-                模型缓存在本机，下载后离线可用
-                <InfoHint text="模型从 ModelScope 显式下载到 ~/.cache/modelscope；首次约 0.3-1GB，下载完成后本地识别零成本。点击下载会先保存当前语音配置。" />
-              </span>
-            </div>
-          </>
-        )}
+export default function SpeechTab() {
+  const config = useInterviewStore((state) => state.config)
+  if (!config) return <p role="status" className="p-5 text-xs text-text-muted">正在加载语音配置…</p>
 
-        {form.stt_provider === 'doubao' && (
-          <>
-            <Field label="API Key（新版控制台）" hint="优先使用；火山引擎新版控制台 API Key 管理中获取">
-              <input type="text" value={form.doubao_stt_api_key} onChange={(e) => setForm({ ...form, doubao_stt_api_key: e.target.value })} placeholder="填入 API Key（UUID 格式）" className="input-field" />
-            </Field>
-            <Field label="App ID（旧版控制台）" hint="使用旧版控制台时填写，新版无需填">
-              <input type="text" value={form.doubao_stt_app_id} onChange={(e) => setForm({ ...form, doubao_stt_app_id: e.target.value })} placeholder="如：123456789" className="input-field" />
-            </Field>
-            <Field label="Access Token（旧版控制台）" hint="使用旧版控制台时填写，新版无需填">
-              <input type="text" value={form.doubao_stt_access_token} onChange={(e) => setForm({ ...form, doubao_stt_access_token: e.target.value })} placeholder="填入 Access Token" className="input-field" />
-            </Field>
-            <Field label="Resource ID" hint="默认为流式语音识别 1.0 小时版">
-              <input type="text" value={form.doubao_stt_resource_id} onChange={(e) => setForm({ ...form, doubao_stt_resource_id: e.target.value })} className="input-field" />
-            </Field>
-            <Field label="热词表 ID（可选）" hint="在自学习平台上传热词文件后获得">
-              <input type="text" value={form.doubao_stt_boosting_table_id} onChange={(e) => setForm({ ...form, doubao_stt_boosting_table_id: e.target.value })} placeholder="留空则不使用" className="input-field" />
-            </Field>
-          </>
-        )}
-
-        {(form.stt_provider === 'doubao_mmpg' || candidateUsesMmpg) && (
-          <MmpgSettings
-            testEnabled={form.stt_provider === 'doubao_mmpg'}
-            form={form.mmpg}
-            stored={config?.mmpg}
-            onChange={(mmpg) => setForm((current) => ({ ...current, mmpg }))}
-            onImport={handleMmpgImport}
-            onSave={handleSave}
-            saving={saving}
-          />
-        )}
-
-        {form.stt_provider === 'generic' && (
-          <>
-            <Field label="Base URL" hint="OpenAI-compatible 地址，例如 https://api.example.com/v1">
-              <input type="text" value={form.generic_stt_api_base_url} onChange={(e) => setForm({ ...form, generic_stt_api_base_url: e.target.value })} placeholder="https://.../v1" className="input-field" />
-            </Field>
-            <Field label="API Key" hint="Bearer token">
-              <input type="text" value={form.generic_stt_api_key} onChange={(e) => setForm({ ...form, generic_stt_api_key: e.target.value })} placeholder="填入 API Key" className="input-field" />
-            </Field>
-            <Field label="Model" hint="例如 whisper-1 / qwen-audio-asr / 供应商模型名">
-              <input type="text" value={form.generic_stt_model} onChange={(e) => setForm({ ...form, generic_stt_model: e.target.value })} placeholder="模型名" className="input-field" />
-            </Field>
-            <Field label="自定义 Header（可选）" hint='JSON {"Key":"Value"} 或每行 Key: Value，追加到请求头'>
-              <textarea value={form.generic_stt_custom_headers} onChange={(e) => setForm({ ...form, generic_stt_custom_headers: e.target.value })} placeholder='{"X-Custom-Header": "value"}&#10;或&#10;X-Custom-Header: value' rows={3} className="input-field min-h-[66px] resize-y font-mono text-xs" />
-            </Field>
-          </>
-        )}
-
-        {['doubao', 'generic'].includes(form.stt_provider) && (
-          <Field label="失败降级引擎" hint="远程 ASR 连不上/超时/返回异常时自动切到的本地引擎；选「不降级」则该段直接丢弃。FunASR 需先在 FunASR 引擎卡下载模型。">
-            <select
-              value={form.stt_fallback_provider}
-              onChange={(e) => setForm({ ...form, stt_fallback_provider: e.target.value })}
-              className="input-field"
-              aria-label="失败降级引擎"
-            >
-              <option value="whisper">Whisper（默认，体积小）</option>
-              <option value="funasr">FunASR（中文更准，需已下载）</option>
-              <option value="none">不降级（远程失败即返回空）</option>
-            </select>
-          </Field>
-        )}
-        {['doubao', 'generic'].includes(form.stt_provider) && form.stt_fallback_provider !== 'none' && (
-          <Field label="预加载降级模型" hint="默认关闭；开启后启动时后台加载降级引擎（FunASR 约 1GB / Whisper 约 300MB），远程故障时零等待降级。">
-            <label className="inline-flex items-center gap-2 cursor-pointer select-none">
-              <input type="checkbox" checked={form.whisper_preload} onChange={(e) => setForm({ ...form, whisper_preload: e.target.checked })} className="rounded border-border text-accent-blue focus:ring-accent-blue/30" />
-              <span className="text-xs text-text-secondary">{form.whisper_preload ? '已启用' : '已关闭'}</span>
-            </label>
-          </Field>
-        )}
-
-        {form.stt_provider !== 'doubao_mmpg' && <div className="flex items-center gap-3 pt-1">
-          <button
-            type="button"
-            onClick={handleSttTest}
-            disabled={sttTesting || saving}
-            className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-accent-blue/15 hover:bg-accent-blue/25 border border-accent-blue/30 text-accent-blue text-xs font-medium transition-colors disabled:opacity-60"
-          >
-            {sttTesting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
-            {sttTesting ? '测试中…' : '保存并测试'}
-          </button>
-          <span className="text-[10px] leading-relaxed text-text-muted inline-flex items-center gap-1">
-            <InfoHint text="会先保存当前语音配置，再测试主链路 ASR。" />
-          </span>
-          {sttTestResult && (
-            <div className="flex flex-col gap-1 min-w-0">
-              <StatusBadge
-                status={sttTestResult.ok ? 'ok' : 'error'}
-                label={sttTestResult.ok ? '连接成功' : (sttTestResult.detail?.slice(0, 40) || '连接失败')}
-              />
-              {sttTestResult.ok && (
-                <div className="text-[10px] text-text-muted max-w-[360px] truncate">
-                  返回文本：{sttTestResult.text?.trim() || '空'}
-                </div>
-              )}
-            </div>
-          )}
-        </div>}
-      </GradientCard>
-      </>)}
-
-      {variant === 'engines' && (<>
-      <Section
-        title="可选辅助 ASR（我的回答）"
-        icon={<Mic className="w-3.5 h-3.5" />}
-        keywords="candidate mic microphone asr 候选人 麦克风 真实回答 追问上下文 成本"
-      >
-        <GradientCard className="p-4 space-y-4">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-            <div className="min-w-0">
-              <h3 className="text-sm font-semibold text-text-primary">我的回答记录（麦克风）</h3>
-              <p className="text-[11px] leading-relaxed text-text-muted mt-0.5">
-                记录你真实说出口的话，用于复盘和实时语音上下文，不会触发自动答题。
-              </p>
-            </div>
-            <div className="inline-flex shrink-0 items-center gap-2 self-start rounded-lg border border-bg-hover bg-bg-tertiary/45 px-2.5 py-2">
-              <span className={`text-xs font-medium ${form.candidate_asr_enabled ? 'text-accent-green' : 'text-text-muted'}`}>
-                {form.candidate_asr_enabled ? '已开启' : '已关闭'}
-              </span>
-              <ToggleSwitch
-                size="sm"
-                checked={form.candidate_asr_enabled}
-                onChange={(enabled) => setForm({ ...form, candidate_asr_enabled: enabled })}
-                title="我的回答记录（麦克风）"
-                labelOn="我的回答记录（麦克风）"
-              />
-            </div>
-          </div>
-          {!form.candidate_asr_enabled && (
-            <div className="rounded-lg border border-bg-hover bg-bg-tertiary/40 px-3 py-2 text-xs text-text-muted">
-              麦克风 ASR 已关闭。实时语音上下文使用会议音频转写。
-            </div>
-          )}
-          {form.candidate_asr_enabled && (
-            <div className="rounded-lg border border-emerald-400/20 bg-emerald-500/10 px-3 py-2 text-xs leading-relaxed text-text-secondary">
-              开启后可在控制条选择“我的麦克风”，用于把你的真实回答写入复盘和实时语音上下文。麦克风以共享方式读取。会议软件独占设备时，口述记录会自动关闭。
-            </div>
-          )}
-
-          <Field label="麦克风兼容模式" hint="推荐开启。只使用共享读取；冲突时尝试更保守采样和默认输入设备，失败则关闭候选人口述，不抢会议软件麦克风。">
-            <label className="inline-flex items-center gap-2 cursor-pointer select-none">
-              <input
-                type="checkbox"
-                checked={form.candidate_mic_compatibility_mode}
-                onChange={(e) => setForm({ ...form, candidate_mic_compatibility_mode: e.target.checked })}
-                className="rounded border-border text-accent-blue focus:ring-accent-blue/30"
-                disabled={!form.candidate_asr_enabled}
-              />
-              <span className="text-xs text-text-secondary">
-                {form.candidate_mic_compatibility_mode ? '共享兼容优先' : '仅按所选麦克风尝试'}
-              </span>
-            </label>
-          </Field>
-
-          <div className="grid gap-3 md:grid-cols-2">
-            <Field label="我的语音识别引擎" hint="默认 Whisper 本地识别，不产生远程 ASR 成本">
-              <select
-                value={effectiveCandidateProvider}
-                onChange={(e) => {
-                const nextProvider = e.target.value
-                setForm({
-                  ...form,
-                  candidate_stt_provider: nextProvider,
-                  candidate_remote_stt_enabled: REMOTE_CANDIDATE_PROVIDERS.includes(nextProvider),
-                })
-              }}
-                className="input-field"
-                disabled={!form.candidate_asr_enabled}
-              >
-                {candidateProviders
-                  .filter((provider) => !primaryLocalEngine || !LOCAL_STT_PROVIDERS.includes(provider) || provider === primaryLocalEngine)
-                  .map((provider) => (
-                  <option key={provider} value={provider}>
-                    {provider === 'whisper'
-                      ? `Whisper（本地，免费${primaryLocalEngine === 'whisper' ? '，跟随主链路' : ''}）`
-                      : provider === 'qwen3_asr'
-                        ? `Qwen3-ASR（本地 GPU${primaryLocalEngine === 'qwen3_asr' ? '，跟随主链路' : ''}）`
-                      : provider === 'funasr'
-                        ? `FunASR（本地，中文更准${primaryLocalEngine === 'funasr' ? '，跟随主链路' : ''}）`
-                        : provider === 'doubao'
-                          ? '豆包（云端，会增加成本）'
-                          : provider === 'doubao_mmpg'
-                            ? '豆包 MMPG（云端）'
-                            : '通用 ASR（云端，会增加成本）'}
-                  </option>
-                ))}
-              </select>
-            </Field>
-            <Field label="手动提问参考麦克风转写" hint="开启后，手动提问可以参考上一轮已转写的候选人回答。">
-              <label className="inline-flex items-center gap-2 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={form.candidate_context_enabled}
-                  onChange={(e) => setForm({ ...form, candidate_context_enabled: e.target.checked })}
-                  className="rounded border-border text-accent-blue focus:ring-accent-blue/30"
-                  disabled={!form.candidate_asr_enabled}
-                />
-                <span className="text-xs text-text-secondary">{
-                  !form.candidate_asr_enabled
-                    ? (form.candidate_context_enabled ? '开启麦克风后生效' : '手动参考已关闭')
-                    : (candidateContextActive ? '手动参考已开启' : '手动参考已关闭')
-                }</span>
-              </label>
-            </Field>
-          </div>
-          {candidateUsesMmpg && (
-            <p className="text-xs text-text-secondary">
-              开始或继续面试时，麦克风会用独立 RTC 会话，复用上方豆包 MMPG 配置。
-              {form.stt_provider === 'doubao_mmpg' && form.mmpg.token_mode === 'manual' &&
-                '两路同时使用时，请把 RTC Token 方式设为自动签发。'}
-            </p>
-          )}
-          {form.candidate_asr_enabled && ['doubao', 'generic'].includes(form.candidate_stt_provider) && (
-            <div className={`rounded-lg border px-3 py-2 text-xs leading-relaxed ${
-              candidateRemoteCredentialReady
-                ? 'border-amber-400/25 bg-amber-500/10 text-text-secondary'
-                : 'border-red-400/30 bg-red-500/10 text-red-200'
-            }`}>
-              {candidateRemoteCredentialReady
-                ? `已选择 ${candidateRemoteProviderLabel} 麦克风 ASR：我的麦克风转写会复用上方云端 ASR 凭据并产生额外成本。切回 Whisper 即恢复本地免费识别。`
-                : `已选择 ${candidateRemoteProviderLabel} 麦克风 ASR，但上方 ${candidateRemoteProviderLabel} 凭据还没补全；启动面试后我的回答记录可能无法转写。请切到对应主链路 ASR 填写凭据并保存，或改回 Whisper。`}
-            </div>
-          )}
-
-          <details className="group rounded-lg border border-bg-hover bg-bg-tertiary/25 px-3 py-2">
-            <summary className="cursor-pointer select-none text-xs font-medium text-text-secondary group-open:text-text-primary">
-              高级设置：{candidateSttLabel}
-              {effectiveCandidateProvider === 'whisper' ? '模型与手动提问上下文' : '与手动提问上下文'}
-            </summary>
-            <div className="mt-3 space-y-3">
-              <div className="rounded-lg border border-bg-hover bg-bg-secondary/40 px-3 py-2 text-xs leading-relaxed text-text-secondary">
-                实时语音按发言顺序使用面试官和候选人已经转写的原话。下方等待时间和字数设置适用于手动提问。
-              </div>
-
-              <Field label="边听边写" hint="开启后会一边听你的麦克风一边预转写；面试官提下一题时，直接使用已经写入的内容。停顿后再用完整结果覆盖。云端 ASR 不做预转写，避免反复计费。">
-                <label className="inline-flex items-center gap-2 cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={form.candidate_streaming_asr_enabled}
-                    onChange={(e) => setForm({ ...form, candidate_streaming_asr_enabled: e.target.checked })}
-                    className="rounded border-border text-accent-blue focus:ring-accent-blue/30"
-                    disabled={!form.candidate_asr_enabled || !LOCAL_STT_PROVIDERS.includes(effectiveCandidateProvider)}
-                  />
-                  <span className="text-xs text-text-secondary">
-                    {LOCAL_STT_PROVIDERS.includes(effectiveCandidateProvider)
-                      ? form.candidate_streaming_asr_enabled ? '已开启' : '已关闭'
-                      : '云端 ASR 不做预转写'}
-                  </span>
-                </label>
-              </Field>
-
-              {effectiveCandidateProvider === 'whisper' && (
-              <div className="grid gap-3 md:grid-cols-2">
-                <Field label="我的 Whisper 模型" hint="留空则沿用主链路 Whisper 模型">
-                  <select
-                    value={form.candidate_whisper_model}
-                    onChange={(e) => setForm({ ...form, candidate_whisper_model: e.target.value })}
-                    className="input-field"
-                    disabled={!form.candidate_asr_enabled}
-                  >
-                    <option value="">沿用主配置 ({form.whisper_model})</option>
-                    {(options?.whisper_models ?? ['tiny', 'base', 'small', 'medium', 'large-v3']).map((m) => (
-                      <option key={m} value={m}>{m}</option>
-                    ))}
-                  </select>
-                </Field>
-                <Field label="我的识别语言" hint="留空则沿用主链路语言">
-                  <select
-                    value={form.candidate_whisper_language}
-                    onChange={(e) => setForm({ ...form, candidate_whisper_language: e.target.value })}
-                    className="input-field"
-                    disabled={!form.candidate_asr_enabled}
-                  >
-                    <option value="">沿用主配置 ({form.whisper_language})</option>
-                    <option value="auto">自动检测 (auto)</option>
-                    <option value="zh">中文 (zh)</option>
-                    <option value="en">English (en)</option>
-                    <option value="ja">日本語 (ja)</option>
-                  </select>
-                </Field>
-              </div>
-              )}
-              {effectiveCandidateProvider === 'funasr' && (
-                <div className="rounded-lg border border-bg-hover bg-bg-secondary/40 px-3 py-2 text-xs leading-relaxed text-text-secondary">
-                  FunASR 沿用主链路的模型（{form.funasr_model}）与岗位热词，无独立参数可调；引擎配置在「语音」分区。
-                </div>
-              )}
-              {['doubao', 'generic'].includes(effectiveCandidateProvider) && (
-                <div className="rounded-lg border border-bg-hover bg-bg-secondary/40 px-3 py-2 text-xs leading-relaxed text-text-secondary">
-                  云端引擎沿用上方 {candidateRemoteProviderLabel} 的凭据与模型，按调用计费；参数在「语音」分区配置。
-                </div>
-              )}
-
-              <div className="grid gap-3 md:grid-cols-4">
-                <Field label="边写刷新间隔 (ms)" hint="每隔多久尝试把你正在说的话写进上下文。拿不到本地 Whisper 空闲资源时会跳过本次，优先保证面试官 ASR。">
-                  <input
-                    type="number"
-                    min={800}
-                    max={5000}
-                    step={100}
-                    value={form.candidate_streaming_asr_interval_ms}
-                    onChange={(e) => setForm({ ...form, candidate_streaming_asr_interval_ms: clampIntegerInput(e.target.value, 800, 5000, 1500) })}
-                    className="input-field"
-                    disabled={!form.candidate_asr_enabled || !form.candidate_streaming_asr_enabled || !LOCAL_STT_PROVIDERS.includes(effectiveCandidateProvider)}
-                  />
-                </Field>
-                <Field label="手动提问等待转写 (ms)" hint="手动提问生成前等待候选人最终转写的最长时间。设为 0 立即提交。">
-                  <input
-                    type="number"
-                    min={0}
-                    max={2000}
-                    step={50}
-                    value={form.candidate_context_wait_ms}
-                    onChange={(e) => setForm({ ...form, candidate_context_wait_ms: clampIntegerInput(e.target.value, 0, 2000, 200) })}
-                    className="input-field"
-                    disabled={!form.candidate_asr_enabled || !form.candidate_context_enabled}
-                  />
-                </Field>
-                <Field label="手动提问上下文字数" hint="手动提问最多携带多少候选人转写字数。">
-                  <input
-                    type="number"
-                    min={100}
-                    max={4000}
-                    step={100}
-                    value={form.candidate_context_max_chars}
-                    onChange={(e) => setForm({ ...form, candidate_context_max_chars: clampIntegerInput(e.target.value, 100, 4000, 900) })}
-                    className="input-field"
-                    disabled={!form.candidate_asr_enabled || !form.candidate_context_enabled}
-                  />
-                </Field>
-                <Field label="手动提问最少有效字" hint="手动提问参考候选人转写时要求的最少字数。">
-                  <input
-                    type="number"
-                    min={1}
-                    max={100}
-                    step={1}
-                    value={form.candidate_context_min_chars}
-                    onChange={(e) => setForm({ ...form, candidate_context_min_chars: clampIntegerInput(e.target.value, 1, 100, 6) })}
-                    className="input-field"
-                    disabled={!form.candidate_asr_enabled || !form.candidate_context_enabled}
-                  />
-                </Field>
-              </div>
-            </div>
-          </details>
-        </GradientCard>
-      </Section>
-
-      </>)}
-      {variant === 'timing' && (<>
-      <Section title="性能" icon={<Settings2 className="w-3.5 h-3.5" />} keywords="threads 线程 cpu 推理 性能 性能风扇 funasr whisper infer">
-        <GradientCard className="p-4 space-y-3">
-          <Field label="本地 ASR 推理线程数" hint="0=自动（min(8, 核数-2)）；转写时风扇/发热明显就调小，识别慢就调大。重启后端生效。">
-            <input
-              type="number"
-              min={0}
-              max={64}
-              value={form.stt_infer_threads}
-              onChange={(e) => setForm({ ...form, stt_infer_threads: Math.max(0, Math.min(64, Number(e.target.value) || 0)) })}
-              onBlur={(e) => setForm({ ...form, stt_infer_threads: Math.max(0, Math.min(64, Number(e.target.value) || 0)) })}
-              className="input-field max-w-[140px]"
-            />
-          </Field>
-          <p className="text-[10px] leading-relaxed text-text-muted inline-flex items-center gap-1">
-            16 核机器自动值是 8
-            <InfoHint text="FunASR/Whisper 都是本地 CPU 推理，线程数直接决定转写瞬间的 CPU 占用与风扇转速。8 线程时 paraformer 转 18 秒音频约 1-2 秒完成，余量很大；追求安静可调到 4。留 2 核以上给音频采集和 LLM 流式。" />
-          </p>
-        </GradientCard>
-      </Section>
-      <Section title="语音活动检测 (VAD)" icon={<Settings2 className="w-3.5 h-3.5" />} keywords="vad silence 静音 断句 阈值 silero 语音活动">
-        <div className="bg-bg-tertiary/30 rounded-lg p-3 text-xs text-text-muted space-y-1.5 mb-2">
-          <div className="flex items-start gap-1.5">
-            <HelpCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-accent-blue" />
-            <span>{form.stt_provider === 'doubao_mmpg' ? 'MMPG 的主链路断句使用语音页的智能判停设置。此处的 VAD 参数适用于分段引擎与候选人链路。' : '根据音量与静音时长判断一句是否说完。'}</span>
-          </div>
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="静音阈值" hint="环境吵可调高">
-            <input type="number" step="0.005" min="0.001" max="0.1" value={form.silence_threshold}
-              onChange={(e) => setForm({ ...form, silence_threshold: clampNumberInput(e.target.value, 0.001, 0.1, 0.01) })} className="input-field" />
-          </Field>
-          <Field label="静音时长 (秒)" hint="说完判定">
-            <input type="number" step="0.1" min="0.5" max="10" value={form.silence_duration}
-              onChange={(e) => setForm({ ...form, silence_duration: clampNumberInput(e.target.value, 0.5, 10, 1.2) })} className="input-field" />
-          </Field>
-        </div>
-        <Field label="转写最少有效字" hint="去标点只计汉字/英文/数字；低于则不触发（如过滤「嗯」）">
-          <input type="number" min={1} max={50} step={1} value={form.transcription_min_sig_chars}
-            onChange={(e) => setForm({ ...form, transcription_min_sig_chars: clampIntegerInput(e.target.value, 1, 50, 2) })} className="input-field" />
-        </Field>
-      </Section>
-
-      <Section title="转写合并与自动答题" keywords="合并 merge auto answer 自动答题 gap interval seconds 间隔">
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="合并间隔 (秒)" hint="上一段结束后静默超过该时间送出；0=每段立即发">
-            <input type="number" step="0.1" min={0} max={15} value={form.assist_transcription_merge_gap_sec}
-              onChange={(e) => setForm({ ...form, assist_transcription_merge_gap_sec: clampNumberInput(e.target.value, 0, 15, 2.0) })}
-              className="input-field" />
-          </Field>
-          <Field label="最长等待 (秒)" hint="从首段起超过该时间强制送出">
-            <input type="number" step="0.1" min={1} max={120} value={form.assist_transcription_merge_max_sec}
-              onChange={(e) => setForm({ ...form, assist_transcription_merge_max_sec: clampNumberInput(e.target.value, 1, 120, 12.0) })}
-              className="input-field" />
-          </Field>
-        </div>
-        <label className="flex items-center gap-2 cursor-pointer mt-2">
-          <input type="checkbox" checked={form.auto_detect}
-            onChange={(e) => setForm({ ...form, auto_detect: e.target.checked })}
-            className="w-4 h-4 rounded bg-bg-tertiary border-bg-hover text-accent-blue focus:ring-accent-blue focus:ring-offset-0" />
-          <span className="text-xs text-text-secondary">自动检测问题并生成答案</span>
-        </label>
-        <Field label="回答长度" hint="和常用页的回答长度设置一致，保存语音配置后生效">
-          <div className="grid grid-cols-2 gap-2">
-            {([
-              { value: false, label: '详细回答', hint: '每轮语音答题使用标准提示词' },
-              { value: true, label: '简短回答', hint: '每轮语音答题使用简短提示词' },
-            ]).map((item) => {
-              const selected = form.assist_high_churn_short_answer === item.value
-              return (
-                <button
-                  key={item.label}
-                  type="button"
-                  onClick={() => setForm({ ...form, assist_high_churn_short_answer: item.value })}
-                  className={`rounded-xl border px-3 py-2.5 text-left transition-all ${
-                    selected
-                      ? 'border-accent-blue bg-accent-blue/10 ring-1 ring-accent-blue/30'
-                      : 'border-bg-hover bg-bg-tertiary/25 hover:border-bg-hover'
-                  }`}
-                >
-                  <span className={`text-xs font-semibold ${selected ? 'text-accent-blue' : 'text-text-primary'}`}>
-                    {item.label}
-                  </span>
-                  <span className="block text-[10px] text-text-muted mt-1">{item.hint}</span>
-                </button>
-              )
-            })}
-          </div>
-        </Field>
-      </Section>
-      </>)}
+  return (
+    <div className="space-y-4 p-5 pb-8">
+      <p className="flex items-center gap-2 text-xs text-text-secondary">
+        <Zap size={14} aria-hidden="true" /> 在这里配置和测试引擎，再到「实时辅助」为面试官和我的回答选择引擎。
+      </p>
+      <SegmentedEngineSettings provider="doubao" title="火山原生豆包" fields={doubaoFields} config={config} />
+      <SegmentedEngineSettings provider="generic" title="OpenAI 兼容 ASR" fields={genericFields} config={config} />
+      <MmpgEngineSettings stored={config.mmpg} configured={Boolean(config.stt_configured?.doubao_mmpg)} />
     </div>
   )
 }

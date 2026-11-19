@@ -9,20 +9,32 @@ def build_config_payload(cfg) -> dict:
     for field in MMPG_SECRET_FIELDS:
         mmpg[f"{field}_configured"] = bool(mmpg.pop(field))
     return {
-        "system_prompts": dict(getattr(cfg, "system_prompts", {})),
+        "system_prompts": {
+            scene: prompt for scene, prompt in getattr(cfg, "system_prompts", {}).items()
+            if scene != "assist_realtime_short"
+        },
         "models": [
             {
+                "id": getattr(model, "id", ""),
                 "name": model.name,
                 "api_type": getattr(model, "api_type", "openai") or "openai",
                 "context_window_tokens": getattr(model, "context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS),
                 "supports_think": model.supports_think,
                 "supports_vision": model.supports_vision,
                 "enabled": getattr(model, "enabled", True),
+                "has_api_key": bool(model.api_key and model.api_key not in ("", "sk-your-api-key-here")),
                 "health_fingerprint": model_health_fingerprint(model),
             }
             for model in cfg.models
         ],
         "max_parallel_answers": getattr(cfg, "max_parallel_answers", 2),
+        "assist_model_ids": list(getattr(cfg, "assist_model_ids", None) or []),
+        "assist_screenshot_model_id": getattr(cfg, "assist_screenshot_model_id", None),
+        "assist_generation": {
+            scene: params.model_dump() for scene, params in getattr(cfg, "assist_generation", {}).items()
+        },
+        "assist_think_mode": getattr(cfg, "assist_think_mode", getattr(cfg, "think_mode", False)),
+        "assist_think_effort": getattr(cfg, "assist_think_effort", getattr(cfg, "think_effort", "off")),
         "active_model": cfg.active_model,
         "model_name": active_model.name,
         "temperature": cfg.temperature,

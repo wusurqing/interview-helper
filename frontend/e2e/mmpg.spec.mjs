@@ -16,7 +16,7 @@ test('MMPG settings test publishes PCM through the native AudioWorklet and stops
     apiPaths.push(path)
     const payloads = {
       '/api/config': config,
-      '/api/options': { ...SAMPLE_OPTIONS, stt_providers: ['whisper', 'doubao_mmpg'], candidate_stt_providers: ['whisper'] },
+      '/api/options': SAMPLE_OPTIONS,
       '/api/devices': { ...SAMPLE_DEVICES, platform: { platform: 'Windows' } },
     }
     return route.fulfill({ json: payloads[path] ?? resolveApiPayload(path, request.method()) ?? {} })
@@ -99,8 +99,9 @@ test('MMPG settings test publishes PCM through the native AudioWorklet and stops
   await page.goto('/')
   await page.getByRole('button', { name: '打开豆包 MMPG 测试设置' }).click()
   await page.getByText('豆包 MMPG 高级设置', { exact: true }).click()
-  await expect(page.getByLabel('答题前等待时长', { exact: true })).toHaveValue('1500')
-  await expect(page.getByLabel('回答启动后的续说窗口', { exact: true })).toHaveValue('1500')
+  await expect(page.getByLabel('判停静音时间', { exact: true })).toHaveValue('800')
+  await expect(page.getByLabel('答题前等待时长（毫秒）', { exact: true })).toHaveCount(0)
+  await expect(page.getByLabel('回答启动后的续说窗口（毫秒）', { exact: true })).toHaveCount(0)
   await page.getByLabel('MMPG 测试音频设备').selectOption('1001')
   await page.getByRole('button', { name: '保存并测试 MMPG' }).click()
   await expect(page.getByText('检测到停顿，等待本轮结束')).toBeVisible()

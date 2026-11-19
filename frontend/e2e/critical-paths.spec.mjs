@@ -17,11 +17,10 @@ test.describe('app shell', () => {
     })
   })
 
-  test('boots and shows the brand header + STT status pill', async ({ page }) => {
+  test('boots and shows the brand header and configured ASR status', async ({ page }) => {
     await page.goto('/')
     await expect(page.getByRole('heading', { name: '学习助手' })).toBeVisible()
-    // App.tsx 状态 chip 文案为「STT 就绪」（中间有空格），且 md+ 才显示文字；viewport 默认 1440 可见
-    await expect(page.getByText('STT 就绪')).toBeVisible({ timeout: 5000 })
+    await expect(page.getByText('ASR 已配置', { exact: true })).toBeVisible()
   })
 
   test('module tabs switch between assist / review / knowledge / resume / job-tracker', async ({ page }) => {
@@ -55,6 +54,10 @@ test.describe('app shell', () => {
   })
 
   test('does not log uncaught errors during initial render', async ({ page }) => {
+    await page.route('https://fonts.googleapis.com/**', route => route.fulfill({
+      contentType: 'text/css',
+      body: '',
+    }))
     /** @type {string[]} */
     const errors = []
     page.on('pageerror', (err) => errors.push(String(err)))

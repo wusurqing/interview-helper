@@ -127,11 +127,11 @@ describe('ModelsTab state sync', () => {
   it('persists enabled changes from the ordering section when saving models', async () => {
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
 
     const switches = screen.getAllByRole('switch')
     fireEvent.click(switches[0])
-    fireEvent.click(screen.getByText('保存模型队列'))
+    fireEvent.click(screen.getByText('保存模型配置'))
 
     await waitFor(() => {
       expect(apiMock.updateConfig).toHaveBeenCalled()
@@ -147,9 +147,9 @@ describe('ModelsTab state sync', () => {
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
 
-    const saveButton = screen.getByRole('button', { name: '保存模型队列' })
+    const saveButton = screen.getByRole('button', { name: '保存模型配置' })
     act(() => {
       saveButton.click()
       saveButton.click()
@@ -168,7 +168,7 @@ describe('ModelsTab state sync', () => {
   it('shows model queue dirty state after editing a model field', async () => {
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Main Model'))
     fireEvent.change(screen.getByPlaceholderText('如：gpt-4o、ep-xxxxx'), { target: { value: 'gpt-4o' } })
 
@@ -184,7 +184,7 @@ describe('ModelsTab state sync', () => {
     expect(screen.getByText('tokens')).toBeVisible()
     fireEvent.change(contextWindow, { target: { value: '65536' } })
     expect(screen.getByText('有未保存更改')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('保存模型队列'))
+    fireEvent.click(screen.getByText('保存模型配置'))
 
     await waitFor(() => {
       expect(apiMock.updateConfig).toHaveBeenCalledWith(expect.objectContaining({
@@ -200,7 +200,7 @@ describe('ModelsTab state sync', () => {
     fireEvent.click(await screen.findByText('Main Model'))
     const contextWindow = screen.getByRole('textbox', { name: '最大上下文窗口' })
     fireEvent.change(contextWindow, { target: { value } })
-    fireEvent.click(screen.getByText('保存模型队列'))
+    fireEvent.click(screen.getByText('保存模型配置'))
 
     expect(contextWindow).toHaveValue(value)
     expect(contextWindow).toHaveAttribute('aria-invalid', 'true')
@@ -225,10 +225,10 @@ describe('ModelsTab state sync', () => {
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Main Model'))
     expect(screen.getByPlaceholderText('已保存，留空则保留现有 API Key')).toHaveValue('')
-    fireEvent.click(screen.getByText('保存模型队列'))
+    fireEvent.click(screen.getByText('保存模型配置'))
 
     await waitFor(() => {
       expect(apiMock.updateConfig).toHaveBeenCalled()
@@ -237,10 +237,11 @@ describe('ModelsTab state sync', () => {
     expect(payload.models[0].api_key).toBe('__IA_KEEP_EXISTING_API_KEY__')
   })
 
-  it('keeps saved model context windows and API keys with their models when rows are reordered', async () => {
+  it('keeps stable IDs, context windows and API keys with the model when catalog rows are reordered', async () => {
     apiMock.getModelsFull.mockResolvedValueOnce({
       models: [
         {
+          id: 'first-id',
           name: 'First Model',
           api_base_url: 'https://api.openai.com/v1',
           api_key: '',
@@ -252,6 +253,7 @@ describe('ModelsTab state sync', () => {
           has_key: true,
         },
         {
+          id: 'second-id',
           name: 'Second Model',
           api_base_url: 'https://api.openai.com/v1',
           api_key: '',
@@ -267,22 +269,24 @@ describe('ModelsTab state sync', () => {
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Second Model'))
     fireEvent.click(screen.getAllByTitle('置顶')[1])
-    fireEvent.click(screen.getByText('保存模型队列'))
+    fireEvent.click(screen.getByText('保存模型配置'))
 
     await waitFor(() => {
       expect(apiMock.updateConfig).toHaveBeenCalled()
     })
     const payload = apiMock.updateConfig.mock.calls[0][0]
     expect(payload.models[0]).toEqual(expect.objectContaining({
+      id: 'second-id',
       name: 'Second Model',
       api_key: '__IA_KEEP_EXISTING_API_KEY__',
       context_window_tokens: 131072,
       model_original_index: 1,
     }))
     expect(payload.models[1]).toEqual(expect.objectContaining({
+      id: 'first-id',
       name: 'First Model',
       api_key: '__IA_KEEP_EXISTING_API_KEY__',
       context_window_tokens: 32768,
@@ -301,7 +305,7 @@ describe('ModelsTab state sync', () => {
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Main Model'))
     fireEvent.change(screen.getByPlaceholderText('填入你的 API Key'), { target: { value: 'sk-test' } })
     fireEvent.click(screen.getByText('获取模型'))
@@ -323,13 +327,43 @@ describe('ModelsTab state sync', () => {
     expect(screen.getByText('有未保存更改')).toBeInTheDocument()
   })
 
+  it('uses the stable catalog ID when fetching with a stored key', async () => {
+    apiMock.getModelsFull.mockResolvedValueOnce({
+      models: [{
+        id: 'stable-main',
+        name: 'Main Model',
+        api_base_url: 'https://api.openai.com/v1',
+        api_key: '',
+        model: 'gpt-4o-mini',
+        supports_think: false,
+        supports_vision: false,
+        enabled: true,
+        has_key: true,
+      }],
+    })
+    apiMock.listRemoteModels.mockResolvedValueOnce({ models: [{ id: 'gpt-4o-mini' }] })
+
+    render(<ModelsTab />)
+
+    fireEvent.click(await screen.findByText('Main Model'))
+    expect(screen.getByPlaceholderText('已保存，留空则保留现有 API Key')).toHaveValue('')
+    fireEvent.click(screen.getByRole('button', { name: '获取模型' }))
+    expect(await screen.findByRole('combobox', { name: '选择远端模型' })).toBeInTheDocument()
+    expect(apiMock.listRemoteModels).toHaveBeenCalledWith({
+      api_base_url: 'https://api.openai.com/v1',
+      api_key: '__IA_KEEP_EXISTING_API_KEY__',
+      model_id: 'stable-main',
+      api_type: 'openai',
+    })
+  })
+
   it('ignores rapid duplicate remote model fetches for the same connection settings', async () => {
     const remoteModels = createDeferred<{ models: { id: string }[] }>()
     apiMock.listRemoteModels.mockReturnValueOnce(remoteModels.promise)
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Main Model'))
     fireEvent.change(screen.getByPlaceholderText('填入你的 API Key'), { target: { value: 'sk-test' } })
 
@@ -361,7 +395,7 @@ describe('ModelsTab state sync', () => {
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Main Model'))
     fireEvent.change(screen.getByPlaceholderText('填入你的 API Key'), { target: { value: 'sk-test' } })
     fireEvent.click(screen.getByText('获取模型'))
@@ -379,7 +413,7 @@ describe('ModelsTab state sync', () => {
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Main Model'))
     fireEvent.change(screen.getByPlaceholderText('填入你的 API Key'), { target: { value: 'sk-test' } })
     fireEvent.click(screen.getByText('获取模型'))
@@ -402,7 +436,7 @@ describe('ModelsTab state sync', () => {
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Main Model'))
     const apiKeyInput = screen.getByPlaceholderText('填入你的 API Key')
     fireEvent.change(apiKeyInput, { target: { value: 'sk-old' } })
@@ -430,7 +464,7 @@ describe('ModelsTab state sync', () => {
     expect(screen.queryByText('stale-model')).not.toBeInTheDocument()
   })
 
-  it('hydrates parallel answer count without marking the queue dirty on first load', async () => {
+  it('keeps room scheduling and generation controls out of the model catalog', async () => {
     const models = ['Main Model', 'Backup Model', 'Vision Model'].map((name, index) => ({
       name,
       api_base_url: 'https://api.openai.com/v1',
@@ -456,91 +490,8 @@ describe('ModelsTab state sync', () => {
     await screen.findByText('Vision Model')
 
     expect(screen.queryByText('有未保存更改')).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '3' })).toHaveClass('bg-accent-blue')
-  })
-
-  it('does not overwrite unsaved generation params when saving the model queue refreshes config', async () => {
-    render(<ModelsTab />)
-
-    await screen.findByText('保存模型队列')
-    fireEvent.change(screen.getByDisplayValue('0.5'), { target: { value: '0.8' } })
-    expect(screen.getByText('有未保存更改')).toBeInTheDocument()
-
-    fireEvent.click(screen.getByText('保存模型队列'))
-
-    await waitFor(() => {
-      expect(apiMock.updateConfig).toHaveBeenCalled()
-    })
-    expect(screen.getByDisplayValue('0.8')).toBeInTheDocument()
-    expect(screen.getByText('有未保存更改')).toBeInTheDocument()
-  })
-
-  it('normalizes invalid generation params from config before saving', async () => {
-    useInterviewStore.setState((state) => ({
-      config: {
-        ...(state.config as any),
-        temperature: 'not-a-number',
-        max_tokens: 999999,
-      },
-    }) as any)
-
-    render(<ModelsTab />)
-
-    await screen.findByText('保存生成参数')
-
-    expect(screen.queryByDisplayValue('NaN')).not.toBeInTheDocument()
-    expect(screen.getByDisplayValue('0.5')).toBeInTheDocument()
-    expect(screen.getByDisplayValue('32768')).toBeInTheDocument()
-
-    fireEvent.click(screen.getByText('保存生成参数'))
-
-    await waitFor(() => {
-      expect(apiMock.updateConfig).toHaveBeenCalledWith(expect.objectContaining({
-        temperature: 0.5,
-        max_tokens: 32768,
-      }))
-    })
-  })
-
-  it('clamps edited generation params before saving', async () => {
-    render(<ModelsTab />)
-
-    await screen.findByText('保存生成参数')
-    const [temperatureInput, maxTokensInput] = screen.getAllByRole('spinbutton')
-
-    fireEvent.change(temperatureInput, { target: { value: '9' } })
-    fireEvent.change(maxTokensInput, { target: { value: '100' } })
-    fireEvent.click(screen.getByText('保存生成参数'))
-
-    await waitFor(() => {
-      expect(apiMock.updateConfig).toHaveBeenCalledWith(expect.objectContaining({
-        temperature: 2,
-        max_tokens: 256,
-      }))
-    })
-  })
-
-  it('ignores rapid duplicate generation parameter saves while saving is pending', async () => {
-    const save = createDeferred<{ ok: boolean }>()
-    apiMock.updateConfig.mockReturnValueOnce(save.promise)
-
-    render(<ModelsTab />)
-
-    await screen.findByText('保存生成参数')
-    const saveButton = screen.getByRole('button', { name: '保存生成参数' })
-
-    act(() => {
-      saveButton.click()
-      saveButton.click()
-    })
-
-    expect(apiMock.updateConfig).toHaveBeenCalledTimes(1)
-    expect(screen.getByRole('button', { name: '保存中…' })).toBeDisabled()
-
-    await act(async () => {
-      save.resolve({ ok: true })
-      await save.promise
-    })
+    expect(screen.queryByText('并行生成路数')).not.toBeInTheDocument()
+    expect(screen.queryByText('生成参数')).not.toBeInTheDocument()
   })
 
   it('shows model health detail as a tooltip in the model list', async () => {
@@ -559,7 +510,7 @@ describe('ModelsTab state sync', () => {
   it('collapses an opened new model after saving without reloading the list', async () => {
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('添加'))
     expect(screen.getByRole('textbox', { name: '最大上下文窗口' })).toHaveValue('262144')
     const nameInputs = screen.getAllByPlaceholderText('如：GPT-4o、DeepSeek-V3')
@@ -567,7 +518,7 @@ describe('ModelsTab state sync', () => {
       expect(nameInputs[nameInputs.length - 1]).toHaveFocus()
     })
     fireEvent.change(nameInputs[nameInputs.length - 1], { target: { value: 'Backup Model' } })
-    fireEvent.click(screen.getByText('保存模型队列'))
+    fireEvent.click(screen.getByText('保存模型配置'))
 
     await waitFor(() => {
       expect(apiMock.updateConfig).toHaveBeenCalled()
@@ -598,7 +549,7 @@ describe('ModelsTab state sync', () => {
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Main Model'))
     expect(screen.getByText('测试会先保存当前模型配置')).toBeInTheDocument()
     fireEvent.click(screen.getByText('保存并测试'))
@@ -615,7 +566,7 @@ describe('ModelsTab state sync', () => {
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Main Model'))
 
     const testButton = screen.getByRole('button', { name: '保存并测试' })
@@ -655,7 +606,7 @@ describe('ModelsTab state sync', () => {
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Main Model'))
     fireEvent.click(screen.getByText('保存并测试'))
 
@@ -690,7 +641,7 @@ describe('ModelsTab state sync', () => {
 
     render(<ModelsTab />)
 
-    await screen.findByText('保存模型队列')
+    await screen.findByText('保存模型配置')
     fireEvent.click(screen.getByText('Main Model'))
     fireEvent.click(screen.getByText('保存并测试'))
 
@@ -772,7 +723,7 @@ describe('ModelsTab state sync', () => {
     fireEvent.click(screen.getAllByTitle('置底')[0])
 
     expect(screen.getByText('有未保存更改')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('保存模型队列'))
+    fireEvent.click(screen.getByText('保存模型配置'))
 
     await waitFor(() => {
       expect(apiMock.updateConfig).toHaveBeenCalled()

@@ -76,28 +76,6 @@ describe('PreferencesTab', () => {
     expect(screen.queryByRole('heading', { name: '快捷提示词' })).not.toBeInTheDocument()
   })
 
-  it('does not call the main Whisper engine a fallback', () => {
-    render(<PreferencesTab />)
-    expect(screen.queryByText(/Whisper 降级就绪/)).not.toBeInTheDocument()
-    expect(screen.getByText(/就绪 · Whisper/)).toBeInTheDocument()
-  })
-
-  it('shows Whisper as a fallback when the configured provider is remote', () => {
-    useInterviewStore.setState({ config: { stt_provider: 'generic' } } as any)
-    render(<PreferencesTab />)
-    expect(screen.getByText(/Whisper 降级就绪/)).toBeInTheDocument()
-  })
-
-  it('saves answer length choices immediately from common preferences', async () => {
-    render(<PreferencesTab />)
-
-    fireEvent.click(screen.getByRole('button', { name: /简短回答/ }))
-
-    await waitFor(() => {
-      expect(updateConfigAndRefresh).toHaveBeenCalledWith({ assist_high_churn_short_answer: true })
-    })
-  })
-
   it('allows zero to disable screen capture scaling', async () => {
     render(<PreferencesTab variant="mode" />)
 
@@ -144,41 +122,6 @@ describe('PreferencesTab', () => {
       kb_deadline_ms: 220,
       kb_asr_deadline_ms: 60,
     })
-  })
-
-  it('serializes immediate auto-save writes so older requests cannot finish last', async () => {
-    let resolveFirst: ((value: unknown) => void) | null = null
-    const firstSave = new Promise((resolve) => {
-      resolveFirst = resolve
-    })
-    vi.mocked(updateConfigAndRefresh)
-      .mockImplementationOnce(() => firstSave as any)
-      .mockResolvedValue({ ok: true } as any)
-
-    render(<PreferencesTab />)
-
-    fireEvent.click(screen.getByRole('button', { name: /简短回答/ }))
-    await waitFor(() => {
-      expect(updateConfigAndRefresh).toHaveBeenCalledTimes(1)
-    })
-
-    fireEvent.click(screen.getByRole('button', { name: /详细回答/ }))
-    await act(async () => {
-      await Promise.resolve()
-    })
-    expect(updateConfigAndRefresh).toHaveBeenCalledTimes(1)
-
-    await act(async () => {
-      if (!resolveFirst) throw new Error('first save resolver was not captured')
-      resolveFirst({ ok: true })
-      await firstSave
-      await Promise.resolve()
-    })
-
-    await waitFor(() => {
-      expect(updateConfigAndRefresh).toHaveBeenCalledTimes(2)
-    })
-    expect(updateConfigAndRefresh).toHaveBeenLastCalledWith({ assist_high_churn_short_answer: false })
   })
 
   it('flushes pending auto-save edits when unmounted before debounce fires', async () => {

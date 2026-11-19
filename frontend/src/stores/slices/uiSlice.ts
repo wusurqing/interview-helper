@@ -54,7 +54,7 @@ export type UiSlice = UiSliceState & UiSliceActions
 
 export const createUiSlice: StateCreator<RootState, [], [], UiSlice> = (set) => ({
   settingsOpen: false,
-  settingsDrawerTab: 'general',
+  settingsDrawerTab: 'realtime',
   fallbackToast: null,
   toastMessage: null,
   toasts: [],
@@ -65,7 +65,7 @@ export const createUiSlice: StateCreator<RootState, [], [], UiSlice> = (set) => 
   toggleSettings: () =>
     set((s) => {
       if (s.settingsOpen) return { settingsOpen: false }
-      return { settingsOpen: true, settingsDrawerTab: 'general' }
+      return { settingsOpen: true, settingsDrawerTab: 'realtime' }
     }),
   openConfigDrawer: () => set({ settingsOpen: true, settingsDrawerTab: 'config' }),
   openModelsDrawer: () => set({ settingsOpen: true, settingsDrawerTab: 'models' }),

@@ -17,6 +17,8 @@ import {
 import { api } from '@/lib/api'
 import { useInterviewStore } from '@/stores/configStore'
 import { buildWsUrl } from '@/lib/backendUrl'
+import { getAssistModelEntries } from '@/lib/assistModels'
+import { speechProviders } from '@/lib/speechProviders'
 
 type StepStatus = 'idle' | 'running' | 'pass' | 'fail' | 'warn' | 'skip'
 
@@ -407,7 +409,7 @@ export default function SoundTest() {
       {/* Model info hint */}
       {!hasAnyResult && config && (
         <div className="mt-3 space-y-1 text-[10px] text-text-muted/70 px-1">
-          <div>{'当前: '}{config.stt_provider} + {config.models?.[config.active_model]?.name ?? 'N/A'}</div>
+          <div>{speechProviders.find(({ id }) => id === config.stt_provider)?.label ?? '语音引擎待选择'} · {getAssistModelEntries(config)[0]?.model.name ?? '答题模型待选择'}</div>
           <div>{selectedDevice != null && devices.find((d) => d.id === selectedDevice)?.is_loopback ? '推荐使用系统音频设备进行真实链路检测' : '当前将使用默认设备进行真实链路检测'}</div>
         </div>
       )}

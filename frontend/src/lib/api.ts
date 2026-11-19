@@ -344,19 +344,8 @@ export const api = {
     latency?: Record<string, number>
     fingerprint?: Record<string, string>
   }>('/api/models/health'),
-  listRemoteModels: (payload: { api_base_url: string; api_key: string; model_index?: number; api_type?: string }) =>
+  listRemoteModels: (payload: { api_base_url: string; api_key: string; model_id?: string; model_index?: number; api_type?: string }) =>
     request<{ models: { id: string; owned_by?: string | null }[] }>('/api/models/list', { method: 'POST', body: JSON.stringify(payload) }),
-  funasrStatus: () => request<{
-    installed: boolean
-    model: string
-    loaded: boolean
-    loading: boolean
-    downloading: boolean
-    download_error: string
-    downloaded_model: string
-  }>('/api/stt/funasr/status'),
-  funasrDownload: (model?: string) =>
-    request<{ ok: boolean; detail?: string }>('/api/stt/funasr/download', { method: 'POST', body: JSON.stringify(model ? { model } : {}) }),
   checkSingleModelHealth: (index: number) => request('/api/models/health/' + index, { method: 'POST' }),
   probeModelCapabilities: (index: number) =>
     request<{
@@ -372,7 +361,8 @@ export const api = {
       think_detail?: string
       think_disabled_detail?: string
     }>('/api/models/probe/' + index, { method: 'POST' }),
-  sttTest: () => request<{ ok: boolean; detail?: string; text?: string }>('/api/stt/test', { method: 'POST' }),
+  sttTest: (payload: { provider: import('@/lib/speechProviders').SegmentedSpeechProvider }) =>
+    request<{ ok: boolean; detail?: string; text?: string }>('/api/stt/test', { method: 'POST', body: JSON.stringify(payload) }),
 
   // Knowledge
   knowledgeSettings: () => request<KnowledgeSettingsPayload>('/api/knowledge/settings'),

@@ -170,6 +170,45 @@ describe('configStore answer streaming', () => {
     })
   })
 
+  it('restarts the same reply and ignores late fragments and completion from the failed model', () => {
+    const store = useInterviewStore.getState()
+    store.startAnswer('same-question', '问题', { answerFormat: 'plain_text', modelName: '主模型', attempt: 1 })
+    store.appendAnswerChunk('same-question', '已显示的旧回答', 1)
+    store.appendThinkChunk('same-question', '队列中的旧思考', 1)
+    store.startAnswer('same-question', '问题', { answerFormat: 'plain_text', modelName: '', attempt: 2 })
+    expect(useInterviewStore.getState().qaPairs[0]).toMatchObject({ answer: '', modelLabel: '', retrying: true })
+    store.startAnswer('same-question', '问题', { answerFormat: 'plain_text', modelName: '备用模型', attempt: 2 })
+    expect(useInterviewStore.getState().qaPairs).toEqual([
+      expect.objectContaining({ answer: '', thinkContent: '', modelLabel: '备用模型', retrying: true }),
+    ])
+    store.appendAnswerChunk('same-question', '迟到的旧回答', 1)
+    store.errorAnswer('same-question', '迟到的旧错误', 1)
+    store.finalizeAnswer('same-question', '问题', '迟到的完成', '', '主模型', 5, 10, undefined, { attempt: 1 })
+    store.appendAnswerChunk('same-question', '备用回答', 2)
+    store.finalizeAnswer('same-question', '问题', '备用回答', '', '备用模型', 10, 20, undefined, { attempt: 2 })
+    vi.advanceTimersByTime(80)
+    expect(useInterviewStore.getState().qaPairs).toEqual([
+      expect.objectContaining({ answer: '备用回答', thinkContent: '', modelLabel: '备用模型', status: 'done' }),
+    ])
+  })
+
+  it('recovers a newer completion even if the retry message was dropped', () => {
+    const store = useInterviewStore.getState()
+    const meta = { answerFormat: 'plain_text' as const, modelName: '失败模型', attempt: 1 }
+    store.startAnswer('dropped-retry', '问题', meta)
+    store.appendAnswerChunk('dropped-retry', '失败模型的半截答案', 1)
+    store.appendThinkChunk('dropped-retry', '旧思考', 1)
+    store.finalizeAnswer('dropped-retry', '问题', '完整答案', '新思考', '成功模型', 12, 20, undefined, {
+      answerFormat: 'plain_text', attempt: 2,
+    })
+    store.appendAnswerChunk('dropped-retry', '更晚的旧片段', 1)
+    expect(useInterviewStore.getState().qaPairs).toEqual([
+      expect.objectContaining({
+        answer: '完整答案', thinkContent: '新思考', attempt: 2, modelLabel: '成功模型', status: 'done',
+      }),
+    ])
+  })
+
   it('recovers a plain answer when the start or a streamed chunk was missed', () => {
     const store = useInterviewStore.getState()
     const meta = { answerFormat: 'plain_text' as const, source: 'manual_text' }

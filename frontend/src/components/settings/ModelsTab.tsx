@@ -13,9 +13,7 @@ import {
   KeyRound,
   Zap,
   Loader2,
-  Sparkles,
   BrainCircuit,
-  SlidersHorizontal,
   X,
 } from 'lucide-react'
 import { useInterviewStore, type ModelFullInfo } from '@/stores/configStore'
@@ -115,19 +113,7 @@ const EMPTY_REMOTE_MODEL_LIST: RemoteModelListState = {
 }
 
 const KEEP_EXISTING_API_KEY = '__IA_KEEP_EXISTING_API_KEY__'
-const DEFAULT_TEMPERATURE = 0.5
-const DEFAULT_MAX_TOKENS = 4096
 const DEFAULT_CONTEXT_WINDOW_TOKENS = 262144
-
-function clampNumberInput(value: unknown, min: number, max: number, fallback: number): number {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed)) return fallback
-  return Math.max(min, Math.min(max, parsed))
-}
-
-function clampIntegerInput(value: unknown, min: number, max: number, fallback: number): number {
-  return Math.floor(clampNumberInput(value, min, max, fallback))
-}
 
 function parseContextWindowTokens(input: string): number | null {
   const value = input.trim()
@@ -137,7 +123,7 @@ function parseContextWindowTokens(input: string): number | null {
 
 function toModelRow({ context_window_tokens, ...model }: ModelFullInfo, index: number): ModelRow {
   return {
-    id: `${index}:${model.name}:${model.model}:${model.api_base_url}`,
+    id: model.id || `${index}:${model.name}:${model.model}:${model.api_base_url}`,
     originalIndex: index,
     model,
     contextWindowInput: String(context_window_tokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS),
@@ -149,7 +135,8 @@ function buildModelPayloadFromRows(rows: ModelRow[]) {
     name: m.name.trim(),
     api_base_url: m.api_base_url.trim() || 'https://api.openai.com/v1',
     api_key: m.api_key.trim() ? m.api_key : m.has_key ? KEEP_EXISTING_API_KEY : '',
-    model_original_index: originalIndex,
+    ...(m.id ? { id: m.id } : {}),
+    ...(originalIndex >= 0 ? { model_original_index: originalIndex } : {}),
     model: m.model.trim() || 'gpt-4o-mini',
     api_type: m.api_type || 'openai',
     context_window_tokens: parseContextWindowTokens(contextWindowInput),
@@ -166,11 +153,10 @@ function resolveActiveIndexForRows(rows: ModelRow[], activeOriginalIndex = 0) {
   return nextActiveIndex >= 0 ? nextActiveIndex : 0
 }
 
-function buildQueueSnapshot(rows: ModelRow[], maxParallel: number, activeOriginalIndex = 0) {
+function buildQueueSnapshot(rows: ModelRow[], activeOriginalIndex = 0) {
   return {
     models: buildModelPayloadFromRows(rows),
     active_model: resolveActiveIndexForRows(rows, activeOriginalIndex),
-    max_parallel_answers: maxParallel,
   }
 }
 
@@ -194,20 +180,6 @@ function apiKeyPayloadValue(model: ModelFullInfo) {
 function apiKeyPlaceholder(model: ModelFullInfo) {
   if (model.has_key && !model.api_key.trim()) return '已保存，留空则保留现有 API Key'
   return '填入你的 API Key'
-}
-
-function normalizeLlmForm(form: {
-  temperature: unknown
-  max_tokens: unknown
-  think_mode: boolean
-  think_effort: string
-}) {
-  return {
-    temperature: clampNumberInput(form.temperature, 0, 2, DEFAULT_TEMPERATURE),
-    max_tokens: clampIntegerInput(form.max_tokens, 256, 32768, DEFAULT_MAX_TOKENS),
-    think_mode: form.think_mode,
-    think_effort: form.think_effort,
-  }
 }
 
 function formatRemoteModelError(error: unknown): string {
@@ -249,7 +221,6 @@ export default function ModelsTab() {
   const [testResults, setTestResults] = useState<Record<number, 'ok' | 'error' | 'checking'>>({})
   const [probeResults, setProbeResults] = useState<Record<number, ModelProbeResult>>({})
   const [remoteModelLists, setRemoteModelLists] = useState<Record<string, RemoteModelListState>>({})
-  const [maxP, setMaxP] = useState(2)
   const [healthChecking, setHealthChecking] = useState(false)
   const [dragFrom, setDragFrom] = useState<number | null>(null)
   const rowRefs = useRef<Record<number, HTMLDivElement | null>>({})
@@ -261,31 +232,16 @@ export default function ModelsTab() {
   const savingRef = useRef(false)
   const testingIdxRef = useRef<number | null>(null)
   const healthCheckingRef = useRef(false)
-  const llmSavingRef = useRef(false)
 
-  const [llmForm, setLlmForm] = useState({
-    temperature: DEFAULT_TEMPERATURE,
-    max_tokens: DEFAULT_MAX_TOKENS,
-    think_mode: false,
-    think_effort: 'off',
-  })
-  const [llmSaving, setLlmSaving] = useState(false)
   const [queueSaveState, setQueueSaveState] = useState<SaveState>('idle')
   const [queueSaveError, setQueueSaveError] = useState<string | null>(null)
-  const [llmSaveState, setLlmSaveState] = useState<SaveState>('idle')
-  const [llmSaveError, setLlmSaveError] = useState<string | null>(null)
-  const queueSnapshot = buildQueueSnapshot(modelRows, maxP, config?.active_model ?? 0)
+  const queueSnapshot = buildQueueSnapshot(modelRows, config?.active_model ?? 0)
   const {
     dirty: queueDirty,
     markSaved: markQueueSaved,
     resetBaseline: resetQueueBaseline,
   } = useDirtySnapshot(queueSnapshot)
-  const {
-    dirty: llmDirty,
-    markSaved: markLlmSaved,
-    resetBaseline: resetLlmBaseline,
-  } = useDirtySnapshot(llmForm)
-  useSettingsDirtyRegistration('models', queueDirty || llmDirty)
+  useSettingsDirtyRegistration('models', queueDirty)
 
   useEffect(() => {
     modelRowsRef.current = modelRows
@@ -312,10 +268,8 @@ export default function ModelsTab() {
       const { models: full } = await api.getModelsFull()
       const rows = full.map(toModelRow)
       const currentConfig = useInterviewStore.getState().config
-      const nextMaxP = Math.min(8, Math.max(1, currentConfig?.max_parallel_answers ?? 2))
       setModelRows(rows)
-      setMaxP(nextMaxP)
-      resetQueueBaseline(buildQueueSnapshot(rows, nextMaxP, currentConfig?.active_model ?? 0))
+      resetQueueBaseline(buildQueueSnapshot(rows, currentConfig?.active_model ?? 0))
       setTestResults({})
       setProbeResults({})
       if (full.length === 0) setExpandedIdx(0)
@@ -328,35 +282,8 @@ export default function ModelsTab() {
 
   useEffect(() => {
     void loadModels()
-  }, [loadModels])
-
-  useEffect(() => {
-    if (!config?.models?.length) return
-    const nextLlmForm = normalizeLlmForm({
-      temperature: config.temperature,
-      max_tokens: config.max_tokens,
-      think_mode: config.think_mode ?? false,
-      think_effort: config.think_effort ?? 'off',
-    })
-    const nextMaxP = Math.min(8, Math.max(1, config.max_parallel_answers ?? 2))
-    if (!queueDirty) {
-      setMaxP(nextMaxP)
-      resetQueueBaseline(buildQueueSnapshot(modelRows, nextMaxP, config.active_model ?? 0))
-    }
-    if (!llmDirty) {
-      setLlmForm(nextLlmForm)
-      resetLlmBaseline(nextLlmForm)
-    }
     void syncHealthFromServer()
-  }, [
-    config,
-    llmDirty,
-    modelRows,
-    queueDirty,
-    resetLlmBaseline,
-    resetQueueBaseline,
-    syncHealthFromServer,
-  ])
+  }, [loadModels, syncHealthFromServer])
 
   useEffect(() => {
     const idx = expandedIdx
@@ -428,10 +355,12 @@ export default function ModelsTab() {
       [rowId]: { ...(prev[rowId] ?? EMPTY_REMOTE_MODEL_LIST), loading: true, error: null, loaded: false, requestKey },
     }))
     try {
+      const apiKey = apiKeyPayloadValue(row.model)
+      const savedModelId = apiKey === KEEP_EXISTING_API_KEY ? row.model.id : undefined
       const result = await api.listRemoteModels({
         api_base_url: row.model.api_base_url,
-        api_key: apiKeyPayloadValue(row.model),
-        model_index: row.originalIndex,
+        api_key: apiKey,
+        ...(savedModelId ? { model_id: savedModelId } : row.originalIndex >= 0 ? { model_index: row.originalIndex } : {}),
         api_type: row.model.api_type || 'openai',
       })
       setRemoteModelLists((prev) => {
@@ -487,7 +416,7 @@ export default function ModelsTab() {
       ...prev,
       {
         id: `new-${Date.now()}-${prev.length}`,
-        originalIndex: prev.length,
+        originalIndex: -1,
         model: { ...EMPTY_MODEL },
         contextWindowInput: String(DEFAULT_CONTEXT_WINDOW_TOKENS),
       },
@@ -537,31 +466,33 @@ export default function ModelsTab() {
     setQueueSaveError(null)
     try {
       const savedActiveIndex = resolveActiveIndex()
-      const rowsToSave = modelRows.map((row, index) => ({
+      const rowsToSave = modelRows.map((row) => ({
         ...row,
-        id: `${index}:${row.model.name}:${row.model.model}:${row.model.api_base_url}`,
         model: {
           ...row.model,
           has_key: row.model.has_key || row.model.api_key.trim().length > 0,
         },
       }))
-      const savedRows = rowsToSave.map((row, index) => ({
-        ...row,
-        originalIndex: index,
-        model: { ...row.model, api_key: '' },
-      }))
-      await updateConfigAndRefresh({
+      const savedConfig = await updateConfigAndRefresh({
         models: buildModelPayload(rowsToSave),
         active_model: savedActiveIndex,
-        max_parallel_answers: maxP,
+      })
+      const savedRows = rowsToSave.map((row, index) => {
+        const id = row.model.id ?? savedConfig.models?.[index]?.id
+        return {
+          ...row,
+          id: id ?? row.id,
+          originalIndex: index,
+          model: { ...row.model, id, api_key: '' },
+        }
       })
       setModelRows(savedRows)
-      markQueueSaved(buildQueueSnapshot(savedRows, maxP, savedActiveIndex))
+      markQueueSaved(buildQueueSnapshot(savedRows, savedActiveIndex))
       setQueueSaveState('saved')
       if (collapse) setExpandedIdx(null)
       setProbeResults({})
       if (!quiet) {
-        useInterviewStore.getState().setToastMessage('模型队列已保存')
+        useInterviewStore.getState().setToastMessage('模型配置已保存')
       }
       return {
         ok: true as const,
@@ -623,9 +554,8 @@ export default function ModelsTab() {
         await updateConfigAndRefresh({
           models: buildModelPayload(nextRows),
           active_model: activeModelIndex,
-          max_parallel_answers: maxP,
         })
-        markQueueSaved(buildQueueSnapshot(nextRows, maxP, activeModelIndex))
+        markQueueSaved(buildQueueSnapshot(nextRows, activeModelIndex))
         setQueueSaveState('saved')
         const visionLabel = result.supports_vision ? '识图支持' : '识图未检测到'
         const thinkLabel = result.supports_think ? `Think ${result.think_style || '支持'}` : 'Think 未检测到'
@@ -726,37 +656,11 @@ export default function ModelsTab() {
     })
   }
 
-  const handleSaveLlm = async () => {
-    if (llmSavingRef.current) return
-    llmSavingRef.current = true
-    setLlmSaving(true)
-    setLlmSaveState('saving')
-    setLlmSaveError(null)
-    try {
-      const savedForm = normalizeLlmForm(llmForm)
-      await updateConfigAndRefresh(savedForm)
-      setLlmForm(savedForm)
-      markLlmSaved(savedForm)
-      setLlmSaveState('saved')
-      useInterviewStore.getState().setToastMessage('LLM 参数已保存')
-    } catch (e: any) {
-      const message = e?.message ?? '保存失败'
-      setLlmSaveError(message)
-      setLlmSaveState('error')
-      useInterviewStore.getState().setToastMessage(message)
-    } finally {
-      llmSavingRef.current = false
-      setLlmSaving(false)
-    }
-  }
-
   if (loading) {
     return <div className="flex items-center justify-center py-12 text-text-muted text-sm">加载中…</div>
   }
 
   const enabledCount = modelRows.filter((row) => row.model.enabled !== false).length
-  const parallelMax = Math.max(1, Math.min(8, Math.max(enabledCount, modelRows.length)))
-  const parallelOptions = Array.from({ length: parallelMax }, (_, i) => i + 1)
   const effectiveQueueSaveState: SaveState = queueSaveState === 'saving' || queueSaveState === 'error'
     ? queueSaveState
     : queueDirty
@@ -764,14 +668,6 @@ export default function ModelsTab() {
       : queueSaveState === 'saved'
         ? 'saved'
         : 'idle'
-  const effectiveLlmSaveState: SaveState = llmSaveState === 'saving' || llmSaveState === 'error'
-    ? llmSaveState
-    : llmDirty
-      ? 'dirty'
-      : llmSaveState === 'saved'
-        ? 'saved'
-        : 'idle'
-
   return (
     <div className="p-5 space-y-5 pb-8">
       <GradientCard className="overflow-hidden">
@@ -780,10 +676,10 @@ export default function ModelsTab() {
             <div>
               <h3 className="text-sm font-semibold text-text-primary flex items-center gap-1.5">
                 <BrainCircuit className="w-4 h-4 text-accent-blue" />
-                模型队列
+                模型配置
               </h3>
               <p className="text-[11px] text-text-muted mt-0.5 leading-relaxed">
-                从上到下就是答题优先级；启用、连通性、模型参数都在同一个列表里管理。
+                编辑和测试各模型。在「实时辅助」设置答题优先级。
               </p>
             </div>
             <div className="flex items-center gap-2 flex-shrink-0">
@@ -809,29 +705,6 @@ export default function ModelsTab() {
             </div>
           </div>
 
-          <div className="rounded-xl border border-bg-hover/60 bg-bg-primary/35 px-3 py-3">
-            <div className="flex items-center gap-2 mb-2">
-              <SlidersHorizontal className="w-3.5 h-3.5 text-text-muted" />
-              <span className="text-xs font-medium text-text-primary">并行生成路数</span>
-              <span className="text-[10px] text-text-muted ml-auto">已启用 {enabledCount} / {modelRows.length}</span>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {parallelOptions.map((v) => (
-                <button
-                  key={v}
-                  type="button"
-                  onClick={() => setMaxP(v)}
-                  className={`min-w-[2.5rem] px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                    maxP === v
-                      ? 'bg-accent-blue text-white shadow-lg shadow-accent-blue/20'
-                      : 'bg-bg-tertiary/80 text-text-secondary hover:bg-bg-hover border border-bg-hover'
-                  }`}
-                >
-                  {v}
-                </button>
-              ))}
-            </div>
-          </div>
         </div>
 
         {modelRows.length === 0 ? (
@@ -1232,79 +1105,12 @@ export default function ModelsTab() {
               className="w-full flex items-center justify-center gap-2 py-2.5 bg-accent-blue hover:bg-accent-blue/90 text-white text-sm font-medium rounded-xl transition-colors disabled:opacity-50"
             >
               <Save className="w-4 h-4" />
-              {saving ? '保存中…' : '保存模型队列'}
+              {saving ? '保存中…' : '保存模型配置'}
             </button>
           </div>
         )}
       </GradientCard>
 
-      <GradientCard className="p-4 space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h3 className="text-sm font-semibold text-text-primary flex items-center gap-1.5">
-            <Sparkles className="w-4 h-4 text-accent-blue" />
-            生成参数
-          </h3>
-          <SaveStateBadge mode="explicit" state={effectiveLlmSaveState} error={llmSaveError} />
-        </div>
-        <label className="flex items-center justify-between gap-3 cursor-pointer rounded-xl border border-bg-hover bg-bg-tertiary/30 px-3 py-3">
-          <div>
-            <span className="text-xs font-medium text-text-primary">Think（全局）</span>
-            <p className="text-[10px] text-text-muted mt-0.5 leading-snug">
-              对所有模型同时生效，与顶栏会场开关同步。
-            </p>
-          </div>
-          <ToggleSwitch
-            checked={llmForm.think_mode}
-            onChange={(next) => {
-              setLlmForm({ ...llmForm, think_mode: next, think_effort: next ? 'xhigh' : 'off' })
-            }}
-            title="全局 Think 开关"
-          />
-        </label>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Temperature" hint="推荐 0.4-0.6">
-            <input
-              type="number"
-              step="0.1"
-              min="0"
-              max="2"
-              value={llmForm.temperature}
-              onChange={(e) => {
-                setLlmForm({
-                  ...llmForm,
-                  temperature: clampNumberInput(e.target.value, 0, 2, DEFAULT_TEMPERATURE),
-                })
-              }}
-              className="input-field"
-            />
-          </Field>
-          <Field label="Max Tokens" hint="建议 2048-4096">
-            <input
-              type="number"
-              step="256"
-              min="256"
-              max="32768"
-              value={llmForm.max_tokens}
-              onChange={(e) => {
-                setLlmForm({
-                  ...llmForm,
-                  max_tokens: clampIntegerInput(e.target.value, 256, 32768, DEFAULT_MAX_TOKENS),
-                })
-              }}
-              className="input-field"
-            />
-          </Field>
-        </div>
-        <button
-          type="button"
-          onClick={handleSaveLlm}
-          disabled={llmSaving}
-          className="w-full flex items-center justify-center gap-2 py-2.5 bg-accent-blue hover:bg-accent-blue/90 text-white text-sm font-medium rounded-xl transition-colors disabled:opacity-50"
-        >
-          <Save className="w-4 h-4" />
-          {llmSaving ? '保存中…' : '保存生成参数'}
-        </button>
-      </GradientCard>
     </div>
   )
 }

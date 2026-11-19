@@ -14,6 +14,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { api } from '@/lib/api'
+import { getAssistScreenshotModel } from '@/lib/assistModels'
 import { buildWsUrl } from '@/lib/backendUrl'
 import { useInterviewStore } from '@/stores/configStore'
 
@@ -495,8 +496,8 @@ export default function WrittenExamTest() {
   const llmQuestion = llmStep?.question ?? steps.submit?.question ?? FIXED_QUESTION
   const firstToken = formatLatency(llmStep?.first_token_ms)
   const total = formatLatency(llmStep?.total_ms)
-  const modelName = llmStep?.model_name ?? steps.submit?.model_name ?? config?.model_name
-  const hasVisionModel = Boolean(config?.models?.some((model) => model.enabled !== false && model.supports_vision))
+  const screenshotModel = getAssistScreenshotModel(config)
+  const modelName = llmStep?.model_name ?? steps.submit?.model_name ?? screenshotModel?.name
 
   return (
     <div className="preflight-panel animate-fade-up">
@@ -551,10 +552,10 @@ export default function WrittenExamTest() {
         </div>
       )}
 
-      {!hasVisionModel && !hasAnyResult && (
+      {!screenshotModel && !hasAnyResult && (
         <div className="flex items-center gap-2 text-xs text-accent-amber bg-accent-amber/10 px-3 py-2 rounded-lg mb-2">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-          <span>固定截图代码题需要支持视觉的模型。</span>
+          <span>请先在实时辅助中配置截图答题模型。</span>
         </div>
       )}
 

@@ -615,17 +615,18 @@ describe('WrittenExamTest', () => {
     expect(screen.getByText('部分环节异常，请检查配置后重试')).toBeInTheDocument()
   })
 
-  it('warns when no vision model is configured', () => {
+  it('warns when no screenshot model is selected even if the catalog has a vision model', () => {
     useInterviewStore.setState({
       config: {
         model_name: 'Text Model',
-        models: [{ name: 'Text Model', supports_vision: false, supports_think: false, enabled: true }],
+        models: [{ id: 'vision', name: 'Vision Model', supports_vision: true, supports_think: false, enabled: true }],
         active_model: 0,
+        assist_screenshot_model_id: null,
       },
     } as any)
 
     render(<WrittenExamTest />)
 
-    expect(screen.getByText('固定截图代码题需要支持视觉的模型。')).toBeInTheDocument()
+    expect(screen.getByText('请先在实时辅助中配置截图答题模型。')).toBeInTheDocument()
   })
 })

@@ -7,7 +7,6 @@ export interface SttSliceState {
   sttLoaded: boolean
   sttLoading: boolean
   sttActiveProvider: string
-  sttFallbackLoaded: boolean
   mmpgPhase: MmpgState | null
   mmpgError: string | null
   candidateSttLoaded: boolean
@@ -36,10 +35,9 @@ export interface SttSliceActions {
 export type SttSlice = SttSliceState & SttSliceActions
 
 export const createSttSlice: StateCreator<RootState, [], [], SttSlice> = (set) => ({
-  sttLoaded: true,
+  sttLoaded: false,
   sttLoading: false,
   sttActiveProvider: '',
-  sttFallbackLoaded: false,
   mmpgPhase: null,
   mmpgError: null,
   candidateSttLoaded: false,
@@ -50,15 +48,10 @@ export const createSttSlice: StateCreator<RootState, [], [], SttSlice> = (set) =
   modelHealthLatency: {},
   tokenUsage: { prompt: 0, completion: 0, total: 0, byModel: {} },
 
-  setSttStatus: (loaded, loading, provider) => set((s) => {
-    if (provider === 'whisper-preload') {
-      return { sttFallbackLoaded: loaded }
-    }
-    return {
-      sttLoaded: loaded,
-      sttLoading: loading,
-      ...(provider != null ? { sttActiveProvider: provider } : {}),
-    }
+  setSttStatus: (loaded, loading, provider) => set({
+    sttLoaded: loaded,
+    sttLoading: loading,
+    ...(provider != null ? { sttActiveProvider: provider } : {}),
   }),
   setCandidateSttStatus: (loaded, loading, provider) => set((s) => ({
     candidateSttLoaded: loaded,

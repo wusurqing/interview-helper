@@ -14,6 +14,7 @@ from core.auth import get_token, is_auth_disabled, is_loopback_host, loopback_by
 from core.config import (
     CANDIDATE_STT_PROVIDER_OPTIONS, DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, MMPG_STT_PROVIDER, Mmpg,
     get_config, update_config, ModelListChanged,
+    AssistGeneration, AssistScene, InvalidAssistModelSelection, ThinkEffort, model_health_fingerprint,
     POSITION_OPTIONS, LANGUAGE_OPTIONS, WHISPER_MODEL_OPTIONS, STT_PROVIDER_OPTIONS,
     FUNASR_MODEL_OPTIONS,
     STT_FALLBACK_PROVIDER_OPTIONS,
@@ -56,6 +57,11 @@ def _has_enabled_model(models: list) -> bool:
 class ConfigUpdate(BaseModel):
     system_prompts: Optional[dict[str, StrictStr | None]] = None
     models: Optional[list] = None
+    assist_model_ids: list[StrictStr] | None = None
+    assist_screenshot_model_id: StrictStr | None = None
+    assist_generation: dict[AssistScene, AssistGeneration] | None = None
+    assist_think_mode: bool | None = None
+    assist_think_effort: ThinkEffort | None = None
     max_parallel_answers: Optional[int] = None
     active_model: Optional[int] = None
     temperature: Optional[float] = None
@@ -135,6 +141,7 @@ class ModelListRequest(BaseModel):
     api_base_url: str
     api_key: str
     model_index: Optional[int] = None
+    model_id: StrictStr | None = None
     api_type: Optional[str] = None
 
 
@@ -327,6 +334,7 @@ async def api_get_models_full():
     return {
         "models": [
             {
+                "id": getattr(mdl, "id", ""),
                 "name": mdl.name,
                 "api_base_url": mdl.api_base_url,
                 "api_key": "",
@@ -350,7 +358,10 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
     from core.config import ModelConfig
 
     d = body.model_dump(exclude_none=True)
+    if "assist_screenshot_model_id" in body.model_fields_set:
+        d["assist_screenshot_model_id"] = body.assist_screenshot_model_id
     model_snapshot = None
+    model_origins = None
     try:
         if body.mmpg is not None:
             _require_local_mmpg_request(request)
@@ -362,19 +373,40 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
             raw_models = []
             current_models = list(get_config().models)
             model_snapshot = current_models
+            model_origins = []
+            by_id = {model.id: i for i, model in enumerate(current_models) if getattr(model, "id", "")}
+            by_fingerprint: dict[str, list[int]] = {}
+            for index, model in enumerate(current_models):
+                by_fingerprint.setdefault(model_health_fingerprint(model), []).append(index)
+            retained_origins: set[int] = set()
             for idx, x in enumerate(d["models"]):
                 if not isinstance(x, dict):
                     continue
-                if x.get("api_key") == _MODEL_API_KEY_KEEP:
-                    source_idx = x.get("model_original_index", idx)
-                    try:
-                        source_idx = int(source_idx)
-                    except (TypeError, ValueError):
-                        source_idx = idx
-                    existing = current_models[source_idx].api_key if 0 <= source_idx < len(current_models) else ""
-                    x = {**x, "api_key": existing}
-                x.pop("model_original_index", None)
-                raw_models.append(ModelConfig(**x))
+                model_id = x.pop("id", None)
+                keep_key = x.get("api_key") == _MODEL_API_KEY_KEEP
+                source_idx = x.pop("model_original_index", idx if keep_key else None)
+                if model_id:
+                    if not isinstance(model_id, str) or model_id not in by_id:
+                        raise ModelListChanged("模型目录已更新，请刷新后重试")
+                    source_idx = by_id[model_id]
+                if model_id or keep_key:
+                    if type(source_idx) is not int or not 0 <= source_idx < len(current_models):
+                        raise ModelListChanged("模型目录已更新，请刷新后重试")
+                if keep_key:
+                    x["api_key"] = current_models[source_idx].api_key
+                row = ModelConfig(**x)
+                if not model_id and not keep_key:
+                    # Older editors send row indices, which may refer to the
+                    # previous ordering. Match unchanged rows by identity.
+                    matches = by_fingerprint.get(model_health_fingerprint(row), [])
+                    source_idx = matches[0] if len(matches) == 1 else None
+                if source_idx is not None:
+                    if source_idx in retained_origins:
+                        raise HTTPException(422, "同一个模型不能在目录中重复保存")
+                    retained_origins.add(source_idx)
+                    row.id = getattr(current_models[source_idx], "id", "")
+                model_origins.append(source_idx)
+                raw_models.append(row)
             d["models"] = raw_models
             if not d["models"]:
                 raise HTTPException(400, "至少保留一个模型")
@@ -520,7 +552,7 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
         if model_snapshot is None:
             await run_in_threadpool(update_config, d)
         else:
-            await run_in_threadpool(update_config, d, model_snapshot=model_snapshot)
+            await run_in_threadpool(update_config, d, model_origins=model_origins, model_snapshot=model_snapshot)
         if {"candidate_asr_enabled", "candidate_stt_provider"}.intersection(d):
             from api.assist import candidate_mmpg
 
@@ -534,6 +566,8 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
         raise
     except ModelListChanged as e:
         raise HTTPException(409, str(e)) from e
+    except InvalidAssistModelSelection as e:
+        raise HTTPException(422, str(e)) from e
     except OSError:
         raise HTTPException(500, "无法保存设置，请检查配置文件目录的写入权限") from None
     except ValidationError as e:
@@ -788,12 +822,18 @@ async def api_get_models_health():
 async def api_list_remote_models(body: ModelListRequest):
     api_base_url = (body.api_base_url or "").strip()
     api_key = (body.api_key or "").strip()
-    if api_key == _MODEL_API_KEY_KEEP and body.model_index is not None:
-        cfg = get_config()
-        idx = int(body.model_index)
-        api_key = cfg.models[idx].api_key if 0 <= idx < len(cfg.models) else ""
     if not api_base_url:
         raise HTTPException(400, "API Base URL 不能为空")
+    if api_key == _MODEL_API_KEY_KEEP:
+        models = get_config().models
+        if body.model_id is not None:
+            saved = next((model for model in models if getattr(model, "id", None) == body.model_id), None)
+        else:
+            index = body.model_index
+            saved = models[index] if index is not None and 0 <= index < len(models) else None
+        if saved is None or saved.api_base_url.strip().rstrip("/") != api_base_url.rstrip("/"):
+            raise HTTPException(409, "模型目录或服务地址已变更，请刷新配置或填写该地址的 API Key")
+        api_key = saved.api_key.strip()
     if not api_key or api_key == "sk-your-api-key-here":
         raise HTTPException(400, "API Key 不能为空")
     api_type = (body.api_type or "openai").strip().lower()

@@ -299,7 +299,8 @@ def test_prompt_catalog_and_settings_api_keep_runtime_data_out(monkeypatch, tmp_
         assert catalog.status_code == 200
         assert "private-" not in catalog.text
         scenes = {row["id"]: row for row in catalog.json()["scenes"]}
-        assert len(scenes) == 13
+        assert len(scenes) == 12
+        assert "assist_realtime_short" not in scenes
         assert scenes["assist_manual"]["max_output_tokens"] == 640
         assert "summary_markdown" in scenes["review_summary"]["output_contract"]
         assert scenes["assist_manual"]["default_prompt"]

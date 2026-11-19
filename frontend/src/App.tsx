@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState, useRef, lazy, Suspense } from 'react'
 import { Settings, SlidersHorizontal, MonitorSmartphone, PanelLeftClose, PanelLeftOpen, Minus, X, ChevronDown } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore, type AppConfig } from '@/stores/configStore'
+import { getAssistModelEntries, getAssistScreenshotModel, isConfiguredModel } from '@/lib/assistModels'
+import { speechProvider } from '@/lib/speechProviders'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { useShortcutsStore } from '@/stores/shortcutsStore'
 import { useInterviewWS } from '@/hooks/useInterviewWS'
@@ -48,8 +50,6 @@ export default function App() {
   )
   const sttLoaded = useInterviewStore((s) => s.sttLoaded)
   const sttLoading = useInterviewStore((s) => s.sttLoading)
-  const sttActiveProvider = useInterviewStore((s) => s.sttActiveProvider)
-  const sttFallbackLoaded = useInterviewStore((s) => s.sttFallbackLoaded)
   const isRecording = useInterviewStore((s) => s.isRecording)
   const interviewerStreaming = useInterviewStore((s) => s.interviewerStreaming)
   const isPaused = useInterviewStore((s) => s.isPaused)
@@ -67,7 +67,11 @@ export default function App() {
     : mmpgPhase === 'listening' && mmpgAnswerLabel ? mmpgAnswerLabel : mmpgStateLabels[mmpgPhase]
   const mmpgError = (localMmpgActive ? mmpg.error : localMmpgError) ?? (backendMmpgError ? mmpgErrorMessage(backendMmpgError) : null)
   const mmpgNotice = localMmpgActive ? mmpg.notice : null
-  const isWhisperFallback = sttActiveProvider === 'whisper' && !!config?.stt_provider && config.stt_provider !== 'whisper'
+  const selectedSpeechProvider = speechProvider(config?.stt_provider)
+  const speechConfigured = config?.stt_configured
+    ? Boolean(selectedSpeechProvider && config.stt_configured[selectedSpeechProvider])
+    : sttLoaded
+  const speechStatus = sttLoading ? '连接中' : sttLoaded ? '就绪' : '未就绪'
   const [mobileTab, setMobileTab] = useState<'transcript' | 'answer'>('transcript')
   const lastMobileStreamingIdRef = useRef<string | null>(null)
   const appMode = useUiPrefsStore((s) => s.appMode)
@@ -81,7 +85,7 @@ export default function App() {
   const [moduleMenuOpen, setModuleMenuOpen] = useState(false)
   const serverScreenAskRef = useRef(false)
   const modelChangeSavingRef = useRef(false)
-  const pendingModelChangeRef = useRef<number | null>(null)
+  const pendingModelChangeRef = useRef<string | number | null>(null)
   const sessionAnchorRef = useRef<HTMLButtonElement | null>(null)
   const moduleMenuRef = useRef<HTMLDivElement | null>(null)
 
@@ -165,7 +169,10 @@ export default function App() {
   const hasGuided = useRef(false)
   useEffect(() => {
     if (!config || hasGuided.current) return
-    if (!config.api_key_set) {
+    const hasConfiguredModel = config.assist_model_ids === undefined
+      ? config.api_key_set
+      : config.models.some(isConfiguredModel)
+    if (!hasConfiguredModel) {
       hasGuided.current = true
       openModelsDrawer()
     }
@@ -193,8 +200,8 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [appMode, toggleAssistTranscriptCollapsed])
 
-  const handleModelChange = useCallback(async (active_model: number) => {
-    pendingModelChangeRef.current = active_model
+  const handleModelChange = useCallback(async (modelId: string | number) => {
+    pendingModelChangeRef.current = modelId
     if (modelChangeSavingRef.current) return
 
     modelChangeSavingRef.current = true
@@ -202,17 +209,29 @@ export default function App() {
       while (pendingModelChangeRef.current !== null) {
         const nextActiveModel = pendingModelChangeRef.current
         pendingModelChangeRef.current = null
-        const targetModel = useInterviewStore.getState().config?.models?.[nextActiveModel]
-        if (!targetModel) {
-          useInterviewStore.getState().setToastMessage('未找到该模型，请刷新配置后重试')
+        const current = useInterviewStore.getState().config
+        const entry = getAssistModelEntries(current).find(({ model, index }) => (
+          typeof nextActiveModel === 'string' ? model.id === nextActiveModel : index === nextActiveModel
+        ))
+        if (!entry) {
+          useInterviewStore.getState().setToastMessage('请先在实时辅助中勾选该模型')
           continue
         }
-        if (targetModel.enabled === false) {
-          useInterviewStore.getState().setToastMessage('该模型已停用，请先在设置中启用后再设为优先')
+        const { model: targetModel, index } = entry
+        if (!isConfiguredModel(targetModel)) {
+          useInterviewStore.getState().setToastMessage('请先在模型配置中启用并配置该模型')
           continue
         }
         try {
-          await updateConfigAndRefresh({ active_model: nextActiveModel })
+          const selected = current?.assist_model_ids
+          if (selected && targetModel.id) {
+            await updateConfigAndRefresh({ assist_model_ids: [
+              targetModel.id,
+              ...selected.filter((id) => id !== targetModel.id),
+            ] })
+          } else {
+            await updateConfigAndRefresh({ active_model: index })
+          }
           useInterviewStore.getState().setToastMessage(`已设为优先答题模型：${targetModel.name}`)
         } catch (error) {
           useInterviewStore.getState().setToastMessage(error instanceof Error ? error.message : '设置优先模型失败')
@@ -225,6 +244,11 @@ export default function App() {
 
   const handleServerScreenAsk = useCallback(async () => {
     if (serverScreenAskRef.current) return
+    const current = useInterviewStore.getState().config
+    if (current && !getAssistScreenshotModel(current)) {
+      useInterviewStore.getState().setToastMessage('请先在实时辅助中配置截图答题模型')
+      return
+    }
     serverScreenAskRef.current = true
     setServerScreenLoading(true)
     try {
@@ -367,8 +391,8 @@ export default function App() {
               aria-live="polite"
               title={
                 isPaused
-                  ? isExamMode ? '笔试已暂停' : `录音已暂停 · STT ${sttLoaded ? (sttActiveProvider === 'whisper' ? 'Whisper' : '就绪') : sttLoading ? '加载中' : '未加载'}`
-                  : isExamMode ? '笔试进行中' : `正在录音中 · STT ${sttLoaded ? (sttActiveProvider === 'whisper' ? 'Whisper' : '就绪') : sttLoading ? '加载中' : '未加载'}`
+                  ? isExamMode ? '笔试已暂停' : `录音已暂停 · ASR ${speechStatus}`
+                  : isExamMode ? '笔试进行中' : `正在录音中 · ASR ${speechStatus}`
               }
             >
               <span className="relative inline-flex w-1.5 h-1.5 flex-shrink-0">
@@ -392,16 +416,12 @@ export default function App() {
               title={
                 isExamMode
                   ? '笔试模式 · 等待提问'
-                  : sttLoaded
-                  ? isWhisperFallback ? 'STT 已降级至 Whisper · 等待录音' : sttFallbackLoaded ? 'STT 就绪 · Whisper 降级已预加载' : 'STT 就绪 · 等待录音'
-                  : sttLoading
-                  ? isWhisperFallback ? 'Whisper 降级加载中…' : 'STT 模型加载中…'
-                  : 'STT 模型尚未加载,首次录音时会自动加载'
+                  : speechConfigured ? '语音引擎已配置 · 等待录音' : '请在实时辅助中选择已配置的语音引擎'
               }
             >
-              <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${sttLoaded ? (isWhisperFallback ? 'bg-accent-amber' : 'bg-accent-green') : sttLoading ? 'bg-accent-amber animate-pulse' : 'bg-accent-red'}`} />
+              <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${speechConfigured ? 'bg-accent-green' : 'bg-accent-amber'}`} />
               <span className="text-[10px] text-text-muted hidden md:inline font-medium">
-                {sttLoaded ? (sttActiveProvider === 'whisper' ? 'Whisper' : sttFallbackLoaded ? 'STT ✓' : 'STT 就绪') : sttLoading ? '加载中' : '未加载'}
+                {isExamMode ? '笔试待开始' : speechConfigured ? 'ASR 已配置' : 'ASR 待配置'}
               </span>
             </div>
           )}
@@ -436,7 +456,7 @@ export default function App() {
             >
               <SlidersHorizontal className="w-3.5 h-3.5" />
               <span className="font-medium hidden sm:inline">会场</span>
-              {config?.think_mode && (
+              {(config?.assist_think_mode ?? config?.think_mode) && (
                 <span
                   className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-accent-green ring-2 ring-bg-primary shadow-[0_0_6px] shadow-accent-green/60"
                   aria-hidden
@@ -472,7 +492,7 @@ export default function App() {
           type="button"
           onClick={toggleSettings}
           className="inline-flex items-center justify-center min-h-[32px] min-w-[32px] p-1.5 rounded-xl hover:bg-bg-tertiary/60 text-text-muted hover:text-text-primary transition-all duration-200 border border-transparent hover:border-bg-hover/40"
-          title="设置中心 (常用 / 语音 / 模型 / 外观 / 快捷操作)"
+          title="设置中心 (实时辅助 / 语音配置 / 模型配置 / 外观 / 快捷操作)"
           aria-label="打开设置"
         >
           <Settings className="w-4 h-4" />

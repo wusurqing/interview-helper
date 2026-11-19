@@ -296,7 +296,10 @@ class _Body:
     def model_dump(self, exclude_none: bool = True):
         return dict(self._data)
 
-    # 让 router 里 `body.whisper_language` 等取属性不报错
+    @property
+    def model_fields_set(self):
+        return set(self._data)
+
     def __getattr__(self, name):
         return self._data.get(name)
 
@@ -801,7 +804,7 @@ def test_model_list_keep_placeholder_uses_saved_api_key(monkeypatch):
     )
 
     result = _run(common_router.api_list_remote_models(common_router.ModelListRequest(
-        api_base_url="https://api.example.com/v1",
+        api_base_url="https://api.openai.com/v1",
         api_key=common_router._MODEL_API_KEY_KEEP,
         model_index=0,
     )))

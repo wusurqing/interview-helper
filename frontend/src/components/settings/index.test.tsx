@@ -1,10 +1,15 @@
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import SettingsDrawer from './index'
 import { useInterviewStore } from '@/stores/configStore'
 
 describe('SettingsDrawer', () => {
+  beforeAll(async () => {
+    // Prime the lazy default tab before testing focus and dirty-state events.
+    await import('./RealtimeAssistTab')
+  })
+
   beforeEach(() => {
     vi.restoreAllMocks()
     Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
@@ -19,9 +24,9 @@ describe('SettingsDrawer', () => {
 
     useInterviewStore.setState({
       settingsOpen: true,
-      settingsDrawerTab: 'config',
+      settingsDrawerTab: 'realtime',
       config: {
-        stt_provider: 'whisper',
+        stt_provider: 'generic',
         whisper_model: 'base',
         whisper_language: 'auto',
         whisper_preload: false,
@@ -35,7 +40,7 @@ describe('SettingsDrawer', () => {
         generic_stt_model: '',
         generic_stt_custom_headers: '',
         candidate_asr_enabled: false,
-        candidate_stt_provider: 'whisper',
+        candidate_stt_provider: 'generic',
         candidate_whisper_model: '',
         candidate_whisper_language: '',
         candidate_remote_stt_enabled: false,
@@ -69,12 +74,12 @@ describe('SettingsDrawer', () => {
 
     render(<SettingsDrawer />)
 
-    const modelSelect = await screen.findByDisplayValue('base')
+    const modelSelect = await screen.findByRole('combobox', { name: '面试官 ASR 引擎' })
     modelSelect.focus()
-    fireEvent.change(modelSelect, { target: { value: 'tiny' } })
+    fireEvent.change(modelSelect, { target: { value: 'doubao' } })
 
     await waitFor(() => {
-      expect(screen.getAllByText('有未保存更改').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('未保存：实时辅助').length).toBeGreaterThan(0)
     })
     expect(document.activeElement).not.toBe(outsideButton)
     expect(screen.getByRole('dialog').contains(document.activeElement)).toBe(true)
@@ -91,10 +96,10 @@ describe('SettingsDrawer', () => {
 
     render(<SettingsDrawer />)
 
-    const modelSelect = await screen.findByDisplayValue('base')
-    fireEvent.change(modelSelect, { target: { value: 'tiny' } })
+    const modelSelect = await screen.findByRole('combobox', { name: '面试官 ASR 引擎' })
+    fireEvent.change(modelSelect, { target: { value: 'doubao' } })
     await waitFor(() => {
-      expect(screen.getAllByText('有未保存更改').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('未保存：实时辅助').length).toBeGreaterThan(0)
     })
 
     fireEvent.click(screen.getByRole('button', { name: '关闭' }))
@@ -109,26 +114,39 @@ describe('SettingsDrawer', () => {
     const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false)
     render(<SettingsDrawer />)
 
-    const modelSelect = await screen.findByDisplayValue('base')
-    fireEvent.change(modelSelect, { target: { value: 'tiny' } })
+    const modelSelect = await screen.findByRole('combobox', { name: '面试官 ASR 引擎' })
+    fireEvent.change(modelSelect, { target: { value: 'doubao' } })
     await waitFor(() => {
-      expect(screen.getAllByText('有未保存更改').length).toBeGreaterThan(0)
+      expect(screen.getAllByText('未保存：实时辅助').length).toBeGreaterThan(0)
     })
 
     fireEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: /模型/ }))
 
     expect(confirmSpy).toHaveBeenCalledWith('有未保存更改，切换后会丢失。')
-    expect(screen.getByText('语音识别引擎')).toBeInTheDocument()
+    expect(screen.getByText('面试官 / 会议音频')).toBeInTheDocument()
   })
 
   it('shows explicit unsaved sections in the drawer header', async () => {
     render(<SettingsDrawer />)
 
-    const modelSelect = await screen.findByDisplayValue('base')
-    fireEvent.change(modelSelect, { target: { value: 'tiny' } })
+    const modelSelect = await screen.findByRole('combobox', { name: '面试官 ASR 引擎' })
+    fireEvent.change(modelSelect, { target: { value: 'doubao' } })
 
     // 桌面导航与移动头部各有一处提示
-    const hints = await screen.findAllByText('未保存：语音配置')
+    const hints = await screen.findAllByText('未保存：实时辅助')
     expect(hints.length).toBeGreaterThanOrEqual(1)
+  })
+
+  it('opens realtime assist by default with a separate speech configuration tab', async () => {
+    useInterviewStore.getState().toggleSettings()
+    useInterviewStore.getState().toggleSettings()
+    render(<SettingsDrawer />)
+
+    const navigation = within(screen.getByRole('navigation'))
+    expect(navigation.getByRole('button', { name: /实时辅助/ })).toHaveAttribute('aria-current', 'page')
+    expect(navigation.getByRole('button', { name: /语音配置/ })).toBeInTheDocument()
+    expect(navigation.queryByRole('button', { name: /^常用|^节奏|^热词/ })).not.toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: /卡片/ })).toBeInTheDocument()
+    expect(screen.queryByText('简短回答')).not.toBeInTheDocument()
   })
 })

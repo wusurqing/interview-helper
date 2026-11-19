@@ -146,6 +146,34 @@ describe('useInterviewWS', () => {
     expect(useInterviewStore.getState().singleMic).toBeNull()
   })
 
+  it('retains the server capture route across pause and clears it on stop', () => {
+    render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+    act(() => {
+      ws.emitOpen()
+      ws.emitMessage({ type: 'init', is_recording: true, candidate_capture_provider: 'doubao_mmpg' })
+      ws.emitMessage({ type: 'paused', value: true })
+    })
+    expect(useInterviewStore.getState().candidateCaptureProvider).toBe('doubao_mmpg')
+    act(() => ws.emitMessage({ type: 'recording', value: false, candidate_capture_provider: '' }))
+    expect(useInterviewStore.getState().candidateCaptureProvider).toBeNull()
+    act(() => ws.emitMessage({ type: 'recording', value: true, candidate_capture_provider: 'generic' }))
+    expect(useInterviewStore.getState().candidateCaptureProvider).toBe('generic')
+  })
+
+  it('reports a segment recognition failure on the affected role', () => {
+    render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+    act(() => {
+      ws.emitOpen()
+      ws.emitMessage({ type: 'stt_error', provider: 'generic', role: 'candidate', message: '网络连接失败' })
+    })
+    expect(useInterviewStore.getState().toasts).toContainEqual(expect.objectContaining({
+      level: 'warn',
+      message: '我的回答识别失败 · 网络连接失败',
+    }))
+  })
+
   it('labels generation and persistence answer failures accurately', () => {
     render(<Harness />)
     const ws = FakeWebSocket.instances[0]
@@ -276,7 +304,7 @@ describe('useInterviewWS', () => {
 
     const state = useInterviewStore.getState()
     expect(state.candidateSttLoaded).toBe(false)
-    expect(state.toastMessage).toContain('候选人口述记录已关闭，不影响面试录音')
+    expect(state.toastMessage).toContain('我的回答识别失败')
   })
 
   it('warns immediately when screenshot self-check fails', () => {

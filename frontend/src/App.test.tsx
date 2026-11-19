@@ -120,9 +120,11 @@ describe('App bootstrap', () => {
   it('does not allow disabled models to be picked as the priority answer model', async () => {
     apiMock.getConfig.mockResolvedValue({
       models: [
-        { name: 'Enabled Model', supports_vision: false, enabled: true },
-        { name: 'Disabled Model', supports_vision: true, enabled: false },
+        { id: 'enabled', name: 'Enabled Model', supports_vision: false, enabled: true },
+        { id: 'disabled', name: 'Disabled Model', supports_vision: true, enabled: false },
+        { id: 'other', name: 'Unselected Model', supports_vision: true, enabled: true },
       ],
+      assist_model_ids: ['enabled', 'disabled'],
       active_model: 0,
       api_key_set: true,
       think_mode: false,
@@ -137,6 +139,7 @@ describe('App bootstrap', () => {
 
     const disabledOption = screen.getByRole('button', { name: /Disabled Model/ })
     expect(disabledOption).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'Unselected Model' })).not.toBeInTheDocument()
     fireEvent.click(disabledOption)
 
     expect(apiMock.updateConfig).not.toHaveBeenCalled()
@@ -144,21 +147,30 @@ describe('App bootstrap', () => {
 
   it('serializes priority model changes so the latest selection wins', async () => {
     const firstSave = deferred<{ ok: boolean }>()
-    apiMock.getConfig.mockResolvedValue({
+    const config = {
       models: [
-        { name: 'First Model', supports_vision: false, enabled: true },
-        { name: 'Second Model', supports_vision: false, enabled: true },
-        { name: 'Third Model', supports_vision: true, enabled: true },
+        { id: 'first', name: 'First Model', supports_vision: false, enabled: true },
+        { id: 'second', name: 'Second Model', supports_vision: false, enabled: true },
+        { id: 'third', name: 'Third Model', supports_vision: true, enabled: true },
       ],
+      assist_model_ids: ['first', 'second', 'third'],
       active_model: 0,
       api_key_set: true,
       think_mode: false,
       think_effort: 'off',
       stt_provider: 'whisper',
-    })
+    }
+    apiMock.getConfig.mockImplementation(async () => ({ ...config }))
     apiMock.updateConfig
-      .mockReturnValueOnce(firstSave.promise)
-      .mockResolvedValue({ ok: true })
+      .mockImplementationOnce(async (patch) => {
+        await firstSave.promise
+        Object.assign(config, patch)
+        return { ok: true }
+      })
+      .mockImplementation(async (patch) => {
+        Object.assign(config, patch)
+        return { ok: true }
+      })
 
     render(<App />)
 
@@ -166,7 +178,7 @@ describe('App bootstrap', () => {
     fireEvent.click(screen.getByRole('button', { name: /Second Model/ }))
 
     await waitFor(() => {
-      expect(apiMock.updateConfig).toHaveBeenCalledWith({ active_model: 1 })
+      expect(apiMock.updateConfig).toHaveBeenCalledWith({ assist_model_ids: ['second', 'first', 'third'] })
     })
     expect(apiMock.updateConfig).toHaveBeenCalledTimes(1)
 
@@ -183,7 +195,7 @@ describe('App bootstrap', () => {
     await waitFor(() => {
       expect(apiMock.updateConfig).toHaveBeenCalledTimes(2)
     })
-    expect(apiMock.updateConfig).toHaveBeenNthCalledWith(2, { active_model: 2 })
+    expect(apiMock.updateConfig).toHaveBeenNthCalledWith(2, { assist_model_ids: ['third', 'second', 'first'] })
     await waitFor(() => {
       expect(useInterviewStore.getState().toastMessage).toBe('已设为优先答题模型：Third Model')
     })
@@ -203,6 +215,13 @@ describe('App bootstrap', () => {
   })
 
   it('prevents duplicate mobile server screen asks while one is in flight', async () => {
+    apiMock.getConfig.mockResolvedValue({
+      models: [{ id: 'screen', name: 'Screenshot model', supports_vision: true, enabled: true }],
+      active_model: 0,
+      assist_model_ids: [],
+      assist_screenshot_model_id: 'screen',
+      api_key_set: true,
+    })
     let resolveAsk: ((value: unknown) => void) | null = null
     const pendingAsk = new Promise((resolve) => {
       resolveAsk = resolve

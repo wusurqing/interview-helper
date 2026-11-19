@@ -11,7 +11,17 @@ const _chunkBuffer: Map<string, { answer: string; think: string }> = new Map()
 let _chunkFlushTimer: ReturnType<typeof setTimeout> | null = null
 let _candidateSegmentIds: Array<string | null> = []
 
-type AnswerMeta = { source?: string; modelName?: string; updatesQaId?: string; answerFormat?: QAPair['answerFormat'] }
+type AnswerMeta = {
+  source?: string
+  modelName?: string
+  updatesQaId?: string
+  answerFormat?: QAPair['answerFormat']
+  attempt?: number
+}
+
+function compareAttempt(qa: QAPair | undefined, attempt: number | undefined) {
+  return qa && attempt !== undefined ? attempt - (qa.attempt ?? 1) : 0
+}
 
 function appendBufferedText(qa: QAPair, buf: { answer: string; think: string }): QAPair {
   return {
@@ -19,6 +29,7 @@ function appendBufferedText(qa: QAPair, buf: { answer: string; think: string }):
     thinkContent: qa.thinkContent + buf.think,
     answer: qa.answer + buf.answer,
     isThinking: buf.answer ? false : buf.think ? true : qa.isThinking,
+    retrying: buf.answer ? false : qa.retrying,
   }
 }
 
@@ -61,6 +72,7 @@ export interface InterviewSliceState {
   isRecording: boolean
   singleMic: SingleMicState | null
   interviewerStreaming: boolean
+  candidateCaptureProvider: string | null
   mmpgAnswerLabel: string | null
   isPaused: boolean
   audioLevel: number
@@ -73,7 +85,7 @@ export interface InterviewSliceState {
 }
 
 export interface InterviewSliceActions {
-  setRecording: (v: boolean, interviewerStreaming?: boolean) => void
+  setRecording: (v: boolean, interviewerStreaming?: boolean, candidateCaptureProvider?: string) => void
   setSingleMic: (value: unknown) => void
   setPaused: (v: boolean) => void
   setMmpgAnswerPhase: (phase: unknown) => void
@@ -86,8 +98,8 @@ export interface InterviewSliceActions {
     question: string,
     meta?: AnswerMeta,
   ) => void
-  appendThinkChunk: (id: string, chunk: string) => void
-  appendAnswerChunk: (id: string, chunk: string) => void
+  appendThinkChunk: (id: string, chunk: string, attempt?: number) => void
+  appendAnswerChunk: (id: string, chunk: string, attempt?: number) => void
   finalizeAnswer: (
     id: string,
     question: string,
@@ -97,10 +109,10 @@ export interface InterviewSliceActions {
     firstTokenMs?: number,
     totalMs?: number,
     updatesQaId?: string,
-    meta?: Pick<AnswerMeta, 'source' | 'answerFormat'>,
+    meta?: Pick<AnswerMeta, 'source' | 'answerFormat' | 'attempt'>,
   ) => void
-  cancelAnswer: (id: string, reason?: string) => void
-  errorAnswer: (id: string, message: string) => void
+  cancelAnswer: (id: string, reason?: string, attempt?: number) => void
+  errorAnswer: (id: string, message: string, attempt?: number) => void
   setVisionVerify: (id: string, verdict: 'PASS' | 'FAIL' | 'UNKNOWN', reason: string) => void
   setInitData: (data: any) => void
   clearSession: () => void
@@ -123,6 +135,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
   isRecording: false,
   singleMic: null,
   interviewerStreaming: false,
+  candidateCaptureProvider: null,
   mmpgAnswerLabel: null,
   isPaused: false,
   audioLevel: 0,
@@ -133,10 +146,11 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
   streamingIds: [],
   currentStreamingId: null,
 
-  setRecording: (v, interviewerStreaming) => set({
+  setRecording: (v, interviewerStreaming, candidateCaptureProvider) => set((state) => ({
     isRecording: v, interviewerStreaming: v && interviewerStreaming === true,
+    candidateCaptureProvider: v ? candidateCaptureProvider ?? state.candidateCaptureProvider : null,
     ...(!v ? { mmpgAnswerLabel: null, singleMic: null } : {}),
-  }),
+  })),
   setSingleMic: (value) => {
     const next = readSingleMic(value)
     if (!next && value !== null) return
@@ -182,13 +196,11 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
     set((s) => {
       const existing = s.qaPairs.find((qa) => qa.id === id)
       if (existing) {
-        if (existing.status !== 'streaming') {
-          return {
-            currentStreamingId: s.currentStreamingId,
-            streamingIds: s.streamingIds,
-            qaPairs: s.qaPairs,
-          }
-        }
+        const attempt = meta?.attempt ?? existing.attempt ?? 1
+        const previousAttempt = existing.attempt ?? 1
+        if (existing.status !== 'streaming' || attempt < previousAttempt) return s
+        const restarted = attempt > previousAttempt
+        if (restarted) _chunkBuffer.delete(id)
         const streamingIds = s.streamingIds.includes(id) ? s.streamingIds : [...s.streamingIds, id]
         return {
           currentStreamingId: id,
@@ -202,6 +214,11 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
                   modelLabel: meta?.modelName ?? qa.modelLabel,
                   updatesQaId: meta?.updatesQaId ?? qa.updatesQaId,
                   answerFormat: meta?.answerFormat ?? qa.answerFormat,
+                  attempt,
+                  ...(restarted ? {
+                    answer: '', thinkContent: '', isThinking: false, retrying: true,
+                    firstTokenMs: undefined, totalMs: undefined,
+                  } : {}),
                 }
               : qa,
           ),
@@ -223,23 +240,28 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
             modelLabel: meta?.modelName,
             updatesQaId: meta?.updatesQaId,
             answerFormat: meta?.answerFormat,
+            attempt: meta?.attempt,
+            retrying: (meta?.attempt ?? 1) > 1,
             status: 'streaming' as QAStatus,
           },
         ],
       }
     }),
 
-  appendThinkChunk: (id, chunk) => {
+  appendThinkChunk: (id, chunk, attempt) => {
+    const qa = get().qaPairs.find(item => item.id === id)
+    if (compareAttempt(qa, attempt) !== 0 || (qa && qa.status !== 'streaming')) return
     const buf = _chunkBuffer.get(id) ?? { answer: '', think: '' }
     buf.think += chunk
     _chunkBuffer.set(id, buf)
     _scheduleChunkFlush(set)
   },
 
-  appendAnswerChunk: (id, chunk) => {
+  appendAnswerChunk: (id, chunk, attempt) => {
+    const qa = get().qaPairs.find(item => item.id === id)
+    if (compareAttempt(qa, attempt) !== 0 || (qa && qa.status !== 'streaming')) return
     const buf = _chunkBuffer.get(id) ?? { answer: '', think: '' }
     buf.answer += chunk
-    const qa = get().qaPairs.find(item => item.id === id)
     if (qa?.answerFormat === 'plain_text' && qa.status === 'streaming' && !qa.answer.trim()) {
       _chunkBuffer.delete(id)
       set((s) => ({ qaPairs: s.qaPairs.map(item => item.id === id ? appendBufferedText(item, buf) : item) }))
@@ -250,7 +272,10 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
   },
 
   finalizeAnswer: (id, question, answer, thinkContent, modelName, firstTokenMs, totalMs, updatesQaId, meta) => {
-    const buffered = _chunkBuffer.get(id)
+    const comparison = compareAttempt(get().qaPairs.find(qa => qa.id === id), meta?.attempt)
+    if (comparison < 0) return
+    const newer = comparison > 0
+    const buffered = newer ? undefined : _chunkBuffer.get(id)
     _chunkBuffer.delete(id)
     set((s) => {
       const next = s.streamingIds.filter((x) => x !== id)
@@ -265,6 +290,8 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
             if (qa.id !== id) return qa
             const terminal = {
               isThinking: false,
+              retrying: false,
+              attempt: meta?.attempt ?? qa.attempt,
               firstTokenMs: firstTokenMs ?? qa.firstTokenMs,
               totalMs: totalMs ?? qa.totalMs,
               status: 'done' as const,
@@ -272,12 +299,13 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
             if (answerFormat === 'plain_text') {
               const streamed = buffered ? appendBufferedText(qa, buffered) : qa
               // The full answer is a recovery copy for a missed WebSocket fragment.
-              const recovered = typeof answer === 'string' && answer !== streamed.answer
+              const recovered = newer || (typeof answer === 'string' && answer !== streamed.answer)
               return {
                 ...streamed,
                 ...terminal,
                 answerFormat,
-                ...(recovered ? { answer, thinkContent: thinkContent ?? streamed.thinkContent } : {}),
+                ...(recovered ? { answer, thinkContent: thinkContent ?? (newer ? '' : streamed.thinkContent) } : {}),
+                ...(meta?.attempt !== undefined && modelName ? { modelLabel: modelName } : {}),
               }
             }
             return {
@@ -302,6 +330,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
               firstTokenMs,
               totalMs,
               updatesQaId,
+              attempt: meta?.attempt,
               status: 'done' as QAStatus,
             },
           ]
@@ -313,8 +342,10 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
     })
   },
 
-  cancelAnswer: (id, reason) => {
-    const buffered = _chunkBuffer.get(id)
+  cancelAnswer: (id, reason, attempt) => {
+    const comparison = compareAttempt(get().qaPairs.find(qa => qa.id === id), attempt)
+    if (comparison < 0) return
+    const buffered = comparison > 0 ? undefined : _chunkBuffer.get(id)
     _chunkBuffer.delete(id)
     set((s) => {
       const next = s.streamingIds.filter((x) => x !== id)
@@ -325,9 +356,13 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
           qa.id === id && qa.status !== 'done'
             ? {
                 ...qa,
-                answer: reason === 'continuation' || qa.answerFormat === 'plain_text'
-                  ? qa.answer + (buffered?.answer ?? '') : qa.answer,
+                ...(comparison > 0 ? { answer: '', thinkContent: '' } : {
+                  answer: reason === 'continuation' || qa.answerFormat === 'plain_text'
+                    ? qa.answer + (buffered?.answer ?? '') : qa.answer,
+                }),
+                attempt: attempt ?? qa.attempt,
                 isThinking: false,
+                retrying: false,
                 status: 'cancelled' as QAStatus,
                 cancelReason: reason,
               }
@@ -337,8 +372,11 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
     })
   },
 
-  errorAnswer: (id, message) => {
-    const buffered = _chunkBuffer.get(id)
+  errorAnswer: (id, message, attempt) => {
+    const previous = get().qaPairs.find(qa => qa.id === id)
+    const comparison = compareAttempt(previous, attempt)
+    if (comparison < 0 || previous?.status === 'done') return
+    const buffered = comparison > 0 ? undefined : _chunkBuffer.get(id)
     _chunkBuffer.delete(id)
     set((s) => {
       const next = s.streamingIds.filter((x) => x !== id)
@@ -349,7 +387,9 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
           qa.id === id
             ? {
                 ...(qa.answerFormat === 'plain_text' && buffered ? appendBufferedText(qa, buffered) : qa),
-                isThinking: false, status: 'error' as QAStatus, errorMessage: message,
+                ...(comparison > 0 ? { answer: '', thinkContent: '' } : {}),
+                attempt: attempt ?? qa.attempt,
+                isThinking: false, retrying: false, status: 'error' as QAStatus, errorMessage: message,
               }
             : qa,
         ),
@@ -414,6 +454,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
       isRecording: data.is_recording ?? false,
       singleMic: readSingleMic(data.single_mic),
       interviewerStreaming: data.is_recording === true && data.interviewer_streaming === true,
+      candidateCaptureProvider: data.is_recording && typeof data.candidate_capture_provider === 'string' ? data.candidate_capture_provider : null,
       mmpgAnswerLabel: mmpgAnswerLabel(data.mmpg_answer_phase),
       isPaused: data.is_paused ?? false,
       sttLoaded: data.stt_loaded ?? false,
@@ -440,6 +481,7 @@ export const createInterviewSlice: StateCreator<RootState, [], [], InterviewSlic
       isRecording: false,
       singleMic: null,
       interviewerStreaming: false,
+      candidateCaptureProvider: null,
       isPaused: false,
       isTranscribing: false,
       audioLevel: 0,

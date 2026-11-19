@@ -1,9 +1,6 @@
 import { useState, useEffect } from 'react'
 import {
-  AlertTriangle,
   Palette,
-  LayoutGrid,
-  AlignVerticalSpaceAround,
   Monitor,
   PenLine,
   ChevronDown,
@@ -68,18 +65,10 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: 
   )
 }
 
-export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' | 'mode' | 'kb' | 'appearance' } = {}) {
+export default function PreferencesTab({ variant }: { variant: 'mode' | 'kb' | 'appearance' }) {
   const config = useInterviewStore((s) => s.config)
   const options = useInterviewStore((s) => s.options)
-  const platformInfo = useInterviewStore((s) => s.platformInfo)
-  const sttLoaded = useInterviewStore((s) => s.sttLoaded)
-  const sttLoading = useInterviewStore((s) => s.sttLoading)
-  const sttActiveProvider = useInterviewStore((s) => s.sttActiveProvider)
-  const sttFallbackLoaded = useInterviewStore((s) => s.sttFallbackLoaded)
-  const isWhisperFallback = sttActiveProvider === 'whisper' && !!config?.stt_provider && config.stt_provider !== 'whisper'
   const setSettingsDrawerTab = useInterviewStore((s) => s.setSettingsDrawerTab)
-  const answerPanelLayout = useUiPrefsStore((s) => s.answerPanelLayout)
-  const setAnswerPanelLayout = useUiPrefsStore((s) => s.setAnswerPanelLayout)
   const colorScheme = useUiPrefsStore((s) => s.colorScheme)
   const setColorScheme = useUiPrefsStore((s) => s.setColorScheme)
   const [scrollBottomPx, setScrollBottomPx] = useState(40)
@@ -118,20 +107,6 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
     config?.kb_asr_deadline_ms,
   ])
 
-  const sttLabel =
-    config?.stt_provider === 'doubao_mmpg'
-      ? '豆包 MMPG'
-      : config?.stt_provider === 'doubao'
-      ? '豆包'
-      : config?.stt_provider === 'generic'
-        ? '通用 ASR'
-        : config?.stt_provider === 'whisper'
-          ? 'Whisper'
-          : config?.stt_provider === 'qwen3_asr'
-            ? 'Qwen3-ASR GPU'
-            : config?.stt_provider === 'funasr'
-              ? 'FunASR'
-              : `不支持 (${config?.stt_provider ?? 'unknown'})`
   const hasScreenCapture = (options?.screen_capture_regions?.length ?? 0) > 0
   const searchQuery = useSettingsSearch()
   const inSearch = searchQuery.trim().length > 0
@@ -141,113 +116,18 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-bg-hover/60 bg-bg-primary/35 px-4 py-3">
         <div>
           <p className="text-sm font-semibold text-text-primary">
-            {variant === 'appearance' ? '外观'
-              : variant === 'mode' ? '笔试与截图'
-              : variant === 'kb' ? '本地知识库'
-              : '常用偏好'}
+            {variant === 'appearance' ? '外观' : variant === 'mode' ? '笔试与截图' : '本地知识库'}
           </p>
           <p className="mt-0.5 text-[11px] leading-relaxed text-text-muted">
             {variant === 'appearance'
               ? '配色即时生效，流式跟滚阈值自动保存。'
               : variant === 'mode'
                 ? '笔试模式与截图审题设置自动保存。'
-                : variant === 'kb'
-                  ? '开启后回答会引用本地知识库笔记；检索参数可按延迟预算调整。'
-                  : '这里的运行偏好会自动保存；外观和悬浮窗本机偏好即时生效。'}
+                : '开启后回答会引用本地知识库笔记。'}
           </p>
         </div>
         {variant !== 'appearance' && <SaveStateBadge mode="auto" state={autoSave.state} error={autoSave.error} />}
       </div>
-
-      {/* ── 系统状态 ── */}
-      {platformInfo?.needs_virtual_device && (
-        <div className="bg-accent-amber/10 border border-accent-amber/30 rounded-lg p-3 text-xs space-y-2">
-          <div className="flex items-start gap-2">
-            <AlertTriangle className="w-4 h-4 text-accent-amber flex-shrink-0 mt-0.5" />
-            <div className="text-text-secondary whitespace-pre-line">{platformInfo.instructions}</div>
-          </div>
-        </div>
-      )}
-
-      {variant === 'main' && (<>
-      <Section title="运行状态" icon={<AlertTriangle className="w-3.5 h-3.5" />} keywords="status 状态 stt 语音识别 就绪">
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          <div className="rounded-xl border border-bg-hover/60 bg-bg-tertiary/25 px-3 py-2.5">
-            <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${sttLoaded ? (isWhisperFallback ? 'bg-accent-amber' : 'bg-accent-green') : sttLoading ? 'bg-accent-amber animate-pulse' : 'bg-accent-red'}`} />
-              <span className="text-xs font-medium text-text-primary">语音识别</span>
-            </div>
-            <p className="text-[11px] text-text-muted mt-1">
-              {sttLoaded ? (isWhisperFallback ? 'Whisper 降级就绪' : sttFallbackLoaded ? '就绪，降级已预备' : '就绪') : sttLoading ? '加载中' : '未就绪'} · {sttLabel}
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() => setSettingsDrawerTab('config')}
-            className="rounded-xl border border-accent-blue/30 bg-accent-blue/10 px-3 py-2.5 text-left hover:bg-accent-blue/15 transition-colors"
-          >
-            <span className="text-xs font-medium text-accent-blue">语音配置</span>
-            <p className="text-[11px] text-text-muted mt-1">切换 STT 与断句参数</p>
-          </button>
-        </div>
-      </Section>
-
-      <Section title="回答体验" icon={<LayoutGrid className="w-3.5 h-3.5" />} keywords="布局 卡片 流式 简短 layout card stream">
-        <div className="grid grid-cols-2 gap-2">
-          {([
-            { key: 'cards' as const, icon: LayoutGrid, label: '卡片', hint: '独立框，框内滚动' },
-            { key: 'stream' as const, icon: AlignVerticalSpaceAround, label: '流式', hint: '通读，无高度限制' },
-          ]).map(({ key, icon: Icon, label, hint }) => (
-            <button
-              key={key}
-              type="button"
-              onClick={() => setAnswerPanelLayout(key)}
-              className={`flex flex-col items-start gap-1.5 p-2.5 rounded-xl border text-left transition-all ${
-                answerPanelLayout === key
-                  ? 'border-accent-blue bg-accent-blue/10 ring-1 ring-accent-blue/30'
-                  : 'border-bg-hover bg-bg-tertiary/30 hover:border-bg-hover'
-              }`}
-            >
-              <Icon className={`w-4 h-4 ${answerPanelLayout === key ? 'text-accent-blue' : 'text-text-muted'}`} />
-              <span className="text-xs font-medium text-text-primary">{label}</span>
-              <span className="text-[10px] text-text-muted leading-snug">{hint}</span>
-            </button>
-          ))}
-        </div>
-        <Field label="回答长度">
-          <div className="grid grid-cols-2 gap-2">
-            {([
-              { value: false, label: '详细回答', hint: '每轮语音答题使用标准提示词' },
-              { value: true, label: '简短回答', hint: '每轮语音答题使用简短提示词' },
-            ]).map((item) => {
-              const selected = (config?.assist_high_churn_short_answer ?? false) === item.value
-              return (
-                <button
-                  key={item.label}
-                  type="button"
-                  onClick={async () => {
-                    await autoSave.saveNow({ assist_high_churn_short_answer: item.value })
-                  }}
-                  className={`rounded-xl border px-3 py-2.5 text-left transition-all ${
-                    selected
-                      ? 'border-accent-blue bg-accent-blue/10 ring-1 ring-accent-blue/30'
-                      : 'border-bg-hover bg-bg-tertiary/25 hover:border-bg-hover'
-                  }`}
-                >
-                  <span className={`text-xs font-semibold ${selected ? 'text-accent-blue' : 'text-text-primary'}`}>
-                    {item.label}
-                  </span>
-                  <span className="block text-[10px] text-text-muted mt-1">{item.hint}</span>
-                </button>
-              )
-            })}
-          </div>
-          <p className="text-[10px] text-text-muted mt-0.5 leading-relaxed">
-            当前：{config?.assist_high_churn_short_answer ? '简短回答' : '详细回答'}
-          </p>
-        </Field>
-      </Section>
-      </>)}
 
       {/* ── 2. 笔试模式与截图 ── */}
       {variant === 'mode' && (<>

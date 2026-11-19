@@ -16,6 +16,9 @@ import {
 } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore } from '@/stores/configStore'
+import { speechProvider } from '@/lib/speechProviders'
+import type { AppConfig } from '@/stores/slices/types'
+import { getAssistModelEntries, isConfiguredModel } from '@/lib/assistModels'
 import type { SingleMicRole } from '@/stores/slices/types'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { api, getErrorMessage } from '@/lib/api'
@@ -43,8 +46,10 @@ export {
   saveQuickPrompts,
 } from './control-bar/quickPrompts'
 
-function getEnabledVisionModels(config: { models?: Array<{ name?: string; supports_vision?: boolean; enabled?: boolean }> } | null | undefined) {
-  return (config?.models ?? []).filter((model) => model.enabled !== false && model.supports_vision)
+function getEnabledVisionModels(config: AppConfig | null) {
+  return getAssistModelEntries(config).flatMap(({ model }) => (
+    model.supports_vision && isConfiguredModel(model) ? [model] : []
+  ))
 }
 
 function connectInterviewerAudio(
@@ -74,6 +79,7 @@ export default function ControlBar() {
     isRecording,
     singleMic,
     interviewerStreaming,
+    candidateCaptureProvider,
     isPaused,
     devices,
     setDevices,
@@ -89,9 +95,7 @@ export default function ControlBar() {
     setLastWSError,
     wsConnected,
     modelHealth,
-    sttLoaded,
     sttLoading,
-    sttActiveProvider,
     mmpgPhase,
     candidateSttLoaded,
     candidateSttLoading,
@@ -101,6 +105,7 @@ export default function ControlBar() {
       isRecording: s.isRecording,
       singleMic: s.singleMic,
       interviewerStreaming: s.interviewerStreaming,
+      candidateCaptureProvider: s.candidateCaptureProvider,
       isPaused: s.isPaused,
       devices: s.devices,
       setDevices: s.setDevices,
@@ -116,9 +121,7 @@ export default function ControlBar() {
       setLastWSError: s.setLastWSError,
       wsConnected: s.wsConnected,
       modelHealth: s.modelHealth,
-      sttLoaded: s.sttLoaded ?? true,
       sttLoading: s.sttLoading ?? false,
-      sttActiveProvider: s.sttActiveProvider ?? '',
       mmpgPhase: s.mmpgPhase,
       candidateSttLoaded: s.candidateSttLoaded ?? false,
       candidateSttLoading: s.candidateSttLoading ?? false,
@@ -145,16 +148,19 @@ export default function ControlBar() {
   const [error, setError] = useState<string | null>(null)
 
   const enabledModelEntries = useMemo(
-    () => (config?.models ?? []).map((model, index) => ({ model, index })).filter(({ model }) => model.enabled !== false),
-    [config?.models],
+    () => getAssistModelEntries(config).filter(({ model }) => isConfiguredModel(model)),
+    [config?.models, config?.assist_model_ids, config?.active_model],
   )
   const isExamMode = !singleMic && !interviewerStreaming && config?.written_exam_mode === true
   const singleMicMode = !isExamMode && (singleMic !== null || (!isRecording && singleMicSelected))
-  const usesMmpg = !isExamMode && config?.stt_provider === 'doubao_mmpg'
+  const usesMmpg = !isExamMode && (isRecording ? interviewerStreaming : config?.stt_provider === 'doubao_mmpg')
+  const interviewerProvider = speechProvider(config?.stt_provider)
+  const interviewerConfigRequired = config?.stt_provider === '' ||
+    Boolean(config?.stt_configured && (!interviewerProvider || !config.stt_configured[interviewerProvider]))
   const mmpg = useMmpgStatus()
   const ownsMmpgConnection = mmpg.mode && mmpg.mode !== 'test' && ['connecting', 'reconnecting'].includes(mmpg.state)
   const mmpgIsConnecting = interviewerStreaming && (ownsMmpgConnection || ['connecting', 'reconnecting'].includes(mmpgPhase))
-  const noEnabledModels = (config?.models?.length ?? 0) > 0 && enabledModelEntries.length === 0
+  const noEnabledModels = (config?.assist_model_ids !== undefined || (config?.models?.length ?? 0) > 0) && enabledModelEntries.length === 0
   const allModelsUnavailable = enabledModelEntries.length > 0 &&
     enabledModelEntries.every(({ index }) => modelHealth[index] === 'error')
   const enabledVisionModels = useMemo(() => getEnabledVisionModels(config), [config])
@@ -216,20 +222,23 @@ export default function ControlBar() {
   const selectedCandidateDevice = devices.find((d) => d.id === selectedCandidateMic) ?? null
   selectedCandidateMicRef.current = selectedCandidateMic
   const selectedCandidateIsMic = selectedCandidateDevice?.is_loopback === false
-  const candidateCaptureEnabled = config?.candidate_asr_enabled ?? false
-  const candidateUsesMmpg = candidateCaptureEnabled && config?.candidate_stt_provider === 'doubao_mmpg'
+  const hasCaptureSnapshot = isRecording && candidateCaptureProvider !== null
+  const currentCandidateProvider = hasCaptureSnapshot ? candidateCaptureProvider : config?.candidate_stt_provider
+  const candidateCaptureEnabled = hasCaptureSnapshot ? Boolean(candidateCaptureProvider) : config?.candidate_asr_enabled === true
+  const candidateUsesMmpg = candidateCaptureEnabled && currentCandidateProvider === 'doubao_mmpg'
   const testMic = singleMic?.device_id
     ?? candidateMicDevices.find((device) => device.id === selectedTestMic)?.id
     ?? candidateMicDevices[0]?.id
     ?? null
+  const dualMmpgManual = usesMmpg && candidateUsesMmpg && config?.mmpg?.token_mode === 'manual'
   const testModeDisabledReason = !candidateCaptureEnabled
-    ? '请先在语音设置开启「我的回答记录」。'
-    : usesMmpg && candidateUsesMmpg && config?.mmpg?.token_mode === 'manual'
+    ? '请先在实时辅助设置开启「我的回答记录」。'
+    : dualMmpgManual
       ? '两路都使用豆包 MMPG 时，请在语音设置选择自动签发 Token。'
       : null
-  const startDisabled = loading || (!isExamMode && (singleMicMode
+  const startDisabled = loading || (!isExamMode && (interviewerConfigRequired || (singleMicMode
     ? testMic === null || testModeDisabledReason !== null || !wsConnected
-    : selectedDevice === null))
+    : selectedDevice === null)))
   const microphoneSwitching = singleMic !== null && (singleMic.switching || roleRequest?.sessionId === singleMic.id)
   const waitingForCandidateMmpg = candidateUsesMmpg && !candidateSttLoaded
   const roleSwitchDisabled = !isRecording || loading || mmpgIsConnecting || microphoneSwitching || waitingForCandidateMmpg || isPaused || !wsConnected
@@ -247,13 +256,13 @@ export default function ControlBar() {
     ? selectedCandidateMic
     : null
   const hasLoopback = devices.some((d) => d.is_loopback)
-  const activeModel = config?.models?.[config.active_model]
+  const activeModel = enabledModelEntries[0]?.model
   const activeModelSupportsVision = activeModel?.supports_vision ?? false
   const pastedImageVisionHint = activeModelSupportsVision
     ? null
     : hasEnabledVisionModel
       ? `当前优先模型不支持图片，将自动使用「${enabledVisionModels[0]?.name ?? '识图模型'}」`
-      : '没有已启用的识图模型，请先在设置中开启带 👁 的模型'
+      : '请在实时辅助中勾选支持识图的答题模型'
 
   useEffect(() => {
     const pending = roleRequestRef.current
@@ -332,8 +341,8 @@ export default function ControlBar() {
         const file = items[i].getAsFile()
         if (!file) continue
         const store = useInterviewStore.getState()
-        if ((store.config?.models?.length ?? 0) > 0 && getEnabledVisionModels(store.config).length === 0) {
-          setError('请先在设置中启用至少一个带 👁 的识图模型，再粘贴截图')
+        if (store.config && getEnabledVisionModels(store.config).length === 0) {
+          setError('请先在实时辅助中勾选支持识图的答题模型，再粘贴图片')
           return
         }
         const reader = new FileReader()
@@ -403,6 +412,7 @@ export default function ControlBar() {
 
   const handleStart = useCallback(async () => {
     if (lifecycleActionRef.current) return
+    if (!isExamMode && interviewerConfigRequired) return
     const device = singleMicMode ? testMic : selectedDevice
     if (!isExamMode && device === null) { setError('请先选择音频设备'); return }
     if (singleMicMode && testModeDisabledReason) { setError(testModeDisabledReason); return }
@@ -448,7 +458,7 @@ export default function ControlBar() {
       lifecycleActionRef.current = false
       setLoading(false)
     }
-  }, [selectedDevice, effectiveCandidateMic, isExamMode, usesMmpg, platformInfo?.platform, connectCandidateMmpg, singleMicMode, testMic, testModeDisabledReason])
+  }, [selectedDevice, effectiveCandidateMic, isExamMode, usesMmpg, platformInfo?.platform, connectCandidateMmpg, singleMicMode, testMic, testModeDisabledReason, interviewerConfigRequired])
   const handleStop = useCallback(async () => {
     if (lifecycleActionRef.current) return
     const interviewName = singleMic ? '单人测试' : isExamMode ? '笔试' : '面试'
@@ -561,15 +571,15 @@ export default function ControlBar() {
     if (askingRef.current) return
     if (!manualQuestion.trim() && !pastedImage) return
     if (noEnabledModels) {
-      setError('请先在设置中启用至少一个模型')
+      setError('请先在实时辅助中勾选可用的答题模型')
       return
     }
     if (allModelsUnavailable) {
-      setError('所有启用模型不可用，请先检查模型连接')
+      setError('所选答题模型均不可用，请检查模型连接')
       return
     }
     if (pastedImage && !hasEnabledVisionModel) {
-      setError('请先在设置中启用至少一个带 👁 的识图模型')
+      setError('请先在实时辅助中勾选支持识图的答题模型')
       return
     }
     askingRef.current = true
@@ -705,17 +715,27 @@ export default function ControlBar() {
           <span>点击「开始笔试」进入答题模式，可通过截图或手动输入提问</span>
         </div>
       )}
+      {!isExamMode && !isRecording && interviewerConfigRequired && (
+        <div className="flex items-center gap-2 rounded-lg bg-accent-amber/10 px-3 py-1.5 text-xs text-accent-amber">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span>请配置面试官语音识别后开始采集。</span>
+          <button type="button" className="ml-auto shrink-0 rounded-md px-2 py-1 text-accent-blue hover:bg-accent-blue/10"
+            onClick={() => useInterviewStore.setState({ settingsOpen: true, settingsDrawerTab: 'realtime' })}>
+            配置面试官 ASR
+          </button>
+        </div>
+      )}
       {!wsConnected && <WsReconnectingBanner />}
       {allModelsUnavailable && (
         <div className="flex items-center gap-2 text-xs text-accent-red bg-accent-red/10 px-3 py-1.5 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-          <span>所有启用模型不可用，请检查 API 与网络。</span>
+          <span>所选答题模型均不可用，请检查 API 与网络。</span>
         </div>
       )}
       {noEnabledModels && (
         <div className="flex items-center gap-2 text-xs text-accent-red bg-accent-red/10 px-3 py-1.5 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-          <span>未启用任何模型，请在设置中开启至少一个模型。</span>
+          <span>请先在实时辅助中勾选可用的答题模型。</span>
         </div>
       )}
       {!isExamMode && !singleMicMode && !hasLoopback && platformInfo?.needs_virtual_device && (
@@ -759,7 +779,7 @@ export default function ControlBar() {
           <button
             type="button"
             className="ml-auto shrink-0 rounded-md px-2 py-1 text-accent-blue hover:bg-accent-blue/10"
-            onClick={() => useInterviewStore.getState().openConfigDrawer()}
+            onClick={() => useInterviewStore.setState({ settingsOpen: true, settingsDrawerTab: dualMmpgManual ? 'config' : 'realtime' })}
           >
             打开设置
           </button>
@@ -954,13 +974,7 @@ export default function ControlBar() {
           <button disabled
             className="flex min-h-[38px] items-center gap-1.5 rounded-lg px-4 py-2 bg-bg-tertiary text-text-muted text-xs font-semibold cursor-not-allowed flex-shrink-0">
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            <span>{sttActiveProvider === 'whisper' && config?.stt_provider && config.stt_provider !== 'whisper' ? '降级加载 Whisper…' : '语音加载中…'}</span>
-          </button>
-        ) : !isExamMode && !usesMmpg && !sttLoaded ? (
-          <button onClick={handleStart} disabled={startDisabled}
-            className="flex min-h-[38px] items-center gap-1.5 rounded-lg px-4 py-2 text-white text-xs font-semibold flex-shrink-0" style={{ background: 'linear-gradient(135deg, rgb(var(--c-accent-amber)), rgb(var(--c-accent-amber) / 0.85))' }}>
-            <AlertTriangle className="w-3.5 h-3.5" />
-            <span>{singleMicMode ? '语音未就绪，开始单人测试' : '语音未就绪，开始面试'}</span>
+            <span>语音连接中…</span>
           </button>
         ) : (
           <button onClick={handleStart} disabled={startDisabled}
@@ -1049,11 +1063,11 @@ export default function ControlBar() {
             asking
               ? '正在提交问题'
               : noEnabledModels
-              ? '请先在设置中启用至少一个模型'
+              ? '请先在实时辅助中勾选可用的答题模型'
               : allModelsUnavailable
-              ? '所有启用模型不可用，请先检查模型连接'
+              ? '所选答题模型均不可用，请检查模型连接'
               : pastedImage && !hasEnabledVisionModel
-              ? '请先在设置中启用至少一个带 👁 的识图模型'
+              ? '请在实时辅助中勾选支持识图的答题模型'
               : manualQuestion.trim() || pastedImage
               ? '发送问题 (Enter)'
               : '请先输入问题或粘贴截图'

@@ -8,8 +8,6 @@ import {
   Monitor,
   PanelsTopLeft,
   BookOpen,
-  Timer,
-  AudioWaveform,
   BrainCircuit,
   FileText,
   Settings2,
@@ -21,8 +19,7 @@ import PreferencesTab from './PreferencesTab'
 
 const SpeechTab = lazy(() => import('./SpeechTab'))
 const OverlaySettingsTab = lazy(() => import('./OverlaySettingsTab'))
-const TimingTab = lazy(() => import('./SpeechTab'))
-const HotwordsTab = lazy(() => import('./HotwordsTab'))
+const RealtimeAssistTab = lazy(() => import('./RealtimeAssistTab'))
 const ModelsTab = lazy(() => import('./ModelsTab'))
 const SystemPromptsTab = lazy(() => import('./SystemPromptsTab'))
 const ShortcutsTab = lazy(() => import('./ShortcutsTab'))
@@ -41,8 +38,11 @@ export default function SettingsDrawer() {
   const [dirtyExplicitSections, setDirtyExplicitSections] = useState<Record<string, boolean>>({})
   const dirtyExplicitCount = Object.values(dirtyExplicitSections).filter(Boolean).length
   const searchEnabled = settingsDrawerTab !== 'models' && settingsDrawerTab !== 'prompts'
+  const speechDirty = ['speech', 'speech-doubao', 'speech-generic', 'speech-mmpg'].some((key) => dirtyExplicitSections[key])
+  const realtimeDirty = ['assist-models', 'assist-prompts', 'speech-roles'].some((key) => dirtyExplicitSections[key])
   const dirtyExplicitLabels = [
-    dirtyExplicitSections.speech ? '语音配置' : null,
+    realtimeDirty ? '实时辅助' : null,
+    speechDirty ? '语音配置' : null,
     dirtyExplicitSections.models ? '模型配置' : null,
     dirtyExplicitSections.prompts ? '系统提示词' : null,
   ].filter(Boolean)
@@ -79,7 +79,7 @@ export default function SettingsDrawer() {
     setSettingsDrawerTab(tab)
   }, [setSettingsDrawerTab, settingsDrawerTab])
 
-  // 检查搜索是否有命中 (仅 general/config tab 判断, 兼容 lazy tab 的挂载时序)
+  // 等待当前分区挂载并登记可搜索的设置项。
   useEffect(() => {
     if (!settingsOpen) return
     if (!searchQuery.trim() || !searchEnabled) {
@@ -189,23 +189,20 @@ export default function SettingsDrawer() {
   if (!settingsOpen) return null
 
   const tabs: { key: typeof settingsDrawerTab; label: string; icon: React.ReactNode; desc: string }[] = [
-    { key: 'general', label: '常用', icon: <LayoutGrid className="w-4 h-4" />, desc: '运行与回答偏好' },
+    { key: 'realtime', label: '实时辅助', icon: <LayoutGrid className="w-4 h-4" />, desc: '答题与语音使用' },
     { key: 'mode', label: '模式', icon: <Monitor className="w-4 h-4" />, desc: '笔试与截图' },
     { key: 'overlay', label: '悬浮窗设置', icon: <PanelsTopLeft className="w-4 h-4" />, desc: '位置、尺寸与外观' },
     { key: 'kb', label: '知识库', icon: <BookOpen className="w-4 h-4" />, desc: '本地笔记引用' },
-    { key: 'config', label: '语音', icon: <Mic className="w-4 h-4" />, desc: 'ASR 引擎与降级' },
-    { key: 'timing', label: '节奏', icon: <Timer className="w-4 h-4" />, desc: '延迟与断句' },
-    { key: 'hotwords', label: '热词', icon: <AudioWaveform className="w-4 h-4" />, desc: '岗位术语偏置' },
-    { key: 'models', label: '模型', icon: <BrainCircuit className="w-4 h-4" />, desc: '队列与协议' },
+    { key: 'config', label: '语音配置', icon: <Mic className="w-4 h-4" />, desc: 'ASR 接入与测试' },
+    { key: 'models', label: '模型配置', icon: <BrainCircuit className="w-4 h-4" />, desc: '模型接入与能力' },
     { key: 'prompts', label: '系统提示词', icon: <FileText className="w-4 h-4" />, desc: '按场景编辑' },
     { key: 'appearance', label: '外观', icon: <Palette className="w-4 h-4" />, desc: '配色与流式跟滚' },
     { key: 'shortcuts', label: '快捷操作', icon: <Keyboard className="w-4 h-4" />, desc: '扫码、提示词与快捷键' },
   ]
 
-  const speechDirty = !!dirtyExplicitSections.speech
   const dirtyByTab: Partial<Record<typeof settingsDrawerTab, boolean>> = {
+    realtime: realtimeDirty,
     config: speechDirty,
-    timing: speechDirty,
     models: !!dirtyExplicitSections.models,
     prompts: !!dirtyExplicitSections.prompts,
   }
@@ -228,7 +225,6 @@ export default function SettingsDrawer() {
                 <Settings2 className="w-4 h-4 text-accent-blue" />
                 设置中心
               </h2>
-              <p className="text-[10px] text-text-muted mt-1 leading-relaxed">常用偏好 · 语音链路 · 模型队列</p>
             </div>
             <div className="flex flex-col gap-1 px-2">
               {tabs.map((t) => {
@@ -289,7 +285,7 @@ export default function SettingsDrawer() {
                         setSearchQuery('')
                       }
                     }}
-                    placeholder={settingsDrawerTab === 'models' ? '模型页直接在队列中编辑' : '搜索设置项，如 VAD / 知识库 / 截图 / 主题'}
+                    placeholder={settingsDrawerTab === 'models' ? '在模型配置中直接编辑' : '搜索设置项，如 VAD / 知识库 / 截图 / 主题'}
                     aria-label="搜索设置项"
                     className="w-full text-xs pl-8 pr-8 py-2 rounded-lg bg-bg-tertiary/60 border border-bg-hover/60 text-text-primary placeholder-text-muted focus:outline-none focus:border-accent-blue/60 focus:ring-2 focus:ring-accent-blue/20 transition"
                     disabled={!searchEnabled}
@@ -344,15 +340,19 @@ export default function SettingsDrawer() {
             <div ref={contentRef} className="flex-1 overflow-y-auto min-h-0">
               <SettingsSearchContext.Provider value={searchEnabled ? searchQuery : ''}>
                 <Suspense fallback={<div className="flex items-center justify-center py-12 text-text-muted text-sm">加载中…</div>}>
-                  {settingsDrawerTab === 'general' && <PreferencesTab variant="main" />}
+                  {settingsDrawerTab === 'realtime' && (
+                    <RealtimeAssistTab
+                      onOpenSpeechConfig={() => changeTab('config')}
+                      onOpenModelConfig={() => changeTab('models')}
+                      onSavingPromptChange={setPromptSaving}
+                    />
+                  )}
                   {settingsDrawerTab === 'mode' && <PreferencesTab variant="mode" />}
                   {settingsDrawerTab === 'overlay' && <OverlaySettingsTab />}
                   {settingsDrawerTab === 'kb' && <PreferencesTab variant="kb" />}
                   {settingsDrawerTab === 'appearance' && <PreferencesTab variant="appearance" />}
                   {settingsDrawerTab === 'shortcuts' && <ShortcutsTab />}
-                  {settingsDrawerTab === 'config' && <SpeechTab variant="engines" />}
-                  {settingsDrawerTab === 'timing' && <TimingTab variant="timing" />}
-                  {settingsDrawerTab === 'hotwords' && <HotwordsTab />}
+                  {settingsDrawerTab === 'config' && <SpeechTab />}
                   {settingsDrawerTab === 'models' && <ModelsTab />}
                   {settingsDrawerTab === 'prompts' && <SystemPromptsTab onSavingChange={setPromptSaving} />}
                 </Suspense>

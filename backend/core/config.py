@@ -1,7 +1,8 @@
 from pydantic import BaseModel, Field, StrictBool, StrictStr, StringConstraints, ValidationError, field_validator, model_validator
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Annotated, Literal, Optional, Any
+from typing import Annotated, Literal, Optional, Any, get_args
+from uuid import NAMESPACE_URL, uuid4, uuid5
 import hashlib
 import hmac
 import json
@@ -55,6 +56,7 @@ CONFIG_EXAMPLE = os.path.join(_BACKEND_DIR, "config.example.json")
 
 
 class ModelConfig(BaseModel):
+    id: str = ""
     name: str = "Default"
     api_base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
@@ -149,10 +151,26 @@ class KnowledgeAnalysisSettings(BaseModel):
     think_effort: Literal["off", "low", "medium", "high", "xhigh"] = "off"
 
 
+AssistScene = Literal["assist_realtime", "assist_manual", "assist_screen", "assist_exam"]
+ASSIST_SCENES = get_args(AssistScene)
+ThinkEffort = Literal["off", "low", "medium", "high", "xhigh"]
+
+
+class AssistGeneration(BaseModel):
+    temperature: float = Field(ge=0, le=2, allow_inf_nan=False)
+    max_output_tokens: int = Field(strict=True, ge=128, le=32768)
+
+
 class AppConfig(BaseModel):
     system_prompts: dict[str, StrictStr] = Field(default_factory=dict)
     models: list[ModelConfig] = Field(default_factory=lambda: [_default_model_config()])
     active_model: int = 0
+    assist_model_ids: list[StrictStr] | None = None
+    assist_screenshot_model_id: StrictStr | None = None
+    assist_generation: dict[AssistScene, AssistGeneration] = Field(default_factory=dict)
+    assist_think_mode: StrictBool | None = None
+    assist_think_effort: ThinkEffort | None = None
+    knowledge_practice_system_prompt: StrictStr | None = None
 
     temperature: float = 0.5
     max_tokens: int = 4096
@@ -388,7 +406,50 @@ class AppConfig(BaseModel):
                     self.active_model = i
                     break
         self.review_model_index = max(0, min(int(self.review_model_index), len(self.models) - 1))
+        self._migrate_assist_settings()
         return self
+
+    def _migrate_assist_settings(self) -> None:
+        used_ids: set[str] = set()
+        reserved_ids = {model.id for model in self.models if model.id}
+        for index, model in enumerate(self.models):
+            if not model.id or model.id in used_ids:
+                # An old config can be read across restarts before its first save.
+                seed = f"interview-helper:legacy-model:{index}"
+                candidate = uuid5(NAMESPACE_URL, seed).hex
+                while candidate in used_ids or candidate in reserved_ids:
+                    candidate = uuid5(NAMESPACE_URL, candidate).hex
+                model = model.model_copy(update={"id": candidate})
+                self.models[index] = model
+            used_ids.add(model.id)
+
+        legacy_order = [self.models[self.active_model]] + [
+            model for index, model in enumerate(self.models) if index != self.active_model
+        ]
+        if self.assist_model_ids is None:
+            self.assist_model_ids = [model.id for model in legacy_order if model.enabled]
+        else:
+            self.assist_model_ids = list(dict.fromkeys(
+                model_id for model_id in self.assist_model_ids if model_id in used_ids
+            ))
+        vision_ids = {model.id for model in self.models if model.supports_vision}
+        if "assist_screenshot_model_id" not in self.model_fields_set:
+            self.assist_screenshot_model_id = next(
+                (model.id for model in legacy_order if model.id in vision_ids and knowledge_model_available(model)),
+                None,
+            )
+        elif self.assist_screenshot_model_id not in vision_ids:
+            self.assist_screenshot_model_id = None
+        for scene in ASSIST_SCENES:
+            if scene not in self.assist_generation:
+                limit = min(self.max_tokens, self.assist_realtime_max_tokens) if scene == "assist_realtime" else self.max_tokens
+                self.assist_generation[scene] = AssistGeneration(temperature=self.temperature, max_output_tokens=limit)
+        if self.assist_think_mode is None:
+            self.assist_think_mode = self.think_mode
+        if self.assist_think_effort is None:
+            self.assist_think_effort = self.think_effort
+        if "knowledge_practice_system_prompt" not in self.model_fields_set:
+            self.knowledge_practice_system_prompt = self.system_prompts.get("assist_manual")
 
     def get_active_model(self) -> ModelConfig:
         idx = max(0, min(self.active_model, len(self.models) - 1))
@@ -412,6 +473,10 @@ def get_config() -> AppConfig:
 
 
 class ModelListChanged(ValueError):
+    pass
+
+
+class InvalidAssistModelSelection(ValueError):
     pass
 
 
@@ -446,8 +511,38 @@ def update_config(
                     current["rtc_token_expires_at"] = None
             elif key == "system_prompts":
                 data[key] = patch_system_prompts(data[key], value)
+            elif key == "assist_generation":
+                data[key].update(value)
             elif hasattr(cfg, key):
                 data[key] = value
+        if "models" in updates:
+            model_rows = [
+                model.model_dump() if isinstance(model, ModelConfig) else dict(model)
+                for model in data["models"]
+            ]
+            for index, model in enumerate(model_rows):
+                if not model.get("id"):
+                    origin = model_origins[index] if model_origins is not None and index < len(model_origins) else None
+                    model["id"] = cfg.models[origin].id if origin is not None else uuid4().hex
+            data["models"] = model_rows
+            by_id = {model["id"]: index for index, model in enumerate(model_rows)}
+            for field in ("active_model", "review_model_index"):
+                if field not in updates:
+                    old_id = cfg.models[getattr(cfg, field)].id
+                    data[field] = by_id.get(old_id, data[field])
+        if "assist_model_ids" in updates or "assist_screenshot_model_id" in updates:
+            catalog = {
+                model.id if isinstance(model, ModelConfig) else model["id"]: model
+                for model in data["models"]
+            }
+            if "assist_model_ids" in updates and any(model_id not in catalog for model_id in updates["assist_model_ids"]):
+                raise ModelListChanged("答题模型目录已更新，请刷新后重试")
+            selected_vision = updates.get("assist_screenshot_model_id")
+            if selected_vision is not None:
+                model = catalog.get(selected_vision)
+                vision = model.supports_vision if isinstance(model, ModelConfig) else (model or {}).get("supports_vision")
+                if not vision:
+                    raise InvalidAssistModelSelection("截图答题请选择支持识图的模型")
         updated = AppConfig(**data)
         index = cfg.knowledge_analysis.model_index
         if "models" in updates and index is not None:
