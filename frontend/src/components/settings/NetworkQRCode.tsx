@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Smartphone } from 'lucide-react'
 import QRCode from 'qrcode'
-import { GradientCard } from './shared'
+import { Section } from './shared'
 import { buildApiUrl } from '@/lib/backendUrl'
 
 export default function NetworkQRCode() {
@@ -42,16 +42,12 @@ export default function NetworkQRCode() {
   if (!networkUrl) return null
 
   return (
-    <GradientCard className="p-4 space-y-3">
-      <div className="flex items-center gap-1.5 text-xs font-semibold text-text-muted uppercase tracking-wider">
-        <Smartphone className="w-3.5 h-3.5" />
-        手机扫码访问
-      </div>
+    <Section title="手机扫码访问" icon={<Smartphone className="w-3.5 h-3.5" />} keywords="手机 扫码 二维码 QR code network wifi 局域网">
       <div className="flex flex-col items-center gap-2">
         {qrSrc && <img src={qrSrc} alt="QR Code" className="rounded-lg" width={160} height={160} />}
         <p className="text-[11px] text-accent-blue break-all text-center select-all">{networkUrl}</p>
         <p className="text-[10px] text-text-muted text-center">手机和电脑需在同一 WiFi 下，音频在电脑端采集</p>
       </div>
-    </GradientCard>
+    </Section>
   )
 }

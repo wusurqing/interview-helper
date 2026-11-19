@@ -8,7 +8,6 @@ import {
   PenLine,
   ChevronDown,
   BookOpen,
-  Keyboard,
 } from 'lucide-react'
 import { useInterviewStore } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
@@ -16,9 +15,6 @@ import { updateConfigAndRefresh } from '@/lib/configSync'
 import { COLOR_SCHEME_OPTIONS } from '@/lib/colorScheme'
 import { prepareExamOverlayPrompt } from '@/lib/examOverlay'
 import { Section, Field, SaveStateBadge, matchSettingsSearch, useAutoSaveSetting, useSettingsSearch } from './shared'
-import NetworkQRCode from './NetworkQRCode'
-import QuickPromptsEditor from './QuickPromptsEditor'
-import GlobalShortcutsEditor from './GlobalShortcutsEditor'
 
 function Collapsible({ title, searchTitle, icon, defaultOpen = false, alwaysOpen = false, keywords, children }: {
   title: React.ReactNode
@@ -145,14 +141,14 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-bg-hover/60 bg-bg-primary/35 px-4 py-3">
         <div>
           <p className="text-sm font-semibold text-text-primary">
-            {variant === 'appearance' ? '外观与快捷操作'
+            {variant === 'appearance' ? '外观'
               : variant === 'mode' ? '笔试与截图'
               : variant === 'kb' ? '本地知识库'
               : '常用偏好'}
           </p>
           <p className="mt-0.5 text-[11px] leading-relaxed text-text-muted">
             {variant === 'appearance'
-              ? '配色与快捷词即时生效；快捷键修改后需要重新聚焦页面。'
+              ? '配色即时生效，流式跟滚阈值自动保存。'
               : variant === 'mode'
                 ? '笔试模式与截图审题设置自动保存。'
                 : variant === 'kb'
@@ -518,9 +514,9 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
       </Collapsible>
       </>)}
 
-      {/* ── 4. 外观与高级 ── */}
+      {/* ── 4. 外观 ── */}
       {variant === 'appearance' && (<>
-      <Collapsible alwaysOpen title="外观" icon={<Palette className="w-3.5 h-3.5" />} keywords="主题 配色 字体 theme color scheme font 高级">
+      <Collapsible alwaysOpen title="外观" icon={<Palette className="w-3.5 h-3.5" />} keywords="主题 配色方案 字体 流式跟滚阈值 滚动 theme color scheme font autoscroll">
         <div className="flex justify-end">
           <SaveStateBadge mode="auto" state="idle" label="本机即时生效" />
         </div>
@@ -563,12 +559,6 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
             className="w-full max-w-[120px] bg-bg-tertiary border border-bg-hover rounded-lg px-3 py-2 text-sm text-text-primary"
           />
         </Field>
-      </Collapsible>
-
-      <Collapsible alwaysOpen title="快捷操作" icon={<Keyboard className="w-3.5 h-3.5" />} keywords="quick prompt 快捷词 模板 shortcut 快捷键 手机 二维码">
-        <NetworkQRCode />
-        <QuickPromptsEditor />
-        <GlobalShortcutsEditor />
       </Collapsible>
       </>)}
 

@@ -472,7 +472,7 @@ export default function App() {
           type="button"
           onClick={toggleSettings}
           className="inline-flex items-center justify-center min-h-[32px] min-w-[32px] p-1.5 rounded-xl hover:bg-bg-tertiary/60 text-text-muted hover:text-text-primary transition-all duration-200 border border-transparent hover:border-bg-hover/40"
-          title="设置中心 (外观 / 偏好 / 模型 / 隐私 / 快捷键)"
+          title="设置中心 (常用 / 语音 / 模型 / 外观 / 快捷操作)"
           aria-label="打开设置"
         >
           <Settings className="w-4 h-4" />

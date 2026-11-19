@@ -4,6 +4,7 @@ import {
   LayoutGrid,
   Mic,
   Palette,
+  Keyboard,
   Monitor,
   PanelsTopLeft,
   BookOpen,
@@ -24,6 +25,7 @@ const TimingTab = lazy(() => import('./SpeechTab'))
 const HotwordsTab = lazy(() => import('./HotwordsTab'))
 const ModelsTab = lazy(() => import('./ModelsTab'))
 const SystemPromptsTab = lazy(() => import('./SystemPromptsTab'))
+const ShortcutsTab = lazy(() => import('./ShortcutsTab'))
 
 export default function SettingsDrawer() {
   const { settingsOpen, toggleSettings, settingsDrawerTab, setSettingsDrawerTab } = useUiSettings()
@@ -196,7 +198,8 @@ export default function SettingsDrawer() {
     { key: 'hotwords', label: '热词', icon: <AudioWaveform className="w-4 h-4" />, desc: '岗位术语偏置' },
     { key: 'models', label: '模型', icon: <BrainCircuit className="w-4 h-4" />, desc: '队列与协议' },
     { key: 'prompts', label: '系统提示词', icon: <FileText className="w-4 h-4" />, desc: '按场景编辑' },
-    { key: 'appearance', label: '外观', icon: <Palette className="w-4 h-4" />, desc: '主题与快捷操作' },
+    { key: 'appearance', label: '外观', icon: <Palette className="w-4 h-4" />, desc: '配色与流式跟滚' },
+    { key: 'shortcuts', label: '快捷操作', icon: <Keyboard className="w-4 h-4" />, desc: '扫码、提示词与快捷键' },
   ]
 
   const speechDirty = !!dirtyExplicitSections.speech
@@ -346,6 +349,7 @@ export default function SettingsDrawer() {
                   {settingsDrawerTab === 'overlay' && <OverlaySettingsTab />}
                   {settingsDrawerTab === 'kb' && <PreferencesTab variant="kb" />}
                   {settingsDrawerTab === 'appearance' && <PreferencesTab variant="appearance" />}
+                  {settingsDrawerTab === 'shortcuts' && <ShortcutsTab />}
                   {settingsDrawerTab === 'config' && <SpeechTab variant="engines" />}
                   {settingsDrawerTab === 'timing' && <TimingTab variant="timing" />}
                   {settingsDrawerTab === 'hotwords' && <HotwordsTab />}

@@ -166,6 +166,109 @@ test.describe('assist mode with WebSocket-driven Q/A', () => {
 })
 
 test.describe('settings drawer', () => {
+  for (const layout of [
+    { name: 'desktop', viewport: { width: 1440, height: 900 }, desktopBridge: true },
+    { name: 'narrow browser', viewport: { width: 390, height: 844 }, desktopBridge: false },
+  ]) {
+    test(`separates appearance and quick actions on ${layout.name}`, async ({ context, page }) => {
+      await page.setViewportSize(layout.viewport)
+      await installMocks(context, {
+        messages: COMMON_WS_BOOTSTRAP,
+        apiOverrides: { '/api/network-info': { url: 'http://192.168.1.9:8000' } },
+      })
+      if (layout.desktopBridge) {
+        await context.addInitScript(() => {
+          window.shortcutsSuspended = false
+          window.electronAPI = {
+            getShortcuts: async () => ({
+              hideOrShowWindow: {
+                action: 'hideOrShowWindow', key: 'CommandOrControl+B',
+                defaultKey: 'CommandOrControl+B', label: '隐藏/显示窗口',
+                category: '窗口', status: 'registered',
+              },
+            }),
+            setShortcutsSuspended: async (suspended) => { window.shortcutsSuspended = suspended },
+          }
+        })
+      }
+      await page.goto('/')
+      await page.getByRole('button', { name: '打开设置', exact: true }).click()
+      const dialog = page.getByRole('dialog')
+      const appearance = dialog.getByRole('button', { name: /^外观/ })
+      const shortcuts = dialog.getByRole('button', { name: /^快捷操作/ })
+      const search = dialog.getByRole('searchbox', { name: '搜索设置项' })
+
+      await appearance.click()
+      await expect(appearance).toHaveAttribute('aria-current', 'page')
+      await expect(dialog.getByText('配色方案', { exact: true })).toBeVisible()
+      await expect(dialog.getByText('流式跟滚阈值（像素）', { exact: true })).toBeVisible()
+      await expect(dialog.getByText('手机扫码访问', { exact: true })).toHaveCount(0)
+      await expect(dialog.getByRole('heading', { name: '快捷提示词', exact: true })).toHaveCount(0)
+      await expect(dialog.getByRole('heading', { name: '全局快捷键', exact: true })).toHaveCount(0)
+
+      await shortcuts.click()
+      await expect(shortcuts).toHaveAttribute('aria-current', 'page')
+      await expect(appearance).not.toHaveAttribute('aria-current', 'page')
+      await expect(dialog.getByText('配色方案', { exact: true })).toHaveCount(0)
+      await expect(dialog.getByText('流式跟滚阈值（像素）', { exact: true })).toHaveCount(0)
+      await expect(dialog.getByText('手机扫码访问', { exact: true })).toBeVisible()
+      await expect(dialog.getByRole('img', { name: 'QR Code' })).toBeVisible()
+      await expect(dialog.getByRole('heading', { name: '快捷提示词', exact: true })).toBeVisible()
+      const globalShortcuts = dialog.getByRole('heading', { name: '全局快捷键', exact: true })
+      if (layout.desktopBridge) await expect(globalShortcuts).toBeVisible()
+      else await expect(globalShortcuts).toHaveCount(0)
+
+      await search.fill('快捷提示词')
+      await expect(dialog.getByRole('heading', { name: '快捷提示词', exact: true })).toBeVisible()
+      await expect(dialog.getByText('手机扫码访问', { exact: true })).toHaveCount(0)
+      await expect(globalShortcuts).toHaveCount(0)
+      await search.fill('二维码')
+      await expect(dialog.getByRole('img', { name: 'QR Code' })).toBeVisible()
+      await expect(dialog.getByRole('heading', { name: '快捷提示词', exact: true })).toHaveCount(0)
+      await expect(globalShortcuts).toHaveCount(0)
+      if (layout.desktopBridge) {
+        await search.fill('全局快捷键')
+        await expect(globalShortcuts).toBeVisible()
+        await expect(dialog.getByText('手机扫码访问', { exact: true })).toHaveCount(0)
+        await expect(dialog.getByRole('heading', { name: '快捷提示词', exact: true })).toHaveCount(0)
+      }
+      await search.fill('不存在的设置项')
+      await expect(dialog.getByText(/没有找到匹配/)).toBeVisible()
+      await search.fill('')
+
+      if (layout.desktopBridge) {
+        await dialog.getByRole('button', { name: /^(?:Ctrl\+B|⌘B)$/ }).click()
+        await expect.poll(() => page.evaluate(() => window.shortcutsSuspended)).toBe(true)
+      }
+      await appearance.click()
+      if (layout.desktopBridge) {
+        await expect.poll(() => page.evaluate(() => window.shortcutsSuspended)).toBe(false)
+      }
+      await search.fill('主题')
+      await expect(dialog.getByText('配色方案', { exact: true })).toBeVisible()
+      await search.fill('流式跟滚阈值')
+      await expect(dialog.getByText('流式跟滚阈值（像素）', { exact: true })).toBeVisible()
+      await search.fill('快捷提示词')
+      await expect(dialog.getByText(/没有找到匹配/)).toBeVisible()
+    })
+  }
+
+  test('keeps quick prompts usable when network discovery fails', async ({ context, page }) => {
+    await installMocks(context, { messages: COMMON_WS_BOOTSTRAP })
+    await context.route('**/api/network-info', (route) => route.abort())
+    await page.goto('/')
+    await page.getByRole('button', { name: '打开设置', exact: true }).click()
+    const dialog = page.getByRole('dialog')
+    await dialog.getByRole('button', { name: /^快捷操作/ }).click()
+    await dialog.getByPlaceholder('输入新的快捷词...').fill('解释实现取舍')
+    await dialog.getByRole('button', { name: '添加', exact: true }).click()
+    await expect(dialog.getByText('解释实现取舍', { exact: true })).toBeVisible()
+    await dialog.getByRole('button', { name: /^外观/ }).click()
+    await dialog.getByRole('button', { name: /^快捷操作/ }).click()
+    await expect(dialog.getByText('解释实现取舍', { exact: true })).toBeVisible()
+    await expect(dialog.getByText('手机扫码访问', { exact: true })).toHaveCount(0)
+  })
+
   test('opens and shows model list / position config', async ({ context, page }) => {
     await installMocks(context, { messages: COMMON_WS_BOOTSTRAP })
     await page.goto('/')
