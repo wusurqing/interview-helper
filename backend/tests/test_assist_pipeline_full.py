@@ -670,9 +670,11 @@ def test_candidate_audio_start_failure_does_not_block_interviewer_chain(
     assert review_calls == [
         {
             "interviewer_device_id": 10,
-            "candidate_device_id": None,
+            "candidate_device_id": 11,
             "candidate_asr_enabled": True,
             "written_exam_mode": False,
+            "single_mic": False,
+            "existing_qa_ids": frozenset(),
         }
     ]
 

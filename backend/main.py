@@ -72,6 +72,11 @@ async def lifespan(app: FastAPI):
         )
 
     cfg = get_config()
+    from services.storage.review_archive import recover_interrupted
+    try:
+        recover_interrupted()
+    except Exception:
+        _log.exception("Could not reconcile interrupted interview archives")
     models_summary = ", ".join(
         f"{m.name}({'on' if m.enabled else 'off'})" for m in cfg.models
     )

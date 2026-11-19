@@ -105,10 +105,17 @@ def _on_turn(kind, trace):
         if kind == "started":
             if trace not in _pending:
                 _pending[trace] = session.current_candidate_qa_id, time.monotonic()
+                if session.archive:
+                    session.record_transcript("candidate", "", started_at=_pending[trace][1],
+                                              utterance_key=f"candidate-mmpg-{trace}", is_final=False,
+                                              epoch=_capture_epoch, cloud=True)
         elif kind == "reset":
+            for key in _pending:
+                session.discard_unfinished_transcript(f"{_capture_epoch}:candidate:candidate-mmpg-{key}")
             _pending.clear()
         else:
             _pending.pop(trace, None)
+            session.discard_unfinished_transcript(f"{_capture_epoch}:candidate:candidate-mmpg-{trace}")
         if _pending:
             qa_id, _ = next(reversed(_pending.values()))
             session.mark_candidate_asr_busy(qa_id)
@@ -128,6 +135,7 @@ def _on_transcript(text, trace):
                 session, text, MMPG_STT_PROVIDER, qa_id,
                 segment_id=f"candidate-mmpg-{trace}",
                 started_at=started_at, transcript_epoch=epoch,
+                cloud=True,
             )
     finally:
         _on_turn("cancelled", trace)

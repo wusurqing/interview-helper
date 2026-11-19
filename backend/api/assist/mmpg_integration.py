@@ -55,6 +55,7 @@ def _turn_event(kind, trace):
             anchor = get_session().record_transcript(
                 "interviewer", "", started_at=started_at, utterance_key=trace,
                 is_final=False, epoch=_capture_epoch,
+                cloud=True,
             )
             _speech_starts[trace] = started_at, anchor
         _turns.started(trace)

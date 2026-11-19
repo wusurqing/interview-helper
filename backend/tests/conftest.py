@@ -8,6 +8,12 @@
 import os
 import tempfile
 
+# Storage modules initialize databases on import. Isolate BEFORE test collection,
+# including legacy fixtures which delete rows through an imported DB_PATH.
+_TEST_DATA = tempfile.TemporaryDirectory(prefix="ia-test-data-", ignore_cleanup_errors=True)
+os.environ["IA_DATA_DIR"] = _TEST_DATA.name
+os.environ["IA_CONFIG_PATH"] = os.path.join(_TEST_DATA.name, "config.json")
+
 _TEST_LOG_DIR = os.path.join(tempfile.gettempdir(), "ia-test-logs")
 
 import core.logger as _logger  # noqa: E402

@@ -188,6 +188,9 @@ class SingleMicSession:
                 return
             self._last_audio_at = time.monotonic()
             active_role = self._role if self._switch is None and self._streams_ready() else None
+            sink = getattr(self, "archive_sink", None)
+            if active_role and sink:
+                sink(samples, active_role)
             silence = None
             for role, stream in self._streams.items():
                 if stream is None:

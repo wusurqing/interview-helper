@@ -13,7 +13,7 @@ def backend_root() -> str:
 
 
 def data_dir() -> str:
-    d = os.path.join(_BACKEND_ROOT, "data")
+    d = os.path.abspath(os.environ.get("IA_DATA_DIR") or os.path.join(_BACKEND_ROOT, "data"))
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -26,7 +26,7 @@ def sqlite_path(filename: str) -> str:
     d = data_dir()
     new_p = os.path.join(d, filename)
     old_p = os.path.join(_BACKEND_ROOT, filename)
-    if not os.path.isfile(new_p) and os.path.isfile(old_p):
+    if not os.environ.get("IA_DATA_DIR") and not os.path.isfile(new_p) and os.path.isfile(old_p):
         try:
             os.replace(old_p, new_p)
             for ext in ("-wal", "-shm"):

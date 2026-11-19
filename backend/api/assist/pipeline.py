@@ -370,6 +370,9 @@ def _maybe_build_interviewer_segment(
     if len(speech_audio) < min_interviewer_samples:
         return False
     audio_sec = len(speech_audio) / AudioCapture.SAMPLE_RATE
+    if getattr(speech_audio, "capture_id", ""):
+        segment_started_mono = speech_audio.started_mono
+        segment_ended_mono = getattr(speech_audio, "source_end_mono", segment_started_mono + audio_sec)
     ended_mono = max(0.0, float(segment_ended_mono))
     started_mono = max(0.0, min(float(segment_started_mono), ended_mono))
     if ended_mono - started_mono + 1e-6 < audio_sec:
@@ -534,6 +537,9 @@ def _reset_answer_state(reset_session_data: bool = False, *, invalidate_capture:
             with conversation_lock:
                 get_session().stop_transcript_capture()
     for task in tasks:
+        meta = task_meta(task)
+        if meta.get("_archive_owner"):
+            meta["_archive_owner"].finish_ai(meta["_archive_run_id"], "cancelled", error="答题任务已取消")
         if request := task_meta(task).get("mmpg_request"):
             _cancel_mmpg_request(request, reason="stopped")
     # commit 相关操作单独处理
@@ -667,6 +673,7 @@ def _begin_asr_turn() -> int:
     global _latest_asr_turn_id
     cfg = get_config()
     with _dispatch_lock:
+        archived = {seq: task_meta(task) for task, seq, _version in _pending if task_meta(task).get("_archive_owner")}
         _latest_asr_turn_id, skipped = scheduler_begin_asr_turn(
             _pending,
             _latest_asr_turn_id,
@@ -674,6 +681,8 @@ def _begin_asr_turn() -> int:
         )
         turn_id = _latest_asr_turn_id
     for seq in skipped:
+        if meta := archived.get(seq):
+            meta["_archive_owner"].finish_ai(meta["_archive_run_id"], "cancelled", error="已进入下一道题")
         _mark_seq_skipped(seq)
     return turn_id
 
@@ -703,7 +712,17 @@ def _should_interrupt_stale_asr(cfg=None) -> bool:
 
 def submit_answer_task(task: TaskPayload) -> bool:
     global _next_submit_seq
+    archive = get_session().archive
+    if archive and task[4].get("purpose") != "knowledge_practice" and not task[4].get("exam_preflight"):
+        meta = dict(task[4])
+        rid = archive.bind_task(meta, task[0])
+        run_id = uuid4().hex
+        archive.start_ai(rid, run_id, {})
+        meta.update(_archive_owner=archive, _archive_run_id=run_id, _archive_round_id=rid)
+        task = (*task[:4], meta)
     if pick_model_index(task, set()) is None:
+        if archive and task[4].get("_archive_run_id"):
+            archive.finish_ai(task[4]["_archive_run_id"], "failed", error="没有可用的答题模型")
         broadcast(
             {
                 "type": "error",
@@ -759,6 +778,9 @@ def cancel_mmpg_answer(request, *, reason="continuation"):
     with _dispatch_lock:
         for index, (task, _seq, _version) in enumerate(_pending):
             if task_meta(task).get("mmpg_request") is request:
+                meta = task_meta(task)
+                if meta.get("_archive_owner"):
+                    meta["_archive_owner"].finish_ai(meta["_archive_run_id"], "cancelled", error=reason)
                 _pending.pop(index)
                 break
     if request.seq is not None:
@@ -895,6 +917,9 @@ def _try_dispatch():
                     config_snapshot = copy.deepcopy(cfg)
                     model_cfg_snapshot = copy.deepcopy(config_snapshot.models[selected_idx])
         if step.skipped_seq is not None:
+            meta = task_meta(step.skipped_task) if step.skipped_task else {}
+            if meta.get("_archive_owner"):
+                meta["_archive_owner"].finish_ai(meta["_archive_run_id"], "cancelled", error="已进入下一道题")
             _mark_seq_skipped(step.skipped_seq)
             continue
         if step.claim is None:
@@ -1136,6 +1161,20 @@ def start_nonblocking(
         session.is_recording = True
         session.is_paused = False
 
+    review_integration.on_assist_start(
+        interviewer_device_id=device_id, candidate_device_id=candidate_mic_device_id,
+        candidate_asr_enabled=bool(getattr(start_cfg, "candidate_asr_enabled", False)),
+        written_exam_mode=not _interviewer_streaming and bool(getattr(start_cfg, "written_exam_mode", False)),
+        single_mic=single_mic is not None, existing_qa_ids=existing_qa_ids,
+    )
+    archive = session.archive
+    audio_capture.archive_sink = archive.capture if archive else None
+    audio_capture.archive_role = None if single_mic else "interviewer"
+    _candidate_audio_capture.archive_sink = archive.capture if archive else None
+    _candidate_audio_capture.archive_role = "candidate"
+    if single_mic:
+        single_mic.archive_sink = archive.capture if archive else None
+
     recording = {"type": "recording", "value": True}
     if _interviewer_streaming:
         recording["interviewer_streaming"] = True
@@ -1186,16 +1225,11 @@ def start_nonblocking(
     if single_mic is not None:
         broadcast_single_mic(single_mic)
 
-    # 创建 review session（如果满足条件）
-    review_integration.on_assist_start(
-        interviewer_device_id=device_id,
-        candidate_device_id=review_candidate_device_id,
-        candidate_asr_enabled=bool(getattr(cfg, "candidate_asr_enabled", False)),
-        written_exam_mode=not _interviewer_streaming and bool(getattr(cfg, "written_exam_mode", False)),
-        **({
-            "single_mic": True, "existing_qa_ids": existing_qa_ids,
-        } if single_mic is not None else {}),
-    )
+    if archive:
+        review_integration.update_candidate_capture(
+            archive, enabled=bool(candidate_mic_device_id is not None and getattr(cfg, "candidate_asr_enabled", False)),
+            available=review_candidate_device_id is not None,
+        )
 
 
 def stop_interview_loop():
@@ -1280,6 +1314,10 @@ def stop_interview_loop():
     # 结束 review session（如果存在）。必须在音频 worker 最后 flush、候选人 ASR final、
     # 以及可等待的答案 commit 之后执行，否则关闭应用时复盘会漏掉末尾问题。
     review_integration.on_assist_stop(session)
+    audio_capture.archive_sink = None
+    _candidate_audio_capture.archive_sink = None
+    if single_mic is not None:
+        single_mic.archive_sink = None
 
     with conversation_lock:
         session.is_recording = False
@@ -1454,6 +1492,7 @@ def publish_streaming_asr_turn(
         anchor = session.record_transcript(
             "interviewer", text, started_at=started_at, utterance_key=trace, epoch=transcript_epoch,
             question_group=question_group if is_transcript_question(get_config(), text) else None,
+            cloud=True,
         )
         if not anchor:
             return None
@@ -1521,6 +1560,7 @@ def _interviewer_asr_worker(runtime: _InterviewerRuntime, session, cfg) -> None:
                 scope="interviewer",
                 fallback_on_empty_remote=True,
             )
+            raw_text = text
             text = postprocess_interview_transcription(text)
             stt_ms = (time.monotonic() - t0) * 1000
             pub = transcription_for_publish(
@@ -1543,6 +1583,7 @@ def _interviewer_asr_worker(runtime: _InterviewerRuntime, session, cfg) -> None:
                 _append_transcription_fragment(
                     current_cfg, session, captured, time.monotonic(), False, started_at=segment.started_mono,
                     transcript_key=segment.transcript_key, transcript_epoch=runtime.transcript_epoch,
+                    raw_text=raw_text, audio_end=segment.ended_mono,
                     publish=bool(pub),
                 )
         except Exception as e:
@@ -1872,6 +1913,9 @@ def _publish_candidate_transcription(
     is_final: bool = True,
     started_at: float | None = None,
     transcript_epoch: int | None = None,
+    raw_text: str | None = None,
+    audio_end: float | None = None,
+    cloud: bool = False,
 ) -> str | None:
     cleaned = (text or "").strip()
     if not cleaned:
@@ -1890,6 +1934,7 @@ def _publish_candidate_transcription(
         anchor = session.record_transcript(
             "candidate", cleaned, started_at=time.monotonic() if started_at is None else started_at,
             utterance_key=segment_id, is_final=is_final, epoch=transcript_epoch,
+            raw_text=raw_text, audio_end=audio_end, cloud=cloud,
         )
         if not anchor:
             return
@@ -2021,6 +2066,8 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
                     is_final=True,
                     started_at=segment_started_at,
                     transcript_epoch=transcript_epoch,
+                    raw_text=text,
+                    audio_end=getattr(final_audio, "source_end_mono", segment_started_at + len(final_audio) / AudioCapture.SAMPLE_RATE),
                 )
                 broadcast({"type": "candidate_asr_status", "loaded": True, "loading": False, "provider": final_provider})
             return True
@@ -2031,6 +2078,9 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
         finally:
             with conversation_lock:
                 session.discard_unfinished_transcript(last_partial_anchor)
+                if session.archive and current_segment_id:
+                    session.archive.discard(f"{transcript_epoch}:candidate:{current_segment_id}",
+                                            audio_end=getattr(final_audio, "source_end_mono", None))
                 if session.transcript_epoch == transcript_epoch:
                     session.mark_candidate_asr_idle()
             current_segment_id = ""
@@ -2054,7 +2104,9 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
                             return False
                         segment_qa_id = session.current_candidate_qa_id
                     current_segment_id = f"cand-{uuid4().hex}"
-                    segment_started_at = chunk_started_at
+                    segment_started_at = getattr(vad_chunk, "started_mono", chunk_started_at)
+                    session.record_transcript("candidate", "", started_at=segment_started_at,
+                                              utterance_key=current_segment_id, is_final=False, epoch=transcript_epoch)
                     _ilog.info("CANDIDATE_ASR_SEGMENT_START segment=%s qa_id=%s", current_segment_id, segment_qa_id)
                 if flushed is not None:
                     if not _finalize_candidate_audio(flushed, "FINAL"):

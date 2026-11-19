@@ -58,6 +58,12 @@ def clean_review_db():
 
     yield
 
+    from core.session import get_session
+    session = get_session()
+    if session.archive:
+        session.archive.stop()
+        session.archive = None
+
     # 清理后
     conn = sqlite3.connect(DB_PATH)
     conn.execute("DELETE FROM review_turns")
@@ -84,26 +90,26 @@ def test_should_create_review_session():
         candidate_asr_enabled=True,
     ) is False
 
-    # candidate 设备无效
+    # 候选人采集不可用时，仍归档面试官问答。
     assert review_integration.should_create_review_session(
         interviewer_device_id=1,
         candidate_device_id=None,
         candidate_asr_enabled=True,
-    ) is False
+    ) is True
 
     # ASR 未开启
     assert review_integration.should_create_review_session(
         interviewer_device_id=1,
         candidate_device_id=2,
         candidate_asr_enabled=False,
-    ) is False
+    ) is True
 
     # 两个设备相同
     assert review_integration.should_create_review_session(
         interviewer_device_id=1,
         candidate_device_id=1,
         candidate_asr_enabled=True,
-    ) is False
+    ) is True
 
     # 笔试模式无音频设备也应落入复盘
     assert review_integration.should_create_review_session(
@@ -134,16 +140,16 @@ def test_on_assist_start_creates_session():
     assert detail["candidate_capture_enabled"] == 1
 
 
-def test_on_assist_start_no_session_when_conditions_not_met():
-    """测试条件不满足时不创建 session"""
+def test_on_assist_start_records_without_candidate_mic():
     session_id = review_integration.on_assist_start(
         interviewer_device_id=1,
         candidate_device_id=None,  # 缺少候选人设备
         candidate_asr_enabled=True,
     )
 
-    assert session_id is None
-    assert review_integration.get_current_review_session_id() is None
+    assert session_id is not None
+    assert review.get_session_detail(session_id)["candidate_capture_enabled"] == 0
+    assert review_integration.get_current_review_session_id() == session_id
 
 
 def test_written_exam_start_creates_session_without_audio_devices():

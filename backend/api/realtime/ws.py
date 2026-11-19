@@ -195,6 +195,7 @@ async def websocket_endpoint(ws: WebSocket):
             current_stt = mmpg_integration.stt_status()
             loaded = current_stt["loaded"]
         snapshot = snapshot_session()
+        from services.review_integration import get_archive_status
         await ws.send_json({
             "type": "init",
             "is_recording": snapshot["is_recording"],
@@ -207,6 +208,7 @@ async def websocket_endpoint(ws: WebSocket):
             "candidate_transcriptions": snapshot.get("candidate_transcriptions", []),
             "candidate_answer_segments": snapshot.get("candidate_answer_segments", []),
             "qa_pairs": snapshot["qa_pairs"],
+            "archive": get_archive_status(),
         })
         if current_stt is not None:
             await ws.send_json({"type": "stt_status", **current_stt})

@@ -28,6 +28,7 @@ from core.logger import LOG_DIR as _DEFAULT_LOG_DIR
 
 LOG_DIR = _DEFAULT_LOG_DIR
 _scope = contextvars.ContextVar("llm_trace_scope", default=None)
+_observer = contextvars.ContextVar("llm_archive_observer", default=None)
 _lock = threading.RLock()
 _handler_path = None
 _handler = None
@@ -240,6 +241,15 @@ def current_context():
     return dict(_scope.get() or {})
 
 
+@contextlib.contextmanager
+def observe(callback):
+    token = _observer.set(callback)
+    try:
+        yield
+    finally:
+        _observer.reset(token)
+
+
 def traced(scene):
     """Scope a complete logical call, including generators consumed later."""
     def decorate(func):
@@ -393,10 +403,12 @@ class TracingHttpxClient(DefaultHttpxClient):
 class Attempt:
     def __init__(self, url, api_type, payload, *, api_key="", context=None):
         self.api_key = api_key
+        self._observer = _observer.get()
         context = dict(context if context is not None else current_context())
         self.call_id = _safe(context.pop("call_id", uuid4().hex), api_key)
         self.context = _safe(context, api_key)
         self.attempt_id = uuid4().hex
+        self.model_id = _redact_text(str(payload.get("model", "")), api_key) if isinstance(payload, dict) else ""
         self.api_type = api_type
         self.request_at = _now()
         self.t0 = time.monotonic()
@@ -412,6 +424,11 @@ class Attempt:
         self.reasoning = []
         self.finish_reason = None
         self._finished = False
+        if self._observer:
+            try:
+                self._observer({"event": "request", "attempt_id": self.attempt_id, "request_at": self.request_at})
+            except Exception:
+                logging.getLogger("llm.trace.failure").exception("Archive observer failed")
         _write({"schema_version": 1, "event": "request", "call_id": self.call_id,
                 "attempt_id": self.attempt_id, "context": self.context, "at": self.request_at,
                 "protocol": api_type, "url": _safe_url(url, api_key), "request": _safe(payload, api_key)})
@@ -516,7 +533,7 @@ class Attempt:
         reasoning = None
         if usage:
             reasoning = (usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}).get("reasoning_tokens")
-        _write({"schema_version": 1, "event": "result", "call_id": self.call_id,
+        record = {"schema_version": 1, "event": "result", "call_id": self.call_id,
                 "attempt_id": self.attempt_id, "context": self.context, "protocol": self.api_type,
                 "status": status, "http_status": self.status_code, "request_at": self.request_at,
                 "response_headers_at": self.response_headers_at, "first_output_at": self.first_output_at,
@@ -534,4 +551,11 @@ class Attempt:
                            "cached_write": created,
                            "cache_hit": usage.get("prompt_cache_hit_tokens") if usage else None,
                            "cache_miss": usage.get("prompt_cache_miss_tokens") if usage else None},
-                "error": _safe(str(error), self.api_key) if error is not None else None})
+                "error": _safe(str(error), self.api_key) if error is not None else None}
+        _write(record)
+        if self._observer:
+            try:
+                self._observer({**{key: value for key, value in record.items()
+                                   if key not in ("response", "stream_events", "context")}, "model": self.model_id})
+            except Exception:
+                logging.getLogger("llm.trace.failure").exception("Archive observer failed")
