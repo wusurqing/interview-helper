@@ -86,6 +86,11 @@ async def _stop_capture(_mode, _reason, *, single_mic_id=None):
     await run_in_threadpool(pipeline._candidate_audio_capture.stop, owner=_CAPTURE_OWNER)
 
 
+async def freeze_input():
+    if manager.active and manager.single_mic_id is None:
+        await _stop_capture(None, "stopped")
+
+
 async def stop(reason, *, drain=False):
     if drain and manager.status()["state"] == "listening":
         try:
@@ -110,6 +115,8 @@ def _on_turn(kind, trace):
                                               utterance_key=f"candidate-mmpg-{trace}", is_final=False,
                                               epoch=_capture_epoch, cloud=True)
         elif kind == "reset":
+            if session.archive:
+                session.archive.end_capture("candidate")
             for key in _pending:
                 session.discard_unfinished_transcript(f"{_capture_epoch}:candidate:candidate-mmpg-{key}")
             _pending.clear()

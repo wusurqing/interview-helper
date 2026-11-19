@@ -48,6 +48,9 @@ def _turn_event(kind, trace):
     if _turns is None:
         return
     if kind == "reset":
+        session = get_session()
+        if session.transcript_epoch == _capture_epoch and session.archive:
+            session.archive.end_capture("interviewer")
         clear_turns()
     elif kind == "started" and _enabled():
         if trace not in _speech_starts:
@@ -268,6 +271,9 @@ def single_mic_transports(single_mic: SingleMicSession):
 
 async def drain_single_mic_transports(single_mic: SingleMicSession, reason: str) -> None:
     single_mic.pause()
+    archive = get_session().archive if reason != "paused" else None
+    if archive:
+        archive.seal_capture()
     pipeline.broadcast_single_mic(single_mic)
     role = single_mic.snapshot()["role"]
     active, idle = manager, candidate_mmpg.manager
@@ -277,14 +283,40 @@ async def drain_single_mic_transports(single_mic: SingleMicSession, reason: str)
     async def drain_active():
         if active.single_mic_id == single_mic.id:
             timeout = max(6.0, get_config().assist_interviewer_asr_drain_timeout_sec)
-            if await active.drain_single_mic_input(single_mic.id, timeout=timeout) and role == "interviewer":
+            finalized = await active.drain_single_mic_input(single_mic.id, timeout=timeout)
+            if finalized and role == "interviewer":
                 finish_interviewer_role(single_mic)
+            elif not finalized and archive:
+                archive.stt_timeout(role)
 
     async def stop_idle():
         if idle.single_mic_id == single_mic.id:
             await idle.stop(reason)
 
     await asyncio.gather(drain_active(), stop_idle())
+
+
+async def drain_dual_input():
+    """Freeze both physical inputs, then wait for the live cloud transports together."""
+    session = get_session()
+    pending = [(role, transport) for role, transport in (
+        ("interviewer", manager), ("candidate", candidate_mmpg.manager),
+    ) if transport.active and transport.status().get("mode") != "test"]
+    if not pending or not session.is_recording or session.is_paused:
+        return
+    await asyncio.gather(run_in_threadpool(pipeline.freeze_interview_inputs), candidate_mmpg.freeze_input())
+    if session.archive:
+        session.archive.seal_capture()
+    timeout = max(3.0, get_config().assist_interviewer_asr_drain_timeout_sec)
+    results = await asyncio.gather(*(transport.drain_transcripts(timeout=timeout) for _, transport in pending),
+                                   return_exceptions=True)
+    for (role, _), result in zip(pending, results):
+        if result is not True:
+            _log.warning("ASR tail incomplete role=%s reason=%s", role, type(result).__name__ if result is not False else "drain_timeout")
+            if session.archive:
+                session.archive.stt_timeout(role)
+    if _turns is not None:
+        _turns.finish_role()
 
 
 async def _pause_after_loss(single_mic: SingleMicSession, *, message=None) -> None:

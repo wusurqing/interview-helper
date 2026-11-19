@@ -160,7 +160,7 @@ def init_db() -> None:
             for name, definition in {
                 "round_id": "TEXT", "archive_version": "INTEGER NOT NULL DEFAULT 0",
                 "candidate_status": "TEXT", "ai_status": "TEXT", "started_at": "REAL", "ended_at": "REAL",
-                "media_json": "TEXT", "model_summary_json": "TEXT",
+                "media_json": "TEXT", "model_summary_json": "TEXT", "audio_status_json": "TEXT",
             }.items():
                 _ensure_column(conn, "review_turns", name, definition)
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_review_round ON review_turns(session_id, round_id)")
@@ -409,7 +409,7 @@ def get_session_detail(session_id: int) -> Optional[dict[str, Any]]:
     turns = []
     for row in turn_rows:
         turn = dict(row)
-        for key in ("media", "model_summary"):
+        for key in ("media", "model_summary", "audio_status"):
             try:
                 turn[key] = json.loads(turn.pop(key + "_json", None) or "null")
             except (ValueError, TypeError):

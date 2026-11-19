@@ -102,8 +102,7 @@ async def lifespan(app: FastAPI):
         _log.debug("Resume auto-restore skipped: %s", e)
     yield
     _log.info("SHUTDOWN cleaning up")
-    await asyncio.gather(mmpg_integration.manager.stop("shutdown"), candidate_mmpg.stop("shutdown", drain=True))
-    assist.stop_interview_loop()
+    await assist.finish_interview("shutdown")
     assist.shutdown_background_workers()
     dispatch_task.cancel()
     heartbeat_task.cancel()

@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from core.config import get_config
 from core.logger import get_logger
 from core.session import get_session, snapshot_session
+from services import review_integration
 from services.audio import AudioBusyError
 from services.stt.mmpg import valid_single_mic_id
 from . import candidate_mmpg
@@ -33,6 +34,7 @@ from .single_mic import Role, RoleSwitch, SingleMicConflict, SingleMicSession
 router = APIRouter()
 _rlog = get_logger("assist.routes")
 _role_switches: dict[RoleSwitch, asyncio.Task[tuple[int, dict | None]]] = {}
+_stop_task: asyncio.Task | None = None
 
 
 class ManualQuestion(BaseModel):
@@ -125,16 +127,32 @@ async def _api_start(body: dict):
 
 @router.post("/stop")
 async def api_stop():
-    async with mmpg.http_lifecycle_lock:
-        single_mic = get_session().single_mic
-        if single_mic is not None:
-            await mmpg.drain_single_mic_transports(single_mic, "stopped")
-        await asyncio.gather(
-            mmpg.manager.stop("stopped"),
-            candidate_mmpg.stop("stopped", drain=single_mic is None),
-        )
-        await run_in_threadpool(stop_interview_loop)
+    await finish_interview()
     return {"ok": True}
+
+
+async def finish_interview(reason="stopped"):
+    global _stop_task
+    if _stop_task is None or _stop_task.done():
+        _stop_task = asyncio.create_task(_finish_interview(reason))
+    await asyncio.shield(_stop_task)
+
+
+async def _finish_interview(reason):
+    async with mmpg.http_lifecycle_lock:
+        session = get_session()
+        if session.is_recording or session.archive or mmpg.manager.active or candidate_mmpg.manager.active:
+            try:
+                if session.single_mic is not None:
+                    await mmpg.drain_single_mic_transports(session.single_mic, reason)
+                else:
+                    await mmpg.drain_dual_input()
+            finally:
+                try:
+                    await asyncio.gather(mmpg.manager.stop(reason), candidate_mmpg.stop(reason))
+                finally:
+                    await run_in_threadpool(stop_interview_loop)
+        await run_in_threadpool(review_integration.wait_for_archive_saves)
 
 
 @router.post("/pause")

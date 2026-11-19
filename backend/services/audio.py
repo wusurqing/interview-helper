@@ -223,6 +223,7 @@ class AudioCapture:
         self._owner: Optional[str] = None
         self._dropped_chunks_count = 0
         self._loopback_discontinuity_count = 0
+        self._keep_tail_on_stop = False
         self._max_queue_chunk_samples = 0
         self._last_queue_chunk_samples = 0
         self._seen_soundcard_warning_messages: set[str] = set()
@@ -354,6 +355,7 @@ class AudioCapture:
             self._owner = owner
             self._audio_queue = queue.Queue(maxsize=940)
             self._archive_capture_id = None
+            self._keep_tail_on_stop = False
             self._resample_state = [None]
             self._agc_peak = 0.0
             self._sc_stop = threading.Event()
@@ -394,7 +396,7 @@ class AudioCapture:
                 _alog.warning("audio_queue_full_dropped chunk_samples=%d", len(dropped))
         self._audio_queue.put_nowait(audio)
 
-    def _push(self, audio: np.ndarray):
+    def _push(self, audio: np.ndarray, *, discontinuity: bool = False):
         """Common path: optionally AGC → queue → callback."""
         if len(audio) <= 0:
             return
@@ -411,7 +413,10 @@ class AudioCapture:
                 self._archive_capture_id = uuid4().hex
                 self._archive_sample = 0
                 self._archive_anchor = time.monotonic() - len(audio) / self.SAMPLE_RATE
-            audio = CapturedAudio(audio, self._archive_capture_id, self._archive_sample, self._archive_anchor)
+            audio = CapturedAudio(
+                audio, self._archive_capture_id, self._archive_sample, self._archive_anchor,
+                discontinuity=discontinuity and self._archive_sample > 0,
+            )
             self._archive_sample += len(audio)
         if sink and role:
             try:
@@ -461,6 +466,7 @@ class AudioCapture:
                 _alog.info("soundcard loopback opened: %s", mic.name)
                 pending_chunks: list[np.ndarray] = []
                 pending_samples = 0
+                pending_discontinuity = False
                 with mic.recorder(samplerate=self.SAMPLE_RATE,
                                   channels=1,
                                   blocksize=self.LOOPBACK_RECORDER_BLOCK_SIZE) as rec:
@@ -473,13 +479,15 @@ class AudioCapture:
                             data = rec.record(numframes=self.LOOPBACK_RECORD_NUMFRAMES)
                         if self._sc_stop is not stop_event:
                             return
-                        if stop_event.is_set() and not self._queue_audio:
+                        if stop_event.is_set() and not (self._queue_audio or self._keep_tail_on_stop):
                             return
                         if caught:
                             for warning in caught:
                                 warning_text = str(getattr(warning, "message", "") or "")
                                 if "data discontinuity in recording" in warning_text.lower():
                                     self._loopback_discontinuity_count += 1
+                                    if getattr(self, "archive_sink", None):
+                                        pending_discontinuity = True
                                     _alog.warning(
                                         "soundcard_loopback_discontinuity count=%d",
                                         self._loopback_discontinuity_count,
@@ -496,11 +504,12 @@ class AudioCapture:
                         pending_samples += len(mono)
                         if pending_samples < self.MIN_LOOPBACK_QUEUE_CHUNK_SAMPLES:
                             continue
-                        self._push(np.concatenate(pending_chunks))
+                        self._push(np.concatenate(pending_chunks), discontinuity=pending_discontinuity)
                         pending_chunks = []
                         pending_samples = 0
-                if pending_chunks and self._sc_stop is stop_event and self._queue_audio:
-                    self._push(np.concatenate(pending_chunks))
+                        pending_discontinuity = False
+                if pending_chunks and self._sc_stop is stop_event and (self._queue_audio or self._keep_tail_on_stop):
+                    self._push(np.concatenate(pending_chunks), discontinuity=pending_discontinuity)
             except Exception as e:
                 _alog.error("soundcard error: %s", e, exc_info=True)
                 if self._sc_stop is stop_event:
@@ -584,12 +593,12 @@ class AudioCapture:
         stop_event = self._sc_stop
 
         def audio_cb(indata, frames, time_info, status):
-            if self._sc_stop is not stop_event or stop_event.is_set():
+            if self._sc_stop is not stop_event or (stop_event.is_set() and not self._keep_tail_on_stop):
                 return
             audio = indata[:, 0].copy() if indata.ndim > 1 else indata.copy().flatten()
             native_sr = getattr(self, '_native_sr', self.SAMPLE_RATE)
             audio = _resample_chunk(audio, native_sr, self.SAMPLE_RATE, self._resample_state)
-            self._push(audio)
+            self._push(audio, discontinuity=bool(getattr(status, "input_overflow", False)))
 
         last_error: Optional[Exception] = None
         try:
@@ -645,6 +654,7 @@ class AudioCapture:
                 and owner != self._owner
             ):
                 return
+            self._keep_tail_on_stop = not clear_queue
             self._running = False
             self._sc_stop.set()
             if self._stream:

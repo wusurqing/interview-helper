@@ -95,6 +95,8 @@ let overlayWindow = null;
 let tray = null;
 let pythonProcess = null;
 let isQuitting = false;
+let readyToQuit = false;
+let desktopStopPromise = null;
 let shortcuts = {};
 let _overlayDragging = false;
 let _blurTimer = null;
@@ -487,8 +489,10 @@ function createWindow() {
   });
 
   // 关闭按钮 = 真正退出
-  mainWindow.on('close', () => {
-    isQuitting = true;
+  mainWindow.on('close', (event) => {
+    if (readyToQuit) return;
+    event.preventDefault();
+    app.quit();
   });
 }
 
@@ -1339,70 +1343,63 @@ function createAppMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-function requestAssistStop(timeoutMs = 12000) {
+function requestAssistStop() {
   return new Promise((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      resolve();
-    };
-    const req = http.request(`${SERVER_URL}/api/stop`, {
-      method: 'POST',
-      timeout: timeoutMs,
-    }, (res) => {
+    const req = http.request(`${SERVER_URL}/api/stop`, { method: 'POST' }, (res) => {
+      res.once('end', () => resolve(res.statusCode >= 200 && res.statusCode < 300));
+      res.once('close', () => resolve(false));
+      res.once('error', () => resolve(false));
       res.resume();
-      res.on('end', finish);
-      res.on('close', finish);
     });
-    req.on('error', finish);
-    req.on('timeout', () => {
-      try { req.destroy(); } catch (_) { /* ignore */ }
-      finish();
-    });
+    req.once('error', () => resolve(false));
     req.end();
   });
 }
 
-// 先等 /api/stop 释放 MMPG 音频和云端会话，并完成复盘归档，再停止后端进程。
-let pythonStopPromise = null;
-function gracefulStopPython(timeoutMs = 20000) {
-  if (pythonStopPromise) return pythonStopPromise;
-  const proc = pythonProcess;
-  if (!proc) return Promise.resolve();
-  pythonStopPromise = new Promise((resolve) => {
+function stopPythonProcess(proc) {
+  return new Promise((resolve) => {
     let settled = false;
-    const finish = () => { if (settled) return; settled = true; resolve(); };
-    proc.once('exit', finish);
-    const stopTimeoutMs = Math.max(1000, timeoutMs - 5000);
-    requestAssistStop(stopTimeoutMs).then(() => {
+    let forceTimer;
+    const finish = () => {
       if (settled) return;
-      try { proc.kill('SIGTERM'); } catch (err) { console.warn('[py] SIGTERM failed:', err.message); }
-      setTimeout(() => {
-        if (settled) return;
-        try {
-          if (proc.exitCode === null && proc.signalCode === null) {
-            console.warn('[py] graceful timeout, escalating to SIGKILL');
-            proc.kill('SIGKILL');
-          }
-        } catch (err) {
-          console.warn('[py] SIGKILL failed:', err.message);
+      settled = true;
+      clearTimeout(forceTimer);
+      resolve();
+    };
+    proc.once('exit', finish);
+    try { proc.kill('SIGTERM'); } catch (err) { console.warn('[py] SIGTERM failed:', err.message); }
+    if (settled) return;
+    forceTimer = setTimeout(() => {
+      try {
+        if (proc.exitCode === null && proc.signalCode === null) {
+          console.warn('[py] graceful timeout, escalating to SIGKILL');
+          proc.kill('SIGKILL');
         }
-        finish();
-      }, Math.max(1000, timeoutMs - stopTimeoutMs));
-    });
+      } catch (err) {
+        console.warn('[py] SIGKILL failed:', err.message);
+      }
+      finish();
+    }, 5000);
   });
-  return pythonStopPromise;
 }
 
 app.on('before-quit', (event) => {
-  isQuitting = true;
-  stopPromptWheelHelper();
-  if (!pythonProcess) return;
+  if (readyToQuit || (!mainWindow && !pythonProcess)) return;
   event.preventDefault();
-  if (pythonStopPromise) return;
-  gracefulStopPython().then(() => {
+  if (desktopStopPromise) return;
+  isQuitting = true;
+  // Keep the renderer's RTC publisher alive until the API has saved the tail.
+  desktopStopPromise = (mainWindow ? requestAssistStop() : Promise.resolve(true)).then(async (acknowledged) => {
+    if (!acknowledged && (pythonProcess || DEV_FRONTEND_PORT)) {
+      desktopStopPromise = null;
+      isQuitting = false;
+      notifyDesktopToast('未能确认面试记录已保存，请重试退出', 'error');
+      return;
+    }
+    stopPromptWheelHelper();
+    if (pythonProcess) await stopPythonProcess(pythonProcess);
     pythonProcess = null;
+    readyToQuit = true;
     app.quit();
   });
 });

@@ -101,6 +101,7 @@ class Session:
         raw_text: str | None = None,
         audio_end: float | None = None,
         cloud: bool = False,
+        source_capture_id: str | None = None,
     ) -> str | None:
         anchor = self._live_transcript.record(
             speaker, text, started_at=started_at, utterance_key=utterance_key,
@@ -109,7 +110,8 @@ class Session:
         if anchor and self.archive:
             try:
                 self.archive.transcript(speaker, text if raw_text is None else raw_text, anchor,
-                                        started_at, is_final, question_group, audio_end=audio_end, cloud=cloud)
+                                        started_at, is_final, question_group, audio_end=audio_end, cloud=cloud,
+                                        source_capture_id=source_capture_id)
             except Exception:
                 import logging
                 logging.getLogger(__name__).exception("archive transcript observation failed")

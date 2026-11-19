@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import sys
+import threading
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -140,6 +142,42 @@ def test_audio_capture_loopback_min_chunk_samples_is_smaller_than_max():
     capture = AudioCapture()
 
     assert capture.MIN_LOOPBACK_QUEUE_CHUNK_SAMPLES < capture.MAX_QUEUE_CHUNK_SAMPLES
+
+
+def test_streaming_loopback_delivers_in_flight_tail_during_graceful_stop(monkeypatch):
+    from services import audio
+
+    capture = AudioCapture()
+    reading = threading.Event()
+    frame = np.full((320, 1), 0.1, dtype=np.float32)
+
+    class Recorder:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def record(self, **_):
+            reading.set()
+            assert capture._sc_stop.wait(2)
+            return frame
+
+    device = SimpleNamespace(name="test loopback", recorder=lambda **_: Recorder())
+    monkeypatch.setattr(audio, "_sc", SimpleNamespace(get_microphone=lambda *_, **__: device))
+    monkeypatch.setitem(audio._SC_ID_MAP, 20001, "test-loopback")
+    captured, sent = [], []
+    capture.archive_sink = lambda samples, role: captured.append((samples, role))
+    capture.archive_role = "interviewer"
+    try:
+        capture.start(20001, on_audio=sent.append, owner="assist", queue_audio=False)
+        assert reading.wait(2)
+    finally:
+        capture.stop(owner="assist", clear_queue=False)
+    assert len(captured) == len(sent) == 1
+    assert captured[0][0] is sent[0]
+    assert captured[0][1] == "interviewer"
+    assert len(sent[0]) == len(frame)
 
 
 def test_audio_device_sort_keeps_default_loopback_first():

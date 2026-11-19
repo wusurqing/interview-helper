@@ -2,6 +2,7 @@
 Review 模块与 Assist 生命周期集成
 在 assist start/stop 时自动创建和结束 review session
 """
+import threading
 import time
 from typing import Optional
 
@@ -10,18 +11,28 @@ from core.session import Session
 from core.config import get_config
 from services.storage import review
 from services import review_async_analysis
+from services.interview_archive.manager import InterviewArchive
 
 logger = get_logger(__name__)
 
 _current_review_session_id: Optional[int] = None
 _existing_qa_ids: frozenset[str] = frozenset()
 _archive_status = None
+_draining_archives: set[InterviewArchive] = set()
+_archive_lock = threading.Lock()
 
 
 def get_archive_status():
     from core.session import get_session
     archive = get_session().archive
     return archive.snapshot() if archive else _archive_status
+
+
+def wait_for_archive_saves():
+    with _archive_lock:
+        pending = tuple(_draining_archives)
+    for archive in pending:
+        archive.wait_finalized()
 
 
 def should_create_review_session(
@@ -76,7 +87,6 @@ def on_assist_start(
         _existing_qa_ids = existing_qa_ids
         if not written_exam_mode:
             from api.realtime.ws import broadcast
-            from services.interview_archive.manager import InterviewArchive
             from services.storage import review_archive
 
             def archive_event(event):
@@ -86,13 +96,15 @@ def on_assist_start(
                 broadcast(event)
 
             def completed():
-                state = archive.snapshot()
-                partial = bool(state["warning"])
-                review.end_session(session_id, status="partial_capture" if partial else "recorded")
-                review_archive.set_state(session_id, "partial" if partial else "complete", state["warning"] or None)
-                if _should_auto_analyze(review_enabled=bool(get_config().review_enabled),
-                                        turn_count=state["persisted_turn_count"]):
-                    review_async_analysis.analyze_session_async(session_id)
+                try:
+                    state = archive.snapshot()
+                    review_archive.finish_session(session_id, state["warning"])
+                    if _should_auto_analyze(review_enabled=bool(get_config().review_enabled),
+                                            turn_count=state["persisted_turn_count"]):
+                        review_async_analysis.analyze_session_async(session_id)
+                finally:
+                    with _archive_lock:
+                        _draining_archives.discard(archive)
 
             archive = InterviewArchive(session_id, candidate_enabled=bool(candidate_device_id is not None and candidate_asr_enabled),
                                        broadcast=archive_event, on_complete=completed)
@@ -135,7 +147,12 @@ def on_assist_stop(session: Session) -> Optional[int]:
     if session.archive is not None:
         from services.storage import review_archive
         archive, session.archive = session.archive, None
-        review_archive.set_state(session_id, "draining")
+        with _archive_lock:
+            _draining_archives.add(archive)
+        try:
+            review_archive.set_state(session_id, "draining")
+        except Exception:
+            logger.exception("Unable to update draining archive state")
         archive.stop(timeout=3)
         return session_id
 

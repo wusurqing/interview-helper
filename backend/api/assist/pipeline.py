@@ -380,7 +380,8 @@ def _maybe_build_interviewer_segment(
     transcript_key = uuid4().hex
     transcript_reservation = session.record_transcript(
         "interviewer", "", started_at=started_mono, utterance_key=transcript_key,
-        is_final=False, epoch=runtime.transcript_epoch,
+        is_final=False, epoch=runtime.transcript_epoch, audio_end=ended_mono,
+        source_capture_id=getattr(speech_audio, "capture_id", None),
     )
     if not transcript_reservation:
         return False
@@ -1174,6 +1175,7 @@ def start_nonblocking(
     _candidate_audio_capture.archive_role = "candidate"
     if single_mic:
         single_mic.archive_sink = archive.capture if archive else None
+        single_mic.archive_end_capture = archive.end_capture if archive else None
 
     recording = {"type": "recording", "value": True}
     if _interviewer_streaming:
@@ -1232,18 +1234,28 @@ def start_nonblocking(
         )
 
 
+def freeze_interview_inputs():
+    """Stop real PCM while still accepting the cloud's last transcript callbacks."""
+    _pause_event.set()
+    _candidate_flush_event.set()
+    _stop_capture_compat(audio_capture, owner="assist", clear_queue=False)
+    _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=False)
+
+
 def stop_interview_loop():
     global _interview_thread, _interviewer_asr_thread, _candidate_thread, _flush_thread, _interviewer_streaming
     global _interviewer_config
     session = get_session()
     single_mic = session.single_mic
-    _stop_event.set()
     if single_mic is not None:
         single_mic.close()
+    _stop_capture_compat(audio_capture, owner="assist", clear_queue=False)
+    _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=False)
+    _stop_event.set()
     _pause_event.clear()
     _candidate_flush_event.set()
-    _stop_capture_compat(audio_capture, owner="assist", clear_queue=False)
-    _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=True)
+    if session.archive:
+        session.archive.seal_capture()
     runtime = _interviewer_runtime
     runtime_snapshot: Optional[dict[str, Any]] = None
 
@@ -1318,6 +1330,7 @@ def stop_interview_loop():
     _candidate_audio_capture.archive_sink = None
     if single_mic is not None:
         single_mic.archive_sink = None
+        single_mic.archive_end_capture = None
 
     with conversation_lock:
         session.is_recording = False
@@ -1584,6 +1597,7 @@ def _interviewer_asr_worker(runtime: _InterviewerRuntime, session, cfg) -> None:
                     current_cfg, session, captured, time.monotonic(), False, started_at=segment.started_mono,
                     transcript_key=segment.transcript_key, transcript_epoch=runtime.transcript_epoch,
                     raw_text=raw_text, audio_end=segment.ended_mono,
+                    source_capture_id=getattr(segment.audio, "capture_id", None),
                     publish=bool(pub),
                 )
         except Exception as e:
@@ -1916,6 +1930,7 @@ def _publish_candidate_transcription(
     raw_text: str | None = None,
     audio_end: float | None = None,
     cloud: bool = False,
+    source_capture_id: str | None = None,
 ) -> str | None:
     cleaned = (text or "").strip()
     if not cleaned:
@@ -1934,7 +1949,7 @@ def _publish_candidate_transcription(
         anchor = session.record_transcript(
             "candidate", cleaned, started_at=time.monotonic() if started_at is None else started_at,
             utterance_key=segment_id, is_final=is_final, epoch=transcript_epoch,
-            raw_text=raw_text, audio_end=audio_end, cloud=cloud,
+            raw_text=raw_text, audio_end=audio_end, cloud=cloud, source_capture_id=source_capture_id,
         )
         if not anchor:
             return
@@ -2068,6 +2083,7 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
                     transcript_epoch=transcript_epoch,
                     raw_text=text,
                     audio_end=getattr(final_audio, "source_end_mono", segment_started_at + len(final_audio) / AudioCapture.SAMPLE_RATE),
+                    source_capture_id=getattr(final_audio, "capture_id", None),
                 )
                 broadcast({"type": "candidate_asr_status", "loaded": True, "loading": False, "provider": final_provider})
             return True
@@ -2106,7 +2122,8 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
                     current_segment_id = f"cand-{uuid4().hex}"
                     segment_started_at = getattr(vad_chunk, "started_mono", chunk_started_at)
                     session.record_transcript("candidate", "", started_at=segment_started_at,
-                                              utterance_key=current_segment_id, is_final=False, epoch=transcript_epoch)
+                                              utterance_key=current_segment_id, is_final=False, epoch=transcript_epoch,
+                                              source_capture_id=getattr(vad_chunk, "capture_id", None))
                     _ilog.info("CANDIDATE_ASR_SEGMENT_START segment=%s qa_id=%s", current_segment_id, segment_qa_id)
                 if flushed is not None:
                     if not _finalize_candidate_audio(flushed, "FINAL"):
@@ -2234,7 +2251,7 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
                     except Exception as exc:
                         _elog.debug("Candidate streaming ASR partial failed: %s", exc)
 
-        if single_mic is not None and session.transcript_epoch == transcript_epoch:
+        if session.transcript_epoch == transcript_epoch and not getattr(audio_input, "is_running", True):
             drain_candidate_input()
         remaining = vad.flush()
         if remaining is not None:
