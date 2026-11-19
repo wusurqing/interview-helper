@@ -72,7 +72,13 @@ def _temporary_answer_runtime(
     if answer_model_name and model_idx is None:
         raise RuntimeError(f"找不到 answer model: {answer_model_name}")
     if model_idx is not None:
-        updates["active_model"] = model_idx
+        model_id = getattr(cfg.models[model_idx], "id", "")
+        selected = getattr(cfg, "assist_model_ids", None)
+        if model_id and selected is not None:
+            original["assist_model_ids"] = list(selected)
+            updates["assist_model_ids"] = [model_id] + [other_id for other_id in selected if other_id != model_id]
+        else:
+            updates["active_model"] = model_idx
     if max_parallel_answers is not None:
         updates["max_parallel_answers"] = max(1, min(8, int(max_parallel_answers)))
     if answer_wait_sec is not None:
@@ -84,7 +90,7 @@ def _temporary_answer_runtime(
     try:
         yield
     finally:
-        update_config(original)
+        update_config({key: original[key] for key in updates})
 
 
 def run_replay_suite(
@@ -115,7 +121,8 @@ def run_replay_suite(
     ):
         cfg = get_config()
         effective_provider = (stt_provider or getattr(get_config(), "stt_provider", "") or "").strip()
-        effective_answer_model = getattr(cfg.models[int(getattr(cfg, "active_model", 0) or 0)], "name", "")
+        answer_order = dispatch_model_order(cfg)
+        effective_answer_model = getattr(cfg.models[answer_order[0]], "name", "") if answer_order else ""
         effective_max_parallel = int(getattr(cfg, "max_parallel_answers", 2) or 2)
         for scenario_id in selected_ids:
             wav_path = tmp_dir / f"{scenario_id}.wav"

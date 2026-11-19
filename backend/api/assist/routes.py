@@ -311,17 +311,19 @@ async def api_ask(body: ManualQuestion):
         meta["override_think_mode"] = bool(body.override_think_mode)
     queued = submit_answer_task((text, body.image, True, src, meta))
     if not queued:
-        raise HTTPException(503, "没有可用的答题模型，请先启用并配置至少一个模型")
+        raise HTTPException(503, (
+            "没有可用的答题模型，请先配置模型" if body.purpose == "knowledge_practice" else
+            "没有可用的答题模型，请在实时辅助中选择已配置且支持该题型的模型"
+        ))
     return {"ok": True}
 
 
 @router.post("/ask-from-server-screen")
 async def api_ask_from_server_screen(body: Optional[ServerScreenQuestion] = None):
-    from services.llm import has_vision_model
     from services.capture import ScreenCaptureError, capture_primary_left_half_data_url
 
-    if not has_vision_model():
-        raise HTTPException(400, "请至少配置一个支持识图且已填写 API Key 的模型")
+    if pick_model_index(("", "screen", True, "server_screen_left", {}), set()) is None:
+        raise HTTPException(400, "请在实时辅助中选择可用的截图识图模型")
     try:
         data_url = capture_primary_left_half_data_url()
     except ScreenCaptureError as e:
@@ -333,7 +335,7 @@ async def api_ask_from_server_screen(body: Optional[ServerScreenQuestion] = None
     if body is not None and body.override_think_mode is not None:
         meta["override_think_mode"] = bool(body.override_think_mode)
     if pick_model_index((text, data_url, True, "server_screen_left", meta), set()) is None:
-        raise HTTPException(400, "没有可用的识图模型，请检查启用状态与 API Key")
+        raise HTTPException(400, "请在实时辅助中选择可用的截图识图模型")
     # Written exam: keep in-flight answers so multi-shot screenshots can run in parallel.
     # Non-exam interview: cancel previous generation (screenshot replaces the live answer).
     if not bool(getattr(cfg, "written_exam_mode", False)):
@@ -356,16 +358,11 @@ async def api_capture_server_screen():
 
 @router.post("/ask-from-server-screens")
 async def api_ask_from_server_screens(body: MultiServerScreenQuestion):
-    from services.llm import has_vision_model
-
     images = [img for img in body.images if img]
     if not images:
         raise HTTPException(400, "至少需要一张截图")
     if len(images) > 8:
         raise HTTPException(400, "一次最多提交 8 张截图")
-    if not has_vision_model():
-        raise HTTPException(400, "请至少配置一个支持识图且已填写 API Key 的模型")
-
     cfg = get_config()
     region = getattr(cfg, "screen_capture_region", "left_half") or "left_half"
     text = prompt_server_screen_code(region, image_count=len(images))
@@ -374,7 +371,7 @@ async def api_ask_from_server_screens(body: MultiServerScreenQuestion):
         meta["override_think_mode"] = bool(body.override_think_mode)
     task = (text, images, True, "server_screen_multi", meta)
     if pick_model_index(task, set()) is None:
-        raise HTTPException(400, "没有可用的识图模型，请检查启用状态与 API Key")
+        raise HTTPException(400, "请在实时辅助中选择可用的截图识图模型")
     if not bool(getattr(cfg, "written_exam_mode", False)):
         cancel_answer_work(reset_session_data=False)
     queued = submit_answer_task(task)

@@ -13,6 +13,8 @@ from typing import Any, Callable, Optional, Tuple
 TaskImage = Optional[str | list[str]]
 TaskPayload = Tuple[str, TaskImage, bool, str, dict[str, Any]]
 PendingTask = Tuple[TaskPayload, int, int]
+ModelReservation = str | int
+InFlightTasks = dict[int, tuple[ModelReservation | None, TaskPayload]]
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,7 @@ class DispatchClaim:
 class DispatchStep:
     claim: DispatchClaim | None = None
     skipped_seq: int | None = None
+    unavailable: bool = False
 
 
 def task_meta(task: TaskPayload) -> dict[str, Any]:
@@ -61,17 +64,18 @@ def priority_model_index(cfg) -> int:
     n = len(cfg.models)
     if n <= 0:
         return 0
+    fallback = max(0, min(int(getattr(cfg, "active_model", 0) or 0), n - 1))
     try:
         active_model = cfg.get_active_model()
     except Exception:
-        return max(0, min(int(cfg.active_model), n - 1))
+        return fallback
     for i, model in enumerate(cfg.models):
         if model is active_model:
             return i
-    return max(0, min(int(cfg.active_model), n - 1))
+    return fallback
 
 
-def dispatch_model_order(cfg) -> list[int]:
+def _legacy_model_order(cfg) -> list[int]:
     n = len(cfg.models)
     if n == 0:
         return []
@@ -79,19 +83,36 @@ def dispatch_model_order(cfg) -> list[int]:
     return [priority] + [i for i in range(n) if i != priority]
 
 
+def dispatch_model_order(cfg, task: TaskPayload | None = None) -> list[int]:
+    selected = getattr(cfg, "assist_model_ids", None)
+    if selected is None or (task is not None and task_meta(task).get("purpose") == "knowledge_practice"):
+        return _legacy_model_order(cfg)
+    if task is not None and task[3].startswith("server_screen_"):
+        selected = [getattr(cfg, "assist_screenshot_model_id", None)]
+    by_id = {model.id: index for index, model in enumerate(cfg.models)}
+    return [by_id[model_id] for model_id in selected if model_id in by_id]
+
+
+def model_reservation(cfg, index: int) -> ModelReservation:
+    return getattr(cfg.models[index], "id", "") or index
+
+
 def pick_model_index(
     task: TaskPayload,
-    busy: set[int],
+    busy: set[ModelReservation],
     cfg,
     get_model_health: Callable[[int], Optional[str]],
-    avoid_models: Optional[set[int]] = None,
+    avoid_models: Optional[set[ModelReservation]] = None,
+    *,
+    excluded_indices: set[int] | None = None,
 ) -> Optional[int]:
     _text, image, _manual, _source, _meta = task
     need_vision = bool(image)
     avoid = avoid_models or set()
+    excluded = excluded_indices or set()
 
     def ok_basic(i: int, model) -> bool:
-        if i in busy:
+        if i in excluded or i in busy or model_reservation(cfg, i) in busy:
             return False
         if not getattr(model, "enabled", True):
             return False
@@ -101,57 +122,32 @@ def pick_model_index(
             return False
         return True
 
-    order = dispatch_model_order(cfg)
-    if avoid:
-        for i in order:
-            if i in avoid:
-                continue
-            model = cfg.models[i]
-            if not ok_basic(i, model):
-                continue
-            if get_model_health(i) == "error":
-                continue
-            return i
-        for i in order:
-            if i in avoid:
-                continue
-            model = cfg.models[i]
-            if ok_basic(i, model):
-                return i
-    for i in order:
-        model = cfg.models[i]
-        if not ok_basic(i, model):
-            continue
-        if get_model_health(i) == "error":
-            continue
-        return i
-    for i in order:
-        model = cfg.models[i]
-        if ok_basic(i, model):
-            return i
-    return None
+    available = [i for i in dispatch_model_order(cfg, task) if ok_basic(i, cfg.models[i])]
+    preferred = [i for i in available if i not in avoid and model_reservation(cfg, i) not in avoid]
+    candidates = preferred or available
+    return next((i for i in candidates if get_model_health(i) != "error"), candidates[0] if candidates else None)
 
 
-def max_parallel_slots(cfg, get_model_health: Callable[[int], Optional[str]]) -> int:
-    n_ok = sum(1 for i, model in enumerate(cfg.models) if model_eligible(i, model, False, get_model_health))
+def max_parallel_slots(
+    cfg, get_model_health: Callable[[int], Optional[str]], *, include_screenshots: bool = True, include_practice: bool = False,
+) -> int:
+    order = _legacy_model_order(cfg) if include_practice else dispatch_model_order(cfg)
+    if include_screenshots and getattr(cfg, "assist_screenshot_model_id", None):
+        order = list(dict.fromkeys(order + dispatch_model_order(cfg, ("", "image", True, "server_screen_left", {}))))
+    n_ok = sum(1 for i in order if model_eligible(i, cfg.models[i], False, get_model_health))
     cap = max(1, getattr(cfg, "max_parallel_answers", 2))
     return max(1, min(cap, max(n_ok, 1)))
 
 
 def dispatch_snapshot(
-    in_flight_tasks: dict[int, tuple[int, TaskPayload]],
+    in_flight_tasks: InFlightTasks,
     latest_asr_turn_id: int,
-) -> tuple[set[int], int]:
-    busy_models: set[int] = set()
-    effective_slots = 0
-    for model_idx, _task in in_flight_tasks.values():
-        busy_models.add(model_idx)
-        effective_slots += 1
-    return busy_models, effective_slots
+) -> tuple[set[ModelReservation], int]:
+    return physical_busy_models(in_flight_tasks), len(in_flight_tasks)
 
 
-def physical_busy_models(in_flight_tasks: dict[int, tuple[int, TaskPayload]]) -> set[int]:
-    return {model_idx for model_idx, _task in in_flight_tasks.values()}
+def physical_busy_models(in_flight_tasks: InFlightTasks) -> set[ModelReservation]:
+    return {model for model, _task in in_flight_tasks.values() if model is not None}
 
 
 def begin_asr_turn(
@@ -176,13 +172,15 @@ def begin_asr_turn(
 
 def claim_next_dispatch(
     pending: list[PendingTask],
-    in_flight_tasks: dict[int, tuple[int, TaskPayload]],
+    in_flight_tasks: InFlightTasks,
     latest_asr_turn_id: int,
     max_parallel_slots: int,
-    pick_model_index: Callable[[TaskPayload, set[int], Optional[set[int]]], Optional[int]],
+    pick_model_index: Callable[[TaskPayload, set[ModelReservation], Optional[set[ModelReservation]]], Optional[int]],
     *,
     interrupt_stale_asr: bool = True,
     now_mono: float | None = None,
+    reserve_model: Callable[[int], ModelReservation] = lambda index: index,
+    discard_unavailable: bool = False,
 ) -> DispatchStep:
     busy_models, effective_slots = dispatch_snapshot(in_flight_tasks, latest_asr_turn_id)
     physical_busy = physical_busy_models(in_flight_tasks)
@@ -204,7 +202,7 @@ def claim_next_dispatch(
         model_idx = pick_model_index(task, busy_models, avoid_models)
         if model_idx is not None:
             pending.pop(idx)
-            in_flight_tasks[seq] = (model_idx, task)
+            in_flight_tasks[seq] = (reserve_model(model_idx), task)
             return DispatchStep(
                 claim=DispatchClaim(
                     task=task,
@@ -213,6 +211,9 @@ def claim_next_dispatch(
                     session_version=session_version,
                 )
             )
+        if discard_unavailable and pick_model_index(task, set(), None) is None:
+            pending.pop(idx)
+            return DispatchStep(skipped_seq=seq, unavailable=True)
         idx += 1
     return DispatchStep()
 

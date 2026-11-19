@@ -45,6 +45,8 @@ from api.assist.asr_state import (
 )
 from api.assist.single_mic import RoleSwitch, SingleMicConflict, SingleMicSession
 from api.assist.scheduler import (
+    InFlightTasks,
+    ModelReservation,
     TaskPayload,
     begin_asr_turn as scheduler_begin_asr_turn,
     claim_next_dispatch,
@@ -56,6 +58,7 @@ from api.assist.scheduler import (
     key_ok,
     max_parallel_slots as scheduler_max_parallel_slots,
     model_eligible as scheduler_model_eligible,
+    model_reservation,
     physical_busy_models as scheduler_physical_busy_models,
     pick_model_index as scheduler_pick_model_index,
     priority_model_index as scheduler_priority_model_index,
@@ -91,8 +94,9 @@ _gen_lock = threading.Lock()
 
 _pending: list[tuple[TaskPayload, int, int]] = []
 _dispatch_lock = threading.Lock()
+_dispatch_changed = threading.Condition(_dispatch_lock)
 _asr_state_lock = threading.RLock()
-_in_flight_tasks: dict[int, tuple[int, TaskPayload]] = {}
+_in_flight_tasks: InFlightTasks = {}
 _task_session_version = 0
 _latest_asr_turn_id = 0
 
@@ -526,6 +530,7 @@ def _reset_answer_state(reset_session_data: bool = False, *, invalidate_capture:
             _latest_asr_turn_id = 0
             _task_session_version += 1
             next_commit_seq = _next_submit_seq
+            _dispatch_changed.notify_all()
         _reset_asr_merge_buffer_locked()
         _reset_pending_asr_group_locked()
         if reset_session_data:
@@ -617,11 +622,11 @@ def _dispatch_model_order(cfg) -> list[int]:
     return scheduler_dispatch_model_order(cfg)
 
 
-def _dispatch_snapshot_locked() -> tuple[set[int], int]:
+def _dispatch_snapshot_locked() -> tuple[set[ModelReservation], int]:
     return scheduler_dispatch_snapshot(_in_flight_tasks, _latest_asr_turn_id)
 
 
-def _physical_busy_models_locked() -> set[int]:
+def _physical_busy_models_locked() -> set[ModelReservation]:
     return scheduler_physical_busy_models(_in_flight_tasks)
 
 
@@ -673,6 +678,7 @@ def _begin_asr_turn() -> int:
             interrupt_pending_asr=_should_interrupt_stale_asr(cfg),
         )
         turn_id = _latest_asr_turn_id
+        _dispatch_changed.notify_all()
     for seq in skipped:
         _mark_seq_skipped(seq)
     return turn_id
@@ -680,8 +686,8 @@ def _begin_asr_turn() -> int:
 
 def pick_model_index(
     task: TaskPayload,
-    busy: set[int],
-    avoid_models: Optional[set[int]] = None,
+    busy: set[ModelReservation],
+    avoid_models: Optional[set[ModelReservation]] = None,
 ) -> Optional[int]:
     return scheduler_pick_model_index(
         task,
@@ -698,7 +704,10 @@ def _max_parallel_slots() -> int:
 
 def _should_interrupt_stale_asr(cfg=None) -> bool:
     cfg = cfg or get_config()
-    return bool(asr_interrupt_running(cfg) and scheduler_max_parallel_slots(cfg, get_model_health) <= 1)
+    return bool(
+        asr_interrupt_running(cfg)
+        and scheduler_max_parallel_slots(cfg, get_model_health, include_screenshots=False) <= 1
+    )
 
 
 def submit_answer_task(task: TaskPayload) -> bool:
@@ -707,7 +716,7 @@ def submit_answer_task(task: TaskPayload) -> bool:
         broadcast(
             {
                 "type": "error",
-                "message": "\u6ca1\u6709\u53ef\u7528\u7684\u7b54\u9898\u6a21\u578b\uff1a\u8bf7\u81f3\u5c11\u542f\u7528\u4e00\u4e2a\u5df2\u914d\u7f6e API Key \u7684\u6a21\u578b\uff08\u8bc6\u56fe\u9898\u9700\u8bc6\u56fe\u6a21\u578b\uff09\u3002",
+                "message": "没有可用的答题模型，请在实时辅助中选择已配置且支持该题型的模型。",
             }
         )
         return False
@@ -860,8 +869,8 @@ def _try_dispatch():
 
         def _pick_from_snapshot(
             task: TaskPayload,
-            busy: set[int],
-            avoid_models: Optional[set[int]] = None,
+            busy: set[ModelReservation],
+            avoid_models: Optional[set[ModelReservation]] = None,
             cfg_snapshot=cfg,
         ) -> Optional[int]:
             return scheduler_pick_model_index(
@@ -873,14 +882,17 @@ def _try_dispatch():
             )
 
         with _dispatch_lock:
+            practice_pending = any(task_meta(task).get("purpose") == "knowledge_practice" for task, _, _ in _pending)
             step = claim_next_dispatch(
                 _pending,
                 _in_flight_tasks,
                 _latest_asr_turn_id,
-                scheduler_max_parallel_slots(cfg, get_model_health),
+                scheduler_max_parallel_slots(cfg, get_model_health, include_practice=practice_pending),
                 _pick_from_snapshot,
                 interrupt_stale_asr=_should_interrupt_stale_asr(cfg),
                 now_mono=time.monotonic(),
+                reserve_model=lambda index: model_reservation(cfg, index),
+                discard_unavailable=True,
             )
             model_cfg_snapshot = None
             config_snapshot = None
@@ -896,6 +908,8 @@ def _try_dispatch():
                     model_cfg_snapshot = copy.deepcopy(config_snapshot.models[selected_idx])
         if step.skipped_seq is not None:
             _mark_seq_skipped(step.skipped_seq)
+            if step.unavailable:
+                broadcast({"type": "error", "message": "选中的答题模型已不可用，请在实时辅助中重新选择。"})
             continue
         if step.claim is None:
             return
@@ -931,12 +945,48 @@ def _run_answer_worker(
             config_snapshot,
         )
     finally:
-        with _dispatch_lock:
+        with _dispatch_changed:
             _in_flight_tasks.pop(seq, None)
+            _dispatch_changed.notify_all()
         request = task_meta(task).get("mmpg_request")
         if request and request.on_finished:
             request.on_finished()
         _try_dispatch()
+
+
+def _reserve_answer_retry(
+    task: TaskPayload, seq: int, cfg, attempted: set[int], aborted: Callable[[], bool],
+    *, on_wait: Callable[[], None] | None = None,
+) -> int | None:
+    with _dispatch_changed:
+        if seq not in _in_flight_tasks:
+            return None
+        # Keep the same question/commit slot and release its failed model so
+        # two concurrent questions can each try the other's available model.
+        _in_flight_tasks[seq] = (None, task)
+        _dispatch_changed.notify_all()
+    announced_wait = False
+    while not aborted():
+        with _dispatch_changed:
+            if seq not in _in_flight_tasks:
+                return None
+            busy = scheduler_physical_busy_models(_in_flight_tasks)
+            index = scheduler_pick_model_index(
+                task, busy, cfg, lambda _index: None, excluded_indices=attempted,
+            )
+            if index is not None:
+                _in_flight_tasks[seq] = (model_reservation(cfg, index), task)
+                return index
+            if not busy or scheduler_pick_model_index(
+                task, set(), cfg, lambda _index: None, excluded_indices=attempted,
+            ) is None:
+                return None
+            if announced_wait or on_wait is None:
+                _dispatch_changed.wait(timeout=0.1)
+                continue
+        on_wait()
+        announced_wait = True
+    return None
 
 
 def _flush_commit(seq: int, apply_fn: Callable[[], None]):
@@ -2083,6 +2133,9 @@ def _process_question_parallel(
             start_abort_check=aborted if request is not None else session_stale,
             model_cfg_snapshot=model_cfg_snapshot,
             config_snapshot=config_snapshot,
+            reserve_retry=lambda attempted, on_wait: _reserve_answer_retry(
+                task, seq, cfg, attempted, aborted, on_wait=on_wait,
+            ),
         ),
     )
 

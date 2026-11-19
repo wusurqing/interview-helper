@@ -119,9 +119,9 @@ def _build_verify_prompt(answer: str, image_count: int) -> str:
     return _VERIFY_PROMPT.format(answer=answer, image_note=image_note)
 
 
-def _verify_blocking(answer: str, image_data_url: str | Sequence[str]) -> dict:
+def _verify_blocking(answer: str, image_data_url: str | Sequence[str], *, model_cfg=None) -> dict:
     """同步执行一次 self-verify。失败时返回 verdict=UNKNOWN。"""
-    model_cfg = _pick_vision_model_cfg()
+    model_cfg = model_cfg if model_cfg is not None else _pick_vision_model_cfg()
     if model_cfg is None:
         return {"verdict": "UNKNOWN", "reason": "未配置可用的视觉模型"}
 
@@ -160,6 +160,7 @@ def schedule_self_verify(
     answer: str,
     image_data_url: Optional[str | Sequence[str]],
     broadcast_callable,
+    model_cfg=None,
 ) -> None:
     """异步触发一次 self-verify,完成后通过 broadcast_callable 推送结果。
 
@@ -169,7 +170,8 @@ def schedule_self_verify(
     images = _normalize_image_data_urls(image_data_url)
     if not qa_id or not answer or not images:
         return
-    if _pick_vision_model_cfg() is None:
+    selected_model = model_cfg if model_cfg is not None else _pick_vision_model_cfg()
+    if selected_model is None:
         return
     if not _VERIFY_SEMAPHORE.acquire(blocking=False):
         _log.debug("vision_verify skipped (semaphore full) id=%s", qa_id)
@@ -179,7 +181,7 @@ def schedule_self_verify(
         try:
             from services.llm import trace
             with trace.scope("vision_verify", qa_id=qa_id):
-                result = _verify_blocking(answer, images)
+                result = _verify_blocking(answer, images, model_cfg=selected_model)
         except Exception as e:  # noqa: BLE001
             _log.warning("vision self-verify worker crashed: %s", e)
             result = {"verdict": "UNKNOWN", "reason": f"自检异常: {e}"}

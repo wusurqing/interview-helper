@@ -11,10 +11,13 @@ from typing import Optional
 import numpy as np
 
 from api.realtime.ws import broadcast
+from api.common.model_health import get_model_health
+from api.assist.scheduler import pick_model_index
 from core.config import get_config
 from core.logger import get_logger
 from services.audio import AudioCapture, play_audio_file
 from services.llm import (
+    LLMError,
     PROMPT_MODE_ASR_REALTIME,
     build_system_prompt,
     chat_stream_single_model,
@@ -23,8 +26,8 @@ from services.llm import (
 from services.llm.interview_budget import stream_interview_answer
 from services.llm.prompts import (
     build_assist_user_context,
+    config_for_assist_generation,
     format_interview_utterance,
-    max_tokens_for_assist_prompt,
 )
 from services.stt import transcribe_segment
 
@@ -478,12 +481,8 @@ def resolve_preflight_scenario(scenario_id: str) -> dict:
 
 def generate_preflight_answer(cfg, model_cfg, question: str) -> dict:
     prompt_mode = PROMPT_MODE_ASR_REALTIME
-    short_answer = bool(getattr(cfg, "assist_high_churn_short_answer", False))
-    system_prompt = build_system_prompt(
-        mode=prompt_mode,
-        high_churn_short_answer=short_answer,
-        cfg=cfg,
-    )
+    generation_cfg = config_for_assist_generation(cfg, prompt_mode)
+    system_prompt = build_system_prompt(mode=prompt_mode, cfg=cfg)
     user_context = build_assist_user_context(cfg, mode=prompt_mode)
     context_prefix = f"[本轮任务资料]\n{user_context}\n\n[真实对话]" if user_context else None
     turn = format_interview_utterance(question, speaker="interviewer", current=True)
@@ -497,8 +496,9 @@ def generate_preflight_answer(cfg, model_cfg, question: str) -> dict:
         system_prompt=system_prompt,
         context_prefix=context_prefix,
         stream_fn=chat_stream_single_model,
-        override_max_tokens=max_tokens_for_assist_prompt(prompt_mode, cfg, high_churn_short_answer=short_answer),
-        config_snapshot=cfg,
+        override_max_tokens=generation_cfg.max_tokens,
+        config_snapshot=generation_cfg,
+        trace_context={"scene": "assist_realtime", "source": "audio_preflight"},
     ):
         if chunk_type != "text":
             continue
@@ -513,6 +513,24 @@ def generate_preflight_answer(cfg, model_cfg, question: str) -> dict:
         "first_token_ms": first_token_ms,
         "total_ms": total_ms,
     }
+
+
+def generate_selected_preflight_answer(cfg, question: str):
+    task = (question, None, False, "conversation_loopback", {})
+    attempted: set[int] = set()
+    reason = "请在实时辅助中选择已配置的答题模型"
+    while (index := pick_model_index(task, set(), cfg, get_model_health, excluded_indices=attempted)) is not None:
+        attempted.add(index)
+        model = cfg.models[index]
+        try:
+            result = generate_preflight_answer(cfg, model, question)
+        except LLMError as exc:
+            reason = exc.user_msg
+        else:
+            if result["answer"].strip():
+                return model, result
+            reason = "模型回答为空"
+    raise RuntimeError(reason)
 
 
 def _run_preflight(device_id: Optional[int], scenario_id: str):
@@ -583,8 +601,7 @@ def _run_preflight(device_id: Optional[int], scenario_id: str):
             raise RuntimeError(detail)
 
         _set_step("llm", "running", "正在通过真实答题链路检测 LLM…")
-        model_cfg = cfg.get_active_model()
-        llm_result = generate_preflight_answer(cfg, model_cfg, llm_question)
+        model_cfg, llm_result = generate_selected_preflight_answer(cfg, llm_question)
         answer = llm_result["answer"]
         if not answer:
             raise RuntimeError("模型回答为空")

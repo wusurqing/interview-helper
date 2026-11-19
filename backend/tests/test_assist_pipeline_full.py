@@ -279,7 +279,7 @@ def test_cancelling_a_plain_answer_waiting_for_an_earlier_commit_emits_terminal_
     pipeline.cancel_answer_work()
     _DeferredThread.started[0].run()
 
-    assert broadcasts[-1] == {"type": "answer_cancelled", "id": qa_id}
+    assert broadcasts[-1] == {"type": "answer_cancelled", "id": qa_id, "attempt": 1}
     assert get_session().qa_pairs == []
 
 

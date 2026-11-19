@@ -176,3 +176,72 @@ def test_pick_model_index_respects_priority_and_vision():
     )
 
     assert picked == 1
+
+
+def test_realtime_selection_limits_pasted_images_and_separates_screenshots():
+    from core.config import AppConfig, ModelConfig
+
+    cfg = AppConfig(
+        models=[
+            ModelConfig(id="outside", api_key="test", supports_vision=True),
+            ModelConfig(id="answer", api_key="test"),
+            ModelConfig(id="paste", api_key="test", supports_vision=True),
+            ModelConfig(id="screen", api_key="test", supports_vision=True),
+        ],
+        assist_model_ids=["answer", "paste"],
+        assist_screenshot_model_id="screen",
+    )
+
+    def pick(image=None, source="manual_text", busy=None, exclude=None):
+        return scheduler.pick_model_index(
+            ("问题", image, True, source, {}), busy or set(), cfg, lambda _index: None,
+            excluded_indices=exclude,
+        )
+
+    assert pick() == 1
+    assert pick(busy={"answer"}) == 2
+    assert pick(exclude={1, 2}) is None
+    assert pick("image", "manual_image") == 2
+    assert pick("image", "manual_image", {"paste"}) is None
+    assert pick("image", "server_screen_left") == 3
+    assert pick("image", "server_screen_left", {"screen"}) is None
+
+
+def test_retry_releases_its_failed_model_and_waits_for_an_occupied_candidate(monkeypatch):
+    from threading import Event, Thread
+
+    from api.assist import pipeline
+    from core.config import AppConfig, ModelConfig
+
+    task = _manual_task("待重试的题")
+    cfg = AppConfig(
+        models=[ModelConfig(id="primary", api_key="test"), ModelConfig(id="fallback", api_key="test")],
+        assist_model_ids=["primary", "fallback"],
+    )
+    in_flight = {0: ("primary", task), 1: ("fallback", _manual_task("并行的题"))}
+    monkeypatch.setattr(pipeline, "_in_flight_tasks", in_flight)
+    released = Event()
+    result = []
+
+    worker = Thread(
+        target=lambda: result.append(
+            pipeline._reserve_answer_retry(task, 0, cfg, {0}, lambda: False, on_wait=released.set)
+        ),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        assert released.wait(2)
+        with pipeline._dispatch_changed:
+            assert in_flight[0] == (None, task)
+            assert in_flight[1][0] == "fallback"
+            del in_flight[1]
+            pipeline._dispatch_changed.notify_all()
+        worker.join(2)
+        assert result == [1]
+        assert in_flight[0] == ("fallback", task)
+    finally:
+        with pipeline._dispatch_changed:
+            in_flight.clear()
+            pipeline._dispatch_changed.notify_all()
+        worker.join(2)
