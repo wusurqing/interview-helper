@@ -68,6 +68,14 @@ describe('PreferencesTab', () => {
     })
   })
 
+  it('keeps appearance controls separate from quick prompts', () => {
+    render(<PreferencesTab variant="appearance" />)
+
+    expect(screen.getByText('配色方案')).toBeInTheDocument()
+    expect(screen.getByText('流式跟滚阈值（像素）')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: '快捷提示词' })).not.toBeInTheDocument()
+  })
+
   it('does not call the main Whisper engine a fallback', () => {
     render(<PreferencesTab />)
     expect(screen.queryByText(/Whisper 降级就绪/)).not.toBeInTheDocument()
