@@ -163,6 +163,49 @@ describe('ControlBar', () => {
     })
   })
 
+  it.each([
+    { written_exam_model_id: null },
+    { written_exam_model_id: 'missing' },
+    { written_exam_model_id: 'disabled' },
+    { written_exam_model_id: 'no-key' },
+    { written_exam_model_id: 'text' },
+  ])('requires a configured vision primary even when an interview backup is ready ($written_exam_model_id)', (selection) => {
+    useInterviewStore.setState(({ config }) => ({
+      config: config && {
+        ...config, written_exam_mode: true, ...selection, assist_model_ids: ['backup'], assist_screenshot_model_id: 'backup',
+        models: [
+          { id: 'backup', name: 'Backup', has_api_key: true, enabled: true, supports_vision: true, supports_think: false },
+          { id: 'disabled', name: 'Off', has_api_key: true, enabled: false, supports_vision: true, supports_think: false },
+          { id: 'no-key', name: 'No Key', has_api_key: false, enabled: true, supports_vision: true, supports_think: false },
+          { id: 'text', name: 'Text', has_api_key: true, enabled: true, supports_vision: false, supports_think: false },
+        ],
+      },
+    }))
+    render(<ControlBar />)
+    fireEvent.change(screen.getByPlaceholderText('输入问题，Enter 发送…'), { target: { value: '题面' } })
+    expect(screen.getByRole('button', { name: '发送问题' })).toBeDisabled()
+    expect(screen.getByText('请先在笔试配置中选择可用的识图模型。')).toBeInTheDocument()
+    expect(apiMock.ask).not.toHaveBeenCalled()
+  })
+
+  it('sends an exam question with a pasted image using an exam-only model', async () => {
+    useInterviewStore.setState(({ config }) => ({
+      config: config && {
+        ...config, written_exam_mode: true, written_exam_model_id: 'exam', assist_model_ids: [],
+        models: [{ id: 'exam', name: 'Exam', supports_think: false, supports_vision: true, enabled: true, has_api_key: true }],
+      },
+    }))
+    render(<ControlBar />)
+    const input = screen.getByPlaceholderText('输入问题，Enter 发送…')
+    const file = new File(['image'], 'shot.png', { type: 'image/png' })
+    fireEvent.change(input, { target: { value: '分析题面' } })
+    expect(screen.getByRole('button', { name: '发送问题' })).toBeEnabled()
+    fireEvent.paste(input, { clipboardData: { items: [{ type: 'image/png', getAsFile: () => file }] } })
+    await waitFor(() => expect(screen.getByAltText('screenshot')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '发送问题' }))
+    await waitFor(() => expect(apiMock.ask).toHaveBeenCalledWith('分析题面', expect.stringMatching(/^data:image/)))
+  })
+
   it('blocks pasted screenshots when no enabled model supports vision', async () => {
     useInterviewStore.setState(({ config }) => ({
       config: config && {

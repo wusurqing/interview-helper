@@ -24,6 +24,7 @@ class QAPair:
     answer_format: str | None = None
     first_token_ms: int | None = None
     total_ms: int | None = None
+    written_exam: bool = False
 
 
 @dataclass
@@ -224,6 +225,7 @@ class Session:
         answer_format: str | None = None,
         first_token_ms: int | None = None,
         total_ms: int | None = None,
+        written_exam: bool = False,
     ) -> QAPair:
         qa = QAPair(
             id=qa_id or f"qa-{len(self.qa_pairs)}-{int(time.time())}",
@@ -235,6 +237,7 @@ class Session:
             answer_format=answer_format,
             first_token_ms=first_token_ms,
             total_ms=total_ms,
+            written_exam=written_exam,
         )
         self.qa_pairs.append(qa)
         if len(self.qa_pairs) > self.MAX_QA_PAIRS:
@@ -424,6 +427,7 @@ class Session:
 
     def _serialize_qa_pair(self, qa: QAPair) -> dict:
         payload = asdict(qa)
+        payload.pop("written_exam")
         verdict = str(payload.pop("vision_verify_verdict", "") or "")
         reason = str(payload.pop("vision_verify_reason", "") or "")
         if not payload.get("updates_qa_id"):

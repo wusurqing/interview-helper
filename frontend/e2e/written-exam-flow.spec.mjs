@@ -42,6 +42,8 @@ test.describe('written exam flow', () => {
     const requests = []
     let config = {
       ...SAMPLE_WRITTEN_EXAM_CONFIG,
+      assist_model_ids: [],
+      assist_screenshot_model_id: null,
       written_exam_mode: false,
       candidate_asr_enabled: true,
       candidate_stt_provider: 'doubao_mmpg',
@@ -98,6 +100,7 @@ test.describe('written exam flow', () => {
     const examTab = page.getByRole('tab', { name: '笔试辅助' })
     await examTab.click()
     await expect(examTab).toHaveAttribute('aria-selected', 'true')
+    await expect(page.getByRole('button', { name: '笔试模型 GPT-4.1 Mini' })).toBeVisible()
     await expect(page.getByLabel('转写记录')).toHaveCount(0)
     await expect(page.getByLabel('选择会议音频设备')).toHaveCount(0)
     await expect(page.getByText('AI 笔试助手')).toBeVisible({ timeout: 5000 })

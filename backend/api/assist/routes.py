@@ -5,7 +5,7 @@ from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool
 
 from core.config import get_config
 from core.logger import get_logger
@@ -30,6 +30,7 @@ from .pipeline import (
     _bump_generation,
 )
 from .single_mic import Role, RoleSwitch, SingleMicConflict, SingleMicSession
+from .scheduler import EXAM_MODEL_UNAVAILABLE, task_is_written_exam
 
 router = APIRouter()
 _rlog = get_logger("assist.routes")
@@ -51,6 +52,7 @@ class SingleMicRoleRequest(BaseModel):
 class MultiServerScreenQuestion(BaseModel):
     images: list[str]
     override_think_mode: Optional[bool] = None
+    expected_written_exam_mode: StrictBool | None = None
 
 
 class ServerScreenQuestion(BaseModel):
@@ -312,8 +314,12 @@ async def api_ask(body: ManualQuestion):
         meta["purpose"] = body.purpose
     if body.override_think_mode is not None:
         meta["override_think_mode"] = bool(body.override_think_mode)
-    queued = submit_answer_task((text, body.image, True, src, meta))
+    cfg = get_config()
+    task = (text, body.image, True, src, meta)
+    queued = submit_answer_task(task, config_snapshot=cfg)
     if not queued:
+        if task_is_written_exam(task, cfg):
+            raise HTTPException(503, EXAM_MODEL_UNAVAILABLE)
         raise HTTPException(503, (
             "没有可用的答题模型，请先配置模型" if body.purpose == "knowledge_practice" else
             "没有可用的答题模型，请在实时辅助中选择已配置且支持该题型的模型"
@@ -325,27 +331,27 @@ async def api_ask(body: ManualQuestion):
 async def api_ask_from_server_screen(body: Optional[ServerScreenQuestion] = None):
     from services.capture import ScreenCaptureError, capture_primary_left_half_data_url
 
-    if pick_model_index(("", "screen", True, "server_screen_left", {}), set()) is None:
-        raise HTTPException(400, "请在实时辅助中选择可用的截图识图模型")
+    cfg = get_config()
+    written_exam = bool(getattr(cfg, "written_exam_mode", False))
+    model_error = EXAM_MODEL_UNAVAILABLE if written_exam else "请在实时辅助中选择可用的截图识图模型"
+    if pick_model_index(("", "screen", True, "server_screen_left", {}), set(), config_snapshot=cfg) is None:
+        raise HTTPException(400, model_error)
     try:
         data_url = capture_primary_left_half_data_url()
     except ScreenCaptureError as e:
         raise HTTPException(503, str(e))
-    cfg = get_config()
     region = getattr(cfg, "screen_capture_region", "left_half") or "left_half"
     text = prompt_server_screen_code(region)
     meta = {"origin": "server_screen"}
     if body is not None and body.override_think_mode is not None:
         meta["override_think_mode"] = bool(body.override_think_mode)
-    if pick_model_index((text, data_url, True, "server_screen_left", meta), set()) is None:
-        raise HTTPException(400, "请在实时辅助中选择可用的截图识图模型")
     # Written exam: keep in-flight answers so multi-shot screenshots can run in parallel.
     # Non-exam interview: cancel previous generation (screenshot replaces the live answer).
-    if not bool(getattr(cfg, "written_exam_mode", False)):
+    if not written_exam:
         cancel_answer_work(reset_session_data=False)
-    queued = submit_answer_task((text, data_url, True, "server_screen_left", meta))
+    queued = submit_answer_task((text, data_url, True, "server_screen_left", meta), config_snapshot=cfg)
     if not queued:
-        raise HTTPException(503, "没有可用的识图模型，请检查启用状态与 API Key")
+        raise HTTPException(503, model_error)
     return {"ok": True}
 
 
@@ -353,8 +359,9 @@ async def api_ask_from_server_screen(body: Optional[ServerScreenQuestion] = None
 async def api_capture_server_screen():
     from services.capture import ScreenCaptureError, capture_primary_left_half_data_url
 
+    written_exam = bool(getattr(get_config(), "written_exam_mode", False))
     try:
-        return {"ok": True, "image": capture_primary_left_half_data_url()}
+        return {"ok": True, "image": capture_primary_left_half_data_url(), "written_exam_mode": written_exam}
     except ScreenCaptureError as e:
         raise HTTPException(503, str(e))
 
@@ -367,19 +374,23 @@ async def api_ask_from_server_screens(body: MultiServerScreenQuestion):
     if len(images) > 8:
         raise HTTPException(400, "一次最多提交 8 张截图")
     cfg = get_config()
+    written_exam = bool(getattr(cfg, "written_exam_mode", False))
+    if body.expected_written_exam_mode is not None and body.expected_written_exam_mode != written_exam:
+        raise HTTPException(409, "答题模式已切换，请重新截图后提交。")
+    model_error = EXAM_MODEL_UNAVAILABLE if written_exam else "请在实时辅助中选择可用的截图识图模型"
     region = getattr(cfg, "screen_capture_region", "left_half") or "left_half"
     text = prompt_server_screen_code(region, image_count=len(images))
     meta = {"origin": "server_screen", "image_count": len(images)}
     if body.override_think_mode is not None:
         meta["override_think_mode"] = bool(body.override_think_mode)
     task = (text, images, True, "server_screen_multi", meta)
-    if pick_model_index(task, set()) is None:
-        raise HTTPException(400, "请在实时辅助中选择可用的截图识图模型")
-    if not bool(getattr(cfg, "written_exam_mode", False)):
+    if pick_model_index(task, set(), config_snapshot=cfg) is None:
+        raise HTTPException(400, model_error)
+    if not written_exam:
         cancel_answer_work(reset_session_data=False)
-    queued = submit_answer_task(task)
+    queued = submit_answer_task(task, config_snapshot=cfg)
     if not queued:
-        raise HTTPException(503, "没有可用的识图模型，请检查启用状态与 API Key")
+        raise HTTPException(503, model_error)
     return {"ok": True}
 
 

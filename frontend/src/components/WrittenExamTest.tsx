@@ -14,7 +14,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { getAssistScreenshotModel } from '@/lib/assistModels'
+import { getWrittenExamModel, missingWrittenExamModel } from '@/lib/assistModels'
 import { buildWsUrl } from '@/lib/backendUrl'
 import { useInterviewStore } from '@/stores/configStore'
 
@@ -453,8 +453,9 @@ export default function WrittenExamTest() {
     preflightGenerationRef.current += 1
   }, [])
 
+  const screenshotModel = getWrittenExamModel(config)
   const handleRun = async () => {
-    if (runRequestRef.current || running) return
+    if (runRequestRef.current || running || !screenshotModel) return
     const generation = preflightGenerationRef.current + 1
     preflightGenerationRef.current = generation
     runRequestRef.current = true
@@ -496,7 +497,6 @@ export default function WrittenExamTest() {
   const llmQuestion = llmStep?.question ?? steps.submit?.question ?? FIXED_QUESTION
   const firstToken = formatLatency(llmStep?.first_token_ms)
   const total = formatLatency(llmStep?.total_ms)
-  const screenshotModel = getAssistScreenshotModel(config)
   const modelName = llmStep?.model_name ?? steps.submit?.model_name ?? screenshotModel?.name
 
   return (
@@ -526,7 +526,7 @@ export default function WrittenExamTest() {
           <button
             type="button"
             onClick={handleRun}
-            disabled={running}
+            disabled={running || !screenshotModel}
             className="flex items-center gap-1.5 px-4 py-2 btn-primary text-xs font-semibold rounded-xl disabled:opacity-50 flex-shrink-0 whitespace-nowrap"
           >
             {running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Code2 className="w-3.5 h-3.5" />}
@@ -536,7 +536,7 @@ export default function WrittenExamTest() {
           <button
             type="button"
             onClick={handleRun}
-            disabled={running}
+            disabled={running || !screenshotModel}
             className="flex items-center gap-1.5 px-3 py-2 btn-ghost text-xs font-medium rounded-xl disabled:opacity-50 flex-shrink-0"
           >
             {running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
@@ -552,10 +552,10 @@ export default function WrittenExamTest() {
         </div>
       )}
 
-      {!screenshotModel && !hasAnyResult && (
+      {!screenshotModel && !running && (
         <div className="flex items-center gap-2 text-xs text-accent-amber bg-accent-amber/10 px-3 py-2 rounded-lg mb-2">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-          <span>请先在实时辅助中配置截图答题模型。</span>
+          <span>{missingWrittenExamModel}</span>
         </div>
       )}
 
@@ -645,7 +645,7 @@ export default function WrittenExamTest() {
 
       {!hasAnyResult && config && (
         <div className="mt-3 space-y-1 text-[10px] text-text-muted/70 px-1">
-          <div>当前模型：{config.models?.[config.active_model]?.name ?? config.model_name ?? 'N/A'}</div>
+          <div>当前模型：{screenshotModel?.name ?? '未配置'}</div>
           <div>检测会走固定截图代码题，不写入正式答题记录</div>
         </div>
       )}

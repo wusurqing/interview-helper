@@ -56,6 +56,7 @@ class ConfigUpdate(BaseModel):
     models: Optional[list] = None
     assist_model_ids: list[StrictStr] | None = None
     assist_screenshot_model_id: StrictStr | None = None
+    written_exam_model_id: StrictStr | None = None
     assist_generation: dict[AssistScene, AssistGeneration] | None = None
     assist_think_mode: bool | None = None
     assist_think_effort: ThinkEffort | None = None
@@ -345,6 +346,8 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
     d = body.model_dump(exclude_none=True)
     if "assist_screenshot_model_id" in body.model_fields_set:
         d["assist_screenshot_model_id"] = body.assist_screenshot_model_id
+    if "written_exam_model_id" in body.model_fields_set:
+        d["written_exam_model_id"] = body.written_exam_model_id
     model_snapshot = None
     model_origins = None
     try:

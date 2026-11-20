@@ -61,3 +61,109 @@ test('selects and drags answer models while keeping the screenshot model separat
   }])
   await expect(settings.getByRole('button', { name: '保存答题模型设置' })).toBeDisabled()
 })
+
+test('saves the exam model and generation settings in their own tab', async ({ context, page }) => {
+  let config = {
+    ...SAMPLE_CONFIG,
+    models: [
+      { id: 'interview-vision', name: '面试截图模型', supports_vision: true, has_api_key: true },
+      { id: 'text', name: '纯文本模型', supports_vision: false, has_api_key: true },
+      { id: 'exam-vision', name: '笔试视觉模型', supports_vision: true, has_api_key: true },
+    ],
+    assist_model_ids: ['text'],
+    assist_screenshot_model_id: 'interview-vision',
+    written_exam_model_id: null,
+    system_prompts: { assist_exam: '按笔试要求作答。' },
+    assist_generation: {
+      assist_manual: { temperature: 0.4, max_output_tokens: 1400 },
+      assist_exam: { temperature: 0.3, max_output_tokens: 2048 },
+    },
+  }
+  const scenes = [
+    {
+      id: 'assist_manual',
+      group: '实时辅助',
+      label: '手动提问',
+      entry: '面试手动输入问题时使用。',
+      default_prompt: '回答面试问题。',
+      output_contract: '',
+      max_output_tokens: 4096,
+    },
+    {
+      id: 'assist_exam',
+      group: '笔试配置',
+      label: '笔试答题',
+      entry: '笔试文字、粘图和截图答题时使用。',
+      default_prompt: '给出可提交的答案。',
+      output_contract: '',
+      max_output_tokens: 4096,
+    },
+  ]
+  const updates = []
+  await installMocks(context, {
+    messages: COMMON_WS_BOOTSTRAP,
+    apiOverrides: (path, method, request) => {
+      if (path === '/api/prompts') return { scenes }
+      if (path !== '/api/config') return undefined
+      if (method === 'POST') {
+        const patch = request.postDataJSON()
+        updates.push(patch)
+        config = {
+          ...config,
+          ...patch,
+          system_prompts: { ...config.system_prompts, ...patch.system_prompts },
+          assist_generation: { ...config.assist_generation, ...patch.assist_generation },
+        }
+      }
+      return config
+    },
+  })
+  await page.goto('/')
+  const openSettings = page.getByRole('button', { name: '打开设置', exact: true })
+  await openSettings.click()
+  const settings = page.getByRole('dialog', { name: /设置/ })
+  const nav = settings.getByRole('navigation', { name: '设置分区' })
+  const scenario = settings.getByRole('combobox', { name: '使用场景' })
+  await expect(scenario.getByRole('option', { name: '手动提问' })).toHaveCount(1)
+  await expect(scenario.getByRole('option', { name: '笔试答题' })).toHaveCount(0)
+  await expect(settings.getByRole('combobox', { name: '笔试答题模型' })).toHaveCount(0)
+
+  const examTab = nav.getByRole('button', { name: /^笔试配置/ })
+  await examTab.click()
+  const model = settings.getByRole('combobox', { name: '笔试答题模型' })
+  await expect(model.getByRole('option', { name: '纯文本模型（该模型不支持图片作为输入）' })).toBeDisabled()
+  await expect(model.getByRole('option', { name: '笔试视觉模型' })).toBeEnabled()
+  await model.selectOption('exam-vision')
+  await expect(nav.getByText('未保存：笔试配置')).toBeVisible()
+  expect(updates).toHaveLength(0)
+  await settings.getByRole('button', { name: '保存笔试模型' }).click()
+  await expect(settings.getByRole('button', { name: '保存笔试模型' })).toBeDisabled()
+  await expect.poll(() => updates).toEqual([{ written_exam_model_id: 'exam-vision' }])
+
+  const editor = settings.getByRole('textbox', { name: '系统提示词' })
+  const temperature = settings.getByRole('spinbutton', { name: '温度' })
+  const tokenLimit = settings.getByRole('spinbutton', { name: '最大输出 Token' })
+  await expect(editor).toHaveValue('按笔试要求作答。')
+  await expect(temperature).toHaveValue('0.3')
+  await expect(tokenLimit).toHaveValue('2048')
+  await editor.fill('只写答案。')
+  await temperature.fill('0.2')
+  await tokenLimit.fill('1024')
+  await settings.getByRole('button', { name: '保存当前场景' }).click()
+  await expect(settings.getByText('已保存当前场景')).toBeVisible()
+  expect(updates[1]).toEqual({
+    system_prompts: { assist_exam: '只写答案。' },
+    assist_generation: { assist_exam: { temperature: 0.2, max_output_tokens: 1024 } },
+  })
+  await settings.getByRole('button', { name: '关闭', exact: true }).click()
+  await expect(settings).toHaveCount(0)
+
+  await openSettings.click()
+  await expect(settings.getByRole('combobox', { name: '截图答题模型' })).toHaveValue('interview-vision')
+  await expect(settings.getByRole('spinbutton', { name: '温度' })).toHaveValue('0.4')
+  await examTab.click()
+  await expect(model).toHaveValue('exam-vision')
+  await expect(editor).toHaveValue('只写答案。')
+  await expect(temperature).toHaveValue('0.2')
+  await expect(tokenLimit).toHaveValue('1024')
+})

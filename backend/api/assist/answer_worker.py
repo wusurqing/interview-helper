@@ -31,7 +31,7 @@ from services.llm.prompts import (
     config_for_assist_generation,
     format_interview_utterance,
 )
-from api.assist.scheduler import TaskPayload
+from api.assist.scheduler import EXAM_MODEL_STALE, TaskPayload, task_is_written_exam
 
 
 @dataclass(frozen=True)
@@ -55,12 +55,11 @@ class AnswerWorkerDeps:
     error_logger: Any
     start_abort_check: Optional[Callable[[], bool]] = None
     model_cfg_snapshot: Any = None
-    # The dispatcher captures the complete immutable configuration that was
-    # active when the task claimed a model.  Runtime/session state is still
-    # read through the callbacks above, but prompt and generation settings
-    # must not drift while a queued worker is waiting to start.
+    # Exam options originate at submission; other options originate at dispatch.
+    # Session state and exam catalog availability are still checked at runtime.
     config_snapshot: Any = None
     reserve_retry: Callable[[set[int], Callable[[], None]], int | None] | None = None
+    resolve_exam_model: Callable[[int], Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +73,10 @@ class GeneratedAnswer:
 
 class EmptyAnswer(LLMError):
     user_msg = "模型未返回有效答案，请重试或更换模型。"
+
+
+class ExamModelUnavailable(LLMError):
+    user_msg = EXAM_MODEL_STALE
 
 
 def _screen_region_label(region: str) -> str:
@@ -157,6 +160,7 @@ def _written_exam_followup_context(session_ref, *, source: str, image_count: int
         qa
         for qa in session_ref.qa_pairs[-4:]
         if (qa.question or qa.answer)
+        and qa.written_exam
         and (qa.source or "").startswith("server_screen_")
         and not (qa.source or "").endswith("exam_preflight")
     ][-2:]
@@ -719,8 +723,15 @@ def process_question_parallel(
     if deps.start_abort_check is not None and deps.start_abort_check():
         deps.mark_seq_skipped(seq)
         return
+    if deps.resolve_exam_model is not None:
+        live_model = deps.resolve_exam_model(model_idx)
+        if live_model is None:
+            _broadcast({"type": "answer_error", "id": qa_id, "stage": "generation", "message": EXAM_MODEL_STALE})
+            deps.mark_seq_skipped(seq)
+            return
+        model_cfg = live_model
 
-    written_exam = bool(meta.get("exam_preflight") or getattr(cfg, "written_exam_mode", False))
+    written_exam = task_is_written_exam(task, cfg)
     written_exam_think = bool(getattr(cfg, "written_exam_think", False))
     prompt_mode = prompt_mode_for_task(source, manual_input, written_exam=written_exam)
     knowledge_practice = meta.get("purpose") == "knowledge_practice"
@@ -1158,8 +1169,14 @@ def process_question_parallel(
     generated = None
     attempted: set[int] = set()
     while not deps.abort_check():
+        first_attempt = not attempted
         attempted.add(model_idx)
         try:
+            if deps.resolve_exam_model is not None:
+                live_model = deps.resolve_exam_model(model_idx)
+                if live_model is None:
+                    raise ExamModelUnavailable(EXAM_MODEL_STALE)
+                model_cfg = live_model
             generated = _generate_attempt()
         except Exception as exc:
             if deps.abort_check():
@@ -1182,7 +1199,8 @@ def process_question_parallel(
                 })
 
             next_index = None
-            if isinstance(exc, LLMError) and not knowledge_practice and deps.reserve_retry is not None:
+            primary_lost = first_attempt and isinstance(exc, ExamModelUnavailable)
+            if isinstance(exc, LLMError) and not primary_lost and not knowledge_practice and deps.reserve_retry is not None:
                 next_index = deps.reserve_retry(attempted, announce_retry)
             if deps.abort_check():
                 break
@@ -1195,8 +1213,12 @@ def process_question_parallel(
                 return
             model_idx = next_index
             model_cfg = cfg.models[next_index]
-            deps.logger.info("ANSWER_RETRY id=%s attempt=%d model=%s", qa_id, retry_attempt, model_cfg.name)
-            announce_retry(model_cfg.name)
+            retry_model_name = model_cfg.name
+            if deps.resolve_exam_model is not None:
+                live_model = deps.resolve_exam_model(next_index)
+                retry_model_name = live_model.name if live_model is not None else ""
+            deps.logger.info("ANSWER_RETRY id=%s attempt=%d model=%s", qa_id, retry_attempt, retry_model_name or model_cfg.name)
+            announce_retry(retry_model_name)
         else:
             break
 
@@ -1272,6 +1294,7 @@ def process_question_parallel(
                     qa_id=qa_id,
                     source=source,
                     model_name=model_cfg.name,
+                    written_exam=written_exam,
                     **({"answer_format": "plain_text", "first_token_ms": int(first_token_ms),
                         "total_ms": int(gen_elapsed)} if plain_text else {}),
                     **({"updates_qa_id": mmpg_request.updates_qa_id} if mmpg_request and mmpg_request.updates_qa_id else {}),

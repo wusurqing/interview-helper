@@ -14,8 +14,9 @@ import {
   Search,
 } from 'lucide-react'
 import { useUiSettings } from '@/stores/hooks'
-import { INPUT_FIELD_STYLE, SettingsSearchContext } from './shared'
+import { INPUT_FIELD_STYLE, Section, SettingsSearchContext } from './shared'
 import PreferencesTab from './PreferencesTab'
+import WrittenExamModelSetting from './WrittenExamModelSetting'
 
 const SpeechTab = lazy(() => import('./SpeechTab'))
 const OverlaySettingsTab = lazy(() => import('./OverlaySettingsTab'))
@@ -31,17 +32,21 @@ export default function SettingsDrawer() {
   const contentRef = useRef<HTMLDivElement>(null)
   const previousActiveRef = useRef<HTMLElement | null>(null)
   const wasOpenRef = useRef(false)
-  const navigationGuardRef = useRef({ dirtyExplicitCount: 0, promptSaving: false })
+  const navigationGuardRef = useRef({ dirtyExplicitCount: 0, saving: false })
   const [searchQuery, setSearchQuery] = useState('')
   const [noResults, setNoResults] = useState(false)
   const [promptSaving, setPromptSaving] = useState(false)
+  const [examModelSaving, setExamModelSaving] = useState(false)
+  const saving = promptSaving || examModelSaving
   const [dirtyExplicitSections, setDirtyExplicitSections] = useState<Record<string, boolean>>({})
   const dirtyExplicitCount = Object.values(dirtyExplicitSections).filter(Boolean).length
   const searchEnabled = settingsDrawerTab !== 'models' && settingsDrawerTab !== 'prompts'
   const speechDirty = ['speech', 'speech-doubao', 'speech-generic', 'speech-mmpg'].some((key) => dirtyExplicitSections[key])
   const realtimeDirty = ['assist-models', 'assist-prompts', 'speech-roles'].some((key) => dirtyExplicitSections[key])
+  const examDirty = Boolean(dirtyExplicitSections['exam-model'] || dirtyExplicitSections['exam-prompts'])
   const dirtyExplicitLabels = [
     realtimeDirty ? '实时辅助' : null,
+    examDirty ? '笔试配置' : null,
     speechDirty ? '语音配置' : null,
     dirtyExplicitSections.models ? '模型配置' : null,
     dirtyExplicitSections.prompts ? '系统提示词' : null,
@@ -58,12 +63,12 @@ export default function SettingsDrawer() {
   }, [])
 
   useEffect(() => {
-    navigationGuardRef.current = { dirtyExplicitCount, promptSaving }
-  }, [dirtyExplicitCount, promptSaving])
+    navigationGuardRef.current = { dirtyExplicitCount, saving }
+  }, [dirtyExplicitCount, saving])
 
   const closeSettings = useCallback(() => {
     const guard = navigationGuardRef.current
-    if (guard.promptSaving || (guard.dirtyExplicitCount > 0 && !window.confirm('有未保存更改，关闭后会丢失。'))) {
+    if (guard.saving || (guard.dirtyExplicitCount > 0 && !window.confirm('有未保存更改，关闭后会丢失。'))) {
       return false
     }
     toggleSettings()
@@ -73,7 +78,7 @@ export default function SettingsDrawer() {
   const changeTab = useCallback((tab: typeof settingsDrawerTab) => {
     if (tab === settingsDrawerTab) return
     const guard = navigationGuardRef.current
-    if (guard.promptSaving || (guard.dirtyExplicitCount > 0 && !window.confirm('有未保存更改，切换后会丢失。'))) {
+    if (guard.saving || (guard.dirtyExplicitCount > 0 && !window.confirm('有未保存更改，切换后会丢失。'))) {
       return
     }
     setSettingsDrawerTab(tab)
@@ -190,7 +195,7 @@ export default function SettingsDrawer() {
 
   const tabs: { key: typeof settingsDrawerTab; label: string; icon: React.ReactNode; desc: string }[] = [
     { key: 'realtime', label: '实时辅助', icon: <LayoutGrid className="w-4 h-4" />, desc: '答题与语音使用' },
-    { key: 'mode', label: '笔试配置', icon: <Monitor className="w-4 h-4" />, desc: '截图与思考' },
+    { key: 'mode', label: '笔试配置', icon: <Monitor className="w-4 h-4" />, desc: '模型与答题参数' },
     { key: 'overlay', label: '悬浮窗设置', icon: <PanelsTopLeft className="w-4 h-4" />, desc: '位置、尺寸与外观' },
     { key: 'kb', label: '知识库', icon: <BookOpen className="w-4 h-4" />, desc: '本地笔记引用' },
     { key: 'config', label: '语音配置', icon: <Mic className="w-4 h-4" />, desc: 'ASR 接入与测试' },
@@ -202,6 +207,7 @@ export default function SettingsDrawer() {
 
   const dirtyByTab: Partial<Record<typeof settingsDrawerTab, boolean>> = {
     realtime: realtimeDirty,
+    mode: examDirty,
     config: speechDirty,
     models: !!dirtyExplicitSections.models,
     prompts: !!dirtyExplicitSections.prompts,
@@ -235,7 +241,7 @@ export default function SettingsDrawer() {
                     key={t.key}
                     type="button"
                     onClick={() => changeTab(t.key)}
-                    aria-disabled={promptSaving || undefined}
+                    aria-disabled={saving || undefined}
                     aria-current={active ? 'page' : undefined}
                     className={`group flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-left transition-colors aria-disabled:opacity-50 ${
                       active
@@ -302,7 +308,7 @@ export default function SettingsDrawer() {
                     </button>
                   )}
                 </div>
-                <button type="button" onClick={closeSettings} aria-disabled={promptSaving || undefined} className="ml-auto p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary flex-shrink-0 aria-disabled:opacity-50" aria-label="关闭">
+                <button type="button" onClick={closeSettings} aria-disabled={saving || undefined} className="ml-auto p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary flex-shrink-0 aria-disabled:opacity-50" aria-label="关闭">
                   <X className="w-5 h-5" />
                 </button>
               </div>
@@ -320,7 +326,7 @@ export default function SettingsDrawer() {
                       key={t.key}
                       type="button"
                       onClick={() => changeTab(t.key)}
-                      aria-disabled={promptSaving || undefined}
+                      aria-disabled={saving || undefined}
                       aria-current={settingsDrawerTab === t.key ? 'page' : undefined}
                       className={`flex items-center justify-center gap-1.5 whitespace-nowrap py-2 px-1.5 rounded-lg text-xs font-medium transition-all aria-disabled:opacity-50 ${
                         settingsDrawerTab === t.key
@@ -347,7 +353,18 @@ export default function SettingsDrawer() {
                       onSavingPromptChange={setPromptSaving}
                     />
                   )}
-                  {settingsDrawerTab === 'mode' && <PreferencesTab variant="mode" />}
+                  {settingsDrawerTab === 'mode' && (
+                    <PreferencesTab variant="mode">
+                      <WrittenExamModelSetting disabled={promptSaving} onSavingChange={setExamModelSaving} />
+                      <Section
+                        title="系统提示词与生成参数"
+                        icon={<FileText className="h-4 w-4" />}
+                        keywords="笔试 提示词 温度 temperature token 上限"
+                      >
+                        <SystemPromptsTab scope="exam" disableSaving={examModelSaving} onSavingChange={setPromptSaving} />
+                      </Section>
+                    </PreferencesTab>
+                  )}
                   {settingsDrawerTab === 'overlay' && <OverlaySettingsTab />}
                   {settingsDrawerTab === 'kb' && <PreferencesTab variant="kb" />}
                   {settingsDrawerTab === 'appearance' && <PreferencesTab variant="appearance" />}

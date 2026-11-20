@@ -18,7 +18,7 @@ import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore } from '@/stores/configStore'
 import { speechProvider } from '@/lib/speechProviders'
 import type { AppConfig } from '@/stores/slices/types'
-import { getAssistModelEntries, isConfiguredModel } from '@/lib/assistModels'
+import { getAssistModelEntries, getWrittenExamModel, isConfiguredModel, missingWrittenExamModel } from '@/lib/assistModels'
 import type { SingleMicRole } from '@/stores/slices/types'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { api, getErrorMessage } from '@/lib/api'
@@ -160,11 +160,13 @@ export default function ControlBar() {
   const mmpg = useMmpgStatus()
   const ownsMmpgConnection = mmpg.mode && mmpg.mode !== 'test' && ['connecting', 'reconnecting'].includes(mmpg.state)
   const mmpgIsConnecting = interviewerStreaming && (ownsMmpgConnection || ['connecting', 'reconnecting'].includes(mmpgPhase))
-  const noEnabledModels = (config?.assist_model_ids !== undefined || (config?.models?.length ?? 0) > 0) && enabledModelEntries.length === 0
-  const allModelsUnavailable = enabledModelEntries.length > 0 &&
+  const examModel = getWrittenExamModel(config)
+  const missingModelMessage = isExamMode ? missingWrittenExamModel : '请先在实时辅助中勾选可用的答题模型'
+  const noEnabledModels = isExamMode ? !examModel : (config?.assist_model_ids !== undefined || (config?.models?.length ?? 0) > 0) && enabledModelEntries.length === 0
+  const allModelsUnavailable = !isExamMode && enabledModelEntries.length > 0 &&
     enabledModelEntries.every(({ index }) => modelHealth[index] === 'error')
   const enabledVisionModels = useMemo(() => getEnabledVisionModels(config), [config])
-  const hasEnabledVisionModel = enabledVisionModels.length > 0
+  const hasEnabledVisionModel = isExamMode ? Boolean(examModel) : enabledVisionModels.length > 0
   const answerModelUnavailable = noEnabledModels || allModelsUnavailable
   const showColdStartHint =
     !isExamMode &&
@@ -257,7 +259,7 @@ export default function ControlBar() {
     ? selectedCandidateMic
     : null
   const hasLoopback = devices.some((d) => d.is_loopback)
-  const activeModel = enabledModelEntries[0]?.model
+  const activeModel = isExamMode ? examModel : enabledModelEntries[0]?.model
   const activeModelSupportsVision = activeModel?.supports_vision ?? false
   const pastedImageVisionHint = activeModelSupportsVision
     ? null
@@ -342,7 +344,11 @@ export default function ControlBar() {
         const file = items[i].getAsFile()
         if (!file) continue
         const store = useInterviewStore.getState()
-        if (store.config && getEnabledVisionModels(store.config).length === 0) {
+        if (store.config?.written_exam_mode && !getWrittenExamModel(store.config)) {
+          setError(missingWrittenExamModel)
+          return
+        }
+        if (store.config && !store.config.written_exam_mode && getEnabledVisionModels(store.config).length === 0) {
           setError('请先在实时辅助中勾选支持识图的答题模型，再粘贴图片')
           return
         }
@@ -573,7 +579,7 @@ export default function ControlBar() {
     if (askingRef.current) return
     if (!manualQuestion.trim() && !pastedImage) return
     if (noEnabledModels) {
-      setError('请先在实时辅助中勾选可用的答题模型')
+      setError(missingModelMessage)
       return
     }
     if (allModelsUnavailable) {
@@ -596,7 +602,7 @@ export default function ControlBar() {
       askingRef.current = false
       setAsking(false)
     }
-  }, [manualQuestion, pastedImage, noEnabledModels, allModelsUnavailable, hasEnabledVisionModel])
+  }, [manualQuestion, pastedImage, noEnabledModels, allModelsUnavailable, hasEnabledVisionModel, missingModelMessage])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (isComposingRef.current) return
@@ -737,7 +743,7 @@ export default function ControlBar() {
       {noEnabledModels && (
         <div className="flex items-center gap-2 text-xs text-accent-red bg-accent-red/10 px-3 py-1.5 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-          <span>请先在实时辅助中勾选可用的答题模型。</span>
+          <span>{isExamMode ? missingWrittenExamModel : '请先在实时辅助中勾选可用的答题模型。'}</span>
         </div>
       )}
       {!isExamMode && !singleMicMode && !hasLoopback && platformInfo?.needs_virtual_device && (
@@ -1065,7 +1071,7 @@ export default function ControlBar() {
             asking
               ? '正在提交问题'
               : noEnabledModels
-              ? '请先在实时辅助中勾选可用的答题模型'
+              ? missingModelMessage
               : allModelsUnavailable
               ? '所选答题模型均不可用，请检查模型连接'
               : pastedImage && !hasEnabledVisionModel

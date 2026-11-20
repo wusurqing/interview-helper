@@ -121,7 +121,7 @@ describe('SettingsDrawer', () => {
       expect(screen.getAllByText('未保存：实时辅助').length).toBeGreaterThan(0)
     })
 
-    fireEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: /模型/ }))
+    fireEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: /^模型配置/ }))
 
     expect(confirmSpy).toHaveBeenCalledWith('有未保存更改，切换后会丢失。')
     expect(screen.getByText('面试官 / 会议音频')).toBeInTheDocument()

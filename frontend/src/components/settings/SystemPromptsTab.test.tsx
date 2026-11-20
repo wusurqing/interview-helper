@@ -15,6 +15,15 @@ const scenes = [
     max_output_tokens: 4096,
   },
   {
+    id: 'assist_exam',
+    group: '实时辅助',
+    label: '笔试答题',
+    entry: '发送笔试题目时生效。',
+    default_prompt: '按笔试要求作答。',
+    output_contract: '',
+    max_output_tokens: 2048,
+  },
+  {
     id: 'answer',
     group: '面试辅助',
     label: '面试回答',
@@ -43,9 +52,16 @@ function jsonResponse(body: unknown, status = 200) {
 
 let savedPrompts: Record<string, string>
 let savedGeneration: Record<string, { temperature: number; max_output_tokens: number }>
+let savedExamModelId: string | null
 let configRequests: string[]
 let loadFailure: boolean
 let saveFailure: boolean
+const examModels = [
+  { id: 'vision', name: '识图模型', supports_vision: true, supports_think: true, has_api_key: true },
+  { id: 'text', name: '文本模型', supports_vision: false, supports_think: false, has_api_key: true },
+  { id: 'disabled', name: '停用模型', supports_vision: true, supports_think: false, has_api_key: true, enabled: false },
+  { id: 'unconfigured', name: '未配置模型', supports_vision: true, supports_think: false, has_api_key: false },
+]
 
 function openPrompts() {
   render(<SettingsDrawer />)
@@ -61,7 +77,11 @@ function savePrompt() {
 describe('系统提示词设置', () => {
   beforeEach(() => {
     savedPrompts = { review: '已有复盘规则。' }
-    savedGeneration = { assist_manual: { temperature: 0.25, max_output_tokens: 1400 } }
+    savedGeneration = {
+      assist_manual: { temperature: 0.25, max_output_tokens: 1400 },
+      assist_exam: { temperature: 0.3, max_output_tokens: 2048 },
+    }
+    savedExamModelId = null
     configRequests = []
     loadFailure = false
     saveFailure = false
@@ -76,13 +96,19 @@ describe('系统提示词设置', () => {
           configRequests.push(body)
           if (saveFailure) return jsonResponse({ detail: '配置无法写入' }, 500)
           const updates = JSON.parse(body)
+          if ('written_exam_model_id' in updates) savedExamModelId = updates.written_exam_model_id
           Object.assign(savedGeneration, updates.assist_generation ?? {})
           for (const [id, text] of Object.entries(updates.system_prompts ?? {}) as [string, string | null][]) {
             if (text === null) delete savedPrompts[id]
             else savedPrompts[id] = text
           }
         }
-        return jsonResponse({ models: [], system_prompts: savedPrompts, assist_generation: savedGeneration })
+        return jsonResponse({
+          models: examModels,
+          system_prompts: savedPrompts,
+          assist_generation: savedGeneration,
+          written_exam_model_id: savedExamModelId,
+        })
       }
       throw new Error(`Unexpected request: ${url}`)
     }))
@@ -100,6 +126,7 @@ describe('系统提示词设置', () => {
     const selector = screen.getByRole('combobox', { name: '使用场景' })
     expect(within(selector).getByRole('group', { name: '面试辅助' })).toBeInTheDocument()
     expect(within(selector).queryByRole('option', { name: '手动提问' })).not.toBeInTheDocument()
+    expect(within(selector).queryByRole('option', { name: '笔试答题' })).not.toBeInTheDocument()
     expect(editor).toHaveValue('生成简洁的面试回答。')
     expect(screen.getByText('使用默认')).toBeInTheDocument()
     expect(screen.getByText(/600\s*tokens/i)).toBeInTheDocument()
@@ -188,6 +215,7 @@ describe('系统提示词设置', () => {
     const selector = screen.getByRole('combobox', { name: '使用场景' })
     expect(within(selector).getByRole('option', { name: '手动提问' })).toBeInTheDocument()
     expect(within(selector).queryByRole('option', { name: '复盘分析' })).not.toBeInTheDocument()
+    expect(within(selector).queryByRole('option', { name: '笔试答题' })).not.toBeInTheDocument()
 
     fireEvent.change(temperature, { target: { value: '0.8' } })
     fireEvent.change(maxTokens, { target: { value: '127' } })
@@ -202,5 +230,64 @@ describe('系统提示词设置', () => {
       assist_generation: { assist_manual: { temperature: 0.8, max_output_tokens: 128 } },
     }])
     expect(savedPrompts.review).toBe('已有复盘规则。')
+  })
+
+  it('只在笔试配置保存笔试的提示词和生成参数', async () => {
+    useInterviewStore.setState({ settingsDrawerTab: 'mode' })
+    render(<SettingsDrawer />)
+
+    const editor = await screen.findByRole('textbox', { name: '系统提示词' })
+    expect(editor).toHaveValue('按笔试要求作答。')
+    expect(screen.queryByRole('combobox', { name: '使用场景' })).not.toBeInTheDocument()
+    const temperature = screen.getByRole('spinbutton', { name: '温度' })
+    const maxTokens = screen.getByRole('spinbutton', { name: '最大输出 Token' })
+    expect(temperature).toHaveValue(0.3)
+    expect(maxTokens).toHaveValue(2048)
+
+    fireEvent.change(editor, { target: { value: '只写答案。' } })
+    fireEvent.change(temperature, { target: { value: '0.1' } })
+    fireEvent.change(maxTokens, { target: { value: '2000' } })
+    savePrompt()
+
+    expect(await screen.findByText('已保存当前场景')).toBeInTheDocument()
+    expect(configRequests.map((body) => JSON.parse(body))).toEqual([{
+      system_prompts: { assist_exam: '只写答案。' },
+      assist_generation: { assist_exam: { temperature: 0.1, max_output_tokens: 2000 } },
+    }])
+    expect(savedGeneration.assist_manual).toEqual({ temperature: 0.25, max_output_tokens: 1400 })
+  })
+
+  it('显示全部笔试模型及其不可选原因，显式保存和清空笔试模型 ID', async () => {
+    useInterviewStore.setState({
+      settingsDrawerTab: 'mode',
+      config: { models: examModels, written_exam_model_id: null } as ReturnType<typeof useInterviewStore.getState>['config'],
+    })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    render(<SettingsDrawer />)
+
+    const model = await screen.findByRole('combobox', { name: /^笔试答题模型/ })
+    expect(within(model).getByRole('option', { name: '文本模型（该模型不支持图片作为输入）' })).toBeDisabled()
+    expect(within(model).getByRole('option', { name: '停用模型（已停用）' })).toBeDisabled()
+    expect(within(model).getByRole('option', { name: '未配置模型（未配置 API Key）' })).toBeDisabled()
+    expect(within(model).getByRole('option', { name: '识图模型' })).toBeEnabled()
+    const save = screen.getByRole('button', { name: '保存笔试模型' })
+    expect(save).toBeDisabled()
+
+    fireEvent.change(model, { target: { value: 'vision' } })
+    await waitFor(() => expect(screen.getAllByText('未保存：笔试配置')).not.toHaveLength(0))
+    expect(configRequests).toHaveLength(0)
+    fireEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: /实时辅助/ }))
+    expect(confirm).toHaveBeenCalledWith('有未保存更改，切换后会丢失。')
+    expect(model).toHaveValue('vision')
+
+    fireEvent.click(save)
+    await waitFor(() => expect(save).toBeDisabled())
+    fireEvent.change(model, { target: { value: '' } })
+    fireEvent.click(save)
+    await waitFor(() => expect(configRequests.map((body) => JSON.parse(body))).toEqual([
+      { written_exam_model_id: 'vision' },
+      { written_exam_model_id: null },
+    ]))
+    await waitFor(() => expect(save).toBeDisabled())
   })
 })

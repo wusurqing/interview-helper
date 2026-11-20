@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, type ReactNode } from 'react'
 import {
   Palette,
   Monitor,
@@ -63,7 +63,7 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: 
   )
 }
 
-export default function PreferencesTab({ variant }: { variant: 'mode' | 'kb' | 'appearance' }) {
+export default function PreferencesTab({ variant, children }: { variant: 'mode' | 'kb' | 'appearance'; children?: ReactNode }) {
   const config = useInterviewStore((s) => s.config)
   const options = useInterviewStore((s) => s.options)
   const colorScheme = useUiPrefsStore((s) => s.colorScheme)
@@ -127,6 +127,7 @@ export default function PreferencesTab({ variant }: { variant: 'mode' | 'kb' | '
       </div>
 
       {variant === 'mode' && (<>
+      {children}
       <Collapsible
         alwaysOpen
         title="截图审题"

@@ -291,7 +291,10 @@ describe('App bootstrap', () => {
     const originalInnerWidth = window.innerWidth
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 })
     apiMock.getConfig.mockResolvedValue({
-      models: [{ name: 'demo', supports_vision: true, enabled: true }],
+      models: [{ id: 'exam', name: 'Exam Vision', supports_vision: true, has_api_key: true, enabled: true }],
+      assist_screenshot_model_id: null,
+      assist_model_ids: [],
+      written_exam_model_id: 'exam',
       active_model: 0,
       api_key_set: true,
       written_exam_mode: true,
@@ -304,6 +307,7 @@ describe('App bootstrap', () => {
       render(<App />)
 
       const screenshotButton = await screen.findByRole('button', { name: '截图答题' })
+      expect(screen.getByRole('button', { name: '笔试模型 Exam Vision' })).toBeInTheDocument()
       expect(screen.queryByText('transcript')).not.toBeInTheDocument()
       expect(screen.getByText('answer')).toBeInTheDocument()
       fireEvent.click(screenshotButton)

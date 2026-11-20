@@ -332,9 +332,11 @@ export const api = {
   askFromServerScreen: () =>
     request('/api/ask-from-server-screen', { method: 'POST', body: '{}' }),
   captureServerScreen: () =>
-    request<{ ok: boolean; image: string }>('/api/capture-server-screen', { method: 'POST', body: '{}' }),
-  askFromServerScreens: (images: string[]) =>
-    request('/api/ask-from-server-screens', { method: 'POST', body: JSON.stringify({ images }) }),
+    request<{ ok: boolean; image: string; written_exam_mode: boolean }>('/api/capture-server-screen', { method: 'POST', body: '{}' }),
+  askFromServerScreens: (images: string[], expectedWrittenExamMode?: boolean) =>
+    request('/api/ask-from-server-screens', {
+      method: 'POST', body: JSON.stringify({ images, expected_written_exam_mode: expectedWrittenExamMode }),
+    }),
   getSttStatus: () => request('/api/stt/status'),
   checkModelsHealth: () => request('/api/models/health', { method: 'POST' }),
   /** 当前各模型健康状态（检测中/可用/不可用） */

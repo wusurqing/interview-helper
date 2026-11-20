@@ -19,9 +19,19 @@ function isAssistScene(id: string): id is AssistPromptScene {
   return id === 'assist_realtime' || id === 'assist_manual' || id === 'assist_screen' || id === 'assist_exam'
 }
 
-export default function SystemPromptsTab({ onSavingChange, scope = 'other' }: {
+const promptSettingsKeys = { assist: 'assist-prompts', exam: 'exam-prompts', other: 'prompts' }
+type PromptScope = keyof typeof promptSettingsKeys
+
+function sceneMatchesScope(id: string, scope: PromptScope): boolean {
+  if (id === 'assist_realtime_short') return false
+  if (id === 'assist_exam') return scope === 'exam'
+  return scope === (isAssistScene(id) ? 'assist' : 'other')
+}
+
+export default function SystemPromptsTab({ onSavingChange, scope = 'other', disableSaving = false }: {
   onSavingChange: (saving: boolean) => void
-  scope?: 'assist' | 'other'
+  scope?: PromptScope
+  disableSaving?: boolean
 }) {
   const [load, setLoad] = useState<LoadState>({ status: 'loading' })
   const [loadAttempt, setLoadAttempt] = useState(0)
@@ -33,7 +43,7 @@ export default function SystemPromptsTab({ onSavingChange, scope = 'other' }: {
   const scene = load.status === 'ready'
     ? load.scenes.find((item) => item.id === selectedId) ?? load.scenes[0]
     : undefined
-  const assistScene = scene && scope === 'assist' && isAssistScene(scene.id) ? scene.id : null
+  const assistScene = scene && isAssistScene(scene.id) ? scene.id : null
   const savedConfig = load.status === 'ready' ? load.config : undefined
   const savedOverride = scene ? savedConfig?.system_prompts?.[scene.id] ?? null : null
   const savedGeneration = assistScene ? savedConfig?.assist_generation?.[assistScene] : undefined
@@ -58,13 +68,13 @@ export default function SystemPromptsTab({ onSavingChange, scope = 'other' }: {
   ))
   const dirty = promptDirty || generationDirty
   const saving = save.status === 'saving'
-  useSettingsDirtyRegistration(scope === 'assist' ? 'assist-prompts' : 'prompts', dirty)
+  useSettingsDirtyRegistration(promptSettingsKeys[scope], dirty)
 
   useEffect(() => {
     let active = true
     Promise.all([api.getSystemPromptScenes(), api.getConfig()])
       .then(([{ scenes }, config]) => {
-        const filtered = scenes.filter(({ id }) => id !== 'assist_realtime_short' && isAssistScene(id) === (scope === 'assist'))
+        const filtered = scenes.filter(({ id }) => sceneMatchesScope(id, scope))
         if (active) setLoad({ status: 'ready', scenes: filtered, config })
       })
       .catch((error: unknown) => {
@@ -121,7 +131,7 @@ export default function SystemPromptsTab({ onSavingChange, scope = 'other' }: {
   }
 
   async function savePrompt() {
-    if (!dirty || saving || !validGeneration) return
+    if (!dirty || saving || disableSaving || !validGeneration) return
     setSave({ status: 'saving' })
     onSavingChange(true)
     try {
@@ -144,24 +154,26 @@ export default function SystemPromptsTab({ onSavingChange, scope = 'other' }: {
   return (
     <div className={assistScene ? undefined : 'p-4'}>
       <GradientCard className="space-y-4 p-4">
-        <div className="space-y-1.5 sm:max-w-sm">
-          <label htmlFor="system-prompt-scene" className="block text-xs font-medium text-text-secondary">
-            使用场景
-          </label>
-          <select
-            id="system-prompt-scene"
-            value={scene.id}
-            onChange={(event) => changeScene(event.target.value)}
-            disabled={saving}
-            className="input-field"
-          >
-            {Array.from(groups, ([group, items]) => (
-              <optgroup key={group} label={group}>
-                {items.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
-              </optgroup>
-            ))}
-          </select>
-        </div>
+        {scope !== 'exam' && (
+          <div className="space-y-1.5 sm:max-w-sm">
+            <label htmlFor="system-prompt-scene" className="block text-xs font-medium text-text-secondary">
+              使用场景
+            </label>
+            <select
+              id="system-prompt-scene"
+              value={scene.id}
+              onChange={(event) => changeScene(event.target.value)}
+              disabled={saving}
+              className="input-field"
+            >
+              {Array.from(groups, ([group, items]) => (
+                <optgroup key={group} label={group}>
+                  {items.map((item) => <option key={item.id} value={item.id}>{item.label}</option>)}
+                </optgroup>
+              ))}
+            </select>
+          </div>
+        )}
 
         <dl className="grid gap-3 rounded-lg border border-bg-hover/60 bg-bg-primary/35 px-3 py-2.5 text-xs leading-relaxed sm:grid-cols-[1fr_auto] sm:gap-x-6">
           <div className="min-w-0">
@@ -245,7 +257,7 @@ export default function SystemPromptsTab({ onSavingChange, scope = 'other' }: {
             <button
               type="button"
               onClick={() => void savePrompt()}
-              disabled={!dirty || saving || !validGeneration}
+              disabled={!dirty || saving || disableSaving || !validGeneration}
               className="inline-flex items-center gap-1.5 rounded-lg bg-accent-blue px-3 py-2 text-xs font-medium text-white hover:bg-accent-blue/90 disabled:opacity-50"
             >
               <Save className="h-3.5 w-3.5" aria-hidden="true" />

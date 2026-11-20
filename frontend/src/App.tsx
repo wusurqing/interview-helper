@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState, useRef, lazy, Suspense } from 'react'
 import { Settings, SlidersHorizontal, MonitorSmartphone, PanelLeftClose, PanelLeftOpen, Minus, X, ChevronDown } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore, type AppConfig } from '@/stores/configStore'
-import { getAssistModelEntries, getAssistScreenshotModel, isConfiguredModel } from '@/lib/assistModels'
+import { getAssistModelEntries, getAssistScreenshotModel, getWrittenExamModel, isConfiguredModel, missingWrittenExamModel } from '@/lib/assistModels'
 import { speechProvider } from '@/lib/speechProviders'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { useShortcutsStore } from '@/stores/shortcutsStore'
@@ -77,6 +77,7 @@ export default function App() {
   const appMode = useUiPrefsStore((s) => s.appMode)
   const setAppMode = useUiPrefsStore((s) => s.setAppMode)
   const activeTab = appMode === 'assist' && isExamMode ? 'exam' : appMode
+  const examModel = getWrittenExamModel(config)
   const assistTranscriptCollapsed = useUiPrefsStore((s) => s.assistTranscriptCollapsed)
   const toggleAssistTranscriptCollapsed = useUiPrefsStore((s) => s.toggleAssistTranscriptCollapsed)
   useOverlayWindowSync(isRecording, appMode)
@@ -257,8 +258,8 @@ export default function App() {
   const handleServerScreenAsk = useCallback(async () => {
     if (serverScreenAskRef.current) return
     const current = useInterviewStore.getState().config
-    if (current && !getAssistScreenshotModel(current)) {
-      useInterviewStore.getState().setToastMessage('请先在实时辅助中配置截图答题模型')
+    if (current && !(current.written_exam_mode ? getWrittenExamModel(current) : getAssistScreenshotModel(current))) {
+      useInterviewStore.getState().setToastMessage(current.written_exam_mode ? missingWrittenExamModel : '请先在实时辅助中配置截图答题模型')
       return
     }
     serverScreenAskRef.current = true
@@ -439,7 +440,14 @@ export default function App() {
 
         <div className="flex items-center gap-1.5 md:gap-2 flex-shrink-0 flex-nowrap justify-end">
           <WindowOpacitySlider />
-          {config?.models && config.models.length > 0 && (
+          {activeTab === 'exam' ? (
+            <button type="button" aria-label={`笔试模型 ${examModel?.name ?? '未配置'}`}
+              title="打开笔试配置"
+              className="max-w-[150px] truncate rounded-xl border border-bg-hover/50 px-2.5 py-1.5 text-xs text-text-primary hover:bg-bg-hover"
+              onClick={() => useInterviewStore.setState({ settingsOpen: true, settingsDrawerTab: 'mode' })}>
+              {examModel?.name ?? '配置笔试模型'}
+            </button>
+          ) : config?.models && config.models.length > 0 && (
             <ModelPriorityDropdown
               config={config}
               modelHealth={modelHealth}

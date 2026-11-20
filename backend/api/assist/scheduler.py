@@ -7,14 +7,18 @@ keeps the mutable scheduling decisions testable and isolated.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Tuple
+
+from core.config import written_exam_model_available
 
 TaskImage = Optional[str | list[str]]
 TaskPayload = Tuple[str, TaskImage, bool, str, dict[str, Any]]
 PendingTask = Tuple[TaskPayload, int, int]
 ModelReservation = str | int
 InFlightTasks = dict[int, tuple[ModelReservation | None, TaskPayload]]
+EXAM_MODEL_UNAVAILABLE = "请在「笔试配置」中选择已启用、已配置 API Key 且支持识图的模型。"
+EXAM_MODEL_STALE = "本题的笔试模型已不可用或接口配置已变更，请重新提交。"
 
 
 @dataclass(frozen=True)
@@ -29,11 +33,62 @@ class DispatchClaim:
 class DispatchStep:
     claim: DispatchClaim | None = None
     skipped_seq: int | None = None
-    unavailable: bool = False
+    unavailable_task: TaskPayload | None = None
+
+
+@dataclass(frozen=True)
+class AnswerRouting:
+    written_exam: bool
+    exam_model_ids: tuple[str, ...] = ()
+    exam_config: Any = field(default=None, repr=False)
 
 
 def task_meta(task: TaskPayload) -> dict[str, Any]:
     return task[4]
+
+
+def task_is_written_exam(task: TaskPayload, cfg) -> bool:
+    meta = task_meta(task)
+    routing = meta.get("answer_routing")
+    if routing is not None:
+        return routing.written_exam
+    return bool(meta.get("exam_preflight") or (
+        task[2] and meta.get("purpose") != "knowledge_practice" and getattr(cfg, "written_exam_mode", False)
+    ))
+
+
+def eligible_exam_model_index(cfg, model_id: str | None) -> int | None:
+    if not model_id:
+        return None
+    return next((
+        index for index, model in enumerate(cfg.models)
+        if getattr(model, "id", None) == model_id and written_exam_model_available(model)
+    ), None)
+
+
+def _exam_model_destination(model) -> tuple[str, str, str]:
+    return (
+        getattr(model, "api_base_url", "").strip().rstrip("/"),
+        getattr(model, "api_type", ""),
+        getattr(model, "model", ""),
+    )
+
+
+def live_exam_model_index(routing: AnswerRouting, cfg, model_id: str) -> int | None:
+    index = eligible_exam_model_index(cfg, model_id)
+    submitted_index = eligible_exam_model_index(routing.exam_config, model_id)
+    if index is None or submitted_index is None:
+        return None
+    if _exam_model_destination(cfg.models[index]) != _exam_model_destination(routing.exam_config.models[submitted_index]):
+        return None
+    return index
+
+
+def exam_primary_index(task: TaskPayload, cfg) -> int | None:
+    routing = task_meta(task).get("answer_routing")
+    if routing is not None:
+        return live_exam_model_index(routing, cfg, routing.exam_model_ids[0])
+    return eligible_exam_model_index(cfg, getattr(cfg, "written_exam_model_id", None))
 
 
 def is_asr_task(task: TaskPayload) -> bool:
@@ -84,6 +139,9 @@ def _legacy_model_order(cfg) -> list[int]:
 
 
 def dispatch_model_order(cfg, task: TaskPayload | None = None) -> list[int]:
+    if task is not None and task_is_written_exam(task, cfg):
+        primary = exam_primary_index(task, cfg)
+        return [] if primary is None else [primary]
     selected = getattr(cfg, "assist_model_ids", None)
     if selected is None or (task is not None and task_meta(task).get("purpose") == "knowledge_practice"):
         return _legacy_model_order(cfg)
@@ -123,6 +181,8 @@ def pick_model_index(
         return True
 
     available = [i for i in dispatch_model_order(cfg, task) if ok_basic(i, cfg.models[i])]
+    if task_is_written_exam(task, cfg):
+        return available[0] if available else None
     preferred = [i for i in available if i not in avoid and model_reservation(cfg, i) not in avoid]
     candidates = preferred or available
     return next((i for i in candidates if get_model_health(i) != "error"), candidates[0] if candidates else None)
@@ -132,8 +192,13 @@ def max_parallel_slots(
     cfg, get_model_health: Callable[[int], Optional[str]], *, include_screenshots: bool = True, include_practice: bool = False,
 ) -> int:
     order = _legacy_model_order(cfg) if include_practice else dispatch_model_order(cfg)
-    if include_screenshots and getattr(cfg, "assist_screenshot_model_id", None):
-        order = list(dict.fromkeys(order + dispatch_model_order(cfg, ("", "image", True, "server_screen_left", {}))))
+    if include_screenshots:
+        screenshot_id = getattr(cfg, "assist_screenshot_model_id", None)
+        exam_id = getattr(cfg, "written_exam_model_id", None)
+        for model_id in (screenshot_id, exam_id):
+            index = eligible_exam_model_index(cfg, model_id)
+            if index is not None and index not in order:
+                order.append(index)
     n_ok = sum(1 for i in order if model_eligible(i, cfg.models[i], False, get_model_health))
     cap = max(1, getattr(cfg, "max_parallel_answers", 2))
     return max(1, min(cap, max(n_ok, 1)))
@@ -213,7 +278,7 @@ def claim_next_dispatch(
             )
         if discard_unavailable and pick_model_index(task, set(), None) is None:
             pending.pop(idx)
-            return DispatchStep(skipped_seq=seq, unavailable=True)
+            return DispatchStep(skipped_seq=seq, unavailable_task=task)
         idx += 1
     return DispatchStep()
 

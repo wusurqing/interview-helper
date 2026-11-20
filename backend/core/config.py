@@ -171,6 +171,7 @@ class AppConfig(BaseModel):
     active_model: int = 0
     assist_model_ids: list[StrictStr] | None = None
     assist_screenshot_model_id: StrictStr | None = None
+    written_exam_model_id: StrictStr | None = None
     assist_generation: dict[AssistScene, AssistGeneration] = Field(default_factory=dict)
     assist_think_mode: StrictBool | None = None
     assist_think_effort: ThinkEffort | None = None
@@ -382,6 +383,13 @@ class AppConfig(BaseModel):
             )
         elif self.assist_screenshot_model_id not in vision_ids:
             self.assist_screenshot_model_id = None
+        if "written_exam_model_id" not in self.model_fields_set:
+            self.written_exam_model_id = next((
+                model.id for model in self.models
+                if model.id == self.assist_screenshot_model_id and written_exam_model_available(model)
+            ), None)
+        elif self.written_exam_model_id not in used_ids:
+            self.written_exam_model_id = None
         for scene in ASSIST_SCENES:
             if scene not in self.assist_generation:
                 limit = min(self.max_tokens, self.assist_realtime_max_tokens) if scene == "assist_realtime" else self.max_tokens
@@ -486,6 +494,11 @@ def update_config(
                 if not vision:
                     raise InvalidAssistModelSelection("截图答题请选择支持识图的模型")
         updated = AppConfig(**data)
+        exam_model_id = updates.get("written_exam_model_id")
+        if exam_model_id is not None:
+            exam_model = next((model for model in updated.models if model.id == exam_model_id), None)
+            if exam_model is None or not written_exam_model_available(exam_model):
+                raise InvalidAssistModelSelection("笔试答题请选择已启用、已配置 API Key 且支持图片输入的模型")
         index = cfg.knowledge_analysis.model_index
         if "models" in updates and index is not None:
             if model_origins is not None:
@@ -507,6 +520,10 @@ def update_config(
 
 def knowledge_model_available(model: ModelConfig) -> bool:
     return bool(model.enabled and model.api_key.strip() not in ("", "sk-your-api-key-here"))
+
+
+def written_exam_model_available(model: ModelConfig) -> bool:
+    return model.supports_vision and knowledge_model_available(model)
 
 
 def update_knowledge_analysis_settings(

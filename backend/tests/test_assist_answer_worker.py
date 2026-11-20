@@ -1509,11 +1509,13 @@ def test_written_exam_screenshot_injects_recent_qa_as_revision_context(monkeypat
     session = get_session()
     session.add_user_message("普通历史不应进入")
     session.add_assistant_message("普通历史答案不应进入")
+    session.add_qa("面试截图私有题面", "面试截图私有答案", source="server_screen_left")
     session.add_qa(
         "代码题：输出最短路径 [图片已省略 x1]",
         "```python\ndef solve():\n    print(0)\n```",
         source="server_screen_left",
         model_name="模型一",
+        written_exam=True,
     )
     cfg = _cfg()
     cfg.written_exam_mode = True
@@ -1548,6 +1550,8 @@ def test_written_exam_screenshot_injects_recent_qa_as_revision_context(monkeypat
     assert "print(0)" in text
     assert "expected=1 actual=0" in text
     assert "普通历史不应进入" not in text
+    assert "面试截图私有" not in text
+    assert session.qa_pairs[-1].written_exam
     assert content[1]["image_url"]["url"] == "data:image/png;base64,failcase"
 
 
@@ -1603,6 +1607,7 @@ def test_written_exam_revision_context_compacts_previous_screen_prompt(monkeypat
         "```python\ndef solve():\n    print('old')\n```",
         source="server_screen_left",
         model_name="模型一",
+        written_exam=True,
     )
     cfg = _cfg()
     cfg.written_exam_mode = True

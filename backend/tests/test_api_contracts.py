@@ -59,7 +59,7 @@ def test_api_start_rejects_non_integer_device_id():
 
 
 def test_api_ask_returns_error_when_no_answer_model_available(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(assist_routes, "submit_answer_task", lambda task: False)
+    monkeypatch.setattr(assist_routes, "submit_answer_task", lambda task, **_kwargs: False)
 
     with pytest.raises(HTTPException) as exc_info:
         asyncio.run(
@@ -68,6 +68,37 @@ def test_api_ask_returns_error_when_no_answer_model_available(monkeypatch: pytes
 
     assert exc_info.value.status_code == 503
     assert "模型" in str(exc_info.value.detail)
+
+
+@pytest.mark.parametrize("capture_mode", [False, True])
+def test_screen_capture_reports_its_workspace(monkeypatch: pytest.MonkeyPatch, capture_mode: bool):
+    monkeypatch.setattr(assist_routes, "get_config", lambda: SimpleNamespace(written_exam_mode=capture_mode))
+    monkeypatch.setattr("services.capture.capture_primary_left_half_data_url", lambda: "data:image/png;base64,fake")
+
+    result = asyncio.run(assist_routes.api_capture_server_screen())
+
+    assert result["image"] == "data:image/png;base64,fake"
+    assert result["written_exam_mode"] is capture_mode
+
+
+@pytest.mark.parametrize("capture_mode", [False, True])
+def test_screen_batch_rejects_another_workspace_before_any_answer_side_effect(
+    monkeypatch: pytest.MonkeyPatch, capture_mode: bool,
+):
+    monkeypatch.setattr(assist_routes, "get_config", lambda: SimpleNamespace(written_exam_mode=not capture_mode))
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("a batch from a different workspace must not touch answer work")
+
+    monkeypatch.setattr(assist_routes, "pick_model_index", unexpected)
+    monkeypatch.setattr(assist_routes, "cancel_answer_work", unexpected)
+    monkeypatch.setattr(assist_routes, "submit_answer_task", unexpected)
+    body = assist_routes.MultiServerScreenQuestion(images=["image"], expected_written_exam_mode=capture_mode)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(assist_routes.api_ask_from_server_screens(body))
+    assert exc.value.status_code == 409
+    assert "重新截图" in exc.value.detail
 
 
 def test_api_ask_from_server_screens_submits_multi_image_task(monkeypatch: pytest.MonkeyPatch):
@@ -80,9 +111,9 @@ def test_api_ask_from_server_screens_submits_multi_image_task(monkeypatch: pytes
         screen_capture_region="left_half",
         written_exam_mode=False,
     ))
-    monkeypatch.setattr(assist_routes, "pick_model_index", lambda task, busy: 0)
+    monkeypatch.setattr(assist_routes, "pick_model_index", lambda task, busy, **_kwargs: 0)
     monkeypatch.setattr(assist_routes, "cancel_answer_work", lambda reset_session_data=False: cancel_calls.append(reset_session_data))
-    monkeypatch.setattr(assist_routes, "submit_answer_task", lambda task: submitted.append(task) or True)
+    monkeypatch.setattr(assist_routes, "submit_answer_task", lambda task, **_kwargs: submitted.append(task) or True)
 
     res = asyncio.run(
         assist_routes.api_ask_from_server_screens(
@@ -112,9 +143,9 @@ def test_api_ask_from_server_screens_skips_cancel_in_written_exam(monkeypatch: p
         screen_capture_region="left_half",
         written_exam_mode=True,
     ))
-    monkeypatch.setattr(assist_routes, "pick_model_index", lambda task, busy: 0)
+    monkeypatch.setattr(assist_routes, "pick_model_index", lambda task, busy, **_kwargs: 0)
     monkeypatch.setattr(assist_routes, "cancel_answer_work", lambda reset_session_data=False: cancel_calls.append(reset_session_data))
-    monkeypatch.setattr(assist_routes, "submit_answer_task", lambda task: submitted.append(task) or True)
+    monkeypatch.setattr(assist_routes, "submit_answer_task", lambda task, **_kwargs: submitted.append(task) or True)
 
     res = asyncio.run(
         assist_routes.api_ask_from_server_screens(
@@ -143,9 +174,9 @@ def test_api_ask_from_server_screen_cancels_existing_generation(monkeypatch: pyt
         screen_capture_region="left_half",
         written_exam_mode=False,
     ))
-    monkeypatch.setattr(assist_routes, "pick_model_index", lambda task, busy: 0)
+    monkeypatch.setattr(assist_routes, "pick_model_index", lambda task, busy, **_kwargs: 0)
     monkeypatch.setattr(assist_routes, "cancel_answer_work", lambda reset_session_data=False: cancel_calls.append(reset_session_data))
-    monkeypatch.setattr(assist_routes, "submit_answer_task", lambda task: submitted.append(task) or True)
+    monkeypatch.setattr(assist_routes, "submit_answer_task", lambda task, **_kwargs: submitted.append(task) or True)
 
     res = asyncio.run(assist_routes.api_ask_from_server_screen())
 
@@ -168,9 +199,9 @@ def test_api_ask_from_server_screen_skips_cancel_in_written_exam(monkeypatch: py
         screen_capture_region="left_half",
         written_exam_mode=True,
     ))
-    monkeypatch.setattr(assist_routes, "pick_model_index", lambda task, busy: 0)
+    monkeypatch.setattr(assist_routes, "pick_model_index", lambda task, busy, **_kwargs: 0)
     monkeypatch.setattr(assist_routes, "cancel_answer_work", lambda reset_session_data=False: cancel_calls.append(reset_session_data))
-    monkeypatch.setattr(assist_routes, "submit_answer_task", lambda task: submitted.append(task) or True)
+    monkeypatch.setattr(assist_routes, "submit_answer_task", lambda task, **_kwargs: submitted.append(task) or True)
 
     res = asyncio.run(
         assist_routes.api_ask_from_server_screen(

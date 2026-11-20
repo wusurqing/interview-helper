@@ -177,6 +177,99 @@ def test_dispatched_worker_keeps_selected_model_when_settings_reorder_models(
     assert [qa.answer for qa in session.qa_pairs] == ["模型一:配置更新期间的问题"]
 
 
+def test_exam_text_waits_for_primary_then_uses_frozen_vision_fallback_and_prompt(monkeypatch):
+    import copy
+    from services.llm.streaming import LLMConnectionError
+
+    cfg = pipeline.get_config()
+    cfg.written_exam_mode = True
+    cfg.written_exam_model_id = "exam"
+    cfg.assist_model_ids = ["text", "exam", "fallback"]
+    cfg.assist_screenshot_model_id = "screenshot"
+    cfg.system_prompts = {"assist_exam": "提交时的笔试指令"}
+    cfg.assist_generation = {"assist_exam": SimpleNamespace(temperature=0.2, max_output_tokens=660)}
+    cfg.models = [
+        SimpleNamespace(id=model_id, name=model_id, api_key="test", enabled=True, supports_vision=vision)
+        for model_id, vision in [("text", False), ("screenshot", True), ("exam", True), ("fallback", True)]
+    ]
+    from services.llm import build_system_prompt
+    monkeypatch.setattr(answer_worker, "build_system_prompt", build_system_prompt)
+    events = []
+    monkeypatch.setattr(pipeline, "broadcast", events.append)
+    calls = []
+
+    def transport(model, _messages, **kwargs):
+        calls.append((model.id, model.api_key, kwargs["system_prompt"], kwargs["override_max_tokens"]))
+        if model.id == "exam":
+            raise LLMConnectionError("fixture")
+        yield "text", "备用模型的答案"
+
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", transport)
+    pipeline._in_flight_tasks[99] = ("exam", ("", None, True, "manual_text", {}))
+    assert pipeline.submit_answer_task(("一道文字笔试题", None, True, "manual_text", {"origin": "manual"}))
+    assert _DeferredThread.started == []
+    next_cfg = copy.deepcopy(cfg)
+    next_cfg.written_exam_mode = False
+    next_cfg.written_exam_model_id = "screenshot"
+    next_cfg.assist_model_ids = ["screenshot"]
+    next_cfg.system_prompts = {"assist_exam": "更新后的笔试指令"}
+    next_cfg.assist_generation["assist_exam"].max_output_tokens = 900
+    next_cfg.models[-1].name = "备用模型（已改名）"
+    next_cfg.models[-1].api_key = "rotated-test-key"
+    next_cfg.models.reverse()
+    monkeypatch.setattr(pipeline, "get_config", lambda: next_cfg)
+    pipeline._in_flight_tasks.pop(99)
+    pipeline._try_dispatch()
+    _DeferredThread.started[0].run()
+
+    assert calls == [("exam", "test", "提交时的笔试指令", 660), ("fallback", "rotated-test-key", "提交时的笔试指令", 660)]
+    answer_events = [event for event in events if event["type"] in ("answer_start", "answer_retry", "answer_done")]
+    assert len({event["id"] for event in answer_events}) == 1
+    assert [event["model_name"] for event in answer_events] == ["exam", "备用模型（已改名）", "备用模型（已改名）"]
+
+
+@pytest.mark.parametrize("stage", ["before_submission", "queued", "before_request", "endpoint_changed"])
+def test_exam_stops_when_primary_is_unavailable_before_any_provider_request(monkeypatch, stage):
+    cfg = pipeline.get_config()
+    cfg.written_exam_mode = True
+    cfg.written_exam_model_id = "exam"
+    cfg.assist_model_ids = ["fallback"]
+    for model, model_id in zip(cfg.models, ("exam", "fallback")):
+        model.id = model_id
+        model.supports_vision = True
+        model.api_base_url = f"https://{model_id}.invalid/v1"
+    events = []
+    monkeypatch.setattr(pipeline, "broadcast", events.append)
+
+    def unexpected_transport(*_args, **_kwargs):
+        pytest.fail("no model may be invoked before a viable primary is attempted")
+
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", unexpected_transport)
+    task = ("文字题", None, True, "manual_text", {"origin": "manual"})
+    if stage == "before_submission":
+        cfg.models[0].api_key = " "
+        assert not pipeline.submit_answer_task(task)
+    elif stage in ("queued", "endpoint_changed"):
+        pipeline._in_flight_tasks[99] = ("exam", ("", None, True, "manual_text", {}))
+        assert pipeline.submit_answer_task(task)
+        if stage == "queued":
+            cfg.models.pop(0)
+        else:
+            cfg.models[0].api_base_url = "https://replacement.invalid/v1"
+        pipeline._in_flight_tasks.pop(99)
+        pipeline._try_dispatch()
+        assert _DeferredThread.started == []
+    else:
+        assert pipeline.submit_answer_task(task)
+        cfg.models[0].enabled = False
+        _DeferredThread.started[0].run()
+
+    errors = [event for event in events if event["type"] in {"error", "answer_error"}]
+    assert len(errors) == 1 and "笔试" in errors[0]["message"]
+    assert pipeline._pending == []
+    assert get_session().qa_pairs == []
+
+
 def test_dispatched_worker_keeps_full_config_snapshot_when_settings_change(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -185,6 +278,7 @@ def test_dispatched_worker_keeps_full_config_snapshot_when_settings_change(
 
     cfg = pipeline.get_config()
     cfg.written_exam_mode = True
+    cfg.written_exam_model_id = cfg.models[0].id = "exam"
     cfg.written_exam_think = False
     cfg.language = "Rust"
     cfg.system_prompts = {"assist_exam": "按段落提交笔试答案。"}

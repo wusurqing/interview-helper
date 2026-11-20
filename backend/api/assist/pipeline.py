@@ -45,6 +45,9 @@ from api.assist.asr_state import (
 )
 from api.assist.single_mic import RoleSwitch, SingleMicConflict, SingleMicSession
 from api.assist.scheduler import (
+    AnswerRouting,
+    EXAM_MODEL_STALE,
+    EXAM_MODEL_UNAVAILABLE,
     InFlightTasks,
     ModelReservation,
     TaskPayload,
@@ -53,15 +56,18 @@ from api.assist.scheduler import (
     dispatch_model_order as scheduler_dispatch_model_order,
     dispatch_snapshot as scheduler_dispatch_snapshot,
     drain_commit_queue,
+    eligible_exam_model_index,
     is_asr_task,
     is_stale_inflight_asr_task,
     key_ok,
+    live_exam_model_index,
     max_parallel_slots as scheduler_max_parallel_slots,
     model_eligible as scheduler_model_eligible,
     model_reservation,
     physical_busy_models as scheduler_physical_busy_models,
     pick_model_index as scheduler_pick_model_index,
     priority_model_index as scheduler_priority_model_index,
+    task_is_written_exam,
     task_meta,
 )
 
@@ -688,11 +694,13 @@ def pick_model_index(
     task: TaskPayload,
     busy: set[ModelReservation],
     avoid_models: Optional[set[ModelReservation]] = None,
+    *,
+    config_snapshot=None,
 ) -> Optional[int]:
     return scheduler_pick_model_index(
         task,
         busy,
-        get_config(),
+        config_snapshot if config_snapshot is not None else get_config(),
         get_model_health,
         avoid_models=avoid_models,
     )
@@ -710,16 +718,35 @@ def _should_interrupt_stale_asr(cfg=None) -> bool:
     )
 
 
-def submit_answer_task(task: TaskPayload) -> bool:
+def submit_answer_task(task: TaskPayload, *, config_snapshot=None) -> bool:
     global _next_submit_seq
-    if pick_model_index(task, set()) is None:
+    cfg = config_snapshot if config_snapshot is not None else get_config()
+    written_exam = task_is_written_exam(task, cfg)
+    model_index = pick_model_index(task, set(), config_snapshot=cfg)
+    if model_index is None:
         broadcast(
             {
                 "type": "error",
-                "message": "没有可用的答题模型，请在实时辅助中选择已配置且支持该题型的模型。",
+                "message": EXAM_MODEL_UNAVAILABLE if written_exam else (
+                    "没有可用的答题模型，请在实时辅助中选择已配置且支持该题型的模型。"
+                ),
             }
         )
         return False
+    routing = AnswerRouting(written_exam=False)
+    if written_exam:
+        primary_id = cfg.models[model_index].id
+        fallback_ids = (
+            model_id for model_id in (getattr(cfg, "assist_model_ids", None) or ())
+            if eligible_exam_model_index(cfg, model_id) is not None
+        )
+        routing = AnswerRouting(
+            written_exam=True,
+            exam_model_ids=tuple(dict.fromkeys((primary_id, *fallback_ids))),
+            exam_config=copy.deepcopy(cfg),
+        )
+    text, image, manual, source, meta = task
+    task = (text, image, manual, source, {**meta, "answer_routing": routing})
     request = task_meta(task).get("mmpg_request")
     with _dispatch_lock:
         seq = _next_submit_seq
@@ -896,6 +923,7 @@ def _try_dispatch():
             )
             model_cfg_snapshot = None
             config_snapshot = None
+            worker_model_idx = step.claim.model_idx if step.claim is not None else None
             if step.claim is not None:
                 selected_idx = step.claim.model_idx
                 if 0 <= selected_idx < len(cfg.models):
@@ -904,21 +932,38 @@ def _try_dispatch():
                     # update_config() replaces the global object while a
                     # worker may be queued; copying only the model used to
                     # let written-exam/KB/token settings drift underneath it.
-                    config_snapshot = copy.deepcopy(cfg)
-                    model_cfg_snapshot = copy.deepcopy(config_snapshot.models[selected_idx])
+                    model_cfg_snapshot = copy.deepcopy(cfg.models[selected_idx])
+                    routing = task_meta(step.claim.task).get("answer_routing")
+                    if routing is not None and routing.written_exam:
+                        config_snapshot = routing.exam_config
+                        worker_model_idx = eligible_exam_model_index(config_snapshot, model_cfg_snapshot.id)
+                    else:
+                        config_snapshot = copy.deepcopy(cfg)
         if step.skipped_seq is not None:
             _mark_seq_skipped(step.skipped_seq)
-            if step.unavailable:
-                broadcast({"type": "error", "message": "选中的答题模型已不可用，请在实时辅助中重新选择。"})
+            if step.unavailable_task is not None:
+                unavailable_task = step.unavailable_task
+                message = EXAM_MODEL_STALE if task_is_written_exam(unavailable_task, cfg) else (
+                    "选中的答题模型已不可用，请在实时辅助中重新选择。"
+                )
+                if preflight_id := task_meta(unavailable_task).get("exam_preflight_id"):
+                    from .exam_test import record_exam_preflight_answer_event
+
+                    record_exam_preflight_answer_event({
+                        "type": "answer_error", "exam_preflight_id": preflight_id, "message": message,
+                    })
+                else:
+                    broadcast({"type": "error", "message": message})
             continue
         if step.claim is None:
             return
+        assert worker_model_idx is not None
         threading.Thread(
             target=_run_answer_worker,
             args=(
                 step.claim.task,
                 step.claim.seq,
-                step.claim.model_idx,
+                worker_model_idx,
                 step.claim.session_version,
                 model_cfg_snapshot,
                 config_snapshot,
@@ -958,6 +1003,20 @@ def _reserve_answer_retry(
     task: TaskPayload, seq: int, cfg, attempted: set[int], aborted: Callable[[], bool],
     *, on_wait: Callable[[], None] | None = None,
 ) -> int | None:
+    routing = task_meta(task).get("answer_routing")
+
+    def pick(busy):
+        if routing is not None and routing.written_exam:
+            current = get_config()
+            for model_id in routing.exam_model_ids:
+                index = eligible_exam_model_index(cfg, model_id)
+                if index is None or index in attempted or model_id in busy:
+                    continue
+                if live_exam_model_index(routing, current, model_id) is not None:
+                    return index
+            return None
+        return scheduler_pick_model_index(task, busy, cfg, lambda _index: None, excluded_indices=attempted)
+
     with _dispatch_changed:
         if seq not in _in_flight_tasks:
             return None
@@ -971,15 +1030,11 @@ def _reserve_answer_retry(
             if seq not in _in_flight_tasks:
                 return None
             busy = scheduler_physical_busy_models(_in_flight_tasks)
-            index = scheduler_pick_model_index(
-                task, busy, cfg, lambda _index: None, excluded_indices=attempted,
-            )
+            index = pick(busy)
             if index is not None:
                 _in_flight_tasks[seq] = (model_reservation(cfg, index), task)
                 return index
-            if not busy or scheduler_pick_model_index(
-                task, set(), cfg, lambda _index: None, excluded_indices=attempted,
-            ) is None:
+            if not busy or pick(set()) is None:
                 return None
             if announced_wait or on_wait is None:
                 _dispatch_changed.wait(timeout=0.1)
@@ -2101,6 +2156,20 @@ def _process_question_parallel(
     my_gen = _capture_generation()
     my_asr_turn = int(_task_meta(task).get("asr_turn_id", 0)) if _is_asr_task(task) else 0
     request = _task_meta(task).get("mmpg_request")
+    routing = task_meta(task).get("answer_routing")
+
+    def resolve_exam_model(index):
+        current = get_config()
+        submitted = cfg.models[index]
+        live_index = live_exam_model_index(routing, current, submitted.id)
+        if live_index is None:
+            return None
+        # Preserve every submitted transport/payload setting. A renamed row
+        # and rotated credentials are valid for the same provider destination.
+        model = copy.copy(submitted)
+        model.name = current.models[live_index].name
+        model.api_key = current.models[live_index].api_key
+        return model
 
     def session_stale() -> bool:
         return sess_v != _task_session_version
@@ -2136,6 +2205,7 @@ def _process_question_parallel(
             start_abort_check=aborted if request is not None else session_stale,
             model_cfg_snapshot=model_cfg_snapshot,
             config_snapshot=config_snapshot,
+            resolve_exam_model=resolve_exam_model if routing is not None and routing.written_exam else None,
             reserve_retry=lambda attempted, on_wait: _reserve_answer_retry(
                 task, seq, cfg, attempted, aborted, on_wait=on_wait,
             ),

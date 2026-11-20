@@ -194,7 +194,7 @@ function AnswerModels({ onOpenModelConfig }: { onOpenModelConfig: () => void }) 
         )}
 
         <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="截图答题模型" htmlFor="assist-screenshot-model" hint="用于电脑截图和笔试截图。">
+          <Field label="截图答题模型" htmlFor="assist-screenshot-model" hint="用于面试时的电脑截图">
             <select id="assist-screenshot-model" className="input-field" disabled={saving}
               value={current.assist_screenshot_model_id ?? ''}
               onChange={(event) => change({ assist_screenshot_model_id: event.target.value || null })}>
@@ -242,7 +242,7 @@ export default function RealtimeAssistTab({ onOpenSpeechConfig, onOpenModelConfi
       <AnswerLayout />
       <AnswerModels onOpenModelConfig={onOpenModelConfig} />
       <Section title="系统提示词与生成参数" icon={<FileText className="h-4 w-4" />}
-        keywords="系统 提示词 温度 temperature max token 上限 语音 手动 电脑截图 笔试">
+        keywords="系统 提示词 温度 temperature max token 上限 语音 手动 电脑截图">
         <SystemPromptsTab scope="assist" onSavingChange={onSavingPromptChange} />
       </Section>
       <SpeechRolesSettings onOpenSpeechConfig={onOpenSpeechConfig} />

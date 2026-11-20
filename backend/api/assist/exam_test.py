@@ -10,8 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from api.common.model_health import get_model_health
-from api.assist.scheduler import pick_model_index
+from api.assist.scheduler import EXAM_MODEL_UNAVAILABLE, exam_primary_index
 from api.realtime.ws import broadcast
 from core.config import get_config
 from core.logger import get_logger
@@ -73,6 +72,8 @@ def _set_step_unless_status(
     with _lock:
         extra = dict(extra or {})
         preflight_id = _status.get("preflight_id")
+        if not _status.get("running") or extra.get("preflight_id", preflight_id) != preflight_id:
+            return False
         if preflight_id and "preflight_id" not in extra:
             extra["preflight_id"] = preflight_id
         if extra:
@@ -174,9 +175,9 @@ def build_fixed_code_question_image_data_url() -> str:
 
 
 def select_exam_preflight_model(cfg):
-    model_index = pick_model_index(_exam_preflight_task("image", ""), set(), cfg, get_model_health)
+    model_index = exam_primary_index(_exam_preflight_task("image", ""), cfg)
     if model_index is None:
-        raise RuntimeError("没有可用的识图模型，请在实时辅助中设置截图模型")
+        raise RuntimeError(EXAM_MODEL_UNAVAILABLE)
     return model_index, cfg.models[model_index]
 
 
@@ -242,9 +243,15 @@ def record_exam_preflight_answer_event(event: dict) -> None:
             {"preflight_id": preflight_id},
         )
         return
+    if event_type == "answer_retry":
+        if model_name := event.get("model_name"):
+            _set_status(model_name=model_name)
+        return
     if event_type == "answer_done":
         answer = str(event.get("answer") or "").strip()
         if answer:
+            if model_name := event.get("model_name"):
+                _set_status(model_name=model_name)
             _set_step(
                 "llm",
                 "pass",
@@ -360,13 +367,14 @@ def _run_exam_preflight(preflight_id: Optional[str] = None) -> None:
         _model_idx, model_cfg = select_exam_preflight_model(cfg)
         _set_status(model_name=getattr(model_cfg, "name", None))
         task = _exam_preflight_task(image_data_url, preflight_id)
-        from .pipeline import pick_model_index, submit_answer_task
+        from .pipeline import submit_answer_task
 
-        if pick_model_index(task, set()) is None:
-            raise RuntimeError("没有可用的识图模型，请检查启用状态与 API Key")
-        queued = submit_answer_task(task)
+        queued = submit_answer_task(task, config_snapshot=cfg)
         if not queued:
-            raise RuntimeError("没有可用的识图模型，请检查启用状态与 API Key")
+            raise RuntimeError(EXAM_MODEL_UNAVAILABLE)
+        with _lock:
+            if not _status.get("running") or _status.get("preflight_id") != preflight_id:
+                return
         _schedule_exam_preflight_timeout(preflight_id)
         _set_step_unless_status(
             "submit",

@@ -744,7 +744,9 @@ function postBackend(pathname, body = '{}') {
             try { resolve(JSON.parse(raw)); } catch { resolve({ ok: true }); }
             return;
           }
-          reject(new Error(raw || res.statusMessage || `HTTP ${res.statusCode}`));
+          let detail;
+          try { detail = JSON.parse(raw).detail; } catch { /* Some errors are plain text. */ }
+          reject(new Error((typeof detail === 'string' && detail) || raw || res.statusMessage || `HTTP ${res.statusCode}`));
         });
       }
     );
@@ -785,11 +787,12 @@ async function getMultiScreenIdleMs() {
 }
 
 const multiServerScreenBatch = createMultiScreenBatch({
-  submitImages: (images) => (
-    postBackend('/api/ask-from-server-screens', JSON.stringify({ images }))
+  submitImages: (images, writtenExamMode) => (
+    postBackend('/api/ask-from-server-screens', JSON.stringify({ images, expected_written_exam_mode: writtenExamMode }))
   ),
   onError: (error) => {
     console.error('flushMultiServerScreenBatch failed:', error);
+    notifyDesktopToast(error.message || '连续截图提交失败', 'error');
   },
 });
 
@@ -797,10 +800,12 @@ async function addMultiServerScreenShot() {
   try {
     const res = await postBackend('/api/capture-server-screen');
     if (!res?.image) throw new Error('capture response missing image');
+    if (typeof res.written_exam_mode !== 'boolean') throw new Error('无法确认截图所属答题模式，请检查后端版本后重新截图。');
     const idleMs = await getMultiScreenIdleMs();
-    multiServerScreenBatch.add(res.image, idleMs);
+    multiServerScreenBatch.add(res.image, idleMs, res.written_exam_mode);
   } catch (error) {
     console.error('addMultiServerScreenShot failed:', error);
+    notifyDesktopToast(error.message || '连续截图失败', 'error');
   }
 }
 
@@ -980,6 +985,7 @@ const shortcutCallbacks = {
       await postBackend('/api/ask-from-server-screen');
     } catch (error) {
       console.error('askFromServerScreen failed:', error);
+      notifyDesktopToast(error.message || '截图答题失败', 'error');
     }
   },
   askScreenForceThink: async () => {

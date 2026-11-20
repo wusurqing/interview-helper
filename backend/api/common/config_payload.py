@@ -23,7 +23,7 @@ def build_config_payload(cfg) -> dict:
                 "supports_think": model.supports_think,
                 "supports_vision": model.supports_vision,
                 "enabled": getattr(model, "enabled", True),
-                "has_api_key": bool(model.api_key and model.api_key not in ("", "sk-your-api-key-here")),
+                "has_api_key": (model.api_key or "").strip() not in ("", "sk-your-api-key-here"),
                 "health_fingerprint": model_health_fingerprint(model),
             }
             for model in cfg.models
@@ -31,6 +31,7 @@ def build_config_payload(cfg) -> dict:
         "max_parallel_answers": getattr(cfg, "max_parallel_answers", 2),
         "assist_model_ids": list(getattr(cfg, "assist_model_ids", None) or []),
         "assist_screenshot_model_id": getattr(cfg, "assist_screenshot_model_id", None),
+        "written_exam_model_id": getattr(cfg, "written_exam_model_id", None),
         "assist_generation": {
             scene: params.model_dump() for scene, params in getattr(cfg, "assist_generation", {}).items()
         },
