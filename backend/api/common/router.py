@@ -484,7 +484,14 @@ async def api_network_info(request: Request):
     client_host = request.client.host if request.client else None
     url = base
     auth_required = not is_auth_disabled()
-    if auth_required and is_loopback_host(client_host):
+    local_same_origin = is_loopback_host(request.url.hostname) and loopback_bypass_allowed(
+        client_host,
+        request.headers.get("origin"),
+        request.url.hostname,
+        request.url.scheme,
+        request.url.port,
+    )
+    if auth_required and local_same_origin:
         url = f"{base}/?t={get_token()}"
     return {
         "ip": ip,

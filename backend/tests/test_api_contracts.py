@@ -27,6 +27,64 @@ def test_is_path_within_dir_rejects_same_prefix_sibling(tmp_path: Path):
     assert main_mod._is_path_within_dir(safe_dir, sibling_dir / "index.html") is False
 
 
+def test_is_path_within_dir_rejects_symlink_escape(tmp_path: Path):
+    import os
+
+    safe_dir = tmp_path / "dist"
+    outside_dir = tmp_path / "outside"
+    safe_dir.mkdir()
+    outside_dir.mkdir()
+    secret = outside_dir / "secret.txt"
+    secret.write_text("secret", encoding="utf-8")
+    link_dir = safe_dir / "escape"
+    try:
+        os.symlink(outside_dir, link_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        if sys.platform == "win32":
+            import _winapi
+
+            _winapi.CreateJunction(str(outside_dir), str(link_dir))
+        else:
+            pytest.skip("cannot create directory link on this platform")
+
+    assert main_mod._is_path_within_dir(safe_dir, link_dir / "secret.txt") is False
+
+
+def test_auth_info_and_network_info_block_cross_origin_and_dns_rebinding(monkeypatch: pytest.MonkeyPatch):
+    common_router = importlib.import_module("api.common.router")
+    monkeypatch.setattr(main_mod, "is_auth_disabled", lambda: False)
+    monkeypatch.setattr(main_mod, "get_token", lambda: "lan-secret-token")
+    monkeypatch.setattr(common_router, "is_auth_disabled", lambda: False)
+    monkeypatch.setattr(common_router, "get_token", lambda: "lan-secret-token")
+
+    def make_req(*, client_host="127.0.0.1", origin=None, hostname="127.0.0.1", port=18080):
+        return SimpleNamespace(
+            client=SimpleNamespace(host=client_host),
+            headers=({"origin": origin} if origin else {}),
+            url=SimpleNamespace(scheme="http", hostname=hostname, port=port),
+        )
+
+    # Cross-origin browser request from loopback must be denied token.
+    cross_origin = make_req(origin="https://evil.example")
+    auth_resp = asyncio.run(main_mod.api_auth_info(cross_origin))
+    assert getattr(auth_resp, "status_code", 200) == 403
+    net_resp = asyncio.run(common_router.api_network_info(cross_origin))
+    assert "lan-secret-token" not in net_resp["url"]
+
+    # DNS-rebinding Host header (non-loopback hostname) must be denied token.
+    rebound = make_req(hostname="attacker.example")
+    auth_rebound = asyncio.run(main_mod.api_auth_info(rebound))
+    assert getattr(auth_rebound, "status_code", 200) == 403
+    net_rebound = asyncio.run(common_router.api_network_info(rebound))
+    assert "lan-secret-token" not in net_rebound["url"]
+
+    # Legitimate same-origin loopback receives token.
+    local_ok = make_req(origin="http://127.0.0.1:18080")
+    assert asyncio.run(main_mod.api_auth_info(local_ok)) == {"required": True, "token": "lan-secret-token"}
+    net_ok = asyncio.run(common_router.api_network_info(local_ok))
+    assert net_ok["url"].endswith("/?t=lan-secret-token")
+
+
 def _request_with_origin(origin: str | None, host: str = "127.0.0.1", port: int = 18080):
     return SimpleNamespace(
         headers=({"origin": origin} if origin else {}),

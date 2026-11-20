@@ -38,9 +38,9 @@ FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 
 def _is_path_within_dir(base_dir: str, candidate_path: str) -> bool:
     try:
-        base_abs = os.path.abspath(base_dir)
-        candidate_abs = os.path.abspath(candidate_path)
-        return os.path.commonpath([base_abs, candidate_abs]) == base_abs
+        base_real = os.path.realpath(base_dir)
+        candidate_real = os.path.realpath(candidate_path)
+        return os.path.commonpath([base_real, candidate_real]) == base_real
     except ValueError:
         return False
 
@@ -205,9 +205,18 @@ async def api_auth_info(request: Request):
     client_host = request.client.host if request.client else None
     if is_auth_disabled():
         return {"required": False, "token": None}
-    if not is_loopback_host(client_host):
+    if not (
+        is_loopback_host(request.url.hostname)
+        and loopback_bypass_allowed(
+            client_host,
+            request.headers.get("origin"),
+            request.url.hostname,
+            request.url.scheme,
+            request.url.port,
+        )
+    ):
         return JSONResponse(
-            {"detail": "auth/info 仅允许环回访问,LAN 端请扫码获取带 token 的 URL。"},
+            {"detail": "auth/info 仅允许环回同源访问,LAN 端请扫码获取带 token 的 URL。"},
             status_code=403,
         )
     return {"required": True, "token": get_token()}
@@ -231,7 +240,7 @@ if os.path.isdir(FRONTEND_DIR):
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         # Prevent path traversal: resolve to realpath and ensure under FRONTEND_DIR
-        file_path = os.path.abspath(os.path.join(FRONTEND_DIR, full_path))
+        file_path = os.path.realpath(os.path.join(FRONTEND_DIR, full_path))
         if not _is_path_within_dir(FRONTEND_DIR, file_path):
             return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
         if os.path.isfile(file_path):
