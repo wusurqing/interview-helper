@@ -138,6 +138,12 @@ CANDIDATE_STT_PROVIDER_OPTIONS = STT_PROVIDER_OPTIONS.copy()
 MMPG_SECRET_FIELDS = frozenset({
     "volc_access_key", "volc_secret_key", "rtc_app_key", "rtc_token", "doubao_api_key",
 })
+STT_SECRET_FIELDS = frozenset({
+    "doubao_stt_access_token",
+    "doubao_stt_api_key",
+    "generic_stt_api_key",
+    "generic_stt_custom_headers",
+})
 _MmpgText = Annotated[str, StringConstraints(strip_whitespace=True, strict=True)]
 _PositiveInt = Annotated[int, Field(strict=True, gt=0)]
 _AnswerWindowMs = Annotated[int, Field(strict=True, ge=0, le=2**53 - 1)]
@@ -211,19 +217,19 @@ class AppConfig(BaseModel):
     mmpg: Mmpg = Field(default_factory=Mmpg)
     # 豆包语音识别 API（当 stt_provider=doubao 时使用），使用小时版 + WebSocket 双流式
     doubao_stt_app_id: str = ""
-    doubao_stt_access_token: str = ""
+    doubao_stt_access_token: str = Field(default="", repr=False)
     # 新版控制台 API Key（优先于 app_id + access_token）
-    doubao_stt_api_key: str = ""
+    doubao_stt_api_key: str = Field(default="", repr=False)
     # 资源 ID：豆包流式语音识别模型2.0 小时版
     doubao_stt_resource_id: str = "volc.seedasr.sauc.duration"
     # 热词表 ID：在自学习平台上传热词文件后获得；有则传入请求，没有则不传
     doubao_stt_boosting_table_id: str = ""
     # 通用 ASR（OpenAI-compatible multipart: POST /audio/transcriptions）
     generic_stt_api_base_url: str = ""
-    generic_stt_api_key: str = ""
+    generic_stt_api_key: str = Field(default="", repr=False)
     generic_stt_model: str = ""
     # 自定义 HTTP header，JSON 格式如 {"X-Custom":"value"} 或每行 Key: Value
-    generic_stt_custom_headers: str = ""
+    generic_stt_custom_headers: str = Field(default="", repr=False)
     # 我的回答需要用户显式选择引擎并启用。
     candidate_asr_enabled: bool = False
     candidate_stt_provider: str = ""
@@ -743,6 +749,16 @@ def update_config(
                     current[field] = setting
                 if current["rtc_token"] != previous_token and "rtc_token_expires_at" not in value:
                     current["rtc_token_expires_at"] = None
+            elif key in STT_SECRET_FIELDS:
+                if isinstance(value, str):
+                    stripped = value.strip()
+                    if not stripped:
+                        continue
+                    data[key] = stripped
+                elif value is None:
+                    data[key] = ""
+                else:
+                    data[key] = value
             elif key == "system_prompts":
                 data[key] = patch_system_prompts(data[key], value)
             elif key == "assist_generation":

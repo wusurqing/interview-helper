@@ -141,7 +141,7 @@ describe('SpeechRolesSettings', () => {
   it('keeps unsaved role changes after a provider credential refresh', () => {
     render(<SpeechRolesSettings />)
     fireEvent.change(screen.getByLabelText('我的回答 ASR 引擎'), { target: { value: 'doubao_mmpg' } })
-    act(() => useInterviewStore.setState((state) => ({ config: { ...state.config!, generic_stt_api_key: 'refreshed' } })))
+    act(() => useInterviewStore.setState((state) => ({ config: { ...state.config!, generic_stt_api_key_configured: true } })))
     expect(screen.getByLabelText('我的回答 ASR 引擎')).toHaveValue('doubao_mmpg')
     expect(screen.getByText('有未保存更改')).toBeInTheDocument()
   })

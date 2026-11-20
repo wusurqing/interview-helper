@@ -11,6 +11,7 @@ from pydantic import BaseModel, StrictInt, StrictStr, ValidationError
 from core.auth import get_token, is_auth_disabled, is_loopback_host, loopback_bypass_allowed
 from core.config import (
     CANDIDATE_STT_PROVIDER_OPTIONS, DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, MMPG_STT_PROVIDER, Mmpg,
+    STT_SECRET_FIELDS,
     get_config, get_model_providers, model_health_fingerprint, provider_url, update_config, ModelListChanged,
     AssistGeneration, AssistScene, InvalidAssistModelSelection, ThinkEffort,
     POSITION_OPTIONS, LANGUAGE_OPTIONS, STT_PROVIDER_OPTIONS,
@@ -251,7 +252,13 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
     from core.config import ModelConfig
 
     d = body.model_dump(exclude_none=True)
-    for field in ("active_model", "active_model_id", "review_model_index", "review_model_id"):
+    for field in (
+        "active_model",
+        "active_model_id",
+        "review_model_index",
+        "review_model_id",
+        *STT_SECRET_FIELDS,
+    ):
         if field in body.model_fields_set:
             d[field] = getattr(body, field)
     if "assist_screenshot_model_id" in body.model_fields_set:
