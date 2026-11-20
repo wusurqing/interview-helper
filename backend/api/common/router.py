@@ -11,7 +11,7 @@ from pydantic import BaseModel, StrictInt, StrictStr, ValidationError
 from core.auth import get_token, is_auth_disabled, is_loopback_host, loopback_bypass_allowed
 from core.config import (
     CANDIDATE_STT_PROVIDER_OPTIONS, DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, MMPG_STT_PROVIDER, Mmpg,
-    STT_SECRET_FIELDS,
+    STT_SECRET_FIELDS, ConfigCorruptError,
     get_config, get_model_providers, model_health_fingerprint, provider_url, update_config, ModelListChanged,
     AssistGeneration, AssistScene, InvalidAssistModelSelection, ThinkEffort,
     POSITION_OPTIONS, LANGUAGE_OPTIONS, STT_PROVIDER_OPTIONS,
@@ -129,6 +129,8 @@ class ConfigUpdate(BaseModel):
     review_enabled: Optional[bool] = None
     review_model_index: Optional[int] = None
     review_model_id: StrictStr | None = None
+    # 明确确认以当前配置覆盖已损坏的 config.json（只读保护解锁）
+    confirm_overwrite_corrupt: Optional[bool] = None
 
 
 _MODEL_API_KEY_KEEP = "__IA_KEEP_EXISTING_API_KEY__"
@@ -416,9 +418,12 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
         if "kb_asr_deadline_ms" in d:
             d["kb_asr_deadline_ms"] = max(20, min(1000, int(d["kb_asr_deadline_ms"])))
 
+        confirm_overwrite = bool(d.pop("confirm_overwrite_corrupt", False))
         save_options = {} if model_snapshot is None else {
             "model_origins": model_origins, "model_snapshot": model_snapshot,
         }
+        if confirm_overwrite:
+            save_options["allow_overwrite_corrupt"] = True
         if "written_exam_mode" in d:
             from api.assist.mmpg_integration import http_lifecycle_lock, manager
             from api.realtime.ws import broadcast
@@ -439,6 +444,8 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
             disable_automatic_answers()
     except HTTPException:
         raise
+    except ConfigCorruptError as e:
+        raise HTTPException(409, str(e)) from e
     except ModelListChanged as e:
         raise HTTPException(409, str(e)) from e
     except InvalidAssistModelSelection as e:
@@ -647,6 +654,8 @@ async def api_import_mmpg_probe(request: Request):
     _require_local_mmpg_request(request)
     try:
         await run_in_threadpool(_import_mmpg_probe_config)
+    except ConfigCorruptError as e:
+        raise HTTPException(409, str(e)) from e
     except OSError:
         raise HTTPException(500, "无法保存设置，请检查配置文件目录的写入权限") from None
     except ValidationError as e:

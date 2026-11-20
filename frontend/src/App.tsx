@@ -22,6 +22,7 @@ import SessionSettingsPopover from '@/components/SessionSettingsPopover'
 import KnowledgeButton from '@/components/kb/KnowledgeButton'
 import KnowledgeDrawer from '@/components/kb/KnowledgeDrawer'
 import { AppToastStack } from '@/components/app/AppToastStack'
+import { ConfigCorruptBanner } from '@/components/app/ConfigCorruptBanner'
 import { InitErrorScreen } from '@/components/app/InitErrorScreen'
 import VisionBadge from '@/components/VisionBadge'
 import { ModelPriorityDropdown } from '@/components/app/ModelPriorityDropdown'
@@ -541,6 +542,8 @@ export default function App() {
         )}
         </div>
       </header>
+
+      <ConfigCorruptBanner />
 
       {/* ── Assist Mode ── */}
       {appMode === 'assist' && (

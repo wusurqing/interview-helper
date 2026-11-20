@@ -1,8 +1,8 @@
 from fastapi import APIRouter, HTTPException, Response
 
 from core.config import (
-    KnowledgeAnalysisSettings, ModelListChanged, get_config, get_provider_layout, knowledge_model_available,
-    model_health_fingerprint, update_knowledge_analysis_settings,
+    ConfigCorruptError, KnowledgeAnalysisSettings, ModelListChanged, get_config, get_provider_layout,
+    knowledge_model_available, model_health_fingerprint, update_knowledge_analysis_settings,
 )
 from services import knowledge_analysis
 from services.storage.knowledge import get_summary, get_history, reset_all
@@ -52,6 +52,8 @@ def api_update_knowledge_settings(body: KnowledgeSettingsUpdate):
     settings.system_prompt = (settings.system_prompt or "").strip() or None
     try:
         return _settings_payload(update_knowledge_analysis_settings(settings, body.model_fingerprint))
+    except ConfigCorruptError as exc:
+        raise HTTPException(409, str(exc)) from exc
     except ModelListChanged as exc:
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:

@@ -1,4 +1,11 @@
-from core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, Mmpg, get_provider_layout, model_health_fingerprint
+from core.config import (
+    DEFAULT_CONTEXT_WINDOW_TOKENS,
+    MMPG_SECRET_FIELDS,
+    Mmpg,
+    get_config_corrupt_state,
+    get_provider_layout,
+    model_health_fingerprint,
+)
 from services.storage.resume_history import get_filename_for_id
 from services.stt import configured_stt_routes
 
@@ -9,6 +16,7 @@ def build_config_payload(cfg) -> dict:
     provider_names = {provider.id: provider.name for provider in providers}
     provider_ids = {model.id: model.provider_id for model in layout}
     resume_active_history_id = getattr(cfg, "resume_active_history_id", None)
+    corrupt_state = get_config_corrupt_state()
     mmpg = (getattr(cfg, "mmpg", None) or Mmpg()).model_dump()
     for field in MMPG_SECRET_FIELDS:
         mmpg[f"{field}_configured"] = bool(mmpg.pop(field))
@@ -138,4 +146,13 @@ def build_config_payload(cfg) -> dict:
         "review_enabled": bool(getattr(cfg, "review_enabled", False)),
         "review_model_index": cfg.review_model_index,
         "review_model_id": cfg.review_model_id,
+        "config_corrupt": corrupt_state is not None,
+        "config_corrupt_info": (
+            {
+                "error": corrupt_state["error"],
+                "backup_filename": corrupt_state.get("backup_filename"),
+            }
+            if corrupt_state is not None
+            else None
+        ),
     }

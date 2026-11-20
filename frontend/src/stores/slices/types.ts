@@ -157,6 +157,11 @@ export interface AppConfig {
   /** 复盘分析使用的模型索引 */
   review_model_index?: number | null
   review_model_id?: string | null
+  config_corrupt?: boolean
+  config_corrupt_info?: {
+    error: string
+    backup_filename: string | null
+  } | null
 }
 
 export type SingleMicRole = 'interviewer' | 'candidate'

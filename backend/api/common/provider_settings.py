@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, ValidationError
 from core.config import (
     DEFAULT_CONTEXT_WINDOW_TOKENS,
     AppConfig,
+    ConfigCorruptError,
     ModelConfig,
     ModelListChanged,
     ModelProvider,
@@ -122,6 +123,8 @@ def put_provider_settings(body: Any = Body()) -> dict:
         )
     except ValidationError:
         raise HTTPException(422, "供应商或模型配置格式无效") from None
+    except ConfigCorruptError as exc:
+        raise HTTPException(409, str(exc)) from None
     except ModelListChanged as exc:
         raise HTTPException(409, str(exc)) from None
     except ValueError as exc:

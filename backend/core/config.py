@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, StrictBool, StrictStr, StringConstraints, ValidationError, field_validator, model_validator
+from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Annotated, Callable, Literal, Optional, Any, get_args
@@ -10,13 +10,13 @@ import json
 import math
 import os
 import secrets
+import shutil
+import threading
+
+from pydantic import BaseModel, Field, StrictBool, StrictStr, StringConstraints, ValidationError, field_validator, model_validator
 
 from core.logger import get_logger
 from core.prompt_settings import patch_system_prompts
-
-logger = get_logger(__name__)
-import shutil
-import threading
 
 logger = get_logger(__name__)
 
@@ -480,7 +480,45 @@ class AppConfig(BaseModel):
 
 
 _config: Optional[AppConfig] = None
+_config_corrupt_state: Optional[dict[str, Any]] = None
 _config_lock = threading.RLock()
+
+
+class ConfigCorruptError(RuntimeError):
+    """配置文件损坏处于只读保护态时，拒绝未确认的覆写保存。"""
+
+
+def _current_config_file_key() -> str:
+    return str(Path(CONFIG_FILE).resolve())
+
+
+def get_config_corrupt_state() -> Optional[dict[str, Any]]:
+    with _config_lock:
+        if _config_corrupt_state is None:
+            return None
+        if _config_corrupt_state.get("config_file") != _current_config_file_key():
+            return None
+        return {
+            "corrupt": True,
+            "error": _config_corrupt_state["error"],
+            "backup_path": _config_corrupt_state.get("backup_path"),
+            "backup_filename": _config_corrupt_state.get("backup_filename"),
+        }
+
+
+def _assert_config_writable(*, allow_overwrite_corrupt: bool = False) -> None:
+    corrupt = get_config_corrupt_state()
+    if corrupt is None or allow_overwrite_corrupt:
+        return
+    backup_hint = (
+        f"（原文件已备份为 {corrupt['backup_filename']}）"
+        if corrupt.get("backup_filename")
+        else ""
+    )
+    raise ConfigCorruptError(
+        f"配置文件加载失败，当前处于只读保护模式{backup_hint}。"
+        "请先修复或恢复 config.json，或在页面明确确认覆盖后再保存。"
+    )
 
 
 def get_config() -> AppConfig:
@@ -587,6 +625,7 @@ def save_provider_layout(
     global _config
     with _config_lock:
         cfg = get_config()
+        _assert_config_writable()
         if revision != provider_layout_revision(cfg):
             raise ModelListChanged("供应商或模型用途已变更，请刷新并重新确认")
         previous_providers, previous_models = get_provider_layout(cfg)
@@ -725,10 +764,12 @@ def update_config(
     *,
     model_origins: list[int | None] | None = None,
     model_snapshot: list[ModelConfig] | None = None,
+    allow_overwrite_corrupt: bool = False,
 ) -> AppConfig:
     global _config
     with _config_lock:
         cfg = get_config()
+        _assert_config_writable(allow_overwrite_corrupt=allow_overwrite_corrupt)
         if model_snapshot is not None and model_snapshot != cfg.models:
             raise ModelListChanged("模型列表已更新，请刷新后重试")
         data = cfg.model_dump()
@@ -851,7 +892,7 @@ def update_config(
                 matches = []
             updated.knowledge_analysis.model_index = matches[0] if len(matches) == 1 else None
             updated.knowledge_analysis.model_id = updated._model_id_at(updated.knowledge_analysis.model_index)
-        _save_config(updated)
+        _save_config(updated, allow_overwrite_corrupt=allow_overwrite_corrupt)
         _config = updated
         return updated
 
@@ -888,7 +929,40 @@ def update_knowledge_analysis_settings(
         return update_config({"knowledge_analysis": data})
 
 
+def _backup_corrupt_config(target: Path) -> Optional[Path]:
+    if not target.exists():
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = target.with_name(f"{target.name}.corrupt.{stamp}")
+    suffix = 1
+    while backup.exists():
+        backup = target.with_name(f"{target.name}.corrupt.{stamp}.{suffix}")
+        suffix += 1
+    temp_path = None
+    try:
+        raw = target.read_bytes()
+        with NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+            temp_path = Path(stream.name)
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, backup)
+        temp_path = None
+        return backup
+    except OSError as exc:
+        logger.error("备份损坏的配置文件失败: %s", exc)
+        return None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _load_config() -> AppConfig:
+    global _config_corrupt_state
+    _config_corrupt_state = None
     _custom_path = os.environ.get("IA_CONFIG_PATH")
     if not os.path.exists(CONFIG_FILE):
         if _custom_path:
@@ -896,11 +970,14 @@ def _load_config() -> AppConfig:
             return AppConfig()
         if os.path.exists(CONFIG_EXAMPLE):
             shutil.copy2(CONFIG_EXAMPLE, CONFIG_FILE)
-            print("[Config] 已从 config.example.json 创建 config.json，请在设置中添加模型供应商")
+            logger.info("已从 config.example.json 创建 config.json，请在设置中添加模型供应商")
     if os.path.exists(CONFIG_FILE):
+        target = Path(CONFIG_FILE)
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(target, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("配置文件根节点必须是 JSON 对象")
             if data.pop("asr_config_version", None) == _ASR_CONFIG_VERSION:
                 data.pop("candidate_remote_stt_enabled", None)
             else:
@@ -908,13 +985,37 @@ def _load_config() -> AppConfig:
                 data["candidate_remote_stt_enabled"] = data.get("candidate_remote_stt_enabled") is True
             return AppConfig(**data)
         except ValidationError as e:
-            logger.warning("配置包含 %s 项无效设置，使用默认配置", e.error_count())
+            backup = _backup_corrupt_config(target)
+            fields = sorted({
+                ".".join(str(part) for part in item.get("loc", ()))
+                for item in e.errors(include_input=False, include_context=False, include_url=False)
+                if item.get("loc")
+            })
+            field_suffix = f"：{', '.join(fields[:5])}" if fields else ""
+            summary = f"配置校验失败（{e.error_count()} 项无效{field_suffix}）"
+            logger.error("%s，已备份至 %s 并进入只读保护模式", summary, backup or "备份失败")
+            _config_corrupt_state = {
+                "config_file": _current_config_file_key(),
+                "error": summary,
+                "backup_path": str(backup) if backup else None,
+                "backup_filename": backup.name if backup else None,
+            }
         except Exception as e:
-            print(f"[Config] 配置文件解析失败: {e}，使用默认配置")
+            backup = _backup_corrupt_config(target)
+            summary = f"配置文件解析失败（{type(e).__name__}）"
+            logger.error("%s，已备份至 %s 并进入只读保护模式: %s", summary, backup or "备份失败", e)
+            _config_corrupt_state = {
+                "config_file": _current_config_file_key(),
+                "error": summary,
+                "backup_path": str(backup) if backup else None,
+                "backup_filename": backup.name if backup else None,
+            }
     return AppConfig()
 
 
-def _save_config(cfg: AppConfig) -> None:
+def _save_config(cfg: AppConfig, *, allow_overwrite_corrupt: bool = False) -> None:
+    global _config_corrupt_state
+    _assert_config_writable(allow_overwrite_corrupt=allow_overwrite_corrupt)
     target = Path(CONFIG_FILE)
     data = cfg.model_dump()
     data["asr_config_version"] = _ASR_CONFIG_VERSION
@@ -943,6 +1044,8 @@ def _save_config(cfg: AppConfig) -> None:
             os.fsync(f.fileno())
         os.replace(temp_path, target)
         temp_path = None
+        if _config_corrupt_state is not None and _config_corrupt_state.get("config_file") == _current_config_file_key():
+            _config_corrupt_state = None
     finally:
         if temp_path is not None:
             try:
