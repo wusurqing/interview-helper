@@ -249,6 +249,9 @@ def optimize_resume_stream(
         return
 
     model_cfg = cfg.get_active_model()
+    if model_cfg is None or not getattr(model_cfg, "enabled", True):
+        yield "[错误: 请先选择通用默认模型]"
+        return
     client = get_client()
 
     configured = getattr(cfg, "system_prompts", None) if system_prompts is None else system_prompts

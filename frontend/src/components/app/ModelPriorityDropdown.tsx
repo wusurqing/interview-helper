@@ -2,9 +2,10 @@ import { useEffect, useRef, useState } from 'react'
 import { ChevronDown } from 'lucide-react'
 
 import VisionBadge from '@/components/VisionBadge'
-import { api } from '@/lib/api'
+import { api, getErrorMessage } from '@/lib/api'
 import { getAssistModelEntries, isConfiguredModel } from '@/lib/assistModels'
 import { useInterviewStore, type AppConfig, type ModelHealthStatus } from '@/stores/configStore'
+import type { ModelCatalogStatus } from '@/stores/slices/types'
 
 interface ModelPriorityDropdownProps {
   config: AppConfig
@@ -18,12 +19,14 @@ function healthDot(
   config: AppConfig,
   modelHealth: Record<number, ModelHealthStatus>,
   index: number,
+  catalog?: ModelCatalogStatus,
 ) {
   if (config.models[index]?.enabled === false) return 'bg-text-muted/40'
   const status = modelHealth[index]
   if (status === 'ok') return 'bg-accent-green'
   if (status === 'checking') return 'bg-accent-amber animate-pulse'
   if (status === 'error') return 'bg-accent-red'
+  if (catalog === 'visible') return 'bg-accent-blue'
   return 'bg-text-muted/30'
 }
 
@@ -39,18 +42,16 @@ function healthLabel(
   const status = modelHealth[index]
   const detail = modelHealthDetail[index]?.trim()
   const lat = modelHealthLatency[index]
-  if (status === 'ok') return lat ? `连接正常 · ${lat}ms` : '连接正常'
-  if (status === 'checking') return '正在检测连接…'
-  if (status === 'error') return detail ? `连接失败：${detail}` : '连接失败，点击下拉菜单「重新检查连接」重试'
-  return '未检测，点击下拉菜单「重新检查连接」'
+  if (status === 'ok') return lat ? `生成可用 · ${lat}ms` : '生成可用'
+  if (status === 'checking') return '正在验证生成…'
+  if (status === 'error') return detail ? `生成验证失败：${detail}` : '生成验证失败'
+  return ''
 }
 
-function normalizeHealthStatus(status: unknown): ModelHealthStatus | null {
-  return status === 'checking' || status === 'ok' || status === 'error' ? status : null
-}
-
-function getErrorMessage(error: unknown) {
-  return error instanceof Error ? error.message : typeof error === 'string' ? error : '健康检查失败'
+function catalogLabel(status?: ModelCatalogStatus) {
+  if (status === 'visible') return '目录可见'
+  if (status === 'not_listed') return '目录未列出'
+  return '目录未验证'
 }
 
 export function ModelPriorityDropdown({
@@ -64,12 +65,18 @@ export function ModelPriorityDropdown({
   const [checkingHealth, setCheckingHealth] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
   const checkingHealthRef = useRef(false)
+  const catalog = useInterviewStore((state) => state.modelCatalog)
   const entries = getAssistModelEntries(config)
   const activeIndex = entries[0]?.index
   const activeModel = entries[0]?.model
-  const activeLabel = activeIndex === undefined
-    ? '请在实时辅助中勾选模型'
-    : healthLabel(config, modelHealth, modelHealthDetail, modelHealthLatency, activeIndex)
+  function modelStatus(index: number) {
+    return [
+      catalogLabel(catalog[index]?.status),
+      catalog[index]?.detail,
+      healthLabel(config, modelHealth, modelHealthDetail, modelHealthLatency, index),
+    ].filter(Boolean).join(' · ')
+  }
+  const activeLabel = activeIndex === undefined ? '请在实时辅助中勾选模型' : modelStatus(activeIndex)
 
   useEffect(() => {
     if (!open) return
@@ -85,35 +92,11 @@ export function ModelPriorityDropdown({
     checkingHealthRef.current = true
     setCheckingHealth(true)
     const indexes = entries.filter(({ model }) => isConfiguredModel(model)).map(({ index }) => index)
-    const store = useInterviewStore.getState()
-    indexes.forEach((index) => store.setModelHealth(index, 'checking', '', 0))
     try {
-      if (config.assist_model_ids === undefined) {
-        await api.checkModelsHealth()
-      } else {
-        await Promise.all(indexes.map((index) => api.checkSingleModelHealth(index)))
-      }
-      const snapshot = await api.getModelsHealth().catch(() => null)
-      if (snapshot?.health) {
-        const latest = useInterviewStore.getState()
-        Object.entries(snapshot.health).forEach(([rawIndex, rawStatus]) => {
-          const index = Number(rawIndex)
-          const status = normalizeHealthStatus(rawStatus)
-          if (!Number.isInteger(index) || !status) return
-          latest.setModelHealth(
-            index,
-            status,
-            snapshot.detail?.[rawIndex],
-            snapshot.latency?.[rawIndex],
-            snapshot.fingerprint?.[rawIndex],
-          )
-        })
-      }
+      const snapshot = await api.checkModelsHealth(indexes)
+      if (snapshot) useInterviewStore.getState().setModelCatalog(snapshot)
     } catch (error) {
-      const detail = getErrorMessage(error)
-      const latest = useInterviewStore.getState()
-      indexes.forEach((index) => latest.setModelHealth(index, 'error', detail, 0))
-      latest.pushToast(`模型健康检查失败：${detail}`, 'error')
+      useInterviewStore.getState().pushToast(`模型目录查询失败：${getErrorMessage(error)}`, 'error')
     } finally {
       checkingHealthRef.current = false
       setCheckingHealth(false)
@@ -130,7 +113,7 @@ export function ModelPriorityDropdown({
         className="flex items-center gap-1.5 bg-bg-tertiary/50 text-text-primary text-xs rounded-xl px-2 py-1.5 sm:px-2.5 border border-bg-hover/50 hover:border-accent-blue/40 transition-all duration-200 max-w-[110px] md:max-w-[160px]"
       >
         <div
-          className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${healthDot(config, modelHealth, activeIndex ?? -1)}`}
+          className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${healthDot(config, modelHealth, activeIndex ?? -1, catalog[activeIndex ?? -1]?.status)}`}
           aria-hidden
         />
         <span className="truncate min-w-0 font-medium hidden sm:inline">
@@ -153,16 +136,17 @@ export function ModelPriorityDropdown({
                   setOpen(false)
                   await onModelChange(model.id ?? index)
                 }}
-                title={`${model.name} · ${healthLabel(config, modelHealth, modelHealthDetail, modelHealthLatency, index)}`}
+                title={`${model.name} · ${modelStatus(index)}`}
                 className={`w-full flex items-center gap-2 px-3 py-2 text-xs text-left transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-55 ${
                   index === activeIndex
                     ? 'text-accent-blue bg-accent-blue/5'
                     : 'text-text-primary hover:bg-bg-tertiary/50'
                 }`}
               >
-                <div className={`w-2 h-2 rounded-full flex-shrink-0 ${healthDot(config, modelHealth, index)}`} aria-hidden />
+                <div className={`w-2 h-2 rounded-full flex-shrink-0 ${healthDot(config, modelHealth, index, catalog[index]?.status)}`} aria-hidden />
                 <span className="truncate font-medium">
                   {model.name}
+                  {model.provider_name && <span className="ml-1 text-text-muted">{model.provider_name}</span>}
                 </span>
                 {model.supports_vision && <VisionBadge />}
                 {model.api_type && model.api_type !== 'openai' && (

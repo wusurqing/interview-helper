@@ -102,7 +102,7 @@ describe('KnowledgeMap', () => {
     const picker = screen.getByRole('button', { name: '分析模型' })
     expect(picker).toHaveTextContent('识图')
     fireEvent.click(picker)
-    expect(screen.getByRole('radio', { name: '停用模型' })).toBeDisabled()
+    expect(screen.queryByRole('radio', { name: '停用模型' })).not.toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('推理强度'), { target: { value: 'high' } })
     fireEvent.click(screen.getByRole('radio', { name: '纯文本' }))
     expect(picker).not.toHaveTextContent('识图')

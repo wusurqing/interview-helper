@@ -11,6 +11,8 @@ export interface ToastItem {
 export type ApiType = 'openai' | 'anthropic' | 'responses'
 
 export interface ModelInfo {
+  provider_id?: string
+  provider_name?: string
   id?: string
   has_api_key?: boolean
   name: string
@@ -23,6 +25,14 @@ export interface ModelInfo {
   health_fingerprint?: string
   think_enabled_params?: Record<string, unknown>
   think_disabled_params?: Record<string, unknown>
+}
+
+export type ModelCatalogStatus = 'visible' | 'not_listed' | 'unverified'
+
+export interface ModelCatalogSnapshot {
+  catalog: Record<number, ModelCatalogStatus>
+  detail?: Record<number, string>
+  fingerprint?: Record<number, string>
 }
 
 export interface ModelFullInfo {
@@ -50,7 +60,8 @@ export interface AssistGenerationSettings {
 
 export interface AppConfig {
   models: ModelInfo[]
-  active_model: number
+  active_model: number | null
+  active_model_id?: string | null
   model_name: string
   temperature: number
   max_tokens: number
@@ -144,7 +155,8 @@ export interface AppConfig {
   /** 是否启用面试复盘功能（默认关闭）*/
   review_enabled?: boolean
   /** 复盘分析使用的模型索引 */
-  review_model_index?: number
+  review_model_index?: number | null
+  review_model_id?: string | null
 }
 
 export type SingleMicRole = 'interviewer' | 'candidate'

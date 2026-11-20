@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { AlignVerticalSpaceAround, BrainCircuit, FileText, LayoutGrid, Save } from 'lucide-react'
 import ModelPicker from '@/components/ModelPicker'
-import { getAssistModelEntries, getAssistScreenshotModel } from '@/lib/assistModels'
+import { getAssistModelEntries, getAssistScreenshotModel, isConfiguredModel, modelOptionLabel } from '@/lib/assistModels'
 import { getErrorMessage } from '@/lib/api'
 import { updateConfigAndRefresh } from '@/lib/configSync'
 import { useInterviewStore } from '@/stores/configStore'
@@ -52,7 +52,9 @@ function AnswerModels({ onOpenModelConfig }: { onOpenModelConfig: () => void }) 
   const [draft, setDraft] = useState<Partial<AnswerModelDraft>>({})
   const [saveState, setSaveState] = useState<SaveState>('idle')
   const [error, setError] = useState<string | null>(null)
-  const catalog = (config?.models ?? []).filter((model): model is CatalogModel => Boolean(model.id))
+  const catalog = (config?.models ?? []).filter(
+    (model): model is CatalogModel => Boolean(model.id) && isConfiguredModel(model),
+  )
   const saved: AnswerModelDraft = {
     assist_model_ids: config?.assist_model_ids ?? getAssistModelEntries(config).flatMap(({ model }) => model.id ? [model.id] : []),
     assist_screenshot_model_id: config?.assist_screenshot_model_id === undefined
@@ -89,7 +91,7 @@ function AnswerModels({ onOpenModelConfig }: { onOpenModelConfig: () => void }) 
     }
   }
 
-  const screenshotOptions = catalog.filter((model) => model.supports_vision || model.id === current.assist_screenshot_model_id)
+  const screenshotOptions = catalog.filter((model) => model.supports_vision)
 
   return (
     <Section title="答题模型" icon={<BrainCircuit className="h-4 w-4" />} keywords="模型 队列 降级 截图 识图 并行 Think">
@@ -117,7 +119,7 @@ function AnswerModels({ onOpenModelConfig }: { onOpenModelConfig: () => void }) 
             onChange={(value) => change({ assist_screenshot_model_id: value || null })}
             options={screenshotOptions.map((model) => ({
               value: model.id,
-              label: model.name,
+              label: modelOptionLabel(model),
               supportsVision: model.supports_vision,
               disabledReason: visionModelUnavailableReason(model),
             }))}

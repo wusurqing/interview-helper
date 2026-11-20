@@ -205,6 +205,8 @@ def _openai_compat_headers() -> dict[str, str]:
 def get_client() -> OpenAI:
     cfg = get_config()
     m = cfg.get_active_model()
+    if m is None or not getattr(m, "enabled", True):
+        raise ValueError("请先选择通用默认模型")
     return get_client_for_model(m)
 
 
@@ -232,7 +234,7 @@ def get_client_for_model(model_cfg) -> OpenAI:
 def has_vision_model() -> bool:
     cfg = get_config()
     for m in cfg.models:
-        if m.supports_vision and m.api_key and m.api_key not in ("", "sk-your-api-key-here"):
+        if getattr(m, "enabled", True) and m.supports_vision and m.api_key and m.api_key not in ("", "sk-your-api-key-here"):
             return True
     return False
 
@@ -324,7 +326,7 @@ def vision_extract_text(image_base64_list: list[str]) -> str:
     cfg = get_config()
     model = None
     for m in cfg.models:
-        if m.supports_vision and m.api_key and m.api_key not in ("", "sk-your-api-key-here"):
+        if getattr(m, "enabled", True) and m.supports_vision and m.api_key and m.api_key not in ("", "sk-your-api-key-here"):
             model = m
             break
     if not model:
@@ -727,6 +729,8 @@ def chat_stream(
 
     cfg = _config_with_think_override(get_config(), override_think_mode)
     active_model = cfg.get_active_model()
+    if active_model is None or not getattr(active_model, "enabled", True):
+        raise ValueError("请先选择通用默认模型")
     clean_messages = _sanitize_messages(messages, active_model.supports_vision)
     full_messages = []
     if system_prompt:

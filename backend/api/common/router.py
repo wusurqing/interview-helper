@@ -4,16 +4,15 @@ import time
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-import requests
-from fastapi import APIRouter, UploadFile, File, HTTPException, Request
+from fastapi import APIRouter, Body, UploadFile, File, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel, StrictStr, ValidationError
+from pydantic import BaseModel, StrictInt, StrictStr, ValidationError
 
 from core.auth import get_token, is_auth_disabled, is_loopback_host, loopback_bypass_allowed
 from core.config import (
     CANDIDATE_STT_PROVIDER_OPTIONS, DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, MMPG_STT_PROVIDER, Mmpg,
-    get_config, update_config, ModelListChanged,
-    AssistGeneration, AssistScene, InvalidAssistModelSelection, ThinkEffort, model_health_fingerprint,
+    get_config, get_model_providers, model_health_fingerprint, provider_url, update_config, ModelListChanged,
+    AssistGeneration, AssistScene, InvalidAssistModelSelection, ThinkEffort,
     POSITION_OPTIONS, LANGUAGE_OPTIONS, STT_PROVIDER_OPTIONS,
     SCREEN_CAPTURE_REGION_OPTIONS,
     normalize_llm_max_tokens, normalize_llm_temperature,
@@ -24,12 +23,19 @@ from services.audio import AudioCapture
 from services.stt import STTError, get_stt_engine, stt_configuration_error
 from api.common.config_payload import build_config_payload
 from api.common.model_health import (
-    get_model_health,
     get_model_health_snapshot,
     probe_single_model,
-    start_all_model_checks,
-    start_single_model_check,
 )
+from api.common.provider_catalog import (
+    Connection,
+    ProviderRequestError,
+    check_catalog_models,
+    fetch_provider_catalog,
+    router as catalog_router,
+    validate_model_request,
+)
+from services.llm.protocols import get_api_type
+from api.common.provider_settings import router as provider_settings_router
 from services.storage.resume_history import (
     MAX_UPLOAD_BYTES as RESUME_UPLOAD_MAX_BYTES,
     add_upload,
@@ -41,6 +47,8 @@ from services.storage.resume_history import (
 )
 
 router = APIRouter()
+router.include_router(catalog_router)
+router.include_router(provider_settings_router)
 
 # 简历上传阈值从 services.storage.resume_history 引入 (单一来源 / DRY)。
 # Router 层做流式校验是为了在拿到 Content-Length 或读到超限时立即拒绝,
@@ -63,6 +71,7 @@ class ConfigUpdate(BaseModel):
     assist_think_effort: ThinkEffort | None = None
     max_parallel_answers: Optional[int] = None
     active_model: Optional[int] = None
+    active_model_id: StrictStr | None = None
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     think_mode: Optional[bool] = None
@@ -118,6 +127,7 @@ class ConfigUpdate(BaseModel):
     # Review (面试复盘)
     review_enabled: Optional[bool] = None
     review_model_index: Optional[int] = None
+    review_model_id: StrictStr | None = None
 
 
 _MODEL_API_KEY_KEEP = "__IA_KEEP_EXISTING_API_KEY__"
@@ -126,130 +136,15 @@ _MODEL_API_KEY_KEEP = "__IA_KEEP_EXISTING_API_KEY__"
 class ModelListRequest(BaseModel):
     api_base_url: str
     api_key: str
+    provider_id: StrictStr | None = None
     model_index: Optional[int] = None
     model_id: StrictStr | None = None
     api_type: Optional[str] = None
 
 
-_MODEL_LIST_KNOWN_COMPAT_SUFFIXES = (
-    "/api/claudecode",
-    "/api/anthropic",
-    "/apps/anthropic",
-    "/api/coding",
-    "/claudecode",
-    "/anthropic",
-    "/step_plan",
-    "/coding",
-    "/claude",
-)
-
-
-def _ends_with_version_segment(url: str) -> bool:
-    last = url.rsplit("/", 1)[-1]
-    return len(last) > 1 and last.startswith("v") and last[1:].isdigit()
-
-
-def _strip_known_model_list_compat_suffix(base_url: str) -> str:
-    for suffix in _MODEL_LIST_KNOWN_COMPAT_SUFFIXES:
-        if base_url.endswith(suffix):
-            return base_url[: -len(suffix)].rstrip("/")
-    return ""
-
-
-def _model_list_url_candidates(api_base_url: str, api_type: str = "openai") -> list[str]:
-    base = (api_base_url or "").strip().rstrip("/")
-    if not base:
-        return []
-    candidates: list[str] = []
-    if api_type == "anthropic":
-        if base.lower().endswith("/v1"):
-            candidates.append(f"{base}/models")
-        else:
-            candidates.append(f"{base}/v1/models")
-            candidates.append(f"{base}/models")
-    else:
-        if _ends_with_version_segment(base):
-            candidates.append(f"{base}/models")
-            if not base.endswith("/v1"):
-                candidates.append(f"{base}/v1/models")
-        else:
-            candidates.append(f"{base}/v1/models")
-            candidates.append(f"{base}/models")
-
-    stripped = _strip_known_model_list_compat_suffix(base)
-    if stripped and "://" in stripped:
-        candidates.append(f"{stripped}/v1/models")
-        candidates.append(f"{stripped}/models")
-
-    unique: list[str] = []
-    for url in candidates:
-        if url not in unique:
-            unique.append(url)
-    return unique
-
-
-def _model_list_error_body(response: requests.Response) -> str:
-    try:
-        text = response.text
-    except Exception:
-        text = ""
-    return text[:512] + ("..." if len(text) > 512 else "")
-
-
-def _extract_remote_models(body: object) -> list[dict[str, str | None]]:
-    if isinstance(body, dict):
-        data = body.get("data", body.get("models", []))
-    else:
-        data = body
-    models_by_id: dict[str, dict[str, str | None]] = {}
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict):
-                model_id = item.get("id")
-                owned_by = item.get("owned_by", item.get("ownedBy"))
-            else:
-                model_id = getattr(item, "id", None)
-                owned_by = getattr(item, "owned_by", getattr(item, "ownedBy", None))
-            if not isinstance(model_id, str) or not model_id.strip():
-                continue
-            clean_id = model_id.strip()
-            clean_owner = owned_by.strip() if isinstance(owned_by, str) and owned_by.strip() else None
-            current = models_by_id.get(clean_id)
-            if current is None:
-                models_by_id[clean_id] = {"id": clean_id, "owned_by": clean_owner}
-            elif not current.get("owned_by") and clean_owner:
-                current["owned_by"] = clean_owner
-    return sorted(models_by_id.values(), key=lambda model: model["id"].lower())
-
-
 def _list_remote_models(api_base_url: str, api_key: str, api_type: str = "openai") -> dict:
-    candidates = _model_list_url_candidates(api_base_url, api_type)
-    if not candidates:
-        raise RuntimeError("API Base URL 不能为空")
-    if api_type == "anthropic":
-        header_variants: list[dict[str, str]] = [
-            {"x-api-key": api_key, "anthropic-version": "2023-06-01"},
-            {"Authorization": f"Bearer {api_key}"},
-        ]
-    else:
-        header_variants = [{"Authorization": f"Bearer {api_key}"}]
-    last_not_found = ""
-    for url in candidates:
-        for headers in header_variants:
-            response = requests.get(url, headers=headers, timeout=15)
-            if response.status_code in (404, 405):
-                last_not_found = f"HTTP {response.status_code}: {_model_list_error_body(response)}"
-                break
-            if response.status_code == 401 and len(header_variants) > 1:
-                continue
-            if response.status_code >= 400:
-                raise RuntimeError(f"HTTP {response.status_code}: {_model_list_error_body(response)}")
-            try:
-                body = response.json()
-            except Exception as exc:
-                raise RuntimeError(f"模型列表响应不是 JSON: {exc}") from exc
-            return {"models": _extract_remote_models(body)}
-    raise RuntimeError(last_not_found or "未找到可用的模型列表接口")
+    entries = fetch_provider_catalog(Connection(api_type, provider_url(api_base_url), api_key.strip()))
+    return {"models": [{"id": entry["id"], "owned_by": entry.get("owned_by")} for entry in entries]}
 
 
 
@@ -341,10 +236,24 @@ async def api_get_models_full():
 
 
 @router.post("/config")
+async def api_update_config_request(request: Request, body: Any = Body()):
+    try:
+        parsed = ConfigUpdate.model_validate(body)
+    except ValidationError as exc:
+        errors = exc.errors(include_input=False, include_context=False, include_url=False)
+        for error in errors:
+            error["loc"] = ("body", *error["loc"])
+        raise HTTPException(422, errors) from None
+    return await api_update_config(parsed, request)
+
+
 async def api_update_config(body: ConfigUpdate, request: Request = None):
     from core.config import ModelConfig
 
     d = body.model_dump(exclude_none=True)
+    for field in ("active_model", "active_model_id", "review_model_index", "review_model_id"):
+        if field in body.model_fields_set:
+            d[field] = getattr(body, field)
     if "assist_screenshot_model_id" in body.model_fields_set:
         d["assist_screenshot_model_id"] = body.assist_screenshot_model_id
     if "written_exam_model_id" in body.model_fields_set:
@@ -381,9 +290,12 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
                 if model_id or keep_key:
                     if type(source_idx) is not int or not 0 <= source_idx < len(current_models):
                         raise ModelListChanged("模型目录已更新，请刷新后重试")
-                if keep_key:
-                    x["api_key"] = current_models[source_idx].api_key
                 row = ModelConfig(**x)
+                if keep_key:
+                    saved = current_models[source_idx]
+                    if provider_url(row.api_base_url) != provider_url(saved.api_base_url) or row.api_type != get_api_type(saved):
+                        raise ModelListChanged("接口地址或类型已变更，请填写对应的 API Key")
+                    row.api_key = saved.api_key
                 if not model_id and not keep_key:
                     # Older editors send row indices, which may refer to the
                     # previous ordering. Match unchanged rows by identity.
@@ -735,11 +647,14 @@ async def api_import_mmpg_probe(request: Request):
     return {"ok": True}
 
 
+class ModelCatalogCheck(BaseModel):
+    indices: list[StrictInt] | None = None
+
+
 @router.post("/models/health")
-async def api_check_models_health():
-    if not start_all_model_checks():
-        raise HTTPException(429, "后台低优先级队列繁忙，请稍后重试")
-    return {"ok": True}
+async def api_check_models_health(body: ModelCatalogCheck | None = None):
+    indices = body.indices if body else None
+    return {"ok": True, **await run_in_threadpool(check_catalog_models, indices)}
 
 
 @router.get("/models/health")
@@ -748,52 +663,58 @@ async def api_get_models_health():
 
 
 @router.post("/models/list")
+async def api_model_list_request(body: Any = Body()):
+    return await api_list_remote_models(validate_model_request(body, ModelListRequest))
+
+
 async def api_list_remote_models(body: ModelListRequest):
     api_base_url = (body.api_base_url or "").strip()
     api_key = (body.api_key or "").strip()
+    api_type = (body.api_type or "openai").strip().lower()
+    if api_type not in ("openai", "anthropic", "responses"):
+        api_type = "openai"
     if not api_base_url:
         raise HTTPException(400, "API Base URL 不能为空")
     if api_key == _MODEL_API_KEY_KEEP:
-        models = get_config().models
-        if body.model_id is not None:
+        cfg = get_config()
+        models = cfg.models
+        if body.provider_id is not None:
+            saved = next((provider for provider in get_model_providers(cfg) if provider.id == body.provider_id), None)
+        elif body.model_id is not None:
             saved = next((model for model in models if getattr(model, "id", None) == body.model_id), None)
         else:
             index = body.model_index
             saved = models[index] if index is not None and 0 <= index < len(models) else None
-        if saved is None or saved.api_base_url.strip().rstrip("/") != api_base_url.rstrip("/"):
-            raise HTTPException(409, "模型目录或服务地址已变更，请刷新配置或填写该地址的 API Key")
+        if saved is None or provider_url(saved.api_base_url) != provider_url(api_base_url) or get_api_type(saved) != api_type:
+            raise HTTPException(409, "模型目录、服务地址或接口类型已变更，请刷新配置或填写对应的 API Key")
         api_key = saved.api_key.strip()
     if not api_key or api_key == "sk-your-api-key-here":
         raise HTTPException(400, "API Key 不能为空")
-    api_type = (body.api_type or "openai").strip().lower()
-    if api_type not in ("openai", "anthropic", "responses"):
-        api_type = "openai"
-    # anthropic 类网关的模型列表通常在主配置（当前模型）对应的站点下
     try:
         return await run_in_threadpool(_list_remote_models, api_base_url, api_key, api_type)
-    except Exception as e:
-        raise HTTPException(502, f"获取模型列表失败: {e}") from e
+    except ProviderRequestError as exc:
+        raise HTTPException(502, f"获取模型列表失败：{exc}") from None
 
 
 @router.post("/models/health/{index}")
 async def api_check_single_model_health(index: int):
-    """Check health of a single model by index (run in background thread)."""
+    """Check whether the saved model ID appears in its provider catalog."""
     cfg = get_config()
     if index < 0 or index >= len(cfg.models):
         raise HTTPException(400, f"模型 index {index} 超出范围")
-    if not start_single_model_check(index):
-        raise HTTPException(429, "后台低优先级队列繁忙，请稍后重试")
-    return {"ok": True}
+    return {"ok": True, **await run_in_threadpool(check_catalog_models, [index])}
 
 
 @router.post("/models/probe/{index}")
-async def api_probe_single_model(index: int):
+async def api_probe_single_model(index: int, model_id: str | None = None):
     """Check connectivity and synchronously probe model capabilities."""
     cfg = get_config()
     if index < 0 or index >= len(cfg.models):
         raise HTTPException(400, f"模型 index {index} 超出范围")
     try:
-        return await run_in_threadpool(probe_single_model, index)
+        return await run_in_threadpool(probe_single_model, index, model_id)
+    except ModelListChanged as exc:
+        raise HTTPException(409, str(exc)) from exc
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 
@@ -883,9 +804,9 @@ async def api_models_layout(body: dict):
         ca = int(client_active)
         if 0 <= ca < len(models):
             updates["active_model"] = ca
-    elif order is not None and isinstance(order, list) and order:
+    elif active is not None and isinstance(order, list) and order:
         try:
-            old = cfg.models[active] if 0 <= active < len(cfg.models) else None
+            old = cfg.models[active] if active is not None and 0 <= active < len(cfg.models) else None
             if old:
                 updates["active_model"] = next(
                     (
@@ -905,4 +826,6 @@ async def api_models_layout(body: dict):
         await run_in_threadpool(update_config, updates, model_origins=origins, model_snapshot=cfg.models)
     except ModelListChanged as e:
         raise HTTPException(409, str(e)) from e
+    except InvalidAssistModelSelection as e:
+        raise HTTPException(422, str(e)) from e
     return {"ok": True}

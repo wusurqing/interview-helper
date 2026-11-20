@@ -172,12 +172,9 @@ describe('App bootstrap', () => {
     const trigger = await screen.findByRole('button', { name: /优先答题模型 Enabled Model/ })
     fireEvent.click(trigger)
 
-    const disabledOption = screen.getByRole('button', { name: /Disabled Model/ })
-    expect(disabledOption).toBeDisabled()
-    expect(disabledOption).toHaveTextContent('识图')
+    expect(screen.queryByRole('button', { name: /Disabled Model/ })).not.toBeInTheDocument()
     expect(trigger).not.toHaveTextContent('识图')
     expect(screen.queryByRole('button', { name: 'Unselected Model' })).not.toBeInTheDocument()
-    fireEvent.click(disabledOption)
 
     expect(apiMock.updateConfig).not.toHaveBeenCalled()
   })
@@ -247,7 +244,7 @@ describe('App bootstrap', () => {
 
     render(<App />)
 
-    const trigger = await screen.findByRole('button', { name: /连接失败：401 unauthorized/ })
+    const trigger = await screen.findByRole('button', { name: /生成验证失败：401 unauthorized/ })
     expect(trigger).toHaveAttribute('title', expect.stringContaining('401 unauthorized'))
   })
 

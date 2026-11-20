@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
 import ModelPicker from '@/components/ModelPicker'
+import { modelOptionLabel } from '@/lib/assistModels'
 import { api, type KnowledgeAnalysisState, type KnowledgeSettingsPayload, type KnowledgeThinkEffort } from '@/lib/api'
 
 const EFFORTS: [KnowledgeThinkEffort, string][] = [
@@ -33,6 +34,7 @@ function SettingsForm({
     try {
       onSaved(await api.saveKnowledgeSettings({
         model_index: modelIndex,
+        ...(model?.id || modelIndex === null ? { model_id: model?.id ?? null } : {}),
         model_fingerprint: model?.fingerprint ?? null,
         system_prompt: prompt.trim() === data.default_system_prompt ? null : prompt.trim() || null,
         temperature: Number(temperature),
@@ -59,11 +61,10 @@ function SettingsForm({
             setModelIndex(index)
             if (!data.models.find(item => item.index === index)?.supports_think) setEffort('off')
           }}
-          options={data.models.map((item) => ({
+          options={data.models.filter((item) => item.available).map((item) => ({
             value: String(item.index),
-            label: item.model && item.model !== item.name ? `${item.name} · ${item.model}` : item.name,
+            label: modelOptionLabel(item),
             supportsVision: item.supports_vision,
-            disabledReason: item.available ? undefined : '不可用',
           }))}
         />
         <label className="block space-y-1">

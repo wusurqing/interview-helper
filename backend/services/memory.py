@@ -74,6 +74,8 @@ def summarize_messages(messages: Sequence[dict], prior_summary: str = "") -> str
 
     cfg = get_config()
     model_cfg = cfg.get_active_model()
+    if model_cfg is None or not getattr(model_cfg, "enabled", True):
+        raise ValueError("请先选择通用默认模型")
 
     prompt = _SUMMARY_PROMPT.format(
         prior=prior_summary.strip() or "(无)",

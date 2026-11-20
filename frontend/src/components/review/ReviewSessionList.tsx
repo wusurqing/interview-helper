@@ -17,6 +17,7 @@ import { api, getErrorMessage } from '../../lib/api'
 import { useInterviewStore } from '../../stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import ModelPicker from '@/components/ModelPicker'
+import { isConfiguredModel, modelOptionLabel } from '@/lib/assistModels'
 import { StageBadge } from '@/components/job-tracker/stageConfig'
 import { isLightColorScheme } from '@/lib/colorScheme'
 import type { ReviewSession, ReviewSessionsResponse } from './types'
@@ -99,7 +100,7 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
   const [triggeringIds, setTriggeringIds] = useState<Set<number>>(new Set())
   const [focusFilter, setFocusFilter] = useState<ReviewListFocus>('all')
   const [pendingReviewEnabled, setPendingReviewEnabled] = useState<boolean | null>(null)
-  const [pendingReviewModelIndex, setPendingReviewModelIndex] = useState<number | null>(null)
+  const [pendingReviewModelIndex, setPendingReviewModelIndex] = useState<number | null>()
   const pageSize = 20
 
   const config = useInterviewStore((s) => s.config)
@@ -111,10 +112,10 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
   const isLight = isLightColorScheme(colorScheme)
 
   const reviewEnabled = config?.review_enabled ?? false
-  const reviewModelIndex = config?.review_model_index ?? 0
+  const reviewModelIndex = config?.review_model_index === undefined ? 0 : config.review_model_index
   const models = config?.models ?? []
   const displayedReviewEnabled = pendingReviewEnabled ?? reviewEnabled
-  const displayedReviewModelIndex = pendingReviewModelIndex ?? reviewModelIndex
+  const displayedReviewModelIndex = pendingReviewModelIndex === undefined ? reviewModelIndex : pendingReviewModelIndex
 
   const loadSessions = useCallback(async (p: number, options?: { silent?: boolean }) => {
     const loadId = latestLoadIdRef.current + 1
@@ -185,25 +186,28 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
     }
   }
 
-  const handleChangeModel = async (modelIndex: number) => {
+  const handleChangeModel = async (modelIndex: number | null) => {
     const saveSeq = reviewConfigSaveSeqRef.current + 1
     reviewConfigSaveSeqRef.current = saveSeq
     const modelSaveSeq = reviewModelSaveSeqRef.current + 1
     reviewModelSaveSeqRef.current = modelSaveSeq
     setPendingReviewModelIndex(modelIndex)
     try {
-      const updated = await api.updateConfig({ review_model_index: modelIndex })
+      const model = modelIndex === null ? undefined : models[modelIndex]
+      const selection = modelIndex === null || model?.id
+        ? { review_model_id: model?.id ?? null }
+        : { review_model_index: modelIndex }
+      const updated = await api.updateConfig(selection)
       if (saveSeq !== reviewConfigSaveSeqRef.current) return
       setConfig(updated)
-      const modelName = updated.models?.[modelIndex]?.name ?? models[modelIndex]?.name ?? '当前模型'
-      setToastMessage(`已切换复盘模型为 ${modelName}`)
+      setToastMessage(model ? `已切换复盘模型为 ${model.name}` : '已清除复盘模型')
     } catch (err) {
       if (saveSeq === reviewConfigSaveSeqRef.current) {
         setToastMessage(getErrorMessage(err, '模型切换失败'))
       }
     } finally {
       if (modelSaveSeq === reviewModelSaveSeqRef.current) {
-        setPendingReviewModelIndex(null)
+        setPendingReviewModelIndex(undefined)
       }
     }
   }
@@ -640,11 +644,11 @@ function ReviewSettingsPanel({
   onChangeModel,
 }: {
   reviewEnabled: boolean
-  reviewModelIndex: number
+  reviewModelIndex: number | null
   reviewToggleSaving: boolean
-  models: { name: string; enabled?: boolean; supports_vision?: boolean }[]
+  models: { name: string; enabled?: boolean; has_api_key?: boolean; provider_name?: string; supports_vision?: boolean }[]
   onToggle: (enabled: boolean) => void
-  onChangeModel: (modelIndex: number) => void
+  onChangeModel: (modelIndex: number | null) => void
 }) {
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<AsrSelfTestResult | null>(null)
@@ -658,7 +662,7 @@ function ReviewSettingsPanel({
     } catch (err) {
       setTestResult({
         ok: false,
-        model_name: models[reviewModelIndex]?.name ?? '复盘模型',
+        model_name: (reviewModelIndex === null ? undefined : models[reviewModelIndex]?.name) ?? '复盘模型',
         model: '',
         original: '',
         corrected: '',
@@ -700,13 +704,13 @@ function ReviewSettingsPanel({
       </div>
       <ModelPicker
         label="复盘分析模型"
-        value={String(reviewModelIndex)}
-        onChange={(value) => onChangeModel(Number(value))}
+        value={reviewModelIndex === null ? '' : String(reviewModelIndex)}
+        emptyLabel="未选择模型"
+        onChange={(value) => onChangeModel(value ? Number(value) : null)}
         disabled={!reviewEnabled}
-        options={models.map((model, index) => ({
-          value: String(index), label: model.name, supportsVision: model.supports_vision,
-          disabledReason: model.enabled ? undefined : '未启用',
-        }))}
+        options={models.flatMap((model, index) => isConfiguredModel(model) ? [{
+          value: String(index), label: modelOptionLabel(model), supportsVision: model.supports_vision,
+        }] : [])}
       />
       <div className="mt-3 border-t border-bg-hover/80 pt-3">
         <div className="flex items-start justify-between gap-3">

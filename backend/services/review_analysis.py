@@ -31,6 +31,8 @@ def get_review_model_cfg():
     cfg = get_config()
     review_model = cfg.get_review_model()
 
+    if review_model is None or not getattr(review_model, "enabled", True):
+        raise ValueError("请先选择复盘分析模型")
     if not review_model.api_key or review_model.api_key in ("", "sk-your-api-key-here"):
         raise ValueError("Review 模型未配置有效的 API Key")
 
@@ -44,16 +46,14 @@ def get_active_llm_client() -> tuple[OpenAI, str]:
     return client, review_model.model
 
 
-def _review_think_params(max_tokens: int) -> dict[str, Any]:
+def _review_think_params(model_cfg, max_tokens: int) -> dict[str, Any]:
     """Review 路径固定关闭思考；返回统一 call 需要的 think 参数。"""
-    cfg = get_config()
-    review_model = cfg.get_review_model()
     request_cfg = SimpleNamespace(
         think_mode=False,
         think_effort="off",
         max_tokens=max_tokens,
     )
-    return _build_think_params(review_model, request_cfg)
+    return _build_think_params(model_cfg, request_cfg)
 
 
 def _review_chat(model_cfg, messages: list, *, temperature: float, max_tokens: int, trace_context=None):
@@ -65,7 +65,7 @@ def _review_chat(model_cfg, messages: list, *, temperature: float, max_tokens: i
         messages,
         temperature=temperature,
         max_tokens=max_tokens,
-        think_params=_review_think_params(max_tokens),
+        think_params=_review_think_params(model_cfg, max_tokens),
         trace_context=trace_context,
     )
 
@@ -112,8 +112,8 @@ def run_asr_correction_check(
     original = (candidate_answer or "").strip() or DEFAULT_ASR_CORRECTION_SAMPLE
     result: dict[str, Any] = {
         "ok": False,
-        "model_name": review_model.name,
-        "model": review_model.model,
+        "model_name": review_model.name if review_model else "",
+        "model": review_model.model if review_model else "",
         "original": original,
         "corrected": original,
         "changed": False,

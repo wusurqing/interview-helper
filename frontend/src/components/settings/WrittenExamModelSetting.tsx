@@ -17,7 +17,10 @@ export default function WrittenExamModelSetting({ disabled, onSavingChange }: {
   const savingRef = useRef(false)
   const savedIds = config?.written_exam_model_ids ?? (config?.written_exam_model_id ? [config.written_exam_model_id] : [])
   const modelIds = draft ?? savedIds
-  const models = (config?.models ?? []).filter((model): model is CatalogModel => Boolean(model.id))
+  const models = (config?.models ?? []).filter(
+    (model): model is CatalogModel => Boolean(model.id) && model.enabled !== false
+      && model.has_api_key === true && model.supports_vision,
+  )
   const dirty = modelIds.length !== savedIds.length || modelIds.some((id, index) => id !== savedIds[index])
   const saving = saveState === 'saving'
   useSettingsDirtyRegistration('exam-model', dirty)

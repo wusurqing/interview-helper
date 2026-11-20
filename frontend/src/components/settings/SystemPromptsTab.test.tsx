@@ -258,7 +258,7 @@ describe('系统提示词设置', () => {
     expect(savedGeneration.assist_manual).toEqual({ temperature: 0.25, max_output_tokens: 1400 })
   })
 
-  it('勾选笔试模型进入队列，保留禁用原因和识图标签，并显式保存和清空队列', async () => {
+  it('仅列出可用识图模型，并显式保存和清空笔试队列', async () => {
     useInterviewStore.setState({
       settingsDrawerTab: 'mode',
       config: { models: examModels, written_exam_model_ids: [] } as ReturnType<typeof useInterviewStore.getState>['config'],
@@ -267,12 +267,9 @@ describe('系统提示词设置', () => {
     render(<SettingsDrawer />)
 
     const unchecked = within(await screen.findByRole('list', { name: '未勾选模型' }))
-    expect(unchecked.getByRole('checkbox', { name: '用于答题 文本模型' })).toBeDisabled()
-    expect(unchecked.getByRole('checkbox', { name: '用于答题 停用模型' })).toBeDisabled()
-    expect(unchecked.getByRole('checkbox', { name: '用于答题 未配置模型' })).toBeDisabled()
-    expect(unchecked.getByText('该模型不支持图片作为输入')).toBeInTheDocument()
-    expect(unchecked.getByText('已停用')).toBeInTheDocument()
-    expect(unchecked.getByText('未配置 API Key')).toBeInTheDocument()
+    expect(unchecked.queryByRole('checkbox', { name: '用于答题 文本模型' })).not.toBeInTheDocument()
+    expect(unchecked.queryByRole('checkbox', { name: '用于答题 停用模型' })).not.toBeInTheDocument()
+    expect(unchecked.queryByRole('checkbox', { name: '用于答题 未配置模型' })).not.toBeInTheDocument()
     const vision = unchecked.getByRole('checkbox', { name: '用于答题 识图模型' })
     expect(vision).toBeEnabled()
     expect(within(vision.closest('li')!).getByText('识图', { exact: true })).toHaveClass('text-accent-blue')

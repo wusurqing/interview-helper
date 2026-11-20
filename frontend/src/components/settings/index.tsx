@@ -37,7 +37,8 @@ export default function SettingsDrawer() {
   const [noResults, setNoResults] = useState(false)
   const [promptSaving, setPromptSaving] = useState(false)
   const [examModelSaving, setExamModelSaving] = useState(false)
-  const saving = promptSaving || examModelSaving
+  const [modelProviderSaving, setModelProviderSaving] = useState(false)
+  const saving = promptSaving || examModelSaving || modelProviderSaving
   const [dirtyExplicitSections, setDirtyExplicitSections] = useState<Record<string, boolean>>({})
   const dirtyExplicitCount = Object.values(dirtyExplicitSections).filter(Boolean).length
   const searchEnabled = settingsDrawerTab !== 'models' && settingsDrawerTab !== 'prompts'
@@ -48,7 +49,7 @@ export default function SettingsDrawer() {
     realtimeDirty ? '实时辅助' : null,
     examDirty ? '笔试配置' : null,
     speechDirty ? '语音配置' : null,
-    dirtyExplicitSections.models ? '模型配置' : null,
+    dirtyExplicitSections.models ? '模型供应商配置' : null,
     dirtyExplicitSections.prompts ? '系统提示词' : null,
   ].filter(Boolean)
 
@@ -199,7 +200,7 @@ export default function SettingsDrawer() {
     { key: 'overlay', label: '悬浮窗设置', icon: <PanelsTopLeft className="w-4 h-4" />, desc: '位置、尺寸与外观' },
     { key: 'kb', label: '知识库', icon: <BookOpen className="w-4 h-4" />, desc: '本地笔记引用' },
     { key: 'config', label: '语音配置', icon: <Mic className="w-4 h-4" />, desc: 'ASR 接入与测试' },
-    { key: 'models', label: '模型配置', icon: <BrainCircuit className="w-4 h-4" />, desc: '模型接入与能力' },
+    { key: 'models', label: '模型供应商配置', icon: <BrainCircuit className="w-4 h-4" />, desc: '模型接入与能力' },
     { key: 'prompts', label: '系统提示词', icon: <FileText className="w-4 h-4" />, desc: '按场景编辑' },
     { key: 'appearance', label: '外观', icon: <Palette className="w-4 h-4" />, desc: '配色与流式跟滚' },
     { key: 'shortcuts', label: '快捷操作', icon: <Keyboard className="w-4 h-4" />, desc: '扫码、提示词与快捷键' },
@@ -291,7 +292,7 @@ export default function SettingsDrawer() {
                         setSearchQuery('')
                       }
                     }}
-                    placeholder={settingsDrawerTab === 'models' ? '在模型配置中直接编辑' : '搜索设置项，如 VAD / 知识库 / 截图 / 主题'}
+                    placeholder={settingsDrawerTab === 'models' ? '在模型供应商配置中直接编辑' : '搜索设置项，如 VAD / 知识库 / 截图 / 主题'}
                     aria-label="搜索设置项"
                     className="w-full text-xs pl-8 pr-8 py-2 rounded-lg bg-bg-tertiary/60 border border-bg-hover/60 text-text-primary placeholder-text-muted focus:outline-none focus:border-accent-blue/60 focus:ring-2 focus:ring-accent-blue/20 transition"
                     disabled={!searchEnabled}
@@ -370,7 +371,7 @@ export default function SettingsDrawer() {
                   {settingsDrawerTab === 'appearance' && <PreferencesTab variant="appearance" />}
                   {settingsDrawerTab === 'shortcuts' && <ShortcutsTab />}
                   {settingsDrawerTab === 'config' && <SpeechTab />}
-                  {settingsDrawerTab === 'models' && <ModelsTab />}
+                  {settingsDrawerTab === 'models' && <ModelsTab onSavingChange={setModelProviderSaving} />}
                   {settingsDrawerTab === 'prompts' && <SystemPromptsTab onSavingChange={setPromptSaving} />}
                 </Suspense>
                 {noResults && (

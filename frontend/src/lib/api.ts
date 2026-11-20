@@ -6,6 +6,7 @@ export type KnowledgeThinkEffort = 'off' | 'low' | 'medium' | 'high' | 'xhigh'
 
 export interface KnowledgeSettings {
   model_index: number | null
+  model_id?: string | null
   system_prompt: string | null
   temperature: number
   max_tokens: number
@@ -16,7 +17,17 @@ export interface KnowledgeSettingsPayload {
   settings: KnowledgeSettings
   default_system_prompt: string
   output_contract: string
-  models: { index: number; name: string; model?: string; fingerprint: string; available: boolean; supports_think: boolean; supports_vision?: boolean }[]
+  models: {
+    id?: string
+    index: number
+    name: string
+    provider_name?: string
+    model?: string
+    fingerprint: string
+    available: boolean
+    supports_think: boolean
+    supports_vision?: boolean
+  }[]
 }
 
 export interface KnowledgeAnalysisState {
@@ -92,7 +103,8 @@ async function buildResponseErrorMessage(res: Response, fallback?: string): Prom
 async function fetchBackend(input: string, init?: RequestInit): Promise<Response> {
   try {
     return await fetch(input, init)
-  } catch {
+  } catch (error) {
+    if (init?.signal?.aborted) throw error
     throw new Error(BACKEND_UNREACHABLE_MESSAGE)
   }
 }
@@ -111,13 +123,19 @@ function buildHeaders(extra?: HeadersInit): HeadersInit {
   return { ...headers, ...(extra as Record<string, string> | undefined) }
 }
 
-async function request<T = any>(url: string, opts?: RequestInit): Promise<T> {
+export class ApiRequestError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+  }
+}
+
+export async function request<T = any>(url: string, opts?: RequestInit): Promise<T> {
   const res = await fetchBackend(buildApiUrl(url), {
     ...opts,
     headers: buildHeaders(opts?.headers),
   })
   if (!res.ok) {
-    throw new Error(await buildResponseErrorMessage(res))
+    throw new ApiRequestError(await buildResponseErrorMessage(res), res.status)
   }
   if (res.status === 204) return undefined as T
   const body = await parseResponseBody(res)
@@ -338,7 +356,9 @@ export const api = {
       method: 'POST', body: JSON.stringify({ images, expected_written_exam_mode: expectedWrittenExamMode }),
     }),
   getSttStatus: () => request('/api/stt/status'),
-  checkModelsHealth: () => request('/api/models/health', { method: 'POST' }),
+  checkModelsHealth: (indices?: number[]) => request<import('@/stores/slices/types').ModelCatalogSnapshot>(
+    '/api/models/health', { method: 'POST', body: indices ? JSON.stringify({ indices }) : undefined },
+  ),
   /** 当前各模型健康状态（检测中/可用/不可用） */
   getModelsHealth: () => request<{
     health: Record<string, string>
@@ -349,7 +369,7 @@ export const api = {
   listRemoteModels: (payload: { api_base_url: string; api_key: string; model_id?: string; model_index?: number; api_type?: string }) =>
     request<{ models: { id: string; owned_by?: string | null }[] }>('/api/models/list', { method: 'POST', body: JSON.stringify(payload) }),
   checkSingleModelHealth: (index: number) => request('/api/models/health/' + index, { method: 'POST' }),
-  probeModelCapabilities: (index: number) =>
+  probeModelCapabilities: (index: number, modelId?: string) =>
     request<{
       ok: boolean
       detail?: string
@@ -362,7 +382,7 @@ export const api = {
       vision_detail?: string
       think_detail?: string
       think_disabled_detail?: string
-    }>('/api/models/probe/' + index, { method: 'POST' }),
+    }>(`/api/models/probe/${index}${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`, { method: 'POST' }),
   sttTest: (payload: { provider: import('@/lib/speechProviders').SegmentedSpeechProvider }) =>
     request<{ ok: boolean; detail?: string; text?: string }>('/api/stt/test', { method: 'POST', body: JSON.stringify(payload) }),
 

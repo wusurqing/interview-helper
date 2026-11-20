@@ -1,10 +1,13 @@
-from core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, Mmpg, model_health_fingerprint
+from core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, Mmpg, get_provider_layout, model_health_fingerprint
 from services.storage.resume_history import get_filename_for_id
 from services.stt import configured_stt_routes
 
 
 def build_config_payload(cfg) -> dict:
     active_model = cfg.get_active_model()
+    providers, layout = get_provider_layout(cfg)
+    provider_names = {provider.id: provider.name for provider in providers}
+    provider_ids = {model.id: model.provider_id for model in layout}
     resume_active_history_id = getattr(cfg, "resume_active_history_id", None)
     mmpg = (getattr(cfg, "mmpg", None) or Mmpg()).model_dump()
     for field in MMPG_SECRET_FIELDS:
@@ -17,6 +20,8 @@ def build_config_payload(cfg) -> dict:
         "models": [
             {
                 "id": getattr(model, "id", ""),
+                "provider_id": provider_ids.get(model.id),
+                "provider_name": provider_names.get(provider_ids.get(model.id)),
                 "name": model.name,
                 "api_type": getattr(model, "api_type", "openai") or "openai",
                 "context_window_tokens": getattr(model, "context_window_tokens", DEFAULT_CONTEXT_WINDOW_TOKENS),
@@ -39,7 +44,8 @@ def build_config_payload(cfg) -> dict:
         "assist_think_mode": getattr(cfg, "assist_think_mode", getattr(cfg, "think_mode", False)),
         "assist_think_effort": getattr(cfg, "assist_think_effort", getattr(cfg, "think_effort", "off")),
         "active_model": cfg.active_model,
-        "model_name": active_model.name,
+        "active_model_id": cfg.active_model_id,
+        "model_name": active_model.name if active_model else "",
         "temperature": cfg.temperature,
         "max_tokens": cfg.max_tokens,
         "think_mode": cfg.think_mode,
@@ -128,7 +134,8 @@ def build_config_payload(cfg) -> dict:
             if resume_active_history_id is not None
             else None
         ),
-        "api_key_set": bool(active_model.api_key and active_model.api_key not in ("", "sk-your-api-key-here")),
+        "api_key_set": bool(active_model and active_model.enabled and active_model.api_key not in ("", "sk-your-api-key-here")),
         "review_enabled": bool(getattr(cfg, "review_enabled", False)),
-        "review_model_index": int(getattr(cfg, "review_model_index", 0)),
+        "review_model_index": cfg.review_model_index,
+        "review_model_id": cfg.review_model_id,
     }

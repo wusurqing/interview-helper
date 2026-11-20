@@ -233,7 +233,7 @@ export default function App() {
         }
         const { model: targetModel, index } = entry
         if (!isConfiguredModel(targetModel)) {
-          useInterviewStore.getState().setToastMessage('请先在模型配置中启用并配置该模型')
+          useInterviewStore.getState().setToastMessage('请先在模型供应商配置中启用该模型')
           continue
         }
         try {
@@ -512,7 +512,7 @@ export default function App() {
           type="button"
           onClick={toggleSettings}
           className="inline-flex items-center justify-center min-h-[32px] min-w-[32px] p-1.5 rounded-xl hover:bg-bg-tertiary/60 text-text-muted hover:text-text-primary transition-all duration-200 border border-transparent hover:border-bg-hover/40"
-          title="设置中心 (实时辅助 / 语音配置 / 模型配置 / 外观 / 快捷操作)"
+          title="设置中心 (实时辅助 / 语音配置 / 模型供应商配置 / 外观 / 快捷操作)"
           aria-label="打开设置"
         >
           <Settings className="w-4 h-4" />

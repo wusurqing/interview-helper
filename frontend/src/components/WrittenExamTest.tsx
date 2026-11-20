@@ -394,7 +394,7 @@ export default function WrittenExamTest() {
       }
       if (step === 'error') {
         if (terminalOutcomeRef.current === 'success') return
-        const message = detail || '笔试链路检测失败，请检查模型配置'
+        const message = detail || '笔试链路检测失败，请检查模型供应商配置'
         if (eventPreflightId) markTerminal(eventPreflightId, 'failure')
         runRequestRef.current = false
         setRunning(false)

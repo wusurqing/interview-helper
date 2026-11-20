@@ -1,6 +1,6 @@
 import type { StateCreator } from 'zustand'
 import type { RootState } from './rootState'
-import type { ModelHealthStatus, TokenUsage } from './types'
+import type { ModelCatalogSnapshot, ModelCatalogStatus, ModelHealthStatus, TokenUsage } from './types'
 import type { MmpgState } from '@/lib/mmpg/rtcController'
 
 export interface SttSliceState {
@@ -15,6 +15,7 @@ export interface SttSliceState {
   modelHealth: Record<number, ModelHealthStatus>
   modelHealthDetail: Record<number, string>
   modelHealthLatency: Record<number, number>
+  modelCatalog: Record<number, { status: ModelCatalogStatus; detail?: string }>
   tokenUsage: TokenUsage
 }
 
@@ -29,6 +30,7 @@ export interface SttSliceActions {
     latencyMs?: number,
     modelFingerprint?: string,
   ) => void
+  setModelCatalog: (snapshot: ModelCatalogSnapshot) => void
   setTokenUsage: (usage: TokenUsage) => void
 }
 
@@ -46,6 +48,7 @@ export const createSttSlice: StateCreator<RootState, [], [], SttSlice> = (set) =
   modelHealth: {},
   modelHealthDetail: {},
   modelHealthLatency: {},
+  modelCatalog: {},
   tokenUsage: { prompt: 0, completion: 0, total: 0, byModel: {} },
 
   setSttStatus: (loaded, loading, provider) => set({
@@ -67,6 +70,17 @@ export const createSttSlice: StateCreator<RootState, [], [], SttSlice> = (set) =
       ...(detail != null ? { modelHealthDetail: { ...s.modelHealthDetail, [index]: detail } } : {}),
       ...(latencyMs != null ? { modelHealthLatency: { ...s.modelHealthLatency, [index]: latencyMs } } : {}),
     }
+  }),
+  setModelCatalog: (snapshot) => set((s) => {
+    const catalog = { ...s.modelCatalog }
+    for (const [key, status] of Object.entries(snapshot.catalog ?? {})) {
+      const index = Number(key)
+      const model = s.config?.models[index]
+      const fingerprint = snapshot.fingerprint?.[index]
+      if (!model || model.enabled === false || (fingerprint && fingerprint !== model.health_fingerprint)) continue
+      catalog[index] = { status, detail: snapshot.detail?.[index] }
+    }
+    return { modelCatalog: catalog }
   }),
   setTokenUsage: (usage) =>
     set({

@@ -51,7 +51,7 @@ def test_model_context_window_round_trips_through_reorder_and_preserves_saved_ke
             "api_key": "__IA_KEEP_EXISTING_API_KEY__",
             "context_window_tokens": 256,
         },
-        {"name": "New"},
+        {"name": "New", "enabled": False},
     ]})
 
     assert saved.status_code == 200

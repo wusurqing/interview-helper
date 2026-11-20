@@ -4,6 +4,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from api.common import provider_catalog
 from api.common.router import router
 from core import config
 
@@ -86,10 +87,16 @@ def test_assist_selection_follows_identity_after_catalog_changes(realtime_settin
     keep = "__IA_KEEP_EXISTING_API_KEY__"
     saved = client.post("/api/config", json={"models": [
         {**primary, "name": "Renamed", "api_key": keep},
-        {"name": "New model", "api_key": "test-new", "supports_vision": True},
+        {"name": "New model", "api_key": "test-new", "supports_vision": True, "enabled": False},
         {**disabled, "api_key": keep},
+        {**vision, "api_key": keep},
     ]})
     assert saved.status_code == 200
+    layout = client.get("/api/model-providers").json()
+    layout["models"] = [model for model in layout["models"] if model["id"] != vision["id"]]
+    assert client.put("/api/model-providers", json=layout).status_code == 409
+    layout["confirmed_remove_ids"] = [vision["id"]]
+    assert client.put("/api/model-providers", json=layout).status_code == 200
     config._config = None
     payload = client.get("/api/config").json()
     assert payload["models"][0]["id"] == primary["id"]
@@ -101,8 +108,11 @@ def test_assist_selection_follows_identity_after_catalog_changes(realtime_settin
     assert client.post("/api/config", json={"models": [vision]}).status_code == 409
 
 
-def test_written_exam_settings_are_independent_and_survive_reload(realtime_settings):
+def test_written_exam_settings_are_independent_and_survive_reload(realtime_settings, monkeypatch):
     client = realtime_settings
+    monkeypatch.setattr(provider_catalog, "was_verified", lambda provider, model: (
+        provider.api_key, model
+    ) in {("test-rotated", "gpt-4o-mini"), ("test-other", "gpt-4o-mini")})
     vision, primary, disabled = client.get("/api/config/models-full").json()["models"]
     keep = "__IA_KEEP_EXISTING_API_KEY__"
     response = client.post("/api/config", json={"models": [
@@ -152,23 +162,30 @@ def test_written_exam_settings_are_independent_and_survive_reload(realtime_setti
     response = client.post("/api/config", json={"models": [
         {**model, "api_key": keep} for model in catalog if model["id"] != other_id
     ]})
-    assert response.status_code == 200
-    assert response.json()["written_exam_model_id"] is None
-    assert response.json()["assist_screenshot_model_id"] == vision["id"]
+    assert response.status_code == 409
+    layout = client.get("/api/model-providers").json()
+    layout["models"] = [model for model in layout["models"] if model["id"] != other_id]
+    layout["confirmed_remove_ids"] = [other_id]
+    assert client.put("/api/model-providers", json=layout).status_code == 200
+    payload = client.get("/api/config").json()
+    assert payload["written_exam_model_id"] is None
+    assert payload["assist_screenshot_model_id"] == vision["id"]
 
 
 def test_written_exam_model_rejects_ineligible_choices(realtime_settings):
     client = realtime_settings
+    config.get_config().models.append(config.ModelConfig(
+        id="old-vision-missing-key", name="Vision missing key", supports_vision=True,
+    ))
     catalog = client.get("/api/config/models-full").json()["models"]
     keep = "__IA_KEEP_EXISTING_API_KEY__"
     response = client.post("/api/config", json={"models": [
         *[{**model, "api_key": keep} for model in catalog],
         {"name": "Disabled vision", "supports_vision": True, "enabled": False, "api_key": "test-disabled-vision"},
-        {"name": "Vision missing key", "supports_vision": True, "api_key": "  "},
     ]})
     assert response.status_code == 200
     models = response.json()["models"]
-    assert not models[-1]["has_api_key"]
+    assert not models[-2]["has_api_key"]
     for invalid_id in (models[1]["id"], models[-2]["id"], models[-1]["id"], "deleted-model", ""):
         for selection in ({"written_exam_model_id": invalid_id}, {"written_exam_model_ids": [invalid_id]}):
             response = client.post("/api/config", json=selection)
@@ -206,8 +223,11 @@ def test_written_exam_queue_migrates_old_primary_and_only_eligible_fallbacks():
     assert config.AppConfig(**{**old_config, "written_exam_model_id": "disabled"}).written_exam_model_ids == ["disabled"]
 
 
-def test_ordered_exam_queue_saves_and_reloads_independently(realtime_settings):
+def test_ordered_exam_queue_saves_and_reloads_independently(realtime_settings, monkeypatch):
     client = realtime_settings
+    monkeypatch.setattr(provider_catalog, "was_verified", lambda provider, model: (
+        provider.api_key, model
+    ) == ("test-second", "gpt-4o-mini"))
     old_catalog = client.get("/api/config/models-full").json()["models"]
     keep = "__IA_KEEP_EXISTING_API_KEY__"
     updated = client.post("/api/config", json={"models": [
@@ -226,10 +246,17 @@ def test_ordered_exam_queue_saves_and_reloads_independently(realtime_settings):
     models_by_id[second_id]["enabled"] = False
     assert client.post("/api/config", json={"models": [
         {**model, "api_key": keep} for model in reversed(list(models_by_id.values()))
-    ]}).status_code == 200
-    assert client.post("/api/config", json={"written_exam_model_ids": [original_id, second_id]}).status_code == 200
+    ]}).status_code == 409
+    layout = client.get("/api/model-providers").json()
+    layout["models"] = list(reversed(layout["models"]))
+    for model in layout["models"]:
+        if model["id"] == second_id:
+            model["enabled"] = False
+    layout["confirmed_remove_ids"] = [second_id]
+    assert client.put("/api/model-providers", json=layout).status_code == 200
+    assert client.post("/api/config", json={"written_exam_model_ids": [original_id, second_id]}).status_code == 422
     config._config = None
-    assert client.get("/api/config").json()["written_exam_model_ids"] == [original_id, second_id]
+    assert client.get("/api/config").json()["written_exam_model_ids"] == [original_id]
 
     assert client.post("/api/config", json={"written_exam_model_ids": []}).status_code == 200
     config._config = None

@@ -4,6 +4,7 @@ import { closestCenter, DndContext, PointerSensor, useSensor, useSensors, type D
 import { arrayMove, SortableContext, useSortable, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { CSS } from '@dnd-kit/utilities'
 import VisionBadge from '@/components/VisionBadge'
+import { modelOptionLabel } from '@/lib/assistModels'
 import type { ModelInfo } from '@/stores/slices/types'
 
 export type CatalogModel = ModelInfo & { id: string }
@@ -24,13 +25,14 @@ interface ModelChoiceProps {
 
 function ModelChoice({ model, checked, disabled, status, onToggle }: ModelChoiceProps) {
   const statusId = useId()
+  const label = modelOptionLabel(model)
   return (
     <label className={`flex min-w-0 flex-1 items-center gap-2.5 py-2.5 ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}>
-      <input type="checkbox" aria-label={`用于答题 ${model.name}`} checked={checked}
+      <input type="checkbox" aria-label={`用于答题 ${label}`} checked={checked}
         aria-describedby={status ? statusId : undefined}
         disabled={disabled} onChange={() => onToggle(model.id)} className="shrink-0 accent-accent-blue" />
       <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-        <span className={`truncate text-xs font-medium ${disabled || status ? 'text-text-muted' : 'text-text-primary'}`} title={model.name}>{model.name}</span>
+        <span className={`truncate text-xs font-medium ${disabled || status ? 'text-text-muted' : 'text-text-primary'}`} title={label}>{label}</span>
         {model.supports_vision && <VisionBadge />}
         {status && <span id={statusId} className="text-[10px] text-accent-amber">{status}</span>}
       </span>
@@ -58,7 +60,7 @@ function SortableModel({ position, onStep, ...props }: Omit<ModelChoiceProps, 'c
       className={`relative flex items-center gap-2 rounded-lg border border-bg-hover/70 bg-bg-secondary px-2.5 ${isDragging ? 'z-10 shadow-lg' : ''}`}>
       <ModelChoice {...props} checked />
       <button {...attributes} {...listeners} ref={setActivatorNodeRef} type="button" disabled={disabled}
-        aria-label={`排序 ${model.name}`}
+        aria-label={`排序 ${modelOptionLabel(model)}`}
         title="拖动或使用上、下方向键调整顺序"
         onKeyDown={(event) => {
           if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return

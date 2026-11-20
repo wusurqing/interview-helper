@@ -1,19 +1,8 @@
 {
   "asr_config_version": 1,
-  "models": [
-    {
-      "name": "Example-Model",
-      "api_base_url": "https://api.openai.com/v1",
-      "api_key": "YOUR_API_KEY_HERE",
-      "model": "gpt-4o-mini",
-      "api_type": "openai",
-      "context_window_tokens": 262144,
-      "supports_think": false,
-      "supports_vision": false,
-      "enabled": true
-    }
-  ],
-  "active_model": 0,
+  "model_providers": [],
+  "models": [],
+  "active_model_id": null,
   "temperature": 0.5,
   "max_tokens": 4096,
   "think_mode": false,

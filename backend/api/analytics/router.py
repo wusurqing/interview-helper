@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Response
 
 from core.config import (
-    KnowledgeAnalysisSettings, ModelListChanged, get_config, knowledge_model_available,
+    KnowledgeAnalysisSettings, ModelListChanged, get_config, get_provider_layout, knowledge_model_available,
     model_health_fingerprint, update_knowledge_analysis_settings,
 )
 from services import knowledge_analysis
@@ -16,6 +16,9 @@ class KnowledgeSettingsUpdate(KnowledgeAnalysisSettings):
 
 
 def _settings_payload(cfg) -> dict:
+    providers, layout = get_provider_layout(cfg)
+    names = {provider.id: provider.name for provider in providers}
+    provider_names = {model.id: names.get(model.provider_id) for model in layout}
     return {
         "settings": cfg.knowledge_analysis.model_dump(),
         "default_system_prompt": knowledge_analysis.DEFAULT_SYSTEM_PROMPT,
@@ -23,7 +26,9 @@ def _settings_payload(cfg) -> dict:
         "models": [
             {
                 "index": index,
+                "id": model.id,
                 "name": model.name,
+                "provider_name": provider_names.get(model.id),
                 "model": model.model,
                 "fingerprint": model_health_fingerprint(model),
                 "available": knowledge_model_available(model),
@@ -31,6 +36,7 @@ def _settings_payload(cfg) -> dict:
                 "supports_vision": model.supports_vision,
             }
             for index, model in enumerate(cfg.models)
+            if knowledge_model_available(model)
         ],
     }
 
@@ -42,7 +48,7 @@ def api_knowledge_settings():
 
 @router.put("/knowledge/settings")
 def api_update_knowledge_settings(body: KnowledgeSettingsUpdate):
-    settings = KnowledgeAnalysisSettings(**body.model_dump(exclude={"model_fingerprint"}))
+    settings = KnowledgeAnalysisSettings(**body.model_dump(exclude={"model_fingerprint"}, exclude_unset=True))
     settings.system_prompt = (settings.system_prompt or "").strip() or None
     try:
         return _settings_payload(update_knowledge_analysis_settings(settings, body.model_fingerprint))

@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import requests
 from fastapi import HTTPException
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -747,16 +748,17 @@ def test_model_list_returns_sorted_model_ids(monkeypatch):
                 ]
             }
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, timeout=None, allow_redirects=True):
         captured["url"] = url
-        captured["headers"] = headers
+        captured["authorization"] = headers["Authorization"]
         captured["timeout"] = timeout
+        captured["allow_redirects"] = allow_redirects
         return _FakeResponse()
 
     async def fake_run_in_threadpool(fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
-    monkeypatch.setattr(common_router.requests, "get", fake_get)
+    monkeypatch.setattr(requests, "get", fake_get)
     monkeypatch.setattr(common_router, "run_in_threadpool", fake_run_in_threadpool)
 
     result = _run(common_router.api_list_remote_models(common_router.ModelListRequest(
@@ -766,8 +768,9 @@ def test_model_list_returns_sorted_model_ids(monkeypatch):
 
     assert captured == {
         "url": "https://api.example.com/v1/models",
-        "headers": {"Authorization": "Bearer sk-test"},
+        "authorization": "Bearer sk-test",
         "timeout": 15,
+        "allow_redirects": False,
     }
     assert result == {
         "models": [
@@ -788,14 +791,14 @@ def test_model_list_keep_placeholder_uses_saved_api_key(monkeypatch):
         def json(self):
             return {"data": [{"id": "gpt-4o-mini"}]}
 
-    def fake_get(url, headers=None, timeout=None):
-        captured["headers"] = headers
+    def fake_get(url, **kwargs):
+        captured["authorization"] = kwargs["headers"]["Authorization"]
         return _FakeResponse()
 
     async def fake_run_in_threadpool(fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
-    monkeypatch.setattr(common_router.requests, "get", fake_get)
+    monkeypatch.setattr(requests, "get", fake_get)
     monkeypatch.setattr(common_router, "run_in_threadpool", fake_run_in_threadpool)
     monkeypatch.setattr(
         common_router,
@@ -809,7 +812,7 @@ def test_model_list_keep_placeholder_uses_saved_api_key(monkeypatch):
         model_index=0,
     )))
 
-    assert captured["headers"] == {"Authorization": "Bearer sk-existing"}
+    assert captured["authorization"] == "Bearer sk-existing"
     assert result == {"models": [{"id": "gpt-4o-mini", "owned_by": None}]}
 
 
@@ -825,7 +828,7 @@ def test_model_list_falls_back_from_compat_suffix(monkeypatch):
         def json(self):
             return self._body
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, **kwargs):
         seen_urls.append(url)
         if url.endswith("/anthropic/v1/models"):
             return _FakeResponse(404, "not found")
@@ -834,7 +837,7 @@ def test_model_list_falls_back_from_compat_suffix(monkeypatch):
     async def fake_run_in_threadpool(fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
-    monkeypatch.setattr(common_router.requests, "get", fake_get)
+    monkeypatch.setattr(requests, "get", fake_get)
     monkeypatch.setattr(common_router, "run_in_threadpool", fake_run_in_threadpool)
 
     result = _run(common_router.api_list_remote_models(common_router.ModelListRequest(
@@ -850,18 +853,18 @@ def test_model_list_falls_back_from_compat_suffix(monkeypatch):
     assert result == {"models": [{"id": "fallback-model", "owned_by": "provider"}]}
 
 
-def test_model_list_surfaces_provider_failure(monkeypatch):
+def test_model_list_reports_provider_failure_without_upstream_body(monkeypatch):
     class _FakeResponse:
         status_code = 403
         text = "request blocked"
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, **kwargs):
         return _FakeResponse()
 
     async def fake_run_in_threadpool(fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
-    monkeypatch.setattr(common_router.requests, "get", fake_get)
+    monkeypatch.setattr(requests, "get", fake_get)
     monkeypatch.setattr(common_router, "run_in_threadpool", fake_run_in_threadpool)
 
     with pytest.raises(HTTPException) as exc:
@@ -872,7 +875,43 @@ def test_model_list_surfaces_provider_failure(monkeypatch):
 
     assert exc.value.status_code == 502
     assert "HTTP 403" in exc.value.detail
-    assert "request blocked" in exc.value.detail
+    assert "request blocked" not in exc.value.detail
+
+
+def test_model_list_keep_key_rejects_a_different_protocol(monkeypatch):
+    monkeypatch.setattr(
+        common_router, "get_config",
+        lambda: _FakeCfg(models=[_FakeModel("main", api_key="saved-fixture-key")], active=0),
+    )
+
+    def forbid_request(*args):
+        pytest.fail("旧目录接口不能把已存 API Key 用于其他协议")
+
+    monkeypatch.setattr(common_router, "_list_remote_models", forbid_request)
+    with pytest.raises(HTTPException) as exc:
+        _run(common_router.api_list_remote_models(common_router.ModelListRequest(
+            api_base_url="https://api.openai.com/v1", api_type="anthropic",
+            api_key=common_router._MODEL_API_KEY_KEEP, model_index=0,
+        )))
+    assert exc.value.status_code == 409
+
+
+def test_old_config_keep_key_rejects_a_different_endpoint(monkeypatch):
+    monkeypatch.setattr(
+        common_router, "get_config",
+        lambda: _FakeCfg(models=[_FakeModel("main", api_key="saved-fixture-key")], active=0),
+    )
+
+    def forbid_save(*args, **kwargs):
+        pytest.fail("更换旧模型地址时必须显式提交新地址用的 API Key")
+
+    monkeypatch.setattr(common_router, "update_config", forbid_save)
+    with pytest.raises(HTTPException) as exc:
+        _run(common_router.api_update_config(_Body(models=[{
+            "name": "main", "api_base_url": "https://modified.example.test/v1",
+            "api_key": common_router._MODEL_API_KEY_KEEP,
+        }])))
+    assert exc.value.status_code == 409
 
 
 # ---------- Written exam mode: /api/start without device_id ------------------

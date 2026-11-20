@@ -1,7 +1,8 @@
 from pydantic import BaseModel, Field, StrictBool, StrictStr, StringConstraints, ValidationError, field_validator, model_validator
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Annotated, Literal, Optional, Any, get_args
+from typing import Annotated, Callable, Literal, Optional, Any, get_args
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, uuid4, uuid5
 import hashlib
 import hmac
@@ -58,9 +59,10 @@ _ASR_CONFIG_VERSION = 1
 
 class ModelConfig(BaseModel):
     id: str = ""
+    provider_id: str = ""
     name: str = "Default"
     api_base_url: str = "https://api.openai.com/v1"
-    api_key: str = ""
+    api_key: str = Field(default="", repr=False)
     model: str = "gpt-4o-mini"
     context_window_tokens: int = Field(default=DEFAULT_CONTEXT_WINDOW_TOKENS, strict=True, ge=1, le=2**53 - 1)
     # 接口协议：openai=Chat Completions，anthropic=Messages，responses=Responses
@@ -68,6 +70,7 @@ class ModelConfig(BaseModel):
     supports_think: bool = False
     supports_vision: bool = False
     enabled: bool = True
+    verified: bool = False
     think_enabled_params: dict[str, Any] = Field(default_factory=dict)
     think_disabled_params: dict[str, Any] = Field(default_factory=dict)
 
@@ -78,6 +81,22 @@ class ModelConfig(BaseModel):
         if normalized not in API_TYPE_OPTIONS:
             return API_TYPE_OPENAI
         return normalized
+
+
+class ModelProvider(BaseModel):
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    api_type: Literal["openai", "anthropic", "responses"]
+    api_base_url: str
+    api_key: str = Field(default="", repr=False)
+
+
+def provider_url(url: str) -> str:
+    return url.strip().rstrip("/")
+
+
+def provider_connection(provider: ModelProvider | ModelConfig) -> tuple[str, str, str]:
+    return (provider_url(provider.api_base_url), provider.api_type, provider.api_key)
 
 
 def model_health_fingerprint(model: Any) -> str:
@@ -149,6 +168,7 @@ class Mmpg(BaseModel):
 
 class KnowledgeAnalysisSettings(BaseModel):
     model_index: Annotated[int, Field(strict=True, ge=0)] | None = None
+    model_id: StrictStr | None = None
     system_prompt: StrictStr | None = None
     temperature: float = Field(default=0.3, ge=0, le=2, allow_inf_nan=False)
     max_tokens: int = Field(default=1024, strict=True, ge=256, le=32768)
@@ -168,7 +188,9 @@ class AssistGeneration(BaseModel):
 class AppConfig(BaseModel):
     system_prompts: dict[str, StrictStr] = Field(default_factory=dict)
     models: list[ModelConfig] = Field(default_factory=lambda: [_default_model_config()])
-    active_model: int = 0
+    model_providers: list[ModelProvider] | None = None
+    active_model: int | None = 0
+    active_model_id: StrictStr | None = None
     assist_model_ids: list[StrictStr] | None = None
     assist_screenshot_model_id: StrictStr | None = None
     written_exam_model_id: StrictStr | None = None
@@ -293,7 +315,8 @@ class AppConfig(BaseModel):
 
     # --- Review (面试复盘) ---
     review_enabled: bool = False
-    review_model_index: int = 0
+    review_model_index: int | None = 0
+    review_model_id: StrictStr | None = None
     knowledge_analysis: KnowledgeAnalysisSettings = Field(default_factory=KnowledgeAnalysisSettings)
 
     @field_validator("temperature", mode="before")
@@ -333,8 +356,15 @@ class AppConfig(BaseModel):
             min(self.assist_realtime_max_tokens, int(self.assist_realtime_high_churn_max_tokens or 320)),
         )
         self.candidate_mic_compatibility_mode = bool(self.candidate_mic_compatibility_mode)
-        if not self.models:
+        if self.model_providers is None and not self.models:
             self.models = [_default_model_config()]
+        if self.model_providers is not None:
+            if "models" not in self.model_fields_set:
+                self.models = []
+            providers = {provider.id: provider for provider in self.model_providers}
+            if len(providers) != len(self.model_providers):
+                raise ValueError("供应商 ID 重复")
+            self.models = [_hydrate_model(model, providers) for model in self.models]
         self.screen_capture_max_long_edge = max(0, min(4000, int(self.screen_capture_max_long_edge or 0)))
         self.assist_vad_max_speech_sec = max(6.0, min(60.0, float(self.assist_vad_max_speech_sec or 18.0)))
         self.assist_vad_min_speech_sec = max(0.1, min(2.0, float(self.assist_vad_min_speech_sec or 0.3)))
@@ -343,13 +373,15 @@ class AppConfig(BaseModel):
             0.5,
             min(30.0, float(self.assist_interviewer_asr_drain_timeout_sec or 6.0)),
         )
-        self.active_model = max(0, min(int(self.active_model), len(self.models) - 1))
-        if not getattr(self.models[self.active_model], "enabled", True):
-            for i, model in enumerate(self.models):
-                if getattr(model, "enabled", True):
-                    self.active_model = i
-                    break
-        self.review_model_index = max(0, min(int(self.review_model_index), len(self.models) - 1))
+        if self.model_providers is None:
+            if self.active_model is not None:
+                self.active_model = max(0, min(self.active_model, len(self.models) - 1))
+                if not self.models[self.active_model].enabled:
+                    self.active_model = next(
+                        (i for i, model in enumerate(self.models) if model.enabled), self.active_model,
+                    )
+            if self.review_model_index is not None:
+                self.review_model_index = max(0, min(self.review_model_index, len(self.models) - 1))
         self._migrate_assist_settings()
         return self
 
@@ -367,9 +399,10 @@ class AppConfig(BaseModel):
                 self.models[index] = model
             used_ids.add(model.id)
 
-        legacy_order = [self.models[self.active_model]] + [
-            model for index, model in enumerate(self.models) if index != self.active_model
-        ]
+        self._sync_model_references()
+        legacy_order = list(self.models)
+        if self.active_model is not None:
+            legacy_order.insert(0, legacy_order.pop(self.active_model))
         if self.assist_model_ids is None:
             self.assist_model_ids = [model.id for model in legacy_order if model.enabled]
         else:
@@ -407,13 +440,37 @@ class AppConfig(BaseModel):
         if "knowledge_practice_system_prompt" not in self.model_fields_set:
             self.knowledge_practice_system_prompt = self.system_prompts.get("assist_manual")
 
-    def get_active_model(self) -> ModelConfig:
-        idx = max(0, min(self.active_model, len(self.models) - 1))
-        return self.models[idx]
+    def _sync_model_references(self) -> None:
+        if self.model_providers is None:
+            if "active_model_id" not in self.model_fields_set:
+                self.active_model_id = self._model_id_at(self.active_model)
+            if "review_model_id" not in self.model_fields_set:
+                self.review_model_id = self._model_id_at(self.review_model_index)
+            if "model_id" not in self.knowledge_analysis.model_fields_set:
+                self.knowledge_analysis.model_id = self._model_id_at(self.knowledge_analysis.model_index)
+            return
 
-    def get_review_model(self) -> ModelConfig:
-        idx = max(0, min(self.review_model_index, len(self.models) - 1))
-        return self.models[idx]
+        enabled_indices = {model.id: i for i, model in enumerate(self.models) if model.enabled}
+        self.active_model = enabled_indices.get(self.active_model_id)
+        self.review_model_index = enabled_indices.get(self.review_model_id)
+        self.knowledge_analysis.model_index = enabled_indices.get(self.knowledge_analysis.model_id)
+        if self.active_model is None:
+            self.active_model_id = None
+        if self.review_model_index is None:
+            self.review_model_id = None
+        if self.knowledge_analysis.model_index is None:
+            self.knowledge_analysis.model_id = None
+
+    def _model_id_at(self, index: int | None) -> str | None:
+        return self.models[index].id if index is not None and 0 <= index < len(self.models) else None
+
+    def get_active_model(self) -> ModelConfig | None:
+        index = self.active_model
+        return self.models[index] if index is not None else None
+
+    def get_review_model(self) -> ModelConfig | None:
+        index = self.review_model_index
+        return self.models[index] if index is not None else None
 
 
 _config: Optional[AppConfig] = None
@@ -434,6 +491,227 @@ class ModelListChanged(ValueError):
 
 class InvalidAssistModelSelection(ValueError):
     pass
+
+
+def _hydrate_model(model: ModelConfig, providers: dict[str, ModelProvider]) -> ModelConfig:
+    provider = providers.get(model.provider_id)
+    if provider is None:
+        raise ValueError("模型引用的供应商不存在")
+    return model.model_copy(update={
+        "api_base_url": provider.api_base_url, "api_key": provider.api_key, "api_type": provider.api_type,
+    })
+
+
+def _provider_name(model: ModelConfig) -> str:
+    try:
+        host = urlsplit(model.api_base_url).hostname
+    except ValueError:
+        return model.name
+    return {
+        "api.openai.com": "OpenAI",
+        "api.deepseek.com": "DeepSeek",
+        "api.anthropic.com": "Anthropic",
+    }.get(host, "火山方舟" if host and host.startswith("ark.") and host.endswith(".volces.com") else host or model.name)
+
+
+def get_provider_layout(cfg: AppConfig) -> tuple[list[ModelProvider], list[ModelConfig]]:
+    if cfg.model_providers is not None:
+        return list(cfg.model_providers), list(cfg.models)
+    groups: dict[tuple[str, str, str], ModelProvider] = {}
+    models = []
+    for model in cfg.models:
+        if not model.api_key and model.name == "请在 config.json 中配置":
+            continue
+        connection = provider_connection(model)
+        provider = groups.get(connection)
+        if provider is None:
+            provider = ModelProvider(
+                id=uuid5(NAMESPACE_URL, f"interview-helper:legacy-provider:{model.id}").hex,
+                name=_provider_name(model),
+                api_base_url=connection[0],
+                api_type=connection[1],
+                api_key=connection[2],
+            )
+            groups[connection] = provider
+        models.append(model.model_copy(update={"provider_id": provider.id, "verified": False}))
+    return list(groups.values()), models
+
+
+def get_model_providers(cfg: AppConfig) -> list[ModelProvider]:
+    return get_provider_layout(cfg)[0]
+
+
+def get_model_usages(cfg: AppConfig) -> dict[str, list[str]]:
+    usages: dict[str, list[str]] = {}
+    for name, model_ids in (
+        ("实时辅助", cfg.assist_model_ids or []),
+        ("截图答题", [cfg.assist_screenshot_model_id]),
+        ("笔试", cfg.written_exam_model_ids),
+        ("复盘", [cfg.review_model_id]),
+        ("知识分析", [cfg.knowledge_analysis.model_id]),
+        ("通用默认模型", [cfg.active_model_id]),
+    ):
+        for model_id in model_ids:
+            if model_id is not None:
+                usages.setdefault(model_id, []).append(name)
+    return usages
+
+
+def provider_layout_revision(cfg: AppConfig) -> str:
+    providers, models = get_provider_layout(cfg)
+    data = [
+        [provider.model_dump() for provider in providers],
+        [model.model_dump() for model in models],
+        get_model_usages(cfg),
+        cfg.assist_model_ids,
+        cfg.written_exam_model_ids,
+    ]
+    payload = json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hmac.new(_MODEL_HEALTH_FINGERPRINT_KEY, payload, hashlib.sha256).hexdigest()
+
+
+def save_provider_layout(
+    revision: str,
+    providers: list[ModelProvider],
+    models: list[ModelConfig],
+    confirmed_remove_ids: set[str],
+    active_model_id: str | None,
+    was_verified: Callable[[ModelProvider, str], bool],
+) -> AppConfig:
+    global _config
+    with _config_lock:
+        cfg = get_config()
+        if revision != provider_layout_revision(cfg):
+            raise ModelListChanged("供应商或模型用途已变更，请刷新并重新确认")
+        previous_providers, previous_models = get_provider_layout(cfg)
+        previous_provider_by_id = {provider.id: provider for provider in previous_providers}
+        providers_by_id = {provider.id: provider for provider in providers}
+        if len(providers_by_id) != len(providers):
+            raise ValueError("供应商 ID 重复")
+        if any(not provider.name.strip() for provider in providers):
+            raise ValueError("请输入供应商名称")
+        for provider in providers:
+            previous = previous_provider_by_id.get(provider.id)
+            if previous is None or provider_url(previous.api_base_url) != provider_url(provider.api_base_url):
+                _validate_provider_url(provider.api_base_url)
+        models_by_id = {model.id: model for model in models}
+        if len(models_by_id) != len(models) or any(not model.id.strip() or not model.model.strip() for model in models):
+            raise ValueError("模型 ID 不能为空或重复")
+        previous_by_id = {model.id: model for model in previous_models}
+        removed = {
+            model.id for model in previous_models
+            if model.id not in models_by_id or (model.enabled and not models_by_id[model.id].enabled)
+        }
+        if (removed & get_model_usages(cfg).keys()) - confirmed_remove_ids:
+            raise ModelListChanged("模型正在被使用，请确认移除后重试")
+        verified_models = []
+        for model in models:
+            provider = providers_by_id.get(model.provider_id)
+            if provider is None:
+                raise ValueError("模型引用的供应商不存在")
+            previous = previous_by_id.get(model.id)
+            connection_changed = (
+                previous is None or previous.model != model.model
+                or previous.provider_id != model.provider_id
+                or provider_connection(previous_provider_by_id[previous.provider_id]) != provider_connection(provider)
+            )
+            has_proof = was_verified(provider, model.model)
+            if model.enabled and (connection_changed or not previous.enabled) and not has_proof:
+                raise ValueError("请在当前供应商连接下验证模型后再勾选")
+            verified_models.append(model.model_copy(update={
+                "verified": has_proof or (not connection_changed and previous.verified),
+            }))
+        if active_model_id in removed:
+            active_model_id = None
+        if active_model_id is not None:
+            active = models_by_id.get(active_model_id)
+            if active is None or not active.enabled:
+                raise ValueError("请选择已勾选的通用默认模型")
+        data = cfg.model_dump()
+        data.update({
+            "model_providers": providers,
+            "models": verified_models,
+            "active_model_id": active_model_id,
+            "assist_model_ids": [mid for mid in cfg.assist_model_ids or [] if mid not in removed],
+            "written_exam_model_ids": [mid for mid in cfg.written_exam_model_ids if mid not in removed],
+        })
+        if cfg.assist_screenshot_model_id in removed:
+            data["assist_screenshot_model_id"] = None
+        if cfg.review_model_id in removed:
+            data["review_model_id"] = None
+        if cfg.knowledge_analysis.model_id in removed:
+            data["knowledge_analysis"]["model_id"] = None
+        updated = AppConfig.model_validate(data)
+        _save_config(updated)
+        _config = updated
+        return updated
+
+
+def _validate_provider_url(url: str) -> None:
+    try:
+        parsed = urlsplit(url)
+        # urllib.parse validates the range only when the port is read.
+        _ = parsed.port
+        valid = (
+            bool(parsed.hostname)
+            and parsed.scheme in ("http", "https")
+            and parsed.username is None
+            and parsed.password is None
+            and "?" not in url
+            and "#" not in url
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("API Base URL 必须是有效的 HTTP 或 HTTPS 地址")
+
+
+def _map_single_model_reference(
+    data: dict, updates: dict, model_rows: list[dict], id_field: str, index_field: str,
+) -> None:
+    if id_field not in updates and index_field in updates:
+        index = updates[index_field]
+        if index is not None and not (type(index) is int and 0 <= index < len(model_rows)):
+            raise InvalidAssistModelSelection("模型已变更，请重新选择")
+        data[id_field] = model_rows[index]["id"] if index is not None else None
+    if id_field not in updates and index_field not in updates:
+        return
+    model_id = data[id_field]
+    model = next((model for model in model_rows if model["id"] == model_id), None)
+    if model_id is not None and (model is None or not model["enabled"]):
+        raise InvalidAssistModelSelection("请选择已勾选的模型")
+    if id_field in updates:
+        data[index_field] = model_rows.index(model) if model is not None else None
+
+
+def _validate_legacy_model_changes(cfg: AppConfig, rows: list[dict]) -> None:
+    previous_by_id = {model.id: model for model in cfg.models}
+    candidates = [ModelConfig.model_validate(row) for row in rows]
+    by_id = {model.id: model for model in candidates}
+    if len(by_id) != len(candidates):
+        raise InvalidAssistModelSelection("模型 ID 不能重复")
+    for model_id in get_model_usages(cfg):
+        previous = previous_by_id.get(model_id)
+        if previous is None:
+            continue
+        candidate = by_id.get(model_id)
+        if candidate is None or (previous.enabled and not candidate.enabled):
+            raise ModelListChanged("模型正在被使用，请在模型供应商配置中确认移除")
+    for candidate in candidates:
+        previous = previous_by_id.get(candidate.id)
+        changed = previous is None or (
+            previous.model != candidate.model or provider_connection(previous) != provider_connection(candidate)
+        )
+        reused_key_at_new_address = previous is not None and bool(previous.api_key.strip()) and (
+            previous.api_key == candidate.api_key
+            and provider_connection(previous)[:2] != provider_connection(candidate)[:2]
+        )
+        needs_proof = candidate.enabled and (changed or not previous.enabled)
+        if needs_proof or reused_key_at_new_address:
+            from api.common.provider_catalog import was_verified
+
+            if not was_verified(candidate, candidate.model):
+                raise InvalidAssistModelSelection("请在模型供应商配置中使用当前连接验证模型")
 
 
 def update_config(
@@ -484,12 +762,34 @@ def update_config(
                 if not model.get("id"):
                     origin = model_origins[index] if model_origins is not None and index < len(model_origins) else None
                     model["id"] = cfg.models[origin].id if origin is not None else uuid4().hex
+            if cfg.model_providers is not None:
+                previous_by_id = {model.id: model for model in cfg.models}
+                if len(model_rows) != len(previous_by_id) or {row["id"] for row in model_rows} != previous_by_id.keys():
+                    raise ModelListChanged("请在模型供应商配置中添加或移除模型")
+                for row in model_rows:
+                    previous = previous_by_id[row["id"]]
+                    candidate = ModelConfig.model_validate(row)
+                    if (candidate.enabled != previous.enabled or candidate.model != previous.model
+                            or provider_connection(candidate) != provider_connection(previous)):
+                        raise ModelListChanged("请在模型供应商配置中变更供应商连接或勾选模型")
+                    row["provider_id"] = previous.provider_id
+                    row["verified"] = previous.verified
+            else:
+                _validate_legacy_model_changes(cfg, model_rows)
             data["models"] = model_rows
             by_id = {model["id"]: index for index, model in enumerate(model_rows)}
             for field in ("active_model", "review_model_index"):
-                if field not in updates:
-                    old_id = cfg.models[getattr(cfg, field)].id
+                if field not in updates and (previous_index := getattr(cfg, field)) is not None:
+                    old_id = cfg.models[previous_index].id
                     data[field] = by_id.get(old_id, data[field])
+        model_rows = data["models"]
+        for id_field, index_field in (("active_model_id", "active_model"), ("review_model_id", "review_model_index")):
+            _map_single_model_reference(data, updates, model_rows, id_field, index_field)
+        if cfg.model_providers is None:
+            if "active_model_id" not in updates:
+                data.pop("active_model_id", None)
+            if "review_model_id" not in updates:
+                data.pop("review_model_id", None)
         if "assist_model_ids" in updates or "assist_screenshot_model_id" in updates:
             catalog = {
                 model.id if isinstance(model, ModelConfig) else model["id"]: model
@@ -497,12 +797,20 @@ def update_config(
             }
             if "assist_model_ids" in updates and any(model_id not in catalog for model_id in updates["assist_model_ids"]):
                 raise ModelListChanged("答题模型目录已更新，请刷新后重试")
+            if cfg.model_providers is not None and "assist_model_ids" in updates and any(
+                not catalog[model_id]["enabled"] and model_id not in (cfg.assist_model_ids or [])
+                for model_id in updates["assist_model_ids"]
+            ):
+                raise InvalidAssistModelSelection("实时辅助请选择已勾选的模型")
             selected_vision = updates.get("assist_screenshot_model_id")
             if selected_vision is not None:
                 model = catalog.get(selected_vision)
                 vision = model.supports_vision if isinstance(model, ModelConfig) else (model or {}).get("supports_vision")
                 if not vision:
                     raise InvalidAssistModelSelection("截图答题请选择支持识图的模型")
+                if cfg.model_providers is not None and selected_vision != cfg.assist_screenshot_model_id:
+                    if not written_exam_model_available(ModelConfig.model_validate(model)):
+                        raise InvalidAssistModelSelection("截图答题请选择已勾选、已配置 API Key 且支持识图的模型")
         updated = AppConfig(**data)
         if legacy_exam_update or "written_exam_model_ids" in updates:
             exam_catalog = {model.id: model for model in updated.models}
@@ -513,7 +821,7 @@ def update_config(
                 if model is None or (not retained and not written_exam_model_available(model)):
                     raise InvalidAssistModelSelection("笔试答题请选择已启用、已配置 API Key 且支持图片输入的模型")
         index = cfg.knowledge_analysis.model_index
-        if "models" in updates and index is not None:
+        if cfg.model_providers is None and "models" in updates and index is not None:
             if model_origins is not None:
                 matches = [new for new, old in enumerate(model_origins) if old == index]
             elif index < len(cfg.models):
@@ -526,6 +834,7 @@ def update_config(
             else:
                 matches = []
             updated.knowledge_analysis.model_index = matches[0] if len(matches) == 1 else None
+            updated.knowledge_analysis.model_id = updated._model_id_at(updated.knowledge_analysis.model_index)
         _save_config(updated)
         _config = updated
         return updated
@@ -543,8 +852,13 @@ def update_knowledge_analysis_settings(
     settings: KnowledgeAnalysisSettings, fingerprint: str | None,
 ) -> AppConfig:
     with _config_lock:
-        models = get_config().models
+        cfg = get_config()
+        models = cfg.models
         index = settings.model_index
+        if settings.model_id is not None:
+            index = next((i for i, model in enumerate(models) if model.id == settings.model_id), None)
+            if index is None:
+                raise ModelListChanged("模型列表已更新，请重新选择分析模型")
         if index is not None:
             if index >= len(models) or fingerprint != model_health_fingerprint(models[index]):
                 raise ModelListChanged("模型列表已更新，请重新选择分析模型")
@@ -552,7 +866,10 @@ def update_knowledge_analysis_settings(
                 raise ValueError("请选择已启用且配置了 API Key 的分析模型")
             if settings.think_effort != "off" and not models[index].supports_think:
                 raise ValueError("该模型未启用推理能力，请将推理强度设为关闭")
-        return update_config({"knowledge_analysis": settings.model_dump()})
+        data = settings.model_dump()
+        data["model_index"] = index
+        data["model_id"] = models[index].id if index is not None else None
+        return update_config({"knowledge_analysis": data})
 
 
 def _load_config() -> AppConfig:
@@ -563,7 +880,7 @@ def _load_config() -> AppConfig:
             return AppConfig()
         if os.path.exists(CONFIG_EXAMPLE):
             shutil.copy2(CONFIG_EXAMPLE, CONFIG_FILE)
-            print("[Config] 已从 config.example.json 创建 config.json，请填入你的 API Key")
+            print("[Config] 已从 config.example.json 创建 config.json，请在设置中添加模型供应商")
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -586,6 +903,21 @@ def _save_config(cfg: AppConfig) -> None:
     data = cfg.model_dump()
     data["asr_config_version"] = _ASR_CONFIG_VERSION
     data.pop("resume_text", None)
+    if cfg.model_providers is None:
+        for field in ("model_providers", "active_model_id", "review_model_id"):
+            data.pop(field, None)
+        data["knowledge_analysis"].pop("model_id", None)
+        for model in data["models"]:
+            for field in ("provider_id", "verified"):
+                model.pop(field, None)
+    else:
+        _backup_legacy_model_config(target)
+        for key in ("active_model", "review_model_index"):
+            data.pop(key, None)
+        data["knowledge_analysis"].pop("model_index", None)
+        for model in data["models"]:
+            for field in ("api_base_url", "api_type", "api_key"):
+                model.pop(field, None)
     temp_path = None
     try:
         with NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as f:
@@ -601,6 +933,32 @@ def _save_config(cfg: AppConfig) -> None:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 logger.warning("无法清理配置临时文件")
+
+
+def _backup_legacy_model_config(target: Path) -> None:
+    backup = target.with_name(target.name + ".pre-model-providers.bak")
+    if backup.exists() or not target.exists():
+        return
+    original = target.read_bytes()
+    try:
+        prev = json.loads(original.decode("utf-8-sig"))
+    except (ValueError, UnicodeError) as exc:
+        raise OSError("无法读取旧配置以备份") from exc
+    if not isinstance(prev, dict):
+        raise OSError("无法读取旧配置以备份")
+    if isinstance(prev.get("model_providers"), list):
+        return
+    temp_path = None
+    try:
+        with NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+            temp_path = Path(stream.name)
+            stream.write(original)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, backup)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 POSITION_OPTIONS = [

@@ -5,7 +5,7 @@ from typing import Optional
 
 import requests
 
-from core.config import get_config, model_health_fingerprint
+from core.config import ModelListChanged, get_config, model_health_fingerprint
 from core.resource_lanes import submit_low_priority_background
 from services.llm.protocols import (
     API_TYPE_ANTHROPIC,
@@ -524,11 +524,13 @@ def _probe_result(
     }
 
 
-def probe_single_model(index: int) -> dict:
+def probe_single_model(index: int, expected_model_id: str | None = None) -> dict:
     cfg = get_config()
     if index < 0 or index >= len(cfg.models):
         raise ValueError(f"模型 index {index} 超出范围")
     model = copy.deepcopy(cfg.models[index])
+    if expected_model_id is not None and getattr(model, "id", None) != expected_model_id:
+        raise ModelListChanged("模型配置已更改，请刷新后重试")
     fingerprint = model_health_fingerprint(model)
     if getattr(model, "enabled", True) is False:
         if _fingerprint_is_current(index, fingerprint):

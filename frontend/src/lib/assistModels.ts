@@ -1,7 +1,11 @@
 import type { AppConfig, ModelInfo } from '@/stores/slices/types'
 
-export function isConfiguredModel(model: ModelInfo) {
+export function isConfiguredModel(model: Pick<ModelInfo, 'enabled' | 'has_api_key'>) {
   return model.enabled !== false && model.has_api_key !== false
+}
+
+export function modelOptionLabel(model: Pick<ModelInfo, 'name' | 'provider_name'>) {
+  return model.provider_name ? `${model.name} · ${model.provider_name}` : model.name
 }
 
 export function getAssistModelEntries(config: AppConfig | null | undefined) {
@@ -16,7 +20,7 @@ export function getAssistModelEntries(config: AppConfig | null | undefined) {
   const byId = new Map(catalog.map((entry) => [entry.model.id, entry]))
   return selectedIds.flatMap((id) => {
     const entry = byId.get(id)
-    return entry ? [entry] : []
+    return entry && entry.model.enabled !== false ? [entry] : []
   })
 }
 
