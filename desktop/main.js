@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, ipcMain, screen } = require('electron');
+const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, ipcMain, screen, shell } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const http = require('http');
@@ -48,6 +48,8 @@ const {
   PROMPT_OVERLAY_MAX_WIDTH,
   consumePendingOverlayShow,
   createOverlayChromeOptions,
+  createSafeWebPreferences,
+  installNavigationGuards,
   relayChildOutput,
 } = require('./windowOptions');
 const {
@@ -452,13 +454,13 @@ function createWindow() {
     ...(opacitySupported ? { opacity: mainWindowOpacity } : {}),
     // Windows 下不在任务栏显示，只在托盘
     skipTaskbar: isWindows,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      // 主窗口隐藏到悬浮窗或托盘时，仍需持续向 RTC 提供会议音频。
-      backgroundThrottling: false,
-    },
+    webPreferences: createSafeWebPreferences(path.join(__dirname, 'preload.js')),
+  });
+
+  installNavigationGuards(mainWindow.webContents, {
+    allowedOrigin: FRONTEND_URL,
+    allowOpenExternal: true,
+    openExternal: (url) => shell?.openExternal?.(url),
   });
 
   mainWindow.setContentProtection(true);
@@ -524,12 +526,12 @@ function createOverlayWindow() {
     autoHideMenuBar: true,
     roundedCorners: true,
     title: `${APP_DISPLAY_NAME} Overlay`,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      backgroundThrottling: false,
-    },
+    webPreferences: createSafeWebPreferences(path.join(__dirname, 'preload.js')),
+  });
+
+  installNavigationGuards(overlayWindow.webContents, {
+    allowedOrigin: FRONTEND_URL,
+    allowOpenExternal: false,
   });
 
   // Content protection 必须尽早调用 —— 等到 ready-to-show 时,

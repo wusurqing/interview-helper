@@ -17,6 +17,7 @@ import {
 } from 'lucide-react'
 import dayjs from 'dayjs'
 import ReactMarkdown from 'react-markdown'
+import { SAFE_MARKDOWN_COMPONENTS } from '@/components/MarkdownLink'
 import { api, getErrorMessage } from '../../lib/api'
 import type { ReviewSessionDetail, ReviewTurn } from './types'
 import { parseReviewSessionDetail } from './types'
@@ -533,7 +534,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
             >
               {detail.summary_markdown ? (
                 <div className="prose prose-sm prose-invert max-w-none text-text-primary leading-relaxed">
-                  <ReactMarkdown>{detail.summary_markdown}</ReactMarkdown>
+                  <ReactMarkdown components={SAFE_MARKDOWN_COMPONENTS}>{detail.summary_markdown}</ReactMarkdown>
                 </div>
               ) : (
                 <PendingSummaryWorkspace

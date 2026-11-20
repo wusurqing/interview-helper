@@ -41,6 +41,68 @@ function writeToStreamSafely(stream, chunk) {
   }
 }
 
+function createSafeWebPreferences(preloadPath) {
+  return {
+    preload: preloadPath,
+    contextIsolation: true,
+    nodeIntegration: false,
+    sandbox: true,
+    // 主窗口或悬浮窗隐藏时，仍需持续向 RTC 提供会议音频或同步状态。
+    backgroundThrottling: false,
+  };
+}
+
+function isAllowedAppOrigin(rawUrl, allowedOrigin) {
+  if (typeof rawUrl !== 'string' || typeof allowedOrigin !== 'string') return false;
+  try {
+    const target = new URL(rawUrl);
+    const allowed = new URL(allowedOrigin);
+    if (target.protocol !== 'http:' && target.protocol !== 'https:') return false;
+    return target.origin === allowed.origin;
+  } catch {
+    return false;
+  }
+}
+
+function isSafeExternalUrl(rawUrl) {
+  if (typeof rawUrl !== 'string') return false;
+  try {
+    const parsed = new URL(rawUrl);
+    return (parsed.protocol === 'https:' || parsed.protocol === 'http:') && Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function installNavigationGuards(
+  webContents,
+  { allowedOrigin, openExternal, allowOpenExternal = false } = {},
+) {
+  if (!webContents) return;
+  if (typeof webContents.setWindowOpenHandler === 'function') {
+    webContents.setWindowOpenHandler(({ url }) => {
+      if (
+        allowOpenExternal
+        && typeof openExternal === 'function'
+        && isSafeExternalUrl(url)
+        && !isAllowedAppOrigin(url, allowedOrigin)
+      ) {
+        Promise.resolve(openExternal(url)).catch(() => {});
+      }
+      return { action: 'deny' };
+    });
+  }
+  if (typeof webContents.on === 'function') {
+    const blockDisallowed = (event, url) => {
+      if (!isAllowedAppOrigin(url, allowedOrigin) && typeof event?.preventDefault === 'function') {
+        event.preventDefault();
+      }
+    };
+    webContents.on('will-navigate', blockDisallowed);
+    webContents.on('will-redirect', blockDisallowed);
+  }
+}
+
 function relayChildOutput(childStream, targetStream, prefix = '') {
   if (!childStream || typeof childStream.on !== 'function') return () => {};
   const onData = (chunk) => {
@@ -59,7 +121,11 @@ module.exports = {
   PROMPT_OVERLAY_MAX_WIDTH,
   consumePendingOverlayShow,
   createOverlayChromeOptions,
+  createSafeWebPreferences,
   getPromptOverlayInitialWidth,
+  installNavigationGuards,
+  isAllowedAppOrigin,
+  isSafeExternalUrl,
   relayChildOutput,
   writeToStreamSafely,
 };
