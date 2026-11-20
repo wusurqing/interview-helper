@@ -66,6 +66,15 @@ def eligible_exam_model_index(cfg, model_id: str | None) -> int | None:
     ), None)
 
 
+def exam_model_order(cfg) -> list[int]:
+    """Return selected catalog-ready vision models in exam preference order."""
+    indices = (
+        eligible_exam_model_index(cfg, model_id)
+        for model_id in getattr(cfg, "written_exam_model_ids", ())
+    )
+    return list(dict.fromkeys(index for index in indices if index is not None))
+
+
 def _exam_model_destination(model) -> tuple[str, str, str]:
     return (
         getattr(model, "api_base_url", "").strip().rstrip("/"),
@@ -88,7 +97,7 @@ def exam_primary_index(task: TaskPayload, cfg) -> int | None:
     routing = task_meta(task).get("answer_routing")
     if routing is not None:
         return live_exam_model_index(routing, cfg, routing.exam_model_ids[0])
-    return eligible_exam_model_index(cfg, getattr(cfg, "written_exam_model_id", None))
+    return next(iter(exam_model_order(cfg)), None)
 
 
 def is_asr_task(task: TaskPayload) -> bool:
@@ -193,12 +202,10 @@ def max_parallel_slots(
 ) -> int:
     order = _legacy_model_order(cfg) if include_practice else dispatch_model_order(cfg)
     if include_screenshots:
-        screenshot_id = getattr(cfg, "assist_screenshot_model_id", None)
-        exam_id = getattr(cfg, "written_exam_model_id", None)
-        for model_id in (screenshot_id, exam_id):
-            index = eligible_exam_model_index(cfg, model_id)
-            if index is not None and index not in order:
-                order.append(index)
+        screenshot = eligible_exam_model_index(cfg, getattr(cfg, "assist_screenshot_model_id", None))
+        if screenshot is not None:
+            order.append(screenshot)
+        order = list(dict.fromkeys((*order, *exam_model_order(cfg))))
     n_ok = sum(1 for i in order if model_eligible(i, cfg.models[i], False, get_model_health))
     cap = max(1, getattr(cfg, "max_parallel_answers", 2))
     return max(1, min(cap, max(n_ok, 1)))

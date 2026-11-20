@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react'
+import ModelPicker from '@/components/ModelPicker'
 import { api, type KnowledgeAnalysisState, type KnowledgeSettingsPayload, type KnowledgeThinkEffort } from '@/lib/api'
 
 const EFFORTS: [KnowledgeThinkEffort, string][] = [
@@ -48,24 +49,23 @@ function SettingsForm({
   return (
     <form onSubmit={save} className="border-t border-bg-tertiary pt-3">
       <fieldset disabled={saving} className="space-y-3 text-xs">
-        <label className="block space-y-1">
-          <span>分析模型</span>
-          <select value={modelIndex ?? ''} onChange={event => {
-            const next = event.target.value
-            setModelIndex(next === '' ? null : Number(next))
-            if (!data.models.find(item => item.index === Number(next))?.supports_think || next === '') {
-              setEffort('off')
-            }
-          }} className="input-field w-full">
-            <option value="">请选择模型</option>
-            {data.models.map(item => (
-              <option key={item.index} value={item.index} disabled={!item.available}>
-                {item.name}{item.model && item.model !== item.name ? ' · ' + item.model : ''}
-                {item.available ? '' : '（不可用）'}
-              </option>
-            ))}
-          </select>
-        </label>
+        <ModelPicker
+          label="分析模型"
+          emptyLabel="请选择模型"
+          value={modelIndex === null ? '' : String(modelIndex)}
+          disabled={saving}
+          onChange={(value) => {
+            const index = value === '' ? null : Number(value)
+            setModelIndex(index)
+            if (!data.models.find(item => item.index === index)?.supports_think) setEffort('off')
+          }}
+          options={data.models.map((item) => ({
+            value: String(item.index),
+            label: item.model && item.model !== item.name ? `${item.name} · ${item.model}` : item.name,
+            supportsVision: item.supports_vision,
+            disabledReason: item.available ? undefined : '不可用',
+          }))}
+        />
         <label className="block space-y-1">
           <span>系统提示词</span>
           <textarea value={prompt} onChange={event => setPrompt(event.target.value)} rows={4} className="input-field w-full" />

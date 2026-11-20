@@ -19,11 +19,12 @@ def test_select_exam_preflight_requires_its_own_vision_model_even_from_interview
     cfg = SimpleNamespace(
         active_model=0,
         written_exam_mode=False,
-        written_exam_model_id="exam",
+        written_exam_model_ids=["text", "exam"],
         assist_screenshot_model_id="screenshot",
         models=[
             SimpleNamespace(id="screenshot", name="interview screenshot", enabled=True, supports_vision=True, api_key="sk"),
             SimpleNamespace(id="exam", name="exam vision", enabled=True, supports_vision=True, api_key="sk"),
+            SimpleNamespace(id="text", name="text only", enabled=True, supports_vision=False, api_key="sk"),
         ],
     )
 
@@ -61,7 +62,7 @@ def test_run_exam_preflight_broadcasts_steps_and_status(monkeypatch: pytest.Monk
     events: list[dict] = []
     cfg = SimpleNamespace(
         active_model=0,
-        written_exam_model_id="vision",
+        written_exam_model_ids=["vision"],
         models=[SimpleNamespace(id="vision", name="vision", enabled=True, supports_vision=True, api_key="sk")],
     )
     monkeypatch.setattr(exam_test, "broadcast", lambda data: events.append(data))
@@ -151,7 +152,7 @@ def test_run_exam_preflight_broadcasts_steps_and_status(monkeypatch: pytest.Monk
 def test_run_exam_preflight_keeps_pass_status_when_worker_returns_fast(monkeypatch: pytest.MonkeyPatch):
     cfg = SimpleNamespace(
         active_model=0,
-        written_exam_model_id="vision",
+        written_exam_model_ids=["vision"],
         models=[SimpleNamespace(id="vision", name="vision", enabled=True, supports_vision=True, api_key="sk")],
     )
     monkeypatch.setattr(exam_test, "broadcast", lambda data: None)
@@ -193,7 +194,7 @@ def test_run_exam_preflight_keeps_pass_status_when_worker_returns_fast(monkeypat
 
 def test_synchronously_failed_exam_preflight_does_not_publish_new_progress(monkeypatch):
     cfg = SimpleNamespace(
-        written_exam_model_id="exam",
+        written_exam_model_ids=["exam"],
         models=[SimpleNamespace(id="exam", name="exam", enabled=True, supports_vision=True, api_key="sk")],
     )
     events = []

@@ -25,12 +25,17 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CONFIG_FILE", str(tmp_path / "config.json"))
     monkeypatch.setattr(config, "_config", config.AppConfig(models=[
         config.ModelConfig(name="Assist", model="assist-model", api_key="test-assist"),
-        config.ModelConfig(name="Analysis", model="analysis-model", api_key="test-analysis", supports_think=True),
+        config.ModelConfig(name="Analysis", model="analysis-model", api_key="test-analysis", supports_think=True, supports_vision=True),
     ]))
     app = FastAPI()
     app.include_router(knowledge_router, prefix="/api")
     app.include_router(common_router, prefix="/api")
     return TestClient(app)
+
+
+def test_model_options_include_vision_capability(client):
+    models = client.get("/api/knowledge/settings").json()["models"]
+    assert [model["supports_vision"] for model in models] == [False, True]
 
 
 def _configure(client, **overrides):

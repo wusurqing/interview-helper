@@ -59,7 +59,7 @@ export const SAMPLE_CONFIG = {
 export const SAMPLE_WRITTEN_EXAM_CONFIG = {
   ...SAMPLE_CONFIG,
   models: SAMPLE_CONFIG.models.map((model, index) => ({ ...model, id: 'model-' + index, has_api_key: true })),
-  written_exam_model_id: 'model-0',
+  written_exam_model_ids: ['model-0'],
   written_exam_mode: true,
   written_exam_think: false,
 }

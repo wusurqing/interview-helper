@@ -52,7 +52,18 @@ test('selects and drags answer models while keeping the screenshot model separat
   await page.mouse.up()
   await expect(queue.getByRole('listitem').first()).toHaveText('DeepSeek V3')
 
-  await settings.getByRole('combobox', { name: '截图答题模型' }).selectOption('vision')
+  const unchecked = settings.getByRole('list', { name: '未勾选模型' })
+  const visionCheckbox = page.getByRole('checkbox', { name: '用于答题 GPT-4.1 Mini' })
+  await expect(unchecked.getByRole('listitem').filter({ has: visionCheckbox }).getByText('识图', { exact: true })).toHaveClass(/text-accent-blue/)
+  await visionCheckbox.check()
+  await expect(queue.getByRole('listitem').filter({ has: visionCheckbox }).getByText('识图', { exact: true })).toHaveClass(/text-accent-blue/)
+  await visionCheckbox.uncheck()
+  await expect(unchecked.getByRole('checkbox', { name: '用于答题 GPT-4.1 Mini' })).not.toBeChecked()
+
+  await settings.getByRole('button', { name: '截图答题模型' }).click()
+  const screenshotChoices = settings.getByRole('group', { name: '截图答题模型选项' })
+  await expect(screenshotChoices.getByText('识图', { exact: true })).toHaveClass(/text-accent-blue/)
+  await screenshotChoices.getByRole('radio', { name: 'GPT-4.1 Mini' }).check()
   await expect(settings.getByRole('checkbox', { name: '用于答题 GPT-4.1 Mini' })).not.toBeChecked()
   await settings.getByRole('button', { name: '保存答题模型设置' }).click()
   await expect.poll(() => updates).toEqual([{
@@ -62,7 +73,7 @@ test('selects and drags answer models while keeping the screenshot model separat
   await expect(settings.getByRole('button', { name: '保存答题模型设置' })).toBeDisabled()
 })
 
-test('saves the exam model and generation settings in their own tab', async ({ context, page }) => {
+test('orders the exam model queue and saves its separate generation settings', async ({ context, page }) => {
   let config = {
     ...SAMPLE_CONFIG,
     models: [
@@ -72,7 +83,7 @@ test('saves the exam model and generation settings in their own tab', async ({ c
     ],
     assist_model_ids: ['text'],
     assist_screenshot_model_id: 'interview-vision',
-    written_exam_model_id: null,
+    written_exam_model_ids: [],
     system_prompts: { assist_exam: '按笔试要求作答。' },
     assist_generation: {
       assist_manual: { temperature: 0.4, max_output_tokens: 1400 },
@@ -126,19 +137,38 @@ test('saves the exam model and generation settings in their own tab', async ({ c
   const scenario = settings.getByRole('combobox', { name: '使用场景' })
   await expect(scenario.getByRole('option', { name: '手动提问' })).toHaveCount(1)
   await expect(scenario.getByRole('option', { name: '笔试答题' })).toHaveCount(0)
-  await expect(settings.getByRole('combobox', { name: '笔试答题模型' })).toHaveCount(0)
+  await expect(settings.getByRole('heading', { name: '笔试答题模型' })).toHaveCount(0)
 
   const examTab = nav.getByRole('button', { name: /^笔试配置/ })
   await examTab.click()
-  const model = settings.getByRole('combobox', { name: '笔试答题模型' })
-  await expect(model.getByRole('option', { name: '纯文本模型（该模型不支持图片作为输入）' })).toBeDisabled()
-  await expect(model.getByRole('option', { name: '笔试视觉模型' })).toBeEnabled()
-  await model.selectOption('exam-vision')
+  const unchecked = settings.getByRole('list', { name: '未勾选模型' })
+  await expect(unchecked.getByRole('checkbox', { name: '用于答题 纯文本模型' })).toBeDisabled()
+  await expect(unchecked.getByText('该模型不支持图片作为输入')).toBeVisible()
+  const examModelCheckbox = page.getByRole('checkbox', { name: '用于答题 笔试视觉模型' })
+  const examModelOption = unchecked.getByRole('listitem').filter({ has: examModelCheckbox })
+  await expect(examModelOption.getByText('识图', { exact: true })).toHaveClass(/text-accent-blue/)
+  await unchecked.getByRole('checkbox', { name: '用于答题 面试截图模型' }).click()
+  await unchecked.getByRole('checkbox', { name: '用于答题 笔试视觉模型' }).click()
+
+  const examQueue = settings.getByRole('list', { name: '笔试答题模型' })
+  await expect(examQueue.getByRole('listitem').filter({ has: examModelCheckbox }).getByText('识图', { exact: true })).toHaveClass(/text-accent-blue/)
+  await examModelCheckbox.uncheck()
+  await expect(examModelOption.getByText('识图', { exact: true })).toHaveClass(/text-accent-blue/)
+  await unchecked.getByRole('checkbox', { name: '用于答题 笔试视觉模型' }).click()
+  const examModelHandle = examQueue.getByRole('button', { name: '排序 笔试视觉模型' })
+  await examModelHandle.press('ArrowUp')
+  await expect(examQueue.getByRole('listitem').first()).toContainText('笔试视觉模型')
+  await expect(examModelHandle).toBeFocused()
+  await page.keyboard.press('ArrowDown')
+  await expect(examQueue.getByRole('listitem').last()).toContainText('笔试视觉模型')
+  await expect(examModelHandle).toBeFocused()
+  await page.keyboard.press('ArrowUp')
+  await expect(examQueue.getByRole('listitem').first()).toContainText('笔试视觉模型')
   await expect(nav.getByText('未保存：笔试配置')).toBeVisible()
   expect(updates).toHaveLength(0)
   await settings.getByRole('button', { name: '保存笔试模型' }).click()
   await expect(settings.getByRole('button', { name: '保存笔试模型' })).toBeDisabled()
-  await expect.poll(() => updates).toEqual([{ written_exam_model_id: 'exam-vision' }])
+  await expect.poll(() => updates).toEqual([{ written_exam_model_ids: ['exam-vision', 'interview-vision'] }])
 
   const editor = settings.getByRole('textbox', { name: '系统提示词' })
   const temperature = settings.getByRole('spinbutton', { name: '温度' })
@@ -159,10 +189,11 @@ test('saves the exam model and generation settings in their own tab', async ({ c
   await expect(settings).toHaveCount(0)
 
   await openSettings.click()
-  await expect(settings.getByRole('combobox', { name: '截图答题模型' })).toHaveValue('interview-vision')
+  await expect(settings.getByRole('button', { name: '截图答题模型' })).toContainText('面试截图模型')
   await expect(settings.getByRole('spinbutton', { name: '温度' })).toHaveValue('0.4')
   await examTab.click()
-  await expect(model).toHaveValue('exam-vision')
+  await expect(examQueue.getByRole('listitem').first()).toContainText('笔试视觉模型')
+  await expect(examQueue.getByRole('listitem').last()).toContainText('面试截图模型')
   await expect(editor).toHaveValue('只写答案。')
   await expect(temperature).toHaveValue('0.2')
   await expect(tokenLimit).toHaveValue('1024')

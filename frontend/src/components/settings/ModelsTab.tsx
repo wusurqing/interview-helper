@@ -6,7 +6,6 @@ import {
   RefreshCw,
   ArrowUpToLine,
   ArrowDownToLine,
-  Eye,
   Trash2,
   ChevronDown,
   ChevronUp,
@@ -16,6 +15,7 @@ import {
   BrainCircuit,
   X,
 } from 'lucide-react'
+import VisionBadge from '@/components/VisionBadge'
 import { useInterviewStore, type ModelFullInfo } from '@/stores/configStore'
 import { api } from '@/lib/api'
 import { updateConfigAndRefresh } from '@/lib/configSync'
@@ -790,11 +790,7 @@ export default function ModelsTab() {
                             {API_TYPE_OPTIONS.find((t) => t.value === m.api_type)?.label}
                           </span>
                         )}
-                        {m.supports_vision && (
-                          <span className="inline-flex items-center gap-0.5 text-[10px] text-accent-blue flex-shrink-0 px-1.5 py-0.5 rounded-md bg-accent-blue/10">
-                            <Eye className="w-3 h-3" /> 识图
-                          </span>
-                        )}
+                        {m.supports_vision && <VisionBadge />}
                       </div>
                       <div className="flex flex-wrap items-center gap-2 mt-1">
                         <span className="text-[10px] text-text-muted truncate max-w-[180px]">{m.model || '(未设置)'}</span>

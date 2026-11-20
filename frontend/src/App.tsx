@@ -23,6 +23,7 @@ import KnowledgeButton from '@/components/kb/KnowledgeButton'
 import KnowledgeDrawer from '@/components/kb/KnowledgeDrawer'
 import { AppToastStack } from '@/components/app/AppToastStack'
 import { InitErrorScreen } from '@/components/app/InitErrorScreen'
+import VisionBadge from '@/components/VisionBadge'
 import { ModelPriorityDropdown } from '@/components/app/ModelPriorityDropdown'
 import { WindowOpacitySlider } from '@/components/app/WindowOpacitySlider'
 const ReviewMode = lazy(() => import('@/components/ReviewMode'))
@@ -443,9 +444,10 @@ export default function App() {
           {activeTab === 'exam' ? (
             <button type="button" aria-label={`笔试模型 ${examModel?.name ?? '未配置'}`}
               title="打开笔试配置"
-              className="max-w-[150px] truncate rounded-xl border border-bg-hover/50 px-2.5 py-1.5 text-xs text-text-primary hover:bg-bg-hover"
+              className="inline-flex max-w-[160px] items-center gap-1.5 rounded-xl border border-bg-hover/50 px-2.5 py-1.5 text-xs text-text-primary hover:bg-bg-hover"
               onClick={() => useInterviewStore.setState({ settingsOpen: true, settingsDrawerTab: 'mode' })}>
-              {examModel?.name ?? '配置笔试模型'}
+              <span className="truncate">{examModel?.name ?? '配置笔试模型'}</span>
+              {examModel?.supports_vision && <VisionBadge />}
             </button>
           ) : config?.models && config.models.length > 0 && (
             <ModelPriorityDropdown

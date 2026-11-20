@@ -57,6 +57,7 @@ from api.assist.scheduler import (
     dispatch_snapshot as scheduler_dispatch_snapshot,
     drain_commit_queue,
     eligible_exam_model_index,
+    exam_model_order,
     is_asr_task,
     is_stale_inflight_asr_task,
     key_ok,
@@ -735,14 +736,9 @@ def submit_answer_task(task: TaskPayload, *, config_snapshot=None) -> bool:
         return False
     routing = AnswerRouting(written_exam=False)
     if written_exam:
-        primary_id = cfg.models[model_index].id
-        fallback_ids = (
-            model_id for model_id in (getattr(cfg, "assist_model_ids", None) or ())
-            if eligible_exam_model_index(cfg, model_id) is not None
-        )
         routing = AnswerRouting(
             written_exam=True,
-            exam_model_ids=tuple(dict.fromkeys((primary_id, *fallback_ids))),
+            exam_model_ids=tuple(cfg.models[index].id for index in exam_model_order(cfg)),
             exam_config=copy.deepcopy(cfg),
         )
     text, image, manual, source, meta = task

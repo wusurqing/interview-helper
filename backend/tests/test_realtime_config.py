@@ -45,6 +45,7 @@ def test_migrates_standard_reply_and_legacy_model_order(realtime_settings):
     assert payload["assist_model_ids"] == [primary_id, vision_id]
     assert payload["assist_screenshot_model_id"] == vision_id
     assert payload["written_exam_model_id"] == vision_id
+    assert payload["written_exam_model_ids"] == [vision_id]
     assert set(payload["assist_generation"]) == {"assist_realtime", "assist_manual", "assist_screen", "assist_exam"}
     assert payload["assist_generation"]["assist_realtime"] == {"temperature": 0.7, "max_output_tokens": 512}
     assert payload["system_prompts"] == {"assist_realtime": "standard voice"}
@@ -169,9 +170,10 @@ def test_written_exam_model_rejects_ineligible_choices(realtime_settings):
     models = response.json()["models"]
     assert not models[-1]["has_api_key"]
     for invalid_id in (models[1]["id"], models[-2]["id"], models[-1]["id"], "deleted-model", ""):
-        response = client.post("/api/config", json={"written_exam_model_id": invalid_id})
-        assert response.status_code == 422
-        assert "笔试答题" in response.json()["detail"]
+        for selection in ({"written_exam_model_id": invalid_id}, {"written_exam_model_ids": [invalid_id]}):
+            response = client.post("/api/config", json=selection)
+            assert response.status_code == 422
+            assert "笔试答题" in response.json()["detail"]
     assert client.get("/api/config").json()["written_exam_model_id"] == catalog[0]["id"]
 
 
@@ -182,6 +184,59 @@ def test_written_exam_does_not_migrate_unconfigured_screenshot_model():
     )
     assert cfg.assist_screenshot_model_id == "old-screen"
     assert cfg.written_exam_model_id is None
+    assert cfg.written_exam_model_ids == []
+
+
+def test_written_exam_queue_migrates_old_primary_and_only_eligible_fallbacks():
+    old_config = {
+        "models": [
+            {"id": "text-only", "api_key": "test-key"},
+            {"id": "vision-a", "supports_vision": True, "api_key": "test-key"},
+            {"id": "vision-b", "supports_vision": True, "api_key": "test-key"},
+            {"id": "primary", "supports_vision": True, "api_key": "test-key"},
+            {"id": "disabled", "supports_vision": True, "api_key": "test-key", "enabled": False},
+            {"id": "missing-key", "supports_vision": True, "api_key": ""},
+        ],
+        "assist_model_ids": ["text-only", "vision-b", "disabled", "missing-key", "primary", "vision-a"],
+        "written_exam_model_id": "primary",
+    }
+    assert config.AppConfig(**old_config).written_exam_model_ids == ["primary", "vision-b", "vision-a"]
+    assert config.AppConfig(**{**old_config, "written_exam_model_id": None}).written_exam_model_ids == []
+    assert config.AppConfig(**old_config, written_exam_model_ids=[]).written_exam_model_ids == []
+    assert config.AppConfig(**{**old_config, "written_exam_model_id": "disabled"}).written_exam_model_ids == ["disabled"]
+
+
+def test_ordered_exam_queue_saves_and_reloads_independently(realtime_settings):
+    client = realtime_settings
+    old_catalog = client.get("/api/config/models-full").json()["models"]
+    keep = "__IA_KEEP_EXISTING_API_KEY__"
+    updated = client.post("/api/config", json={"models": [
+        *[{**model, "api_key": keep} for model in old_catalog],
+        {"name": "Second vision", "supports_vision": True, "api_key": "test-second"},
+    ]}).json()
+    original_id = old_catalog[0]["id"]
+    second_id = updated["models"][-1]["id"]
+    saved = client.post("/api/config", json={"written_exam_model_ids": [second_id, original_id, second_id]}).json()
+    assert saved["written_exam_model_ids"] == [second_id, original_id]
+    assert saved["written_exam_model_id"] == second_id
+    assert saved["assist_model_ids"] == updated["assist_model_ids"]
+
+    catalog = client.get("/api/config/models-full").json()["models"]
+    models_by_id = {model["id"]: model for model in catalog}
+    models_by_id[second_id]["enabled"] = False
+    assert client.post("/api/config", json={"models": [
+        {**model, "api_key": keep} for model in reversed(list(models_by_id.values()))
+    ]}).status_code == 200
+    assert client.post("/api/config", json={"written_exam_model_ids": [original_id, second_id]}).status_code == 200
+    config._config = None
+    assert client.get("/api/config").json()["written_exam_model_ids"] == [original_id, second_id]
+
+    assert client.post("/api/config", json={"written_exam_model_ids": []}).status_code == 200
+    config._config = None
+    payload = client.get("/api/config").json()
+    assert payload["written_exam_model_ids"] == []
+    assert payload["written_exam_model_id"] is None
+    assert payload["assist_model_ids"] == updated["assist_model_ids"]
 
 
 def test_remote_model_discovery_keeps_the_original_provider_after_reorder(realtime_settings, monkeypatch):

@@ -16,7 +16,7 @@ export interface KnowledgeSettingsPayload {
   settings: KnowledgeSettings
   default_system_prompt: string
   output_contract: string
-  models: { index: number; name: string; model?: string; fingerprint: string; available: boolean; supports_think: boolean }[]
+  models: { index: number; name: string; model?: string; fingerprint: string; available: boolean; supports_think: boolean; supports_vision?: boolean }[]
 }
 
 export interface KnowledgeAnalysisState {

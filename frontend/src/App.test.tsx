@@ -174,6 +174,8 @@ describe('App bootstrap', () => {
 
     const disabledOption = screen.getByRole('button', { name: /Disabled Model/ })
     expect(disabledOption).toBeDisabled()
+    expect(disabledOption).toHaveTextContent('识图')
+    expect(trigger).not.toHaveTextContent('识图')
     expect(screen.queryByRole('button', { name: 'Unselected Model' })).not.toBeInTheDocument()
     fireEvent.click(disabledOption)
 
@@ -291,10 +293,14 @@ describe('App bootstrap', () => {
     const originalInnerWidth = window.innerWidth
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 })
     apiMock.getConfig.mockResolvedValue({
-      models: [{ id: 'exam', name: 'Exam Vision', supports_vision: true, has_api_key: true, enabled: true }],
+      models: [
+        { id: 'other', name: 'Second Vision', supports_vision: true, has_api_key: true, enabled: true },
+        { id: 'off', name: 'Disabled Vision', supports_vision: true, has_api_key: true, enabled: false },
+        { id: 'exam', name: 'Exam Vision', supports_vision: true, has_api_key: true, enabled: true },
+      ],
       assist_screenshot_model_id: null,
       assist_model_ids: [],
-      written_exam_model_id: 'exam',
+      written_exam_model_ids: ['off', 'exam', 'other'],
       active_model: 0,
       api_key_set: true,
       written_exam_mode: true,
@@ -307,7 +313,7 @@ describe('App bootstrap', () => {
       render(<App />)
 
       const screenshotButton = await screen.findByRole('button', { name: '截图答题' })
-      expect(screen.getByRole('button', { name: '笔试模型 Exam Vision' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: '笔试模型 Exam Vision' })).toHaveTextContent('识图')
       expect(screen.queryByText('transcript')).not.toBeInTheDocument()
       expect(screen.getByText('answer')).toBeInTheDocument()
       fireEvent.click(screenshotButton)

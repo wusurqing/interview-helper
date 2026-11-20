@@ -48,7 +48,7 @@ describe('WrittenExamTest', () => {
     useInterviewStore.setState({
       config: {
         model_name: 'GPT-4.1 Vision',
-        written_exam_model_id: 'exam',
+        written_exam_model_ids: ['exam'],
         models: [{ id: 'exam', name: 'GPT-4.1 Vision', supports_vision: true, supports_think: true, has_api_key: true, enabled: true }],
         active_model: 0,
       },
@@ -622,13 +622,13 @@ describe('WrittenExamTest', () => {
         model_name: 'Text Model',
         models: [{ id: 'vision', name: 'Vision Model', supports_vision: true, supports_think: false, enabled: true }],
         active_model: 0,
-        written_exam_model_id: null,
+        written_exam_model_ids: [],
       },
     } as any)
 
     render(<WrittenExamTest />)
 
-    expect(screen.getByText('请先在笔试配置中选择可用的识图模型。')).toBeInTheDocument()
+    expect(screen.getByText(/请先在笔试配置中.*识图模型/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '开始检测' })).toBeDisabled()
   })
 })

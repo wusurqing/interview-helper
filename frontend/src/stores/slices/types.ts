@@ -59,6 +59,7 @@ export interface AppConfig {
   assist_model_ids?: string[]
   assist_screenshot_model_id?: string | null
   written_exam_model_id?: string | null
+  written_exam_model_ids?: string[]
   assist_think_mode?: boolean
   assist_think_effort?: string
   think_mode: boolean

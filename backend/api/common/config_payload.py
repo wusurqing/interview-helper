@@ -32,6 +32,7 @@ def build_config_payload(cfg) -> dict:
         "assist_model_ids": list(getattr(cfg, "assist_model_ids", None) or []),
         "assist_screenshot_model_id": getattr(cfg, "assist_screenshot_model_id", None),
         "written_exam_model_id": getattr(cfg, "written_exam_model_id", None),
+        "written_exam_model_ids": list(getattr(cfg, "written_exam_model_ids", [])),
         "assist_generation": {
             scene: params.model_dump() for scene, params in getattr(cfg, "assist_generation", {}).items()
         },

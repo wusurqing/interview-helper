@@ -164,12 +164,12 @@ describe('ControlBar', () => {
   })
 
   it.each([
-    { written_exam_model_id: null },
-    { written_exam_model_id: 'missing' },
-    { written_exam_model_id: 'disabled' },
-    { written_exam_model_id: 'no-key' },
-    { written_exam_model_id: 'text' },
-  ])('requires a configured vision primary even when an interview backup is ready ($written_exam_model_id)', (selection) => {
+    { written_exam_model_ids: [] },
+    { written_exam_model_ids: ['missing'] },
+    { written_exam_model_ids: ['disabled'] },
+    { written_exam_model_ids: ['no-key'] },
+    { written_exam_model_ids: ['text'] },
+  ])('requires a configured vision primary even when an interview backup is ready ($written_exam_model_ids)', (selection) => {
     useInterviewStore.setState(({ config }) => ({
       config: config && {
         ...config, written_exam_mode: true, ...selection, assist_model_ids: ['backup'], assist_screenshot_model_id: 'backup',
@@ -184,14 +184,14 @@ describe('ControlBar', () => {
     render(<ControlBar />)
     fireEvent.change(screen.getByPlaceholderText('输入问题，Enter 发送…'), { target: { value: '题面' } })
     expect(screen.getByRole('button', { name: '发送问题' })).toBeDisabled()
-    expect(screen.getByText('请先在笔试配置中选择可用的识图模型。')).toBeInTheDocument()
+    expect(screen.getByText(/请先在笔试配置中.*识图模型/)).toBeInTheDocument()
     expect(apiMock.ask).not.toHaveBeenCalled()
   })
 
   it('sends an exam question with a pasted image using an exam-only model', async () => {
     useInterviewStore.setState(({ config }) => ({
       config: config && {
-        ...config, written_exam_mode: true, written_exam_model_id: 'exam', assist_model_ids: [],
+        ...config, written_exam_mode: true, written_exam_model_ids: ['exam'], assist_model_ids: [],
         models: [{ id: 'exam', name: 'Exam', supports_think: false, supports_vision: true, enabled: true, has_api_key: true }],
       },
     }))

@@ -16,6 +16,7 @@ import {
 import { api, getErrorMessage } from '../../lib/api'
 import { useInterviewStore } from '../../stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
+import ModelPicker from '@/components/ModelPicker'
 import { StageBadge } from '@/components/job-tracker/stageConfig'
 import { isLightColorScheme } from '@/lib/colorScheme'
 import type { ReviewSession, ReviewSessionsResponse } from './types'
@@ -641,7 +642,7 @@ function ReviewSettingsPanel({
   reviewEnabled: boolean
   reviewModelIndex: number
   reviewToggleSaving: boolean
-  models: { name: string; enabled?: boolean }[]
+  models: { name: string; enabled?: boolean; supports_vision?: boolean }[]
   onToggle: (enabled: boolean) => void
   onChangeModel: (modelIndex: number) => void
 }) {
@@ -697,21 +698,16 @@ function ReviewSettingsPanel({
           </span>
         </button>
       </div>
-      <label className="mb-2 block text-xs font-medium text-text-secondary">
-        复盘分析模型
-      </label>
-      <select
-        value={reviewModelIndex}
-        onChange={(event) => onChangeModel(Number(event.target.value))}
+      <ModelPicker
+        label="复盘分析模型"
+        value={String(reviewModelIndex)}
+        onChange={(value) => onChangeModel(Number(value))}
         disabled={!reviewEnabled}
-        className={FIELD_CLASS}
-      >
-        {models.map((model, idx) => (
-          <option key={idx} value={idx} disabled={!model.enabled}>
-            {model.name} {!model.enabled ? '(未启用)' : ''}
-          </option>
-        ))}
-      </select>
+        options={models.map((model, index) => ({
+          value: String(index), label: model.name, supportsVision: model.supports_vision,
+          disabledReason: model.enabled ? undefined : '未启用',
+        }))}
+      />
       <div className="mt-3 border-t border-bg-hover/80 pt-3">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">

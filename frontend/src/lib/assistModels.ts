@@ -30,9 +30,12 @@ export function getAssistScreenshotModel(config: AppConfig | null | undefined) {
 }
 
 export function getWrittenExamModel(config: AppConfig | null | undefined) {
-  const id = config?.written_exam_model_id
-  if (!id) return undefined
-  return config.models.find(model => model.id === id && model.supports_vision && model.enabled !== false && model.has_api_key === true)
+  if (!config) return undefined
+  const { written_exam_model_id: legacyId, written_exam_model_ids: selectedIds, models } = config
+  for (const id of selectedIds ?? (legacyId ? [legacyId] : [])) {
+    const model = models.find(candidate => candidate.id === id)
+    if (model?.supports_vision && model.enabled !== false && model.has_api_key === true) return model
+  }
 }
 
 export const missingWrittenExamModel = '请先在笔试配置中选择可用的识图模型。'

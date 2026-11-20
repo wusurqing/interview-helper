@@ -183,14 +183,16 @@ def test_exam_text_waits_for_primary_then_uses_frozen_vision_fallback_and_prompt
 
     cfg = pipeline.get_config()
     cfg.written_exam_mode = True
-    cfg.written_exam_model_id = "exam"
-    cfg.assist_model_ids = ["text", "exam", "fallback"]
+    cfg.written_exam_model_ids = ["text", "exam", "fallback", "unused"]
+    cfg.assist_model_ids = ["screenshot"]
     cfg.assist_screenshot_model_id = "screenshot"
     cfg.system_prompts = {"assist_exam": "提交时的笔试指令"}
     cfg.assist_generation = {"assist_exam": SimpleNamespace(temperature=0.2, max_output_tokens=660)}
     cfg.models = [
         SimpleNamespace(id=model_id, name=model_id, api_key="test", enabled=True, supports_vision=vision)
-        for model_id, vision in [("text", False), ("screenshot", True), ("exam", True), ("fallback", True)]
+        for model_id, vision in [
+            ("text", False), ("screenshot", True), ("exam", True), ("unused", True), ("fallback", True),
+        ]
     ]
     from services.llm import build_system_prompt
     monkeypatch.setattr(answer_worker, "build_system_prompt", build_system_prompt)
@@ -210,7 +212,7 @@ def test_exam_text_waits_for_primary_then_uses_frozen_vision_fallback_and_prompt
     assert _DeferredThread.started == []
     next_cfg = copy.deepcopy(cfg)
     next_cfg.written_exam_mode = False
-    next_cfg.written_exam_model_id = "screenshot"
+    next_cfg.written_exam_model_ids = ["screenshot"]
     next_cfg.assist_model_ids = ["screenshot"]
     next_cfg.system_prompts = {"assist_exam": "更新后的笔试指令"}
     next_cfg.assist_generation["assist_exam"].max_output_tokens = 900
@@ -232,7 +234,7 @@ def test_exam_text_waits_for_primary_then_uses_frozen_vision_fallback_and_prompt
 def test_exam_stops_when_primary_is_unavailable_before_any_provider_request(monkeypatch, stage):
     cfg = pipeline.get_config()
     cfg.written_exam_mode = True
-    cfg.written_exam_model_id = "exam"
+    cfg.written_exam_model_ids = ["exam", "fallback"]
     cfg.assist_model_ids = ["fallback"]
     for model, model_id in zip(cfg.models, ("exam", "fallback")):
         model.id = model_id
@@ -248,6 +250,7 @@ def test_exam_stops_when_primary_is_unavailable_before_any_provider_request(monk
     task = ("文字题", None, True, "manual_text", {"origin": "manual"})
     if stage == "before_submission":
         cfg.models[0].api_key = " "
+        cfg.models[1].supports_vision = False
         assert not pipeline.submit_answer_task(task)
     elif stage in ("queued", "endpoint_changed"):
         pipeline._in_flight_tasks[99] = ("exam", ("", None, True, "manual_text", {}))
@@ -278,7 +281,8 @@ def test_dispatched_worker_keeps_full_config_snapshot_when_settings_change(
 
     cfg = pipeline.get_config()
     cfg.written_exam_mode = True
-    cfg.written_exam_model_id = cfg.models[0].id = "exam"
+    cfg.models[0].id = "exam"
+    cfg.written_exam_model_ids = ["exam"]
     cfg.written_exam_think = False
     cfg.language = "Rust"
     cfg.system_prompts = {"assist_exam": "按段落提交笔试答案。"}

@@ -52,12 +52,13 @@ function jsonResponse(body: unknown, status = 200) {
 
 let savedPrompts: Record<string, string>
 let savedGeneration: Record<string, { temperature: number; max_output_tokens: number }>
-let savedExamModelId: string | null
+let savedExamModelIds: string[]
 let configRequests: string[]
 let loadFailure: boolean
 let saveFailure: boolean
 const examModels = [
   { id: 'vision', name: '识图模型', supports_vision: true, supports_think: true, has_api_key: true },
+  { id: 'backup', name: '备用视觉模型', supports_vision: true, supports_think: false, has_api_key: true },
   { id: 'text', name: '文本模型', supports_vision: false, supports_think: false, has_api_key: true },
   { id: 'disabled', name: '停用模型', supports_vision: true, supports_think: false, has_api_key: true, enabled: false },
   { id: 'unconfigured', name: '未配置模型', supports_vision: true, supports_think: false, has_api_key: false },
@@ -81,7 +82,7 @@ describe('系统提示词设置', () => {
       assist_manual: { temperature: 0.25, max_output_tokens: 1400 },
       assist_exam: { temperature: 0.3, max_output_tokens: 2048 },
     }
-    savedExamModelId = null
+    savedExamModelIds = []
     configRequests = []
     loadFailure = false
     saveFailure = false
@@ -96,7 +97,7 @@ describe('系统提示词设置', () => {
           configRequests.push(body)
           if (saveFailure) return jsonResponse({ detail: '配置无法写入' }, 500)
           const updates = JSON.parse(body)
-          if ('written_exam_model_id' in updates) savedExamModelId = updates.written_exam_model_id
+          if ('written_exam_model_ids' in updates) savedExamModelIds = updates.written_exam_model_ids
           Object.assign(savedGeneration, updates.assist_generation ?? {})
           for (const [id, text] of Object.entries(updates.system_prompts ?? {}) as [string, string | null][]) {
             if (text === null) delete savedPrompts[id]
@@ -107,7 +108,7 @@ describe('系统提示词设置', () => {
           models: examModels,
           system_prompts: savedPrompts,
           assist_generation: savedGeneration,
-          written_exam_model_id: savedExamModelId,
+          written_exam_model_ids: savedExamModelIds,
         })
       }
       throw new Error(`Unexpected request: ${url}`)
@@ -257,36 +258,50 @@ describe('系统提示词设置', () => {
     expect(savedGeneration.assist_manual).toEqual({ temperature: 0.25, max_output_tokens: 1400 })
   })
 
-  it('显示全部笔试模型及其不可选原因，显式保存和清空笔试模型 ID', async () => {
+  it('勾选笔试模型进入队列，保留禁用原因和识图标签，并显式保存和清空队列', async () => {
     useInterviewStore.setState({
       settingsDrawerTab: 'mode',
-      config: { models: examModels, written_exam_model_id: null } as ReturnType<typeof useInterviewStore.getState>['config'],
+      config: { models: examModels, written_exam_model_ids: [] } as ReturnType<typeof useInterviewStore.getState>['config'],
     })
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
     render(<SettingsDrawer />)
 
-    const model = await screen.findByRole('combobox', { name: /^笔试答题模型/ })
-    expect(within(model).getByRole('option', { name: '文本模型（该模型不支持图片作为输入）' })).toBeDisabled()
-    expect(within(model).getByRole('option', { name: '停用模型（已停用）' })).toBeDisabled()
-    expect(within(model).getByRole('option', { name: '未配置模型（未配置 API Key）' })).toBeDisabled()
-    expect(within(model).getByRole('option', { name: '识图模型' })).toBeEnabled()
+    const unchecked = within(await screen.findByRole('list', { name: '未勾选模型' }))
+    expect(unchecked.getByRole('checkbox', { name: '用于答题 文本模型' })).toBeDisabled()
+    expect(unchecked.getByRole('checkbox', { name: '用于答题 停用模型' })).toBeDisabled()
+    expect(unchecked.getByRole('checkbox', { name: '用于答题 未配置模型' })).toBeDisabled()
+    expect(unchecked.getByText('该模型不支持图片作为输入')).toBeInTheDocument()
+    expect(unchecked.getByText('已停用')).toBeInTheDocument()
+    expect(unchecked.getByText('未配置 API Key')).toBeInTheDocument()
+    const vision = unchecked.getByRole('checkbox', { name: '用于答题 识图模型' })
+    expect(vision).toBeEnabled()
+    expect(within(vision.closest('li')!).getByText('识图', { exact: true })).toHaveClass('text-accent-blue')
     const save = screen.getByRole('button', { name: '保存笔试模型' })
     expect(save).toBeDisabled()
 
-    fireEvent.change(model, { target: { value: 'vision' } })
+    fireEvent.click(vision)
+    fireEvent.click(unchecked.getByRole('checkbox', { name: '用于答题 备用视觉模型' }))
+    const selected = within(await screen.findByRole('list', { name: '笔试答题模型' }))
+    expect(selected.getAllByRole('checkbox').map((model) => model.getAttribute('aria-label'))).toEqual([
+      '用于答题 识图模型',
+      '用于答题 备用视觉模型',
+    ])
+    expect(selected.getByRole('button', { name: '排序 备用视觉模型' })).toBeEnabled()
+
     await waitFor(() => expect(screen.getAllByText('未保存：笔试配置')).not.toHaveLength(0))
     expect(configRequests).toHaveLength(0)
     fireEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: /实时辅助/ }))
     expect(confirm).toHaveBeenCalledWith('有未保存更改，切换后会丢失。')
-    expect(model).toHaveValue('vision')
+    expect(selected.getByRole('checkbox', { name: '用于答题 识图模型' })).toBeChecked()
 
     fireEvent.click(save)
     await waitFor(() => expect(save).toBeDisabled())
-    fireEvent.change(model, { target: { value: '' } })
+    fireEvent.click(selected.getByRole('checkbox', { name: '用于答题 识图模型' }))
+    fireEvent.click(selected.getByRole('checkbox', { name: '用于答题 备用视觉模型' }))
     fireEvent.click(save)
     await waitFor(() => expect(configRequests.map((body) => JSON.parse(body))).toEqual([
-      { written_exam_model_id: 'vision' },
-      { written_exam_model_id: null },
+      { written_exam_model_ids: ['vision', 'backup'] },
+      { written_exam_model_ids: [] },
     ]))
     await waitFor(() => expect(save).toBeDisabled())
   })

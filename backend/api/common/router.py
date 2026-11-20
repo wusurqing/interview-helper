@@ -57,6 +57,7 @@ class ConfigUpdate(BaseModel):
     assist_model_ids: list[StrictStr] | None = None
     assist_screenshot_model_id: StrictStr | None = None
     written_exam_model_id: StrictStr | None = None
+    written_exam_model_ids: list[StrictStr] | None = None
     assist_generation: dict[AssistScene, AssistGeneration] | None = None
     assist_think_mode: bool | None = None
     assist_think_effort: ThinkEffort | None = None

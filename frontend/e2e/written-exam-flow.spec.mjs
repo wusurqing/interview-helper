@@ -42,6 +42,12 @@ test.describe('written exam flow', () => {
     const requests = []
     let config = {
       ...SAMPLE_WRITTEN_EXAM_CONFIG,
+      models: [
+        { id: 'later-vision', name: '备用识图', enabled: true, has_api_key: true, supports_vision: true },
+        { id: 'missing-key', name: '待配置识图', enabled: true, has_api_key: false, supports_vision: true },
+        ...SAMPLE_WRITTEN_EXAM_CONFIG.models,
+      ],
+      written_exam_model_ids: ['missing-key', 'model-0', 'later-vision'],
       assist_model_ids: [],
       assist_screenshot_model_id: null,
       written_exam_mode: false,
@@ -100,7 +106,9 @@ test.describe('written exam flow', () => {
     const examTab = page.getByRole('tab', { name: '笔试辅助' })
     await examTab.click()
     await expect(examTab).toHaveAttribute('aria-selected', 'true')
-    await expect(page.getByRole('button', { name: '笔试模型 GPT-4.1 Mini' })).toBeVisible()
+    const examModel = page.getByRole('button', { name: '笔试模型 GPT-4.1 Mini' })
+    await expect(examModel).toBeVisible()
+    await expect(examModel.getByText('识图')).toBeVisible()
     await expect(page.getByLabel('转写记录')).toHaveCount(0)
     await expect(page.getByLabel('选择会议音频设备')).toHaveCount(0)
     await expect(page.getByText('AI 笔试助手')).toBeVisible({ timeout: 5000 })

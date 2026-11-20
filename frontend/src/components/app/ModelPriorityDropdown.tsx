@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { ChevronDown } from 'lucide-react'
 
+import VisionBadge from '@/components/VisionBadge'
 import { api } from '@/lib/api'
 import { getAssistModelEntries, isConfiguredModel } from '@/lib/assistModels'
 import { useInterviewStore, type AppConfig, type ModelHealthStatus } from '@/stores/configStore'
@@ -134,8 +135,8 @@ export function ModelPriorityDropdown({
         />
         <span className="truncate min-w-0 font-medium hidden sm:inline">
           {activeModel?.name ?? '选择模型'}
-          {activeModel?.supports_vision ? ' 👁' : ''}
         </span>
+        {activeModel?.supports_vision && <VisionBadge />}
         <ChevronDown className={`w-3 h-3 flex-shrink-0 text-text-muted transition-transform duration-200 ${open ? 'rotate-180' : ''}`} />
       </button>
 
@@ -162,8 +163,8 @@ export function ModelPriorityDropdown({
                 <div className={`w-2 h-2 rounded-full flex-shrink-0 ${healthDot(config, modelHealth, index)}`} aria-hidden />
                 <span className="truncate font-medium">
                   {model.name}
-                  {model.supports_vision ? ' 👁' : ''}
                 </span>
+                {model.supports_vision && <VisionBadge />}
                 {model.api_type && model.api_type !== 'openai' && (
                   <span
                     className="flex-shrink-0 text-[9px] px-1 py-px rounded bg-accent-violet/15 text-accent-violet font-medium"
