@@ -1188,11 +1188,11 @@ def process_question_parallel(
             )
             retry_attempt = attempt_number + 1
 
-            def announce_retry(model_name: str = "") -> None:
+            def announce_retry(model_name: str = "", *, attempt: int = retry_attempt) -> None:
                 nonlocal attempt_number
                 if deps.abort_check():
                     return
-                attempt_number = retry_attempt
+                attempt_number = attempt
                 _broadcast({
                     "type": "answer_retry", "id": qa_id, "question": display_question, "source": source,
                     "model_name": model_name, **format_payload,

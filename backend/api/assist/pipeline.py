@@ -914,7 +914,7 @@ def _try_dispatch():
                 _pick_from_snapshot,
                 interrupt_stale_asr=_should_interrupt_stale_asr(cfg),
                 now_mono=time.monotonic(),
-                reserve_model=lambda index: model_reservation(cfg, index),
+                reserve_model=lambda index, snapshot=cfg: model_reservation(snapshot, index),
                 discard_unavailable=True,
             )
             model_cfg_snapshot = None
