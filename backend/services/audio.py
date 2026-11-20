@@ -896,7 +896,13 @@ audio_capture = AudioCapture()
 
 
 def load_wav_file(path: str | Path) -> tuple[np.ndarray, int]:
-    with wave.open(str(path), 'rb') as wf:
+    raw = str(path or "").strip()
+    if not raw or raw.startswith(("\\\\", "//")):
+        raise ValueError("不支持的 WAV 音频路径")
+    wav_path = Path(raw)
+    if wav_path.suffix.lower() != ".wav":
+        raise ValueError("仅支持 .wav 测试音频文件")
+    with wave.open(str(wav_path), 'rb') as wf:
         sr = wf.getframerate()
         channels = wf.getnchannels()
         width = wf.getsampwidth()

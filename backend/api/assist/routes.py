@@ -1,6 +1,7 @@
 """Interview assist HTTP routes."""
 
 import asyncio
+from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -432,40 +433,55 @@ async def api_preflight_replay(body: dict):
     if session.is_recording and not session.is_paused:
         raise HTTPException(409, "请先暂停或结束面试，再做高频回放检测")
     device_id = body.get("device_id")
-    if device_id is None:
-        raise HTTPException(400, "device_id 必须提供")
+    if device_id is None or isinstance(device_id, bool):
+        raise HTTPException(400, "device_id 必须是整数")
     try:
         device_id = int(device_id)
     except (TypeError, ValueError):
         raise HTTPException(400, "device_id 必须是整数")
+    if body.get("audio_path") is not None:
+        raise HTTPException(400, "不允许通过 HTTP 指定自定义 audio_path，请使用受控 fixture_id")
     repeats = body.get("repeats", 3)
     gap_sec = body.get("gap_sec", 0.25)
-    audio_path = body.get("audio_path")
+    fixture_id = body.get("fixture_id")
     expected_phrase = body.get("expected_phrase")
+    if expected_phrase is not None and not isinstance(expected_phrase, str):
+        raise HTTPException(400, "expected_phrase 必须是字符串")
+    if isinstance(repeats, bool):
+        raise HTTPException(400, "repeats 必须是整数")
     try:
         repeats = int(repeats)
     except (TypeError, ValueError):
         raise HTTPException(400, "repeats 必须是整数")
+    if isinstance(gap_sec, bool):
+        raise HTTPException(400, "gap_sec 必须是数字")
     try:
         gap_sec = float(gap_sec)
     except (TypeError, ValueError):
         raise HTTPException(400, "gap_sec 必须是数字")
+    from .sound_test import replay_preflight_capture_stt, resolve_preflight_fixture
+    try:
+        fixture_path = resolve_preflight_fixture(fixture_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
     _check_segment_preflight()
     try:
-        from .sound_test import replay_preflight_capture_stt
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             replay_preflight_capture_stt,
             device_id,
             repeats=repeats,
             gap_sec=gap_sec,
-            audio_path=audio_path,
+            audio_path=fixture_path,
             expected_phrase=expected_phrase,
         )
+        if isinstance(result, dict) and "audio_path" in result:
+            result = {**result, "audio_path": Path(str(result["audio_path"])).name}
+        return result
     except AudioBusyError as e:
         raise HTTPException(409, str(e))
     except Exception as e:
         _rlog.warning("preflight replay failed device=%s: %s", device_id, e, exc_info=True)
-        raise HTTPException(503, f"高频回放检测失败: {e}")
+        raise HTTPException(503, "高频回放检测失败，请检查音频设备与语音配置")
 
 
 @router.post("/exam-preflight/run")

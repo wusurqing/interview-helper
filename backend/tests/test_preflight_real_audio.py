@@ -330,3 +330,37 @@ def test_collect_capture_audio_during_playback_captures_while_playing(monkeypatc
     assert playback_sec == 0.5
     assert captured is not None
     assert len(captured) == 5
+
+
+def test_resolve_preflight_fixture_enforces_allowlist_and_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    assert sound_test.resolve_preflight_fixture(None) == sound_test.PREFLIGHT_AUDIO_PATH.resolve()
+    assert sound_test.resolve_preflight_fixture("") == sound_test.PREFLIGHT_AUDIO_PATH.resolve()
+    assert sound_test.resolve_preflight_fixture("default") == sound_test.PREFLIGHT_AUDIO_PATH.resolve()
+
+    with pytest.raises(ValueError):
+        sound_test.resolve_preflight_fixture("nonexistent")
+
+    outside = tmp_path / "escape.wav"
+    outside.write_bytes(b"RIFF")
+    monkeypatch.setitem(sound_test.PREFLIGHT_REPLAY_FIXTURES, "escaped", outside)
+    with pytest.raises(ValueError):
+        sound_test.resolve_preflight_fixture("escaped")
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "\\\\server\\share\\probe.wav",
+        "//server/share/probe.wav",
+        "C:\\Windows\\win.ini",
+        "notes.txt",
+        "",
+    ],
+)
+def test_play_audio_fixture_and_load_wav_reject_unc_and_non_wav(bad_path: str):
+    from services.audio import load_wav_file
+
+    with pytest.raises(ValueError):
+        sound_test.play_audio_fixture(bad_path)
+    with pytest.raises(ValueError):
+        load_wav_file(bad_path)

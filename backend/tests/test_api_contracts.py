@@ -245,12 +245,14 @@ def test_api_preflight_replay_validates_params_and_returns_result(monkeypatch: p
     monkeypatch.setattr(assist_routes, "run_in_threadpool", fake_run_in_threadpool)
     monkeypatch.setattr("api.assist.sound_test.replay_preflight_capture_stt", fake_replay)
 
+    from api.assist import sound_test
+
     result = asyncio.run(
         assist_routes.api_preflight_replay({
             "device_id": 7,
             "repeats": 4,
             "gap_sec": 0.1,
-            "audio_path": "tmp/sample.wav",
+            "fixture_id": "default",
             "expected_phrase": "你好",
         })
     )
@@ -260,9 +262,96 @@ def test_api_preflight_replay_validates_params_and_returns_result(monkeypatch: p
         "device_id": 7,
         "repeats": 4,
         "gap_sec": 0.1,
-        "audio_path": "tmp/sample.wav",
+        "audio_path": sound_test.PREFLIGHT_AUDIO_PATH.resolve(),
         "expected_phrase": "你好",
     }
+
+
+@pytest.mark.parametrize(
+    "audio_path",
+    [
+        "",
+        "tmp/sample.wav",
+        "C:\\Windows\\win.ini",
+        "\\\\attacker\\share\\probe.wav",
+        "//attacker/share/probe.wav",
+        "../secret.wav",
+    ],
+)
+def test_api_preflight_replay_rejects_arbitrary_audio_path(monkeypatch: pytest.MonkeyPatch, audio_path: str):
+    monkeypatch.setattr(assist_routes, "get_config", lambda: SimpleNamespace(
+        stt_provider="doubao", doubao_stt_api_key="test-key",
+    ))
+    monkeypatch.setattr(
+        assist_routes,
+        "get_session",
+        lambda: SimpleNamespace(is_recording=False, is_paused=False),
+    )
+
+    def should_not_run(*_args, **_kwargs):
+        pytest.fail("replay should not be invoked when arbitrary audio_path is supplied")
+
+    monkeypatch.setattr("api.assist.sound_test.replay_preflight_capture_stt", should_not_run)
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(assist_routes.api_preflight_replay({"device_id": 7, "audio_path": audio_path}))
+
+    assert exc_info.value.status_code == 400
+    assert audio_path not in str(exc_info.value.detail) or not audio_path
+
+
+@pytest.mark.parametrize("fixture_id", ["unknown", "../preflight_phrase", "C:evil.wav", 123])
+def test_api_preflight_replay_rejects_invalid_fixture_id(monkeypatch: pytest.MonkeyPatch, fixture_id):
+    monkeypatch.setattr(assist_routes, "get_config", lambda: SimpleNamespace(
+        stt_provider="doubao", doubao_stt_api_key="test-key",
+    ))
+    monkeypatch.setattr(
+        assist_routes,
+        "get_session",
+        lambda: SimpleNamespace(is_recording=False, is_paused=False),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(assist_routes.api_preflight_replay({"device_id": 7, "fixture_id": fixture_id}))
+
+    assert exc_info.value.status_code == 400
+
+
+def test_api_preflight_replay_hides_filesystem_paths_in_response_and_errors(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(assist_routes, "get_config", lambda: SimpleNamespace(
+        stt_provider="doubao", doubao_stt_api_key="test-key",
+    ))
+    monkeypatch.setattr(
+        assist_routes,
+        "get_session",
+        lambda: SimpleNamespace(is_recording=False, is_paused=False),
+    )
+
+    async def fake_run_in_threadpool(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(assist_routes, "run_in_threadpool", fake_run_in_threadpool)
+    monkeypatch.setattr(
+        "api.assist.sound_test.replay_preflight_capture_stt",
+        lambda device_id, **kwargs: {
+            "device_id": device_id,
+            "audio_path": "E:\\secret\\server\\assets\\preflight_phrase.wav",
+            "success_count": 1,
+            "failure_count": 0,
+        },
+    )
+
+    result = asyncio.run(assist_routes.api_preflight_replay({"device_id": 7}))
+    assert result["audio_path"] == "preflight_phrase.wav"
+
+    def fail_with_path(*_args, **_kwargs):
+        raise RuntimeError("测试音频不存在: E:\\secret\\server\\assets\\preflight_phrase.wav")
+
+    monkeypatch.setattr("api.assist.sound_test.replay_preflight_capture_stt", fail_with_path)
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(assist_routes.api_preflight_replay({"device_id": 7}))
+    assert exc_info.value.status_code == 503
+    assert "secret" not in str(exc_info.value.detail)
 
 
 def test_api_preflight_replay_rejects_when_recording(monkeypatch: pytest.MonkeyPatch):

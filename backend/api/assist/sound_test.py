@@ -41,7 +41,12 @@ PREFLIGHT_SCENARIOS = [
 ]
 
 PREFLIGHT_EXPECTED_PHRASE = "请介绍一下你最近做过的项目"
-PREFLIGHT_AUDIO_PATH = Path(__file__).resolve().parents[2] / "assets" / "preflight_phrase.wav"
+PREFLIGHT_FIXTURES_DIR = Path(__file__).resolve().parents[2] / "assets"
+PREFLIGHT_AUDIO_PATH = PREFLIGHT_FIXTURES_DIR / "preflight_phrase.wav"
+PREFLIGHT_REPLAY_FIXTURES: dict[str, Path] = {
+    "default": PREFLIGHT_AUDIO_PATH,
+    "preflight_phrase": PREFLIGHT_AUDIO_PATH,
+}
 
 _running = False
 _lock = threading.Lock()
@@ -143,18 +148,49 @@ def collect_capture_audio(cap: AudioCapture, duration_sec: float, poll_interval:
     return np.concatenate(chunks)
 
 
+def resolve_preflight_fixture(fixture_id: Optional[str] = None) -> Path:
+    """将 HTTP 回放请求中的 fixture_id 解析为受控目录内的 WAV 文件。"""
+    if fixture_id is None:
+        key = "default"
+    elif isinstance(fixture_id, str):
+        key = fixture_id.strip() or "default"
+    else:
+        raise ValueError("fixture_id 必须是字符串")
+    candidate = PREFLIGHT_REPLAY_FIXTURES.get(key)
+    if candidate is None:
+        raise ValueError("不支持的测试音频 fixture_id")
+    raw = str(candidate)
+    if raw.startswith(("\\\\", "//")):
+        raise ValueError("不支持网络共享路径")
+    root = PREFLIGHT_FIXTURES_DIR.resolve()
+    resolved = candidate.resolve()
+    if resolved == root or not resolved.is_relative_to(root):
+        raise ValueError("测试音频路径越出受控目录")
+    if resolved.suffix.lower() != ".wav":
+        raise ValueError("测试音频必须是 .wav 文件")
+    return resolved
+
+
 def play_preflight_audio() -> float:
     if not PREFLIGHT_AUDIO_PATH.exists():
-        raise RuntimeError(f"测试音频不存在: {PREFLIGHT_AUDIO_PATH}")
+        raise FileNotFoundError("内置测试音频不存在")
     started = time.monotonic()
     play_audio_file(PREFLIGHT_AUDIO_PATH)
     return time.monotonic() - started
 
 
 def play_audio_fixture(audio_path: str | Path | None = None) -> float:
-    target = Path(audio_path) if audio_path else PREFLIGHT_AUDIO_PATH
+    if audio_path is not None:
+        raw = str(audio_path).strip()
+        if not raw or raw.startswith(("\\\\", "//")):
+            raise ValueError("不支持的测试音频路径")
+        target = Path(raw)
+        if target.suffix.lower() != ".wav":
+            raise ValueError("仅支持 .wav 测试音频文件")
+    else:
+        target = PREFLIGHT_AUDIO_PATH
     if not target.exists():
-        raise RuntimeError(f"测试音频不存在: {target}")
+        raise FileNotFoundError("测试音频不存在")
     started = time.monotonic()
     play_audio_file(target)
     return time.monotonic() - started
