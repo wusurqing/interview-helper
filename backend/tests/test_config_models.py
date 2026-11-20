@@ -112,7 +112,8 @@ def test_candidate_remote_stt_requires_explicit_cost_opt_in():
         candidate_remote_stt_enabled=False,
     )
 
-    assert cfg.candidate_stt_provider == "whisper"
+    assert cfg.candidate_stt_provider == ""
+    assert not cfg.candidate_asr_enabled
 
 
 def test_candidate_mic_asr_defaults_to_opt_in():

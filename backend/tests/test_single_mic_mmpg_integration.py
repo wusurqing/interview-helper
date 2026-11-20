@@ -32,8 +32,14 @@ def _transport():
 @pytest.mark.parametrize("main_rtc,candidate_rtc", [(True, False), (False, True), (True, True)])
 def test_single_mic_mmpg_transport_matrix(monkeypatch, main_rtc, candidate_rtc):
     cfg = config.AppConfig(
-        stt_provider="doubao_mmpg" if main_rtc else "whisper",
-        candidate_stt_provider="doubao_mmpg" if candidate_rtc else "whisper",
+        stt_provider="doubao_mmpg" if main_rtc else "doubao",
+        candidate_stt_provider="doubao_mmpg" if candidate_rtc else "doubao",
+        doubao_stt_api_key="test-segment-key",
+        mmpg=config.Mmpg(
+            volc_access_key="test-access-key", volc_secret_key="test-secret-key",
+            rtc_app_id="x" * 24, rtc_app_key="test-rtc-key", rtc_room_id="test-room",
+            rtc_user_id="interviewer", rtc_bot_id="bot", doubao_api_key="test-asr-key",
+        ),
         candidate_asr_enabled=True,
         assist_stop_answer_wait_sec=0,
     )
@@ -58,7 +64,7 @@ def test_single_mic_mmpg_transport_matrix(monkeypatch, main_rtc, candidate_rtc):
     monkeypatch.setattr(mmpg_integration, "manager", main_manager)
     monkeypatch.setattr(candidate_mmpg, "manager", candidate_manager)
 
-    # The local worker's ASR/VAD is tested separately. Consume its handoff
+    # The segmented worker's ASR/VAD is tested separately. Consume its handoff
     # barrier here after the test has read the queued PCM.
     def complete_local_role(single_mic, operation, _timeout):
         audio_input = (

@@ -7,12 +7,18 @@ keeps the mutable scheduling decisions testable and isolated.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Tuple
+
+from core.config import written_exam_model_available
 
 TaskImage = Optional[str | list[str]]
 TaskPayload = Tuple[str, TaskImage, bool, str, dict[str, Any]]
 PendingTask = Tuple[TaskPayload, int, int]
+ModelReservation = str | int
+InFlightTasks = dict[int, tuple[ModelReservation | None, TaskPayload]]
+EXAM_MODEL_UNAVAILABLE = "请在「笔试配置」中选择已启用、已配置 API Key 且支持识图的模型。"
+EXAM_MODEL_STALE = "本题的笔试模型已不可用或接口配置已变更，请重新提交。"
 
 
 @dataclass(frozen=True)
@@ -27,10 +33,71 @@ class DispatchClaim:
 class DispatchStep:
     claim: DispatchClaim | None = None
     skipped_seq: int | None = None
+    unavailable_task: TaskPayload | None = None
+
+
+@dataclass(frozen=True)
+class AnswerRouting:
+    written_exam: bool
+    exam_model_ids: tuple[str, ...] = ()
+    exam_config: Any = field(default=None, repr=False)
 
 
 def task_meta(task: TaskPayload) -> dict[str, Any]:
     return task[4]
+
+
+def task_is_written_exam(task: TaskPayload, cfg) -> bool:
+    meta = task_meta(task)
+    routing = meta.get("answer_routing")
+    if routing is not None:
+        return routing.written_exam
+    return bool(meta.get("exam_preflight") or (
+        task[2] and meta.get("purpose") != "knowledge_practice" and getattr(cfg, "written_exam_mode", False)
+    ))
+
+
+def eligible_exam_model_index(cfg, model_id: str | None) -> int | None:
+    if not model_id:
+        return None
+    return next((
+        index for index, model in enumerate(cfg.models)
+        if getattr(model, "id", None) == model_id and written_exam_model_available(model)
+    ), None)
+
+
+def exam_model_order(cfg) -> list[int]:
+    """Return selected catalog-ready vision models in exam preference order."""
+    indices = (
+        eligible_exam_model_index(cfg, model_id)
+        for model_id in getattr(cfg, "written_exam_model_ids", ())
+    )
+    return list(dict.fromkeys(index for index in indices if index is not None))
+
+
+def _exam_model_destination(model) -> tuple[str, str, str]:
+    return (
+        getattr(model, "api_base_url", "").strip().rstrip("/"),
+        getattr(model, "api_type", ""),
+        getattr(model, "model", ""),
+    )
+
+
+def live_exam_model_index(routing: AnswerRouting, cfg, model_id: str) -> int | None:
+    index = eligible_exam_model_index(cfg, model_id)
+    submitted_index = eligible_exam_model_index(routing.exam_config, model_id)
+    if index is None or submitted_index is None:
+        return None
+    if _exam_model_destination(cfg.models[index]) != _exam_model_destination(routing.exam_config.models[submitted_index]):
+        return None
+    return index
+
+
+def exam_primary_index(task: TaskPayload, cfg) -> int | None:
+    routing = task_meta(task).get("answer_routing")
+    if routing is not None:
+        return live_exam_model_index(routing, cfg, routing.exam_model_ids[0])
+    return next(iter(exam_model_order(cfg)), None)
 
 
 def is_asr_task(task: TaskPayload) -> bool:
@@ -61,17 +128,18 @@ def priority_model_index(cfg) -> int:
     n = len(cfg.models)
     if n <= 0:
         return 0
+    fallback = max(0, min(int(getattr(cfg, "active_model", 0) or 0), n - 1))
     try:
         active_model = cfg.get_active_model()
     except Exception:
-        return max(0, min(int(cfg.active_model), n - 1))
+        return fallback
     for i, model in enumerate(cfg.models):
         if model is active_model:
             return i
-    return max(0, min(int(cfg.active_model), n - 1))
+    return fallback
 
 
-def dispatch_model_order(cfg) -> list[int]:
+def _legacy_model_order(cfg) -> list[int]:
     n = len(cfg.models)
     if n == 0:
         return []
@@ -79,19 +147,39 @@ def dispatch_model_order(cfg) -> list[int]:
     return [priority] + [i for i in range(n) if i != priority]
 
 
+def dispatch_model_order(cfg, task: TaskPayload | None = None) -> list[int]:
+    if task is not None and task_is_written_exam(task, cfg):
+        primary = exam_primary_index(task, cfg)
+        return [] if primary is None else [primary]
+    selected = getattr(cfg, "assist_model_ids", None)
+    if selected is None or (task is not None and task_meta(task).get("purpose") == "knowledge_practice"):
+        return _legacy_model_order(cfg)
+    if task is not None and task[3].startswith("server_screen_"):
+        selected = [getattr(cfg, "assist_screenshot_model_id", None)]
+    by_id = {model.id: index for index, model in enumerate(cfg.models)}
+    return [by_id[model_id] for model_id in selected if model_id in by_id]
+
+
+def model_reservation(cfg, index: int) -> ModelReservation:
+    return getattr(cfg.models[index], "id", "") or index
+
+
 def pick_model_index(
     task: TaskPayload,
-    busy: set[int],
+    busy: set[ModelReservation],
     cfg,
     get_model_health: Callable[[int], Optional[str]],
-    avoid_models: Optional[set[int]] = None,
+    avoid_models: Optional[set[ModelReservation]] = None,
+    *,
+    excluded_indices: set[int] | None = None,
 ) -> Optional[int]:
     _text, image, _manual, _source, _meta = task
     need_vision = bool(image)
     avoid = avoid_models or set()
+    excluded = excluded_indices or set()
 
     def ok_basic(i: int, model) -> bool:
-        if i in busy:
+        if i in excluded or i in busy or model_reservation(cfg, i) in busy:
             return False
         if not getattr(model, "enabled", True):
             return False
@@ -101,57 +189,37 @@ def pick_model_index(
             return False
         return True
 
-    order = dispatch_model_order(cfg)
-    if avoid:
-        for i in order:
-            if i in avoid:
-                continue
-            model = cfg.models[i]
-            if not ok_basic(i, model):
-                continue
-            if get_model_health(i) == "error":
-                continue
-            return i
-        for i in order:
-            if i in avoid:
-                continue
-            model = cfg.models[i]
-            if ok_basic(i, model):
-                return i
-    for i in order:
-        model = cfg.models[i]
-        if not ok_basic(i, model):
-            continue
-        if get_model_health(i) == "error":
-            continue
-        return i
-    for i in order:
-        model = cfg.models[i]
-        if ok_basic(i, model):
-            return i
-    return None
+    available = [i for i in dispatch_model_order(cfg, task) if ok_basic(i, cfg.models[i])]
+    if task_is_written_exam(task, cfg):
+        return available[0] if available else None
+    preferred = [i for i in available if i not in avoid and model_reservation(cfg, i) not in avoid]
+    candidates = preferred or available
+    return next((i for i in candidates if get_model_health(i) != "error"), candidates[0] if candidates else None)
 
 
-def max_parallel_slots(cfg, get_model_health: Callable[[int], Optional[str]]) -> int:
-    n_ok = sum(1 for i, model in enumerate(cfg.models) if model_eligible(i, model, False, get_model_health))
+def max_parallel_slots(
+    cfg, get_model_health: Callable[[int], Optional[str]], *, include_screenshots: bool = True, include_practice: bool = False,
+) -> int:
+    order = _legacy_model_order(cfg) if include_practice else dispatch_model_order(cfg)
+    if include_screenshots:
+        screenshot = eligible_exam_model_index(cfg, getattr(cfg, "assist_screenshot_model_id", None))
+        if screenshot is not None:
+            order.append(screenshot)
+        order = list(dict.fromkeys((*order, *exam_model_order(cfg))))
+    n_ok = sum(1 for i in order if model_eligible(i, cfg.models[i], False, get_model_health))
     cap = max(1, getattr(cfg, "max_parallel_answers", 2))
     return max(1, min(cap, max(n_ok, 1)))
 
 
 def dispatch_snapshot(
-    in_flight_tasks: dict[int, tuple[int, TaskPayload]],
+    in_flight_tasks: InFlightTasks,
     latest_asr_turn_id: int,
-) -> tuple[set[int], int]:
-    busy_models: set[int] = set()
-    effective_slots = 0
-    for model_idx, _task in in_flight_tasks.values():
-        busy_models.add(model_idx)
-        effective_slots += 1
-    return busy_models, effective_slots
+) -> tuple[set[ModelReservation], int]:
+    return physical_busy_models(in_flight_tasks), len(in_flight_tasks)
 
 
-def physical_busy_models(in_flight_tasks: dict[int, tuple[int, TaskPayload]]) -> set[int]:
-    return {model_idx for model_idx, _task in in_flight_tasks.values()}
+def physical_busy_models(in_flight_tasks: InFlightTasks) -> set[ModelReservation]:
+    return {model for model, _task in in_flight_tasks.values() if model is not None}
 
 
 def begin_asr_turn(
@@ -176,13 +244,15 @@ def begin_asr_turn(
 
 def claim_next_dispatch(
     pending: list[PendingTask],
-    in_flight_tasks: dict[int, tuple[int, TaskPayload]],
+    in_flight_tasks: InFlightTasks,
     latest_asr_turn_id: int,
     max_parallel_slots: int,
-    pick_model_index: Callable[[TaskPayload, set[int], Optional[set[int]]], Optional[int]],
+    pick_model_index: Callable[[TaskPayload, set[ModelReservation], Optional[set[ModelReservation]]], Optional[int]],
     *,
     interrupt_stale_asr: bool = True,
     now_mono: float | None = None,
+    reserve_model: Callable[[int], ModelReservation] = lambda index: index,
+    discard_unavailable: bool = False,
 ) -> DispatchStep:
     busy_models, effective_slots = dispatch_snapshot(in_flight_tasks, latest_asr_turn_id)
     physical_busy = physical_busy_models(in_flight_tasks)
@@ -204,7 +274,7 @@ def claim_next_dispatch(
         model_idx = pick_model_index(task, busy_models, avoid_models)
         if model_idx is not None:
             pending.pop(idx)
-            in_flight_tasks[seq] = (model_idx, task)
+            in_flight_tasks[seq] = (reserve_model(model_idx), task)
             return DispatchStep(
                 claim=DispatchClaim(
                     task=task,
@@ -213,6 +283,9 @@ def claim_next_dispatch(
                     session_version=session_version,
                 )
             )
+        if discard_unavailable and pick_model_index(task, set(), None) is None:
+            pending.pop(idx)
+            return DispatchStep(skipped_seq=seq, unavailable_task=task)
         idx += 1
     return DispatchStep()
 

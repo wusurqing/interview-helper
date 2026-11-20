@@ -97,31 +97,31 @@ def reset_worker_state(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.parametrize(
-    "scene, source, manual, exam, short, image_count, limit",
+    "scene, source, manual, exam, image_count, temperature, limit",
     [
-        ("assist_realtime", "conversation_loopback", False, False, False, 0, 720),
-        ("assist_realtime_short", "conversation_loopback", False, False, True, 0, 320),
-        ("assist_realtime", "conversation_mic", False, False, False, 0, 720),
-        ("assist_realtime_short", "conversation_mic", False, False, True, 0, 320),
-        ("assist_manual", "manual_text", True, False, True, 0, 850),
-        ("assist_manual", "manual_image", True, False, False, 1, 850),
-        ("assist_screen", "server_screen_left", True, False, True, 1, 850),
-        ("assist_screen", "server_screen_multi", True, False, False, 2, 850),
-        ("assist_exam", "server_screen_exam_preflight", True, False, False, 1, 850),
-        ("assist_exam", "manual_image", True, True, True, 1, 850),
+        ("assist_realtime", "conversation_loopback", False, False, 0, 0.1, 900),
+        ("assist_realtime", "conversation_mic", False, False, 0, 0.1, 900),
+        ("assist_manual", "manual_text", True, False, 0, 0.8, 850),
+        ("assist_manual", "manual_image", True, False, 1, 0.8, 850),
+        ("assist_screen", "server_screen_left", True, False, 1, 1.0, 1700),
+        ("assist_screen", "server_screen_multi", True, False, 2, 1.0, 1700),
+        ("assist_exam", "server_screen_exam_preflight", True, False, 1, 0.0, 3200),
+        ("assist_exam", "manual_image", True, True, 1, 0.0, 3200),
     ],
 )
 def test_custom_prompt_uses_dispatch_snapshot_and_preserves_answer(
-    monkeypatch, scene, source, manual, exam, short, image_count, limit,
+    monkeypatch, scene, source, manual, exam, image_count, temperature, limit,
 ):
+    from core.config import AssistGeneration
     from services.llm import build_system_prompt
 
     cfg = _cfg()
     cfg.written_exam_mode = exam
-    cfg.assist_high_churn_short_answer = short
+    cfg.assist_high_churn_short_answer = True
     cfg.position = "快照里的岗位"
     cfg.language = "Rust"
     cfg.max_tokens = 850
+    cfg.assist_generation = {scene: AssistGeneration(temperature=temperature, max_output_tokens=limit)}
     cfg.system_prompts = {
         "assist_realtime": "实时回答",
         "assist_realtime_short": "实时简答",
@@ -163,6 +163,7 @@ def test_custom_prompt_uses_dispatch_snapshot_and_preserves_answer(
 
     assert captured["system_prompt"] == cfg.system_prompts[scene]
     assert captured["override_max_tokens"] == limit
+    assert captured["config_snapshot"].temperature == temperature
     text = str(captured["messages"])
     for value in ["本轮题目", "Rust", *images]:
         assert value in text
@@ -170,6 +171,53 @@ def test_custom_prompt_uses_dispatch_snapshot_and_preserves_answer(
         assert "快照里的岗位" in text
     assert "".join(event["chunk"] for event in broadcasts if event["type"] == "answer_chunk") == expected
     assert next(event["answer"] for event in broadcasts if event["type"] == "answer_done") == expected
+
+
+def test_model_failure_restarts_same_answer_without_committing_the_partial(monkeypatch):
+    from core.config import AppConfig, ModelConfig
+
+    config = AppConfig(
+        models=[ModelConfig(name="primary", api_key="test"), ModelConfig(name="fallback", api_key="test")],
+        system_prompts={"assist_manual": "same prompt"},
+        assist_generation={"assist_manual": {"temperature": 1.2, "max_output_tokens": 192}},
+    )
+    broadcasts = []
+    skipped = []
+    requests = []
+    closed = []
+
+    def stream(model, _messages, **options):
+        requests.append((model.name, options["config_snapshot"].temperature, options["override_max_tokens"]))
+        try:
+            if model.name == "primary":
+                yield "text", "T" * 180
+                raise answer_worker.LLMError("broken stream")
+            yield "text", "备用模型完成回答。"
+        finally:
+            closed.append(model.name)
+
+    def reserve_retry(attempted, _on_wait):
+        assert attempted == {0}
+        return 1
+
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", stream)
+    deps = replace(
+        _deps(broadcasts=broadcasts, skipped=skipped), config_snapshot=config, reserve_retry=reserve_retry,
+    )
+    answer_worker.process_question_parallel(("问题", None, True, "manual_text", {}), 0, 0, 0, deps)
+
+    start = next(event for event in broadcasts if event["type"] == "answer_start")
+    retry = next(event for event in broadcasts if event["type"] == "answer_retry")
+    done = next(event for event in broadcasts if event["type"] == "answer_done")
+    assert any(event["type"] == "answer_chunk" and event["attempt"] == 1 for event in broadcasts)
+    assert start["id"] == retry["id"] == done["id"]
+    assert retry["attempt"] == done["attempt"] == 2
+    assert done["answer"] == "备用模型完成回答。"
+    assert done["model_name"] == "fallback"
+    assert requests == [("primary", 1.2, 192), ("fallback", 1.2, 192)]
+    assert closed == ["primary", "fallback"]
+    assert not skipped
+    assert len(get_session().qa_pairs) == 1
 
 
 def test_manual_prompt_keeps_references_in_user_context(monkeypatch):
@@ -1461,11 +1509,13 @@ def test_written_exam_screenshot_injects_recent_qa_as_revision_context(monkeypat
     session = get_session()
     session.add_user_message("普通历史不应进入")
     session.add_assistant_message("普通历史答案不应进入")
+    session.add_qa("面试截图私有题面", "面试截图私有答案", source="server_screen_left")
     session.add_qa(
         "代码题：输出最短路径 [图片已省略 x1]",
         "```python\ndef solve():\n    print(0)\n```",
         source="server_screen_left",
         model_name="模型一",
+        written_exam=True,
     )
     cfg = _cfg()
     cfg.written_exam_mode = True
@@ -1500,6 +1550,8 @@ def test_written_exam_screenshot_injects_recent_qa_as_revision_context(monkeypat
     assert "print(0)" in text
     assert "expected=1 actual=0" in text
     assert "普通历史不应进入" not in text
+    assert "面试截图私有" not in text
+    assert session.qa_pairs[-1].written_exam
     assert content[1]["image_url"]["url"] == "data:image/png;base64,failcase"
 
 
@@ -1555,6 +1607,7 @@ def test_written_exam_revision_context_compacts_previous_screen_prompt(monkeypat
         "```python\ndef solve():\n    print('old')\n```",
         source="server_screen_left",
         model_name="模型一",
+        written_exam=True,
     )
     cfg = _cfg()
     cfg.written_exam_mode = True

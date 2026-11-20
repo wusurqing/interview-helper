@@ -163,10 +163,10 @@ function renderAnswerBody(
             <AnswerMarkdownContent answer={qa.answer} colorScheme={colorScheme} stream={stream} />
           </Suspense>
         )
-      ) : isStreaming && !qa.isThinking ? (
+      ) : isStreaming && (qa.retrying || !qa.isThinking) ? (
         <div className="flex items-center gap-2 text-text-muted text-sm">
           <Loader2 className="w-4 h-4 animate-spin" />
-          {'生成中…'}
+          {qa.retrying ? plainAnswerStatus(qa, true) : '生成中…'}
         </div>
       ) : null}
       {qa.visionVerify && qaStatus !== 'cancelled' && qaStatus !== 'error' && (

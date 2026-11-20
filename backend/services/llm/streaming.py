@@ -891,7 +891,7 @@ def chat_stream_single_model(
         transport_options = {}
         if protect_output_limit:
             think_params = _build_think_params(model_cfg, cfg)
-            for field in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
+            for field in ("temperature", "max_tokens", "max_completion_tokens", "max_output_tokens"):
                 think_params.pop(field, None)
             transport_options["think_params"] = think_params
         if mmpg_request is not None:
@@ -934,5 +934,7 @@ def chat_stream_single_model(
             raise
         raise err from None
     finally:
-        if mmpg_request is not None and "response" in locals():
-            response.close()
+        if "response" in locals():
+            close = getattr(response, "close", None)
+            if close is not None:
+                close()

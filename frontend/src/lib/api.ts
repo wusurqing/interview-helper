@@ -16,7 +16,7 @@ export interface KnowledgeSettingsPayload {
   settings: KnowledgeSettings
   default_system_prompt: string
   output_contract: string
-  models: { index: number; name: string; model?: string; fingerprint: string; available: boolean; supports_think: boolean }[]
+  models: { index: number; name: string; model?: string; fingerprint: string; available: boolean; supports_think: boolean; supports_vision?: boolean }[]
 }
 
 export interface KnowledgeAnalysisState {
@@ -332,9 +332,11 @@ export const api = {
   askFromServerScreen: () =>
     request('/api/ask-from-server-screen', { method: 'POST', body: '{}' }),
   captureServerScreen: () =>
-    request<{ ok: boolean; image: string }>('/api/capture-server-screen', { method: 'POST', body: '{}' }),
-  askFromServerScreens: (images: string[]) =>
-    request('/api/ask-from-server-screens', { method: 'POST', body: JSON.stringify({ images }) }),
+    request<{ ok: boolean; image: string; written_exam_mode: boolean }>('/api/capture-server-screen', { method: 'POST', body: '{}' }),
+  askFromServerScreens: (images: string[], expectedWrittenExamMode?: boolean) =>
+    request('/api/ask-from-server-screens', {
+      method: 'POST', body: JSON.stringify({ images, expected_written_exam_mode: expectedWrittenExamMode }),
+    }),
   getSttStatus: () => request('/api/stt/status'),
   checkModelsHealth: () => request('/api/models/health', { method: 'POST' }),
   /** 当前各模型健康状态（检测中/可用/不可用） */
@@ -344,19 +346,8 @@ export const api = {
     latency?: Record<string, number>
     fingerprint?: Record<string, string>
   }>('/api/models/health'),
-  listRemoteModels: (payload: { api_base_url: string; api_key: string; model_index?: number; api_type?: string }) =>
+  listRemoteModels: (payload: { api_base_url: string; api_key: string; model_id?: string; model_index?: number; api_type?: string }) =>
     request<{ models: { id: string; owned_by?: string | null }[] }>('/api/models/list', { method: 'POST', body: JSON.stringify(payload) }),
-  funasrStatus: () => request<{
-    installed: boolean
-    model: string
-    loaded: boolean
-    loading: boolean
-    downloading: boolean
-    download_error: string
-    downloaded_model: string
-  }>('/api/stt/funasr/status'),
-  funasrDownload: (model?: string) =>
-    request<{ ok: boolean; detail?: string }>('/api/stt/funasr/download', { method: 'POST', body: JSON.stringify(model ? { model } : {}) }),
   checkSingleModelHealth: (index: number) => request('/api/models/health/' + index, { method: 'POST' }),
   probeModelCapabilities: (index: number) =>
     request<{
@@ -372,7 +363,8 @@ export const api = {
       think_detail?: string
       think_disabled_detail?: string
     }>('/api/models/probe/' + index, { method: 'POST' }),
-  sttTest: () => request<{ ok: boolean; detail?: string; text?: string }>('/api/stt/test', { method: 'POST' }),
+  sttTest: (payload: { provider: import('@/lib/speechProviders').SegmentedSpeechProvider }) =>
+    request<{ ok: boolean; detail?: string; text?: string }>('/api/stt/test', { method: 'POST', body: JSON.stringify(payload) }),
 
   // Knowledge
   knowledgeSettings: () => request<KnowledgeSettingsPayload>('/api/knowledge/settings'),

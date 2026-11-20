@@ -28,6 +28,7 @@ def _settings_payload(cfg) -> dict:
                 "fingerprint": model_health_fingerprint(model),
                 "available": knowledge_model_available(model),
                 "supports_think": model.supports_think,
+                "supports_vision": model.supports_vision,
             }
             for index, model in enumerate(cfg.models)
         ],

@@ -32,6 +32,7 @@ export type MmpgPublicFields = {
 
 export type MmpgConfig = MmpgPublicFields & Partial<Record<`${MmpgSecret}_configured`, boolean>>
 export type MmpgForm = MmpgPublicFields & Partial<Record<MmpgSecret, string | null>>
+export type MmpgEngineForm = Omit<MmpgForm, 'answer_delay_ms' | 'followup_window_ms'>
 
 export function mmpgFormFromConfig(config?: MmpgConfig): MmpgForm {
   return {
@@ -53,20 +54,7 @@ export function mmpgFormFromConfig(config?: MmpgConfig): MmpgForm {
   }
 }
 
-export function mmpgConfigPatch(form: MmpgForm, baseline: MmpgForm) {
-  const patch = Object.fromEntries(Object.entries(form).filter(([key, value]) => {
-    if (mmpgSecrets.includes(key as MmpgSecret)) return value === null || (typeof value === 'string' && value.trim() !== '')
-    return value !== baseline[key as keyof MmpgForm]
-  })) as Partial<MmpgForm>
-  return Object.keys(patch).length ? patch : undefined
-}
-
-export function mmpgCredentialsPresent(form: MmpgForm, config?: MmpgConfig) {
-  const token = form.token_mode === 'auto' ? 'rtc_app_key' : 'rtc_token'
-  const secrets = ['volc_access_key', 'volc_secret_key', 'doubao_api_key', token] as const
-  const fields = ['rtc_app_id', 'rtc_room_id', 'rtc_user_id', 'rtc_bot_id', 'doubao_resource_id'] as const
-  return fields.every((field) => Boolean(form[field].trim())) && secrets.every((secret) => {
-    if (form[secret] === null) return false
-    return Boolean(form[secret]?.trim() || config?.[`${secret}_configured`])
-  })
+export function mmpgEngineFormFromConfig(config?: MmpgConfig): MmpgEngineForm {
+  const { answer_delay_ms: _delay, followup_window_ms: _followup, ...engine } = mmpgFormFromConfig(config)
+  return engine
 }

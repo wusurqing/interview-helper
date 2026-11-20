@@ -24,6 +24,17 @@ export function useInterviewWS(active = true) {
   const reconnectAttempts = useRef(0)
   const shouldReconnect = useRef(true)
   const lastServerPongAt = useRef(0)
+  const pendingWorkspace = useRef<boolean | undefined>(undefined)
+  const workspaceChannel = useRef<BroadcastChannel | null>(null)
+
+  const applyWorkspace = (exam: boolean) => {
+    const { config, setConfig } = useInterviewStore.getState()
+    if (!config) {
+      pendingWorkspace.current = exam
+    } else if (config.written_exam_mode !== exam) {
+      setConfig({ ...config, written_exam_mode: exam })
+    }
+  }
 
   const scheduleReconnect = () => {
     if (!shouldReconnect.current) return
@@ -103,12 +114,20 @@ export function useInterviewWS(active = true) {
 
   const handleMessage = (msg: WsMsg) => {
     const s = useInterviewStore.getState()
+    if ((msg.type === 'init' || msg.type === 'workspace_mode') && typeof msg.written_exam_mode === 'boolean') {
+      applyWorkspace(msg.written_exam_mode)
+      workspaceChannel.current?.postMessage(msg.written_exam_mode)
+    }
     switch (msg.type) {
       case 'init':
         s.setInitData(msg as Parameters<typeof s.setInitData>[0])
         break
       case 'recording':
-        s.setRecording(msg.value as boolean, msg.interviewer_streaming === true)
+        s.setRecording(
+          msg.value as boolean,
+          msg.interviewer_streaming === true,
+          typeof msg.candidate_capture_provider === 'string' ? msg.candidate_capture_provider : undefined,
+        )
         break
       case 'single_mic':
         s.setSingleMic(msg.value)
@@ -138,21 +157,23 @@ export function useInterviewWS(active = true) {
         s.setMmpgAnswerPhase(msg.phase)
         break
       case 'answer_start':
+      case 'answer_retry':
         if (msg.exam_preflight_id) return
         s.startAnswer(msg.id as string, msg.question as string, {
           source: msg.source as string,
           modelName: msg.model_name as string,
           ...(msg.answer_format === 'plain_text' ? { answerFormat: 'plain_text' as const } : {}),
           updatesQaId: msg.updates_qa_id as string | undefined,
+          attempt: typeof msg.attempt === 'number' ? msg.attempt : undefined,
         })
         break
       case 'answer_think_chunk':
         if (msg.exam_preflight_id) return
-        s.appendThinkChunk(msg.id as string, msg.chunk as string)
+        s.appendThinkChunk(msg.id as string, msg.chunk as string, msg.attempt as number | undefined)
         break
       case 'answer_chunk':
         if (msg.exam_preflight_id) return
-        s.appendAnswerChunk(msg.id as string, msg.chunk as string)
+        s.appendAnswerChunk(msg.id as string, msg.chunk as string, msg.attempt as number | undefined)
         break
       case 'answer_done':
         if (msg.exam_preflight_id) return
@@ -165,21 +186,25 @@ export function useInterviewWS(active = true) {
           msg.first_token_ms as number | undefined,
           msg.total_ms as number | undefined,
           msg.updates_qa_id as string | undefined,
-          msg.answer_format === 'plain_text'
-            ? { answerFormat: 'plain_text', source: msg.source as string | undefined }
-            : undefined,
+          {
+            ...(msg.answer_format === 'plain_text' ? { answerFormat: 'plain_text' as const } : {}),
+            source: msg.source as string | undefined,
+            attempt: msg.attempt as number | undefined,
+          },
         )
         break
       case 'answer_cancelled':
         if (msg.exam_preflight_id) return
-        s.cancelAnswer(msg.id as string, msg.reason as string | undefined)
+        s.cancelAnswer(msg.id as string, msg.reason as string | undefined, msg.attempt as number | undefined)
         break
       case 'answer_error':
         if (msg.exam_preflight_id) return
         {
+          const qa = s.qaPairs.find(item => item.id === msg.id)
+          if (qa && (qa.status === 'done' || (typeof msg.attempt === 'number' && msg.attempt < (qa.attempt ?? 1)))) return
           const message = (msg.message as string) || '答案处理失败'
           const prefix = msg.stage === 'persistence' ? '答案保存失败' : '答案生成失败'
-          s.errorAnswer(msg.id as string, message)
+          s.errorAnswer(msg.id as string, message, msg.attempt as number | undefined)
           s.pushToast(message.startsWith(prefix) ? message : `${prefix}: ${message}`, 'error')
         }
         break
@@ -215,7 +240,7 @@ export function useInterviewWS(active = true) {
         } else if (msg.error) {
           const prefix = s.singleMic
             ? '测试麦克风识别失败'
-            : '会议软件可能独占麦克风，候选人口述记录已关闭，不影响面试录音'
+            : '我的回答识别失败'
           s.pushToast(`${prefix}: ${msg.error as string}`, 'warn')
         }
         break
@@ -239,15 +264,11 @@ export function useInterviewWS(active = true) {
       case 'model_fallback':
         s.setFallbackToast({ from: msg.from as string, to: msg.to as string, reason: msg.reason as string })
         break
-      case 'stt_fallback':
-        s.setFallbackToast({
-          from: `STT:${msg.from as string}`,
-          to: `STT:${msg.to as string}`,
-          reason: msg.reason as string,
-        })
-        break
-      case 'candidate_stt_fallback':
-        s.pushToast(`候选人麦克风 ASR 已降级到 ${msg.to as string}`, 'warn')
+      case 'stt_error':
+        if (typeof msg.message === 'string') {
+          const role = msg.role === 'candidate' ? '我的回答' : '面试官'
+          s.pushToast(`${role}识别失败 · ${msg.message}`, 'warn')
+        }
         break
       case 'resume_opt_start':
         s.resetResumeOpt(typeof msg.job_id === 'string' ? msg.job_id : null)
@@ -299,6 +320,20 @@ export function useInterviewWS(active = true) {
       return teardown
     }
 
+    // Follower tabs share the leader's socket. Relay only the workspace flag.
+    const channel = typeof window.BroadcastChannel === 'function'
+      ? new window.BroadcastChannel('ia-workspace-mode') : null
+    workspaceChannel.current = channel
+    if (channel) channel.onmessage = (event) => {
+      if (!useInterviewStore.getState().wsIsLeader && typeof event.data === 'boolean') applyWorkspace(event.data)
+    }
+    const unsubscribeBootstrap = useInterviewStore.subscribe((state) => {
+      if (!state.config || pendingWorkspace.current === undefined) return
+      const exam = pendingWorkspace.current
+      pendingWorkspace.current = undefined
+      applyWorkspace(exam)
+    })
+
     unsubscribe = subscribeLeader((isLeader) => {
       useInterviewStore.getState().setWsIsLeader(isLeader)
       if (isLeader) {
@@ -328,6 +363,10 @@ export function useInterviewWS(active = true) {
 
     return () => {
       unsubscribe?.()
+      unsubscribeBootstrap()
+      pendingWorkspace.current = undefined
+      workspaceChannel.current = null
+      channel?.close()
       if (pingTimer) clearInterval(pingTimer)
       teardown()
     }

@@ -434,8 +434,8 @@ describe('ReviewSessionList', () => {
     const fastModel = createDeferred<{ review_enabled: boolean; review_model_index: number; models: { name: string; enabled: boolean }[] }>()
     const setConfig = vi.fn()
     const models = [
-      { name: 'lite-ark', enabled: true },
-      { name: 'deepseek', enabled: true },
+      { name: 'lite-ark', enabled: true, supports_vision: true },
+      { name: 'deepseek', enabled: true, supports_vision: false },
     ]
     useInterviewStore.setState({
       config: {
@@ -454,12 +454,15 @@ describe('ReviewSessionList', () => {
     await screen.findByText('OpenAI 一面')
     fireEvent.click(screen.getByRole('button', { name: '配置' }))
 
-    const select = screen.getByRole('combobox')
-    fireEvent.change(select, { target: { value: '1' } })
-    expect(screen.getByRole('combobox')).toHaveValue('1')
-
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: '0' } })
-    expect(screen.getByRole('combobox')).toHaveValue('0')
+    const picker = screen.getByRole('button', { name: '复盘分析模型' })
+    expect(picker).toHaveTextContent('lite-ark')
+    expect(picker).toHaveTextContent('识图')
+    fireEvent.click(picker)
+    fireEvent.click(screen.getByRole('radio', { name: 'deepseek' }))
+    expect(picker).toHaveTextContent('deepseek')
+    expect(picker).not.toHaveTextContent('识图')
+    fireEvent.click(screen.getByRole('radio', { name: 'lite-ark' }))
+    expect(picker).toHaveTextContent('lite-ark')
 
     expect(apiMock.updateConfig).toHaveBeenNthCalledWith(1, { review_model_index: 1 })
     expect(apiMock.updateConfig).toHaveBeenNthCalledWith(2, { review_model_index: 0 })

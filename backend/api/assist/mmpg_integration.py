@@ -11,7 +11,7 @@ from core.config import get_config
 from core.logger import get_logger
 from core.session import conversation_lock, get_session
 from services.audio import AudioBusyError, audio_capture
-from services.stt.mmpg import MmpgError, MmpgManager
+from services.stt.mmpg import MmpgError, MmpgManager, refresh_manual_rtc_token
 from . import candidate_mmpg, pipeline
 from .mmpg_turns import MmpgTurns
 from .single_mic import Role, SingleMicConflict, SingleMicSession
@@ -19,6 +19,7 @@ from .single_mic import Role, SingleMicConflict, SingleMicSession
 PROVIDER = "doubao_mmpg"
 http_lifecycle_lock = asyncio.Lock()
 _session_settings = None
+_session_config = None
 _test_settings = None
 _turns = None
 _capture_epoch: int | None = None
@@ -38,6 +39,12 @@ def clear_turns():
     for _, anchor in _speech_starts.values():
         session.discard_unfinished_transcript(anchor)
     _speech_starts.clear()
+
+
+def disable_automatic_answers():
+    pipeline.discard_pending_auto_answer()
+    if _turns is not None:
+        _turns.disable_automatic_answers()
 
 
 def answer_phase():
@@ -98,6 +105,7 @@ def _new_turns():
         answer_delay_ms=_session_settings.answer_delay_ms,
         followup_window_ms=_session_settings.followup_window_ms,
         record_final=_record_final,
+        allow_answer=lambda: get_config().auto_detect,
     )
     return turns
 
@@ -111,19 +119,25 @@ async def prepare(mode, device_ids, candidate_mic_id, *, single_mic_id=None):
     from .exam_test import is_exam_preflight_running
     from .sound_test import get_preflight_status
 
-    global _session_settings, _test_settings
+    global _session_config, _session_settings, _test_settings
     async with http_lifecycle_lock:
-        cfg = get_config()
+        latest_cfg = get_config()
+        cfg = pipeline.get_capture_config() if mode == "resume" else latest_cfg
         session = get_session()
         if is_exam_preflight_running() or get_preflight_status()["running"]:
             raise MmpgError("capture_busy")
         if not device_ids or not pipeline._is_valid_device_id(device_ids[0]):
             raise MmpgError("device_required")
+        if (
+            mode != "test"
+            and (single_mic_id is not None or candidate_mic_id is not None)
+            and candidate_mmpg.enabled(cfg)
+            and cfg.mmpg.token_mode == "manual"
+        ):
+            raise MmpgError("candidate_mmpg_auto_token_required")
         if mode in ("start", "resume") and single_mic_id is not None:
             if not cfg.candidate_asr_enabled:
                 raise MmpgError("candidate_provider_not_selected")
-            if cfg.candidate_stt_provider == PROVIDER and cfg.mmpg.token_mode == "manual":
-                raise MmpgError("candidate_mmpg_auto_token_required")
             if await run_in_threadpool(pipeline._device_is_loopback, device_ids[0]):
                 raise MmpgError("candidate_mic_required")
         if mode == "resume":
@@ -140,26 +154,17 @@ async def prepare(mode, device_ids, candidate_mic_id, *, single_mic_id=None):
                 except SingleMicConflict:
                     raise MmpgError("single_mic_settings_changed") from None
             _test_settings = None
-            current = cfg.mmpg
-            if (
-                _session_settings.token_mode == current.token_mode == "manual"
-                and _session_settings.rtc_app_id == current.rtc_app_id
-                and _session_settings.rtc_room_id == current.rtc_room_id
-                and _session_settings.rtc_user_id == current.rtc_user_id
-            ):
-                _session_settings = _session_settings.model_copy(update={
-                    "rtc_token": current.rtc_token,
-                    "rtc_token_expires_at": current.rtc_token_expires_at,
-                })
+            _session_settings = refresh_manual_rtc_token(_session_settings, latest_cfg.mmpg)
         else:
             if session.is_recording:
                 raise MmpgError("interview_active")
-            if cfg.stt_provider != PROVIDER or (mode != "test" and cfg.written_exam_mode):
+            if mode != "test" and (cfg.stt_provider != PROVIDER or cfg.written_exam_mode):
                 raise MmpgError("provider_not_selected")
             snapshot = cfg.mmpg.model_copy(deep=True)
             if mode == "test":
                 _test_settings = snapshot
             else:
+                _session_config = cfg
                 _session_settings = snapshot
                 _test_settings = None
 
@@ -192,15 +197,20 @@ async def start_capture(mode, device_ids, candidate_mic_id, *, single_mic_id=Non
             else:
                 worker = run_in_threadpool(
                     pipeline.start_nonblocking, device, stream_audio=manager.offer_audio,
-                    single_mic_id=single_mic_id,
+                    single_mic_id=single_mic_id, config_snapshot=_session_config,
                 )
             clear_turns()
             _turns = _new_turns()
         else:
             clear_turns()
             _turns = _new_turns()
-            action = pipeline.unpause_interview if pipeline.is_streaming_interview() else pipeline.start_nonblocking
-            worker = run_in_threadpool(action, device, candidate_mic_id, stream_audio=manager.offer_audio)
+            if pipeline.is_streaming_interview():
+                worker = run_in_threadpool(pipeline.unpause_interview, device, candidate_mic_id, stream_audio=manager.offer_audio)
+            else:
+                worker = run_in_threadpool(
+                    pipeline.start_nonblocking, device, candidate_mic_id, stream_audio=manager.offer_audio,
+                    config_snapshot=_session_config,
+                )
         task = asyncio.create_task(worker)
         try:
             await asyncio.shield(task)

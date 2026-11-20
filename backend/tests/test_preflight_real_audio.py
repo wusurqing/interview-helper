@@ -158,10 +158,11 @@ def test_run_preflight_updates_status_and_completes(monkeypatch: pytest.MonkeyPa
         def compute_energy(audio):
             return 0.1
 
-    cfg = SimpleNamespace(stt_provider='whisper', get_active_model=lambda: SimpleNamespace(name='demo', model='demo-model'))
+    model = SimpleNamespace(name='demo', model='demo-model', api_key='test', supports_vision=False)
+    cfg = SimpleNamespace(stt_provider='generic', models=[model], active_model=0, get_active_model=lambda: model)
     monkeypatch.setattr(sound_test, 'get_config', lambda: cfg)
     monkeypatch.setattr(sound_test, 'AudioCapture', FakeCapture)
-    monkeypatch.setattr(sound_test, 'transcribe_with_fallback', lambda *args, **kwargs: sound_test.PREFLIGHT_EXPECTED_PHRASE)
+    monkeypatch.setattr(sound_test, 'transcribe_segment', lambda *args, **kwargs: sound_test.PREFLIGHT_EXPECTED_PHRASE)
     monkeypatch.setattr(
         sound_test,
         'generate_preflight_answer',
@@ -183,18 +184,15 @@ def test_run_preflight_updates_status_and_completes(monkeypatch: pytest.MonkeyPa
     assert any(e.get('type') == 'preflight_step' for e in events)
 
 
-@pytest.mark.parametrize(
-    ("short", "expected_prompt", "expected_limit"),
-    [(True, "简短语音规则", 320), (False, "标准语音规则", 720)],
-)
-def test_generate_preflight_answer_uses_selected_voice_prompt(
-    monkeypatch: pytest.MonkeyPatch, short: bool, expected_prompt: str, expected_limit: int,
-):
+def test_generate_preflight_answer_uses_voice_profile(monkeypatch: pytest.MonkeyPatch):
+    from core.config import AssistGeneration
+
     calls: dict = {}
     cfg = SimpleNamespace(
-        assist_high_churn_short_answer=short,
+        assist_high_churn_short_answer=True,
         assist_realtime_max_tokens=720,
         assist_realtime_high_churn_max_tokens=320,
+        assist_generation={"assist_realtime": AssistGeneration(temperature=0.6, max_output_tokens=600)},
         system_prompts={
             'assist_realtime': '标准语音规则',
             'assist_realtime_short': '简短语音规则',
@@ -218,8 +216,9 @@ def test_generate_preflight_answer_uses_selected_voice_prompt(
     assert result == {'answer': '# 真实回答', 'first_token_ms': 400, 'total_ms': 900}
     assert calls['model'] is model_cfg
     assert calls['messages'] == [{'role': 'user', 'content': '【面试官｜当前发言】"请做一下自我介绍"'}]
-    assert calls['system_prompt'] == expected_prompt
-    assert calls['override_max_tokens'] == expected_limit
+    assert calls['system_prompt'] == '标准语音规则'
+    assert calls['override_max_tokens'] == 600
+    assert calls['config_snapshot'].temperature == 0.6
 
 
 def test_replay_preflight_capture_stt_collects_round_stats(monkeypatch: pytest.MonkeyPatch):
@@ -262,7 +261,7 @@ def test_replay_preflight_capture_stt_collects_round_stats(monkeypatch: pytest.M
     )
     monkeypatch.setattr(
         sound_test,
-        "transcribe_with_fallback",
+        "transcribe_segment",
         lambda *args, **kwargs: next(transcripts),
     )
 

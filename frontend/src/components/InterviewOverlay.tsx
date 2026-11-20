@@ -132,7 +132,9 @@ export default function InterviewOverlay() {
           : '上一条回答已取消')
       : displayedQa?.status === 'error'
         ? `保存失败: ${displayedQa.errorMessage || '未知原因'}`
-        : displayedQa?.answer?.trim() || (displayedQa ? (displayedQa.isThinking ? '思考中…' : '正在组织回答…') : '')
+        : displayedQa?.retrying
+          ? plainAnswerStatus(displayedQa, true)
+          : displayedQa?.answer?.trim() || (displayedQa ? (displayedQa.isThinking ? '思考中…' : '正在组织回答…') : '')
   const activeVisionVerify =
     displayedQa?.status !== 'cancelled' && displayedQa?.status !== 'error'
       ? displayedQa?.visionVerify

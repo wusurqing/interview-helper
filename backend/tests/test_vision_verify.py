@@ -78,12 +78,14 @@ def test_schedule_self_verify_persists_result_before_broadcast(monkeypatch):
     seen_snapshot: list[dict] = []
     done = threading.Event()
 
-    monkeypatch.setattr(vision_verify, "_pick_vision_model_cfg", lambda: SimpleNamespace(model="vision-model"))
-    monkeypatch.setattr(
-        vision_verify,
-        "_verify_blocking",
-        lambda _answer, _images: {"verdict": "FAIL", "reason": "样例不通过"},
-    )
+    model = SimpleNamespace(model="selected-vision-model")
+    monkeypatch.setattr(vision_verify, "_pick_vision_model_cfg", lambda: None)
+
+    def verify(_answer, _images, *, model_cfg):
+        assert model_cfg is model
+        return {"verdict": "FAIL", "reason": "样例不通过"}
+
+    monkeypatch.setattr(vision_verify, "_verify_blocking", verify)
 
     def capture_broadcast(payload):
         seen_snapshot.append(session.snapshot()["qa_pairs"][0]["vision_verify"])
@@ -95,6 +97,7 @@ def test_schedule_self_verify_persists_result_before_broadcast(monkeypatch):
         answer="```python\nprint(0)\n```",
         image_data_url="data:image/png;base64,a",
         broadcast_callable=capture_broadcast,
+        model_cfg=model,
     )
 
     assert done.wait(1)

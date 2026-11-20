@@ -11,6 +11,8 @@ export interface ToastItem {
 export type ApiType = 'openai' | 'anthropic' | 'responses'
 
 export interface ModelInfo {
+  id?: string
+  has_api_key?: boolean
   name: string
   api_type?: ApiType
   context_window_tokens?: number
@@ -24,6 +26,7 @@ export interface ModelInfo {
 }
 
 export interface ModelFullInfo {
+  id?: string
   name: string
   api_base_url: string
   api_key: string
@@ -38,6 +41,13 @@ export interface ModelFullInfo {
   has_key: boolean
 }
 
+export type AssistPromptScene = 'assist_realtime' | 'assist_manual' | 'assist_screen' | 'assist_exam'
+
+export interface AssistGenerationSettings {
+  temperature: number
+  max_output_tokens: number
+}
+
 export interface AppConfig {
   models: ModelInfo[]
   active_model: number
@@ -45,20 +55,18 @@ export interface AppConfig {
   temperature: number
   max_tokens: number
   system_prompts?: Record<string, string>
+  assist_generation?: Partial<Record<AssistPromptScene, AssistGenerationSettings>>
+  assist_model_ids?: string[]
+  assist_screenshot_model_id?: string | null
+  written_exam_model_id?: string | null
+  written_exam_model_ids?: string[]
+  assist_think_mode?: boolean
+  assist_think_effort?: string
   think_mode: boolean
   think_effort: string
   stt_provider: string
+  stt_configured?: Partial<Record<import('@/lib/speechProviders').SpeechProvider, boolean>>
   mmpg?: import('@/lib/mmpg/settings').MmpgConfig
-  whisper_model: string
-  whisper_language: string
-  whisper_preload: boolean
-  funasr_model?: string
-  /** 岗位热词：{岗位: 词串}；"通用" 键全局生效 */
-  stt_hotwords?: Record<string, string>
-  /** 远程 ASR 失败降级引擎：whisper / funasr / none */
-  stt_fallback_provider?: string
-  /** 本地 ASR 推理线程数：0=自动 */
-  stt_infer_threads?: number
   doubao_stt_app_id: string
   doubao_stt_access_token: string
   doubao_stt_api_key: string
@@ -70,15 +78,10 @@ export interface AppConfig {
   generic_stt_custom_headers: string
   candidate_asr_enabled?: boolean
   candidate_stt_provider?: string
-  candidate_whisper_model?: string
-  candidate_whisper_language?: string
-  candidate_remote_stt_enabled?: boolean
   candidate_context_enabled?: boolean
   candidate_context_wait_ms?: number
   candidate_context_max_chars?: number
   candidate_context_min_chars?: number
-  candidate_streaming_asr_enabled?: boolean
-  candidate_streaming_asr_interval_ms?: number
   candidate_mic_compatibility_mode?: boolean
   position: string
   language: string
@@ -168,6 +171,8 @@ export interface QAPair {
   firstTokenMs?: number
   totalMs?: number
   answerFormat?: 'plain_text'
+  attempt?: number
+  retrying?: boolean
   visionVerify?: { verdict: 'PASS' | 'FAIL' | 'UNKNOWN'; reason: string }
   status?: QAStatus
   updatesQaId?: string
@@ -195,7 +200,6 @@ export interface OptionsInfo {
   languages: string[]
   stt_providers?: string[]
   candidate_stt_providers?: string[]
-  whisper_models: string[]
   screen_capture_regions?: string[]
 }
 
@@ -206,5 +210,5 @@ export interface TokenUsage {
   byModel?: Record<string, { prompt: number; completion: number }>
 }
 
-export type SettingsDrawerTab = 'general' | 'mode' | 'overlay' | 'kb' | 'config' | 'timing' | 'hotwords' | 'models' | 'prompts' | 'appearance' | 'shortcuts'
+export type SettingsDrawerTab = 'realtime' | 'mode' | 'overlay' | 'kb' | 'config' | 'models' | 'prompts' | 'appearance' | 'shortcuts'
 export type ModelHealthStatus = 'checking' | 'ok' | 'error'

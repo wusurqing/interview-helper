@@ -296,7 +296,10 @@ class _Body:
     def model_dump(self, exclude_none: bool = True):
         return dict(self._data)
 
-    # 让 router 里 `body.whisper_language` 等取属性不报错
+    @property
+    def model_fields_set(self):
+        return set(self._data)
+
     def __getattr__(self, name):
         return self._data.get(name)
 
@@ -519,7 +522,7 @@ def test_update_config_rejects_unknown_stt_provider(monkeypatch):
         update_called = True
 
     monkeypatch.setattr(common_router, "update_config", fake_update_config)
-    monkeypatch.setattr(common_router, "STT_PROVIDER_OPTIONS", ("whisper", "doubao", "generic"))
+    monkeypatch.setattr(common_router, "STT_PROVIDER_OPTIONS", ("doubao", "generic", "doubao_mmpg"))
 
     async def fake_run_in_threadpool(fn, *args, **kwargs):
         return fn(*args, **kwargs)
@@ -542,7 +545,7 @@ def test_stt_test_rejects_legacy_iflytek_provider(monkeypatch):
     result = _run(common_router.api_stt_test())
 
     assert result["ok"] is False
-    assert "已下线" in result["detail"]
+    assert "选择 ASR" in result["detail"]
 
 
 def test_stt_test_rejects_empty_transcription(monkeypatch):
@@ -552,7 +555,7 @@ def test_stt_test_rejects_empty_transcription(monkeypatch):
         def transcribe(self, audio, sample_rate=16000):
             return ""
 
-    monkeypatch.setattr(common_router, "get_stt_engine", lambda: _FakeEngine())
+    monkeypatch.setattr(common_router, "get_stt_engine", lambda *_args, **_kwargs: _FakeEngine())
     monkeypatch.setattr(common_router.Path, "exists", lambda self: False)
 
     result = _run(common_router.api_stt_test())
@@ -801,7 +804,7 @@ def test_model_list_keep_placeholder_uses_saved_api_key(monkeypatch):
     )
 
     result = _run(common_router.api_list_remote_models(common_router.ModelListRequest(
-        api_base_url="https://api.example.com/v1",
+        api_base_url="https://api.openai.com/v1",
         api_key=common_router._MODEL_API_KEY_KEEP,
         model_index=0,
     )))
@@ -914,7 +917,7 @@ def test_start_accepts_no_device_in_written_exam_mode(monkeypatch):
     assert start_called["v"] is True
 
 
-def test_start_passes_device_id_when_provided_in_exam_mode(monkeypatch):
+def test_start_ignores_device_id_when_provided_in_exam_mode(monkeypatch):
     assist_router = importlib.import_module("api.assist.routes")
 
     monkeypatch.setattr(
@@ -935,4 +938,4 @@ def test_start_passes_device_id_when_provided_in_exam_mode(monkeypatch):
 
     result = _run(assist_router.api_start({"device_id": 5}))
     assert result == {"ok": True}
-    assert start_args["device_id"] == 5
+    assert start_args["device_id"] is None

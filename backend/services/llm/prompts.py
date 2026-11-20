@@ -3,6 +3,7 @@
 
 import json
 import re
+from copy import copy
 from typing import Literal, Optional, Sequence
 from core.config import get_config
 from core.prompt_settings import resolve_system_prompt
@@ -601,15 +602,34 @@ def max_tokens_for_assist_prompt(
     *,
     high_churn_short_answer: bool = False,
 ) -> int:
+    profile = getattr(cfg, "assist_generation", {}).get(assist_prompt_scene(mode, high_churn_short_answer=high_churn_short_answer))
+    if profile is not None:
+        return profile.max_output_tokens
     base_limit = max(1, int(getattr(cfg, "max_tokens", 4096) or 4096))
     if mode == PROMPT_MODE_ASR_REALTIME:
         cap = (
-            int(getattr(cfg, "assist_realtime_high_churn_max_tokens", 420) or 420)
+            int(getattr(cfg, "assist_realtime_high_churn_max_tokens", 320) or 320)
             if high_churn_short_answer
-            else int(getattr(cfg, "assist_realtime_max_tokens", 900) or 900)
+            else int(getattr(cfg, "assist_realtime_max_tokens", 720) or 720)
         )
         return max(1, min(base_limit, cap))
     return base_limit
+
+
+def config_for_assist_generation(cfg, mode: PromptMode):
+    profile = getattr(cfg, "assist_generation", {}).get(assist_prompt_scene(mode))
+    updates = {
+        "temperature": profile.temperature if profile else getattr(cfg, "temperature", 0.5),
+        "max_tokens": max_tokens_for_assist_prompt(mode, cfg),
+        "think_mode": getattr(cfg, "assist_think_mode", getattr(cfg, "think_mode", False)),
+        "think_effort": getattr(cfg, "assist_think_effort", getattr(cfg, "think_effort", "off")),
+    }
+    if hasattr(cfg, "model_copy"):
+        return cfg.model_copy(update=updates)
+    snapshot = copy(cfg)
+    for key, value in updates.items():
+        setattr(snapshot, key, value)
+    return snapshot
 
 
 def _default_system_prompt(mode: PromptMode, high_churn_short_answer: bool, *, structured_manual: bool = False) -> str:
@@ -626,19 +646,18 @@ def _default_system_prompt(mode: PromptMode, high_churn_short_answer: bool, *, s
 
 def assist_prompt_specs(cfg) -> dict[str, tuple[str, str, int]]:
     scenes = (
-        (PROMPT_MODE_ASR_REALTIME, False),
-        (PROMPT_MODE_ASR_REALTIME, True),
-        (PROMPT_MODE_MANUAL_TEXT, False),
-        (PROMPT_MODE_SERVER_SCREEN, False),
-        (PROMPT_MODE_WRITTEN_EXAM, False),
+        PROMPT_MODE_ASR_REALTIME,
+        PROMPT_MODE_MANUAL_TEXT,
+        PROMPT_MODE_SERVER_SCREEN,
+        PROMPT_MODE_WRITTEN_EXAM,
     )
     return {
-        assist_prompt_scene(mode, high_churn_short_answer=short): (
-            _default_system_prompt(mode, short),
+        assist_prompt_scene(mode): (
+            _default_system_prompt(mode, False),
             "",
-            max_tokens_for_assist_prompt(mode, cfg, high_churn_short_answer=short),
+            max_tokens_for_assist_prompt(mode, cfg),
         )
-        for mode, short in scenes
+        for mode in scenes
     }
 
 
@@ -649,13 +668,18 @@ def build_system_prompt(
     *,
     cfg=None,
     structured_manual: bool = False,
+    knowledge_practice: bool = False,
 ) -> str:
     cfg = get_config() if cfg is None else cfg
     if mode is None:
         mode = PROMPT_MODE_MANUAL_TEXT if manual_input else PROMPT_MODE_ASR_REALTIME
     scene = assist_prompt_scene(mode, high_churn_short_answer=high_churn_short_answer)
+    overrides = getattr(cfg, "system_prompts", {})
+    if knowledge_practice and hasattr(cfg, "knowledge_practice_system_prompt"):
+        saved = cfg.knowledge_practice_system_prompt
+        overrides = {} if saved is None else {scene: saved}
     return resolve_system_prompt(
-        getattr(cfg, "system_prompts", {}),
+        overrides,
         scene,
         _default_system_prompt(mode, high_churn_short_answer, structured_manual=structured_manual),
     )

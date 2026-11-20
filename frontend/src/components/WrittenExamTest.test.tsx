@@ -48,7 +48,8 @@ describe('WrittenExamTest', () => {
     useInterviewStore.setState({
       config: {
         model_name: 'GPT-4.1 Vision',
-        models: [{ name: 'GPT-4.1 Vision', supports_vision: true, supports_think: true, enabled: true }],
+        written_exam_model_ids: ['exam'],
+        models: [{ id: 'exam', name: 'GPT-4.1 Vision', supports_vision: true, supports_think: true, has_api_key: true, enabled: true }],
         active_model: 0,
       },
     } as any)
@@ -615,17 +616,19 @@ describe('WrittenExamTest', () => {
     expect(screen.getByText('部分环节异常，请检查配置后重试')).toBeInTheDocument()
   })
 
-  it('warns when no vision model is configured', () => {
+  it('warns when no screenshot model is selected even if the catalog has a vision model', () => {
     useInterviewStore.setState({
       config: {
         model_name: 'Text Model',
-        models: [{ name: 'Text Model', supports_vision: false, supports_think: false, enabled: true }],
+        models: [{ id: 'vision', name: 'Vision Model', supports_vision: true, supports_think: false, enabled: true }],
         active_model: 0,
+        written_exam_model_ids: [],
       },
     } as any)
 
     render(<WrittenExamTest />)
 
-    expect(screen.getByText('固定截图代码题需要支持视觉的模型。')).toBeInTheDocument()
+    expect(screen.getByText(/请先在笔试配置中.*识图模型/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '开始检测' })).toBeDisabled()
   })
 })

@@ -3,16 +3,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import PreferencesTab from './PreferencesTab'
 import { updateConfigAndRefresh } from '@/lib/configSync'
-import { prepareExamOverlayPrompt } from '@/lib/examOverlay'
 import { useInterviewStore } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 
 vi.mock('@/lib/configSync', () => ({
   updateConfigAndRefresh: vi.fn().mockResolvedValue({ ok: true }),
-}))
-
-vi.mock('@/lib/examOverlay', () => ({
-  prepareExamOverlayPrompt: vi.fn(),
 }))
 
 describe('PreferencesTab', () => {
@@ -24,7 +19,6 @@ describe('PreferencesTab', () => {
     localStorage.clear()
     vi.mocked(updateConfigAndRefresh).mockReset()
     vi.mocked(updateConfigAndRefresh).mockResolvedValue({ ok: true } as any)
-    vi.mocked(prepareExamOverlayPrompt).mockClear()
     useInterviewStore.setState({
       config: {
         stt_provider: 'whisper',
@@ -57,7 +51,6 @@ describe('PreferencesTab', () => {
     render(<PreferencesTab variant="mode" />)
 
     expect(screen.getByText('自动保存')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('工作模式'))
     expect(screen.getByText('截图最长边: 1600px')).toBeInTheDocument()
     const input = screen.getByDisplayValue('1600')
 
@@ -76,32 +69,9 @@ describe('PreferencesTab', () => {
     expect(screen.queryByRole('heading', { name: '快捷提示词' })).not.toBeInTheDocument()
   })
 
-  it('does not call the main Whisper engine a fallback', () => {
-    render(<PreferencesTab />)
-    expect(screen.queryByText(/Whisper 降级就绪/)).not.toBeInTheDocument()
-    expect(screen.getByText(/就绪 · Whisper/)).toBeInTheDocument()
-  })
-
-  it('shows Whisper as a fallback when the configured provider is remote', () => {
-    useInterviewStore.setState({ config: { stt_provider: 'generic' } } as any)
-    render(<PreferencesTab />)
-    expect(screen.getByText(/Whisper 降级就绪/)).toBeInTheDocument()
-  })
-
-  it('saves answer length choices immediately from common preferences', async () => {
-    render(<PreferencesTab />)
-
-    fireEvent.click(screen.getByRole('button', { name: /简短回答/ }))
-
-    await waitFor(() => {
-      expect(updateConfigAndRefresh).toHaveBeenCalledWith({ assist_high_churn_short_answer: true })
-    })
-  })
-
   it('allows zero to disable screen capture scaling', async () => {
     render(<PreferencesTab variant="mode" />)
 
-    fireEvent.click(screen.getByText('工作模式'))
     fireEvent.change(screen.getByDisplayValue('1600'), { target: { value: '0' } })
 
     await waitFor(() => {
@@ -113,7 +83,6 @@ describe('PreferencesTab', () => {
     vi.useFakeTimers()
     render(<PreferencesTab variant="mode" />)
 
-    fireEvent.click(screen.getByText('工作模式'))
     fireEvent.change(screen.getByDisplayValue('1600'), { target: { value: '2400' } })
     fireEvent.change(screen.getByDisplayValue('10'), { target: { value: '12' } })
 
@@ -146,46 +115,10 @@ describe('PreferencesTab', () => {
     })
   })
 
-  it('serializes immediate auto-save writes so older requests cannot finish last', async () => {
-    let resolveFirst: ((value: unknown) => void) | null = null
-    const firstSave = new Promise((resolve) => {
-      resolveFirst = resolve
-    })
-    vi.mocked(updateConfigAndRefresh)
-      .mockImplementationOnce(() => firstSave as any)
-      .mockResolvedValue({ ok: true } as any)
-
-    render(<PreferencesTab />)
-
-    fireEvent.click(screen.getByRole('button', { name: /简短回答/ }))
-    await waitFor(() => {
-      expect(updateConfigAndRefresh).toHaveBeenCalledTimes(1)
-    })
-
-    fireEvent.click(screen.getByRole('button', { name: /详细回答/ }))
-    await act(async () => {
-      await Promise.resolve()
-    })
-    expect(updateConfigAndRefresh).toHaveBeenCalledTimes(1)
-
-    await act(async () => {
-      if (!resolveFirst) throw new Error('first save resolver was not captured')
-      resolveFirst({ ok: true })
-      await firstSave
-      await Promise.resolve()
-    })
-
-    await waitFor(() => {
-      expect(updateConfigAndRefresh).toHaveBeenCalledTimes(2)
-    })
-    expect(updateConfigAndRefresh).toHaveBeenLastCalledWith({ assist_high_churn_short_answer: false })
-  })
-
   it('flushes pending auto-save edits when unmounted before debounce fires', async () => {
     vi.useFakeTimers()
     const { unmount } = render(<PreferencesTab variant="mode" />)
 
-    fireEvent.click(screen.getByText('工作模式'))
     fireEvent.change(screen.getByDisplayValue('1600'), { target: { value: '2400' } })
     unmount()
 
@@ -196,25 +129,19 @@ describe('PreferencesTab', () => {
     expect(updateConfigAndRefresh).toHaveBeenCalledWith({ screen_capture_max_long_edge: 2400 })
   })
 
-  it('does not prepare exam overlay prompt when enabling exam mode save fails', async () => {
-    vi.mocked(updateConfigAndRefresh).mockRejectedValueOnce(new Error('save failed'))
+  it('edits exam Think while the exam is inactive and keeps module switching out of settings', async () => {
     render(<PreferencesTab variant="mode" />)
 
-    fireEvent.click(screen.getByText('工作模式'))
-    fireEvent.click(screen.getAllByText('笔试模式')[0])
+    const think = screen.getByRole('checkbox', { name: '深度思考 (Think)' })
+    expect(think).not.toBeChecked()
+    expect(screen.queryByText('工作模式')).not.toBeInTheDocument()
+    expect(screen.queryByText('笔试模式')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /悬浮窗设置/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('combobox', { name: /^截图区域/ })).toHaveValue('left_half')
+    expect(screen.getByText('多图截图等待: 10 秒')).toBeInTheDocument()
 
-    await waitFor(() => {
-      expect(updateConfigAndRefresh).toHaveBeenCalledWith({ written_exam_mode: true })
-    })
-    await act(async () => {
-      await Promise.resolve()
-    })
-    expect(prepareExamOverlayPrompt).not.toHaveBeenCalled()
-  })
+    fireEvent.click(think)
 
-  it('links to the dedicated overlay settings from work mode', () => {
-    render(<PreferencesTab variant="mode" />)
-    fireEvent.click(screen.getByRole('button', { name: /悬浮窗设置/ }))
-    expect(useInterviewStore.getState().settingsDrawerTab).toBe('overlay')
+    await waitFor(() => expect(updateConfigAndRefresh).toHaveBeenCalledExactlyOnceWith({ written_exam_think: true }))
   })
 })

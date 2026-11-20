@@ -1,9 +1,8 @@
 import json
 import socket
-import threading
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import requests
 from fastapi import APIRouter, UploadFile, File, HTTPException, Request
@@ -14,16 +13,15 @@ from core.auth import get_token, is_auth_disabled, is_loopback_host, loopback_by
 from core.config import (
     CANDIDATE_STT_PROVIDER_OPTIONS, DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, MMPG_STT_PROVIDER, Mmpg,
     get_config, update_config, ModelListChanged,
-    POSITION_OPTIONS, LANGUAGE_OPTIONS, WHISPER_MODEL_OPTIONS, STT_PROVIDER_OPTIONS,
-    FUNASR_MODEL_OPTIONS,
-    STT_FALLBACK_PROVIDER_OPTIONS,
+    AssistGeneration, AssistScene, InvalidAssistModelSelection, ThinkEffort, model_health_fingerprint,
+    POSITION_OPTIONS, LANGUAGE_OPTIONS, STT_PROVIDER_OPTIONS,
     SCREEN_CAPTURE_REGION_OPTIONS,
     normalize_llm_max_tokens, normalize_llm_temperature,
 )
 from core.env import env_int
 from core.prompt_settings import PROMPT_SCENES
 from services.audio import AudioCapture
-from services.stt import get_stt_engine, set_whisper_language
+from services.stt import STTError, get_stt_engine, stt_configuration_error
 from api.common.config_payload import build_config_payload
 from api.common.model_health import (
     get_model_health,
@@ -56,6 +54,13 @@ def _has_enabled_model(models: list) -> bool:
 class ConfigUpdate(BaseModel):
     system_prompts: Optional[dict[str, StrictStr | None]] = None
     models: Optional[list] = None
+    assist_model_ids: list[StrictStr] | None = None
+    assist_screenshot_model_id: StrictStr | None = None
+    written_exam_model_id: StrictStr | None = None
+    written_exam_model_ids: list[StrictStr] | None = None
+    assist_generation: dict[AssistScene, AssistGeneration] | None = None
+    assist_think_mode: bool | None = None
+    assist_think_effort: ThinkEffort | None = None
     max_parallel_answers: Optional[int] = None
     active_model: Optional[int] = None
     temperature: Optional[float] = None
@@ -65,14 +70,6 @@ class ConfigUpdate(BaseModel):
     stt_provider: Optional[str] = None
     # Validated inside the handler so malformed credential fields never appear in FastAPI's error body.
     mmpg: Any = None
-    whisper_model: Optional[str] = None
-    whisper_language: Optional[str] = None
-    whisper_preload: Optional[bool] = None
-    funasr_model: Optional[str] = None
-    # 岗位热词：{"通用": "RAG LLM", "后端开发": "ZSET ..."}；空值键会被剔除
-    stt_hotwords: Optional[dict] = None
-    stt_fallback_provider: Optional[str] = None
-    stt_infer_threads: Optional[int] = None
     doubao_stt_app_id: Optional[str] = None
     doubao_stt_access_token: Optional[str] = None
     doubao_stt_api_key: Optional[str] = None
@@ -108,15 +105,10 @@ class ConfigUpdate(BaseModel):
     generic_stt_custom_headers: Optional[str] = None
     candidate_asr_enabled: Optional[bool] = None
     candidate_stt_provider: Optional[str] = None
-    candidate_whisper_model: Optional[str] = None
-    candidate_whisper_language: Optional[str] = None
-    candidate_remote_stt_enabled: Optional[bool] = None
     candidate_context_enabled: Optional[bool] = None
     candidate_context_wait_ms: Optional[int] = None
     candidate_context_max_chars: Optional[int] = None
     candidate_context_min_chars: Optional[int] = None
-    candidate_streaming_asr_enabled: Optional[bool] = None
-    candidate_streaming_asr_interval_ms: Optional[int] = None
     candidate_mic_compatibility_mode: Optional[bool] = None
     # KB - 详细字段(min_score / OCR / Vision / chunk_size 等)仍走 config.json
     kb_enabled: Optional[bool] = None
@@ -135,6 +127,7 @@ class ModelListRequest(BaseModel):
     api_base_url: str
     api_key: str
     model_index: Optional[int] = None
+    model_id: StrictStr | None = None
     api_type: Optional[str] = None
 
 
@@ -291,9 +284,10 @@ async def api_get_prompts():
     return {"scenes": scenes}
 
 
-_LEGACY_STT_PROVIDER_MAP = {"iflytek": "generic"}
 _MMPG_PROBE_CONFIG_PATH = Path(__file__).resolve().parents[3] / "tools" / "mmpg-probe" / "config.local.json"
-_MMPG_PROBE_IMPORT_FIELDS = set(Mmpg.model_fields) - {"rtc_app_key", "token_mode"}
+_MMPG_PROBE_IMPORT_FIELDS = set(Mmpg.model_fields) - {
+    "rtc_app_key", "token_mode", "answer_delay_ms", "followup_window_ms",
+}
 _MMPG_PROBE_CONFIG_LIMIT = 64 * 1024
 
 
@@ -327,6 +321,7 @@ async def api_get_models_full():
     return {
         "models": [
             {
+                "id": getattr(mdl, "id", ""),
                 "name": mdl.name,
                 "api_base_url": mdl.api_base_url,
                 "api_key": "",
@@ -350,7 +345,12 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
     from core.config import ModelConfig
 
     d = body.model_dump(exclude_none=True)
+    if "assist_screenshot_model_id" in body.model_fields_set:
+        d["assist_screenshot_model_id"] = body.assist_screenshot_model_id
+    if "written_exam_model_id" in body.model_fields_set:
+        d["written_exam_model_id"] = body.written_exam_model_id
     model_snapshot = None
+    model_origins = None
     try:
         if body.mmpg is not None:
             _require_local_mmpg_request(request)
@@ -362,81 +362,61 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
             raw_models = []
             current_models = list(get_config().models)
             model_snapshot = current_models
+            model_origins = []
+            by_id = {model.id: i for i, model in enumerate(current_models) if getattr(model, "id", "")}
+            by_fingerprint: dict[str, list[int]] = {}
+            for index, model in enumerate(current_models):
+                by_fingerprint.setdefault(model_health_fingerprint(model), []).append(index)
+            retained_origins: set[int] = set()
             for idx, x in enumerate(d["models"]):
                 if not isinstance(x, dict):
                     continue
-                if x.get("api_key") == _MODEL_API_KEY_KEEP:
-                    source_idx = x.get("model_original_index", idx)
-                    try:
-                        source_idx = int(source_idx)
-                    except (TypeError, ValueError):
-                        source_idx = idx
-                    existing = current_models[source_idx].api_key if 0 <= source_idx < len(current_models) else ""
-                    x = {**x, "api_key": existing}
-                x.pop("model_original_index", None)
-                raw_models.append(ModelConfig(**x))
+                model_id = x.pop("id", None)
+                keep_key = x.get("api_key") == _MODEL_API_KEY_KEEP
+                source_idx = x.pop("model_original_index", idx if keep_key else None)
+                if model_id:
+                    if not isinstance(model_id, str) or model_id not in by_id:
+                        raise ModelListChanged("模型目录已更新，请刷新后重试")
+                    source_idx = by_id[model_id]
+                if model_id or keep_key:
+                    if type(source_idx) is not int or not 0 <= source_idx < len(current_models):
+                        raise ModelListChanged("模型目录已更新，请刷新后重试")
+                if keep_key:
+                    x["api_key"] = current_models[source_idx].api_key
+                row = ModelConfig(**x)
+                if not model_id and not keep_key:
+                    # Older editors send row indices, which may refer to the
+                    # previous ordering. Match unchanged rows by identity.
+                    matches = by_fingerprint.get(model_health_fingerprint(row), [])
+                    source_idx = matches[0] if len(matches) == 1 else None
+                if source_idx is not None:
+                    if source_idx in retained_origins:
+                        raise HTTPException(422, "同一个模型不能在目录中重复保存")
+                    retained_origins.add(source_idx)
+                    row.id = getattr(current_models[source_idx], "id", "")
+                model_origins.append(source_idx)
+                raw_models.append(row)
             d["models"] = raw_models
             if not d["models"]:
                 raise HTTPException(400, "至少保留一个模型")
             if not _has_enabled_model(d["models"]):
                 raise HTTPException(422, "至少启用一个模型")
-        if "funasr_model" in d and str(d["funasr_model"]).strip() and str(d["funasr_model"]).strip() not in FUNASR_MODEL_OPTIONS:
-            raise HTTPException(422, f"funasr_model 必须是 {FUNASR_MODEL_OPTIONS} 之一")
-        if d.get("stt_fallback_provider", "").strip() and d["stt_fallback_provider"].strip() not in STT_FALLBACK_PROVIDER_OPTIONS:
-            raise HTTPException(422, f"stt_fallback_provider 必须是 {STT_FALLBACK_PROVIDER_OPTIONS} 之一")
-        if d.get("stt_fallback_provider") == "":
-            d.pop("stt_fallback_provider", None)
-        if "stt_infer_threads" in d:
-            d["stt_infer_threads"] = max(0, min(64, int(d["stt_infer_threads"] or 0)))
-        if "stt_hotwords" in d:
-            raw_hotwords = d["stt_hotwords"] if isinstance(d["stt_hotwords"], dict) else {}
-            d["stt_hotwords"] = {
-                str(k).strip(): str(v).strip()
-                for k, v in raw_hotwords.items()
-                if str(k).strip() and str(v).strip()
-            }
-        if d.get("stt_provider") in _LEGACY_STT_PROVIDER_MAP:
-            raise HTTPException(
-                422,
-                f"stt_provider={d['stt_provider']} 已废弃，请改用 {_LEGACY_STT_PROVIDER_MAP[d['stt_provider']]} 或 whisper",
-            )
-        if d.get("stt_provider") == "":
-            d.pop("stt_provider", None)
-        elif "stt_provider" in d and d["stt_provider"] not in STT_PROVIDER_OPTIONS:
-            raise HTTPException(
-                422,
-                f"stt_provider 必须是 {list(STT_PROVIDER_OPTIONS)} 之一",
-            )
-        if d.get("candidate_stt_provider") in _LEGACY_STT_PROVIDER_MAP:
-            raise HTTPException(
-                422,
-                f"candidate_stt_provider={d['candidate_stt_provider']} 已废弃，请改用 whisper",
-            )
-        if d.get("candidate_stt_provider") == "":
-            d.pop("candidate_stt_provider", None)
-        elif "candidate_stt_provider" in d and d["candidate_stt_provider"] not in CANDIDATE_STT_PROVIDER_OPTIONS:
-            raise HTTPException(
-                422,
-                f"candidate_stt_provider 必须是 {CANDIDATE_STT_PROVIDER_OPTIONS} 之一",
-            )
-        if d.get("candidate_stt_provider") in ("doubao", "generic") and not bool(d.get("candidate_remote_stt_enabled", get_config().candidate_remote_stt_enabled)):
-            d["candidate_stt_provider"] = "whisper"
+        for field, options in (
+            ("stt_provider", STT_PROVIDER_OPTIONS),
+            ("candidate_stt_provider", CANDIDATE_STT_PROVIDER_OPTIONS),
+        ):
+            if field in d and d[field] not in ("", *options):
+                raise HTTPException(422, f"{field} 已废弃或不受支持，请选择 {options} 中的引擎")
         if "temperature" in d:
             d["temperature"] = normalize_llm_temperature(d["temperature"])
         if "max_tokens" in d:
             d["max_tokens"] = normalize_llm_max_tokens(d["max_tokens"])
-        if "candidate_whisper_model" in d:
-            d["candidate_whisper_model"] = str(d["candidate_whisper_model"]).strip()
-        if "candidate_whisper_language" in d:
-            d["candidate_whisper_language"] = str(d["candidate_whisper_language"]).strip()
         if "candidate_context_wait_ms" in d:
             d["candidate_context_wait_ms"] = max(0, min(2000, int(d["candidate_context_wait_ms"])))
         if "candidate_context_max_chars" in d:
             d["candidate_context_max_chars"] = max(100, min(4000, int(d["candidate_context_max_chars"])))
         if "candidate_context_min_chars" in d:
             d["candidate_context_min_chars"] = max(1, min(100, int(d["candidate_context_min_chars"])))
-        if "candidate_streaming_asr_interval_ms" in d:
-            d["candidate_streaming_asr_interval_ms"] = max(800, min(5000, int(d["candidate_streaming_asr_interval_ms"])))
         if "max_parallel_answers" in d:
             d["max_parallel_answers"] = max(1, min(8, int(d["max_parallel_answers"])))
         if "answer_autoscroll_bottom_px" in d:
@@ -517,23 +497,33 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
         if "kb_asr_deadline_ms" in d:
             d["kb_asr_deadline_ms"] = max(20, min(1000, int(d["kb_asr_deadline_ms"])))
 
-        if model_snapshot is None:
-            await run_in_threadpool(update_config, d)
+        save_options = {} if model_snapshot is None else {
+            "model_origins": model_origins, "model_snapshot": model_snapshot,
+        }
+        if "written_exam_mode" in d:
+            from api.assist.mmpg_integration import http_lifecycle_lock, manager
+            from api.realtime.ws import broadcast
+            from core.session import get_session
+
+            async with http_lifecycle_lock:
+                changing_workspace = d["written_exam_mode"] != get_config().written_exam_mode
+                if changing_workspace and (get_session().is_recording or manager.active):
+                    raise HTTPException(409, "请先结束当前会话，再切换答题模式。")
+                await run_in_threadpool(update_config, d, **save_options)
+                if changing_workspace:
+                    broadcast({"type": "workspace_mode", "written_exam_mode": d["written_exam_mode"]})
         else:
-            await run_in_threadpool(update_config, d, model_snapshot=model_snapshot)
-        if {"candidate_asr_enabled", "candidate_stt_provider"}.intersection(d):
-            from api.assist import candidate_mmpg
-
-            if not candidate_mmpg.enabled(get_config()):
-                await candidate_mmpg.stop("settings_changed")
+            await run_in_threadpool(update_config, d, **save_options)
         if d.get("auto_detect") is False:
-            from api.assist.mmpg_integration import clear_turns
+            from api.assist.mmpg_integration import disable_automatic_answers
 
-            clear_turns()
+            disable_automatic_answers()
     except HTTPException:
         raise
     except ModelListChanged as e:
         raise HTTPException(409, str(e)) from e
+    except InvalidAssistModelSelection as e:
+        raise HTTPException(422, str(e)) from e
     except OSError:
         raise HTTPException(500, "无法保存设置，请检查配置文件目录的写入权限") from None
     except ValidationError as e:
@@ -542,13 +532,6 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
         raise HTTPException(400, str(e)) from e
     except (TypeError, ValueError) as e:
         raise HTTPException(400, str(e)) from e
-    if body.whisper_language is not None:
-        set_whisper_language(body.whisper_language)
-    if body.whisper_model is not None and get_config().stt_provider == "whisper":
-        engine = await run_in_threadpool(get_stt_engine)
-        new_model = body.whisper_model
-        if hasattr(engine, "change_model"):
-            threading.Thread(target=lambda: engine.change_model(new_model), daemon=True).start()
     # 返回更新后的完整配置，而不是简单的 {ok: True}
     return build_config_payload(get_config())
 
@@ -592,9 +575,6 @@ async def api_options():
         "languages": LANGUAGE_OPTIONS,
         "stt_providers": STT_PROVIDER_OPTIONS,
         "candidate_stt_providers": CANDIDATE_STT_PROVIDER_OPTIONS,
-        "whisper_models": WHISPER_MODEL_OPTIONS,
-        "funasr_models": FUNASR_MODEL_OPTIONS,
-        "stt_fallback_providers": STT_FALLBACK_PROVIDER_OPTIONS,
         "screen_capture_regions": SCREEN_CAPTURE_REGION_OPTIONS,
     }
 
@@ -705,8 +685,9 @@ async def api_resume_history_delete(entry_id: int):
 async def api_stt_status():
     from api.assist import mmpg_integration
 
-    cfg = get_config()
-    if cfg.stt_provider == MMPG_STT_PROVIDER or mmpg_integration.pipeline.is_streaming_interview():
+    cfg = mmpg_integration.pipeline.get_capture_config()
+    provider = cfg.stt_provider
+    if provider == MMPG_STT_PROVIDER:
         from services.stt.mmpg import MmpgError, validate_config
 
         try:
@@ -714,27 +695,9 @@ async def api_stt_status():
             configured, missing = True, []
         except MmpgError as e:
             configured, missing = False, e.fields
-        return {
-            **mmpg_integration.stt_status(),
-            "configured": configured,
-            "missing": missing,
-        }
-    try:
-        engine = await run_in_threadpool(get_stt_engine)
-        status = {"loaded": engine.is_loaded, "loading": engine.is_loading, "model": engine.model_size}
-        provider = get_config().stt_provider
-        if provider in ("whisper", "funasr", "qwen3_asr"):
-            status["provider"] = provider
-            if getattr(engine, "device", None):
-                status["device"] = engine.device
-            if getattr(engine, "compute_type", None):
-                status["compute_type"] = engine.compute_type
-        if provider == "qwen3_asr":
-            if engine.load_error:
-                status["detail"] = engine.load_error[:200]
-        return status
-    except Exception as e:
-        return {"loaded": False, "loading": False, "model": get_config().stt_provider, "detail": str(e)[:200]}
+        return {**mmpg_integration.stt_status(), "configured": configured, "missing": missing}
+    detail = stt_configuration_error(cfg, provider)
+    return {"loaded": not detail, "loading": False, "model": provider, "provider": provider, "detail": detail}
 
 
 def _import_mmpg_probe_config() -> None:
@@ -788,12 +751,18 @@ async def api_get_models_health():
 async def api_list_remote_models(body: ModelListRequest):
     api_base_url = (body.api_base_url or "").strip()
     api_key = (body.api_key or "").strip()
-    if api_key == _MODEL_API_KEY_KEEP and body.model_index is not None:
-        cfg = get_config()
-        idx = int(body.model_index)
-        api_key = cfg.models[idx].api_key if 0 <= idx < len(cfg.models) else ""
     if not api_base_url:
         raise HTTPException(400, "API Base URL 不能为空")
+    if api_key == _MODEL_API_KEY_KEEP:
+        models = get_config().models
+        if body.model_id is not None:
+            saved = next((model for model in models if getattr(model, "id", None) == body.model_id), None)
+        else:
+            index = body.model_index
+            saved = models[index] if index is not None and 0 <= index < len(models) else None
+        if saved is None or saved.api_base_url.strip().rstrip("/") != api_base_url.rstrip("/"):
+            raise HTTPException(409, "模型目录或服务地址已变更，请刷新配置或填写该地址的 API Key")
+        api_key = saved.api_key.strip()
     if not api_key or api_key == "sk-your-api-key-here":
         raise HTTPException(400, "API Key 不能为空")
     api_type = (body.api_type or "openai").strip().lower()
@@ -829,134 +798,34 @@ async def api_probe_single_model(index: int):
         raise HTTPException(400, str(e)) from e
 
 
-_funasr_download_lock = threading.Lock()
-_funasr_download_state: dict = {"running": False, "error": "", "done_model": ""}
-
-
-def _funasr_installed() -> bool:
-    try:
-        from services.stt.local_runtime import configure_funasr_cache
-        configure_funasr_cache(get_config())
-        import funasr  # noqa: F401  首次 import 会加载 torch（数秒），勿在事件循环内直接执行
-        return True
-    except ImportError:
-        return False
-
-
-@router.get("/stt/funasr/status")
-async def api_funasr_status():
-    """FunASR 可用性：包是否安装、当前模型加载状态、下载任务状态。"""
-    installed = await run_in_threadpool(_funasr_installed)
-    cfg = get_config()
-    from services.stt.factory import get_stt_engine
-
-    try:
-        engine = get_stt_engine(provider="funasr")
-        loaded = bool(engine.is_loaded)
-        loading = bool(engine.is_loading)
-        model = getattr(engine, "model_name", cfg.funasr_model)
-    except Exception:
-        loaded = False
-        loading = False
-        model = getattr(cfg, "funasr_model", "paraformer-zh")
-    with _funasr_download_lock:
-        state = dict(_funasr_download_state)
-    return {
-        "installed": installed,
-        "model": model,
-        "loaded": loaded,
-        "loading": loading,
-        "downloading": state.get("running", False),
-        "download_error": state.get("error", ""),
-        "downloaded_model": state.get("done_model", ""),
-    }
-
-
-@router.post("/stt/funasr/download")
-async def api_funasr_download(body: dict = None):
-    """显式下载并加载 FunASR 模型（首次约数百 MB，从 ModelScope 拉取）。"""
-    body = body or {}
-    requested = str(body.get("model") or "").strip()
-    if requested and requested not in FUNASR_MODEL_OPTIONS:
-        raise HTTPException(422, f"model 必须是 {FUNASR_MODEL_OPTIONS} 之一")
-    installed = await run_in_threadpool(_funasr_installed)
-    if not installed:
-        return {"ok": False, "detail": "FunASR 未安装：请先运行 pip install funasr torch"}
-    from services.stt.factory import get_stt_engine
-
-    global _funasr_download_state
-    with _funasr_download_lock:
-        if _funasr_download_state.get("running"):
-            return {"ok": True, "detail": "下载已在进行中"}
-        _funasr_download_state = {"running": True, "error": "", "done_model": ""}
-
-    def _download():
-        global _funasr_download_state
-        try:
-            from services.stt import factory as stt_factory
-
-            engine = get_stt_engine(provider="funasr")
-            if requested and requested != engine.model_name:
-                old_name = engine.model_name
-                engine.change_model(requested)
-                # 同步引擎缓存键，避免下一次 get_stt_engine 以为模型变了又加载一遍
-                with stt_factory._engine_lock:
-                    stt_factory._funasr_engines.pop(old_name, None)
-                    stt_factory._funasr_engines[requested] = engine
-            engine.load_model()
-            with _funasr_download_lock:
-                _funasr_download_state = {
-                    "running": False,
-                    "error": "" if engine.is_loaded else "加载未完成",
-                    "done_model": engine.model_name if engine.is_loaded else "",
-                }
-        except Exception as e:  # noqa: BLE001
-            with _funasr_download_lock:
-                _funasr_download_state = {"running": False, "error": str(e)[:300], "done_model": ""}
-
-    threading.Thread(target=_download, daemon=True, name="funasr-download").start()
-    return {"ok": True, "detail": "已开始后台下载/加载，完成后状态见 /api/stt/funasr/status"}
+class SttConnectionTest(BaseModel):
+    provider: Literal["doubao", "generic"]
 
 
 @router.post("/stt/test")
-async def api_stt_test():
-    """Test current STT engine connectivity with credential pre-checks."""
+async def api_stt_test(body: SttConnectionTest | None = None):
+    """Test one saved segmented ASR connection using a known sample."""
     cfg = get_config()
-    if cfg.stt_provider == MMPG_STT_PROVIDER:
-        return {"ok": False, "detail": "请在语音设置中使用豆包 MMPG 的会话诊断"}
-    if cfg.stt_provider == "iflytek":
-        return {"ok": False, "detail": "讯飞 STT 已下线，请改为通用 ASR 或 Whisper"}
-    if cfg.stt_provider == "doubao":
-        doubao_api_key = getattr(cfg, "doubao_stt_api_key", "") or ""
-        doubao_access_token = cfg.doubao_stt_access_token or ""
-        if not doubao_api_key and not doubao_access_token:
-            return {"ok": False, "detail": "豆包 API Key 或 Access Token 未配置"}
-        if not doubao_api_key and not cfg.doubao_stt_app_id:
-            return {"ok": False, "detail": "豆包 App ID 未配置（新版控制台请填 API Key）"}
-    elif cfg.stt_provider == "generic":
-        generic_api_key = getattr(cfg, "generic_stt_api_key", "") or ""
-        if not getattr(cfg, "generic_stt_api_base_url", ""):
-            return {"ok": False, "detail": "通用 ASR Base URL 未配置"}
-        if not generic_api_key:
-            return {"ok": False, "detail": "通用 ASR API Key 未配置"}
-        if not getattr(cfg, "generic_stt_model", ""):
-            return {"ok": False, "detail": "通用 ASR Model 未配置"}
+    provider = cfg.stt_provider if body is None else body.provider
+    if provider == MMPG_STT_PROVIDER:
+        return {"ok": False, "detail": "请在语音配置中使用豆包 MMPG 的会话诊断"}
+    if detail := stt_configuration_error(cfg, provider):
+        return {"ok": False, "detail": detail}
     try:
-        engine = await run_in_threadpool(get_stt_engine)
         from services.audio import load_wav_file
         wav_path = Path(__file__).resolve().parents[2] / "assets" / "preflight_phrase.wav"
-        if wav_path.exists():
-            audio, sr = load_wav_file(wav_path)
-        else:
-            import numpy as _np
-            sr = 16000
-            audio = _np.zeros(int(sr * 1.5), dtype=_np.float32)
-        result = await run_in_threadpool(engine.transcribe, audio, sample_rate=sr)
-        if not (result or "").strip():
-            return {"ok": False, "detail": "引擎返回空文本，请检查接口兼容性或模型配置"}
-        return {"ok": True, "text": result}
-    except Exception as e:
-        return {"ok": False, "detail": str(e)[:200]}
+        audio, sample_rate = await run_in_threadpool(load_wav_file, wav_path)
+        engine = get_stt_engine(provider, config_snapshot=cfg)
+        result = await run_in_threadpool(engine.transcribe, audio, sample_rate=sample_rate)
+    except STTError as error:
+        return {"ok": False, "detail": str(error)}
+    except (TimeoutError, OSError):
+        return {"ok": False, "detail": "ASR 连接失败或超时，请检查网络和服务地址"}
+    except Exception:
+        return {"ok": False, "detail": "无法完成 ASR 连接测试，请检查语音配置"}
+    if not (result or "").strip():
+        return {"ok": False, "detail": "引擎返回空文本，请检查接口兼容性或模型配置"}
+    return {"ok": True, "text": result}
 
 
 @router.get("/token/stats")

@@ -33,8 +33,8 @@ def _server_text_frame(text: str, *, with_sequence: bool = False, is_last: bool 
     return header + prefix + struct.pack(">I", len(payload)) + payload
 
 
-def test_doubao_stt_does_not_retry_timeout_before_factory_fallback(monkeypatch):
-    calls = {"connect": 0, "sleep": []}
+def test_doubao_stt_leaves_timeout_retry_to_the_segment_worker(monkeypatch):
+    calls = {"connect": 0}
 
     def fake_create_connection(*_args, **_kwargs):
         calls["connect"] += 1
@@ -45,7 +45,6 @@ def test_doubao_stt_does_not_retry_timeout_before_factory_fallback(monkeypatch):
         "websocket",
         SimpleNamespace(create_connection=fake_create_connection),
     )
-    monkeypatch.setattr(engines.time, "sleep", lambda seconds: calls["sleep"].append(seconds))
 
     engine = DoubaoSTT(api_key="sk-test")
 
@@ -53,11 +52,10 @@ def test_doubao_stt_does_not_retry_timeout_before_factory_fallback(monkeypatch):
         engine.transcribe(np.zeros(1600, dtype=np.float32), sample_rate=16000)
 
     assert calls["connect"] == 1
-    assert calls["sleep"] == []
 
 
-def test_doubao_stt_leaves_transient_retry_to_factory_fallback(monkeypatch):
-    calls = {"connect": 0, "sleep": []}
+def test_doubao_stt_leaves_connection_retry_to_the_segment_worker(monkeypatch):
+    calls = {"connect": 0}
 
     class FakeWebSocket:
         def __init__(self):
@@ -89,7 +87,6 @@ def test_doubao_stt_leaves_transient_retry_to_factory_fallback(monkeypatch):
         "websocket",
         SimpleNamespace(create_connection=fake_create_connection),
     )
-    monkeypatch.setattr(engines.time, "sleep", lambda seconds: calls["sleep"].append(seconds))
 
     engine = DoubaoSTT(api_key="sk-test")
 
@@ -97,7 +94,6 @@ def test_doubao_stt_leaves_transient_retry_to_factory_fallback(monkeypatch):
         engine.transcribe(np.zeros(1600, dtype=np.float32), sample_rate=16000)
 
     assert calls["connect"] == 1
-    assert calls["sleep"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -176,3 +172,31 @@ def test_transcribe_returns_immediately_on_server_last_frame(monkeypatch):
     for i, frame in enumerate(audio_frames[:-1]):
         assert frame[1] == 0x21
         assert struct.unpack(">i", frame[4:8])[0] == 2 + i
+
+
+def test_disconnect_before_final_packet_is_not_a_successful_transcription(monkeypatch):
+    calls = {"received": 0, "closed": False}
+
+    class InterruptedSocket:
+        def send_binary(self, _frame):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self):
+            calls["received"] += 1
+            if calls["received"] == 1:
+                return _server_text_frame("未完成的转写")
+            raise TimeoutError("final packet timed out")
+
+        def close(self):
+            calls["closed"] = True
+
+    monkeypatch.setattr(
+        engines, "websocket",
+        SimpleNamespace(create_connection=lambda *_args, **_options: InterruptedSocket()),
+    )
+    with pytest.raises(TimeoutError):
+        DoubaoSTT(api_key="test-key").transcribe(np.zeros(16000, dtype=np.float32))
+    assert calls["closed"]

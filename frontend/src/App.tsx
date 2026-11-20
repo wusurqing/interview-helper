@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState, useRef, lazy, Suspense } from 'react'
 import { Settings, SlidersHorizontal, MonitorSmartphone, PanelLeftClose, PanelLeftOpen, Minus, X, ChevronDown } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore, type AppConfig } from '@/stores/configStore'
+import { getAssistModelEntries, getAssistScreenshotModel, getWrittenExamModel, isConfiguredModel, missingWrittenExamModel } from '@/lib/assistModels'
+import { speechProvider } from '@/lib/speechProviders'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { useShortcutsStore } from '@/stores/shortcutsStore'
 import { useInterviewWS } from '@/hooks/useInterviewWS'
@@ -21,6 +23,7 @@ import KnowledgeButton from '@/components/kb/KnowledgeButton'
 import KnowledgeDrawer from '@/components/kb/KnowledgeDrawer'
 import { AppToastStack } from '@/components/app/AppToastStack'
 import { InitErrorScreen } from '@/components/app/InitErrorScreen'
+import VisionBadge from '@/components/VisionBadge'
 import { ModelPriorityDropdown } from '@/components/app/ModelPriorityDropdown'
 import { WindowOpacitySlider } from '@/components/app/WindowOpacitySlider'
 const ReviewMode = lazy(() => import('@/components/ReviewMode'))
@@ -29,12 +32,14 @@ const ResumeOptimizer = lazy(() => import('@/components/ResumeOptimizer'))
 const JobTracker = lazy(() => import('@/components/JobTracker'))
 
 const APP_MODE_TABS = [
-  ['assist', '实时辅助'],
+  ['assist', '面试辅助'],
+  ['exam', '笔试辅助'],
   ['review', '面试复盘'],
   ['knowledge', '能力分析'],
   ['resume-opt', '简历优化'],
   ['job-tracker', '求职看板'],
 ] as const
+type WorkspaceTab = typeof APP_MODE_TABS[number][0]
 
 export default function App() {
   useInterviewWS()
@@ -48,8 +53,6 @@ export default function App() {
   )
   const sttLoaded = useInterviewStore((s) => s.sttLoaded)
   const sttLoading = useInterviewStore((s) => s.sttLoading)
-  const sttActiveProvider = useInterviewStore((s) => s.sttActiveProvider)
-  const sttFallbackLoaded = useInterviewStore((s) => s.sttFallbackLoaded)
   const isRecording = useInterviewStore((s) => s.isRecording)
   const interviewerStreaming = useInterviewStore((s) => s.interviewerStreaming)
   const isPaused = useInterviewStore((s) => s.isPaused)
@@ -57,7 +60,6 @@ export default function App() {
   const mmpgAnswerLabel = useInterviewStore((s) => s.mmpgAnswerLabel)
   const backendMmpgError = useInterviewStore((s) => s.mmpgError)
   const mmpg = useMmpgStatus()
-  const currentStreamingId = useInterviewStore((s) => s.currentStreamingId)
   const isExamMode = !interviewerStreaming && config?.written_exam_mode === true
   const usesMmpg = !isExamMode && (isRecording ? interviewerStreaming : config?.stt_provider === 'doubao_mmpg')
   const localMmpgActive = mmpg.mode && mmpg.mode !== 'test' && !['idle', 'error'].includes(mmpg.state)
@@ -67,11 +69,16 @@ export default function App() {
     : mmpgPhase === 'listening' && mmpgAnswerLabel ? mmpgAnswerLabel : mmpgStateLabels[mmpgPhase]
   const mmpgError = (localMmpgActive ? mmpg.error : localMmpgError) ?? (backendMmpgError ? mmpgErrorMessage(backendMmpgError) : null)
   const mmpgNotice = localMmpgActive ? mmpg.notice : null
-  const isWhisperFallback = sttActiveProvider === 'whisper' && !!config?.stt_provider && config.stt_provider !== 'whisper'
+  const selectedSpeechProvider = speechProvider(config?.stt_provider)
+  const speechConfigured = config?.stt_configured
+    ? Boolean(selectedSpeechProvider && config.stt_configured[selectedSpeechProvider])
+    : sttLoaded
+  const speechStatus = sttLoading ? '连接中' : sttLoaded ? '就绪' : '未就绪'
   const [mobileTab, setMobileTab] = useState<'transcript' | 'answer'>('transcript')
-  const lastMobileStreamingIdRef = useRef<string | null>(null)
   const appMode = useUiPrefsStore((s) => s.appMode)
   const setAppMode = useUiPrefsStore((s) => s.setAppMode)
+  const activeTab = appMode === 'assist' && isExamMode ? 'exam' : appMode
+  const examModel = getWrittenExamModel(config)
   const assistTranscriptCollapsed = useUiPrefsStore((s) => s.assistTranscriptCollapsed)
   const toggleAssistTranscriptCollapsed = useUiPrefsStore((s) => s.toggleAssistTranscriptCollapsed)
   useOverlayWindowSync(isRecording, appMode)
@@ -79,9 +86,11 @@ export default function App() {
   const [serverScreenLoading, setServerScreenLoading] = useState(false)
   const [sessionPopoverOpen, setSessionPopoverOpen] = useState(false)
   const [moduleMenuOpen, setModuleMenuOpen] = useState(false)
+  const [workspaceSwitching, setWorkspaceSwitching] = useState(false)
+  const workspaceSwitchRef = useRef(false)
   const serverScreenAskRef = useRef(false)
   const modelChangeSavingRef = useRef(false)
-  const pendingModelChangeRef = useRef<number | null>(null)
+  const pendingModelChangeRef = useRef<string | number | null>(null)
   const sessionAnchorRef = useRef<HTMLButtonElement | null>(null)
   const moduleMenuRef = useRef<HTMLDivElement | null>(null)
 
@@ -94,6 +103,37 @@ export default function App() {
   } = useAssistSplit()
 
   const { initError } = useAppBootstrap()
+
+  const selectWorkspace = useCallback(async (tab: WorkspaceTab) => {
+    if (workspaceSwitchRef.current) return
+    setModuleMenuOpen(false)
+    if (tab !== 'assist' && tab !== 'exam') {
+      setAppMode(tab)
+      return
+    }
+    const state = useInterviewStore.getState()
+    if (!state.config) return
+    const exam = tab === 'exam'
+    if (Boolean(state.config.written_exam_mode) === exam) {
+      setAppMode('assist')
+      return
+    }
+    if (state.isRecording || localMmpgActive) {
+      state.setToastMessage(exam ? '请先结束当前面试，再切换到笔试辅助。' : '请先结束当前笔试，再切换到面试辅助。')
+      return
+    }
+    workspaceSwitchRef.current = true
+    setWorkspaceSwitching(true)
+    try {
+      await updateConfigAndRefresh({ written_exam_mode: exam })
+      setAppMode('assist')
+    } catch (error) {
+      state.setToastMessage(error instanceof Error ? error.message : '切换失败，请重试。')
+    } finally {
+      workspaceSwitchRef.current = false
+      setWorkspaceSwitching(false)
+    }
+  }, [localMmpgActive, setAppMode])
 
   useEffect(() => {
     if (!moduleMenuOpen) return
@@ -109,28 +149,6 @@ export default function App() {
   useEffect(() => {
     setModuleMenuOpen(false)
   }, [appMode])
-
-  // 笔试题提交后优先展示答案流，避免手机端仍停留在「答题记录」而看不到
-  // 正在生成的结果。用户仍可手动切回记录页；同一题的后续 token 不会强制抢回焦点。
-  useEffect(() => {
-    if (!isExamMode) {
-      lastMobileStreamingIdRef.current = currentStreamingId
-      return
-    }
-    // During the very first layout pass some embedded/browser surfaces briefly
-    // report width 0. Treat that as unknown rather than mobile; otherwise a
-    // desktop answer panel can be mounted twice and duplicate its cards.
-    const viewportWidth = typeof window !== 'undefined' ? window.innerWidth : 0
-    const isMobileViewport = viewportWidth > 0 && viewportWidth < 768
-    if (
-      isMobileViewport
-      && currentStreamingId
-      && currentStreamingId !== lastMobileStreamingIdRef.current
-    ) {
-      setMobileTab('answer')
-    }
-    lastMobileStreamingIdRef.current = currentStreamingId
-  }, [currentStreamingId, isExamMode])
 
   useEffect(() => {
     if (!window.electronAPI?.getShortcuts) return
@@ -165,7 +183,10 @@ export default function App() {
   const hasGuided = useRef(false)
   useEffect(() => {
     if (!config || hasGuided.current) return
-    if (!config.api_key_set) {
+    const hasConfiguredModel = config.assist_model_ids === undefined
+      ? config.api_key_set
+      : config.models.some(isConfiguredModel)
+    if (!hasConfiguredModel) {
       hasGuided.current = true
       openModelsDrawer()
     }
@@ -175,7 +196,7 @@ export default function App() {
   // 注: Chrome 等浏览器把 Cmd+J / Ctrl+J 保留给「下载」, 故叠加 Shift 降低冲突.
   // 仅桌面端 assist 模式下生效; 输入框/contenteditable 内按键忽略.
   useEffect(() => {
-    if (appMode !== 'assist') return
+    if (activeTab !== 'assist') return
     const onKeyDown = (e: KeyboardEvent) => {
       const isToggle =
         (e.metaKey || e.ctrlKey) &&
@@ -191,10 +212,10 @@ export default function App() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [appMode, toggleAssistTranscriptCollapsed])
+  }, [activeTab, toggleAssistTranscriptCollapsed])
 
-  const handleModelChange = useCallback(async (active_model: number) => {
-    pendingModelChangeRef.current = active_model
+  const handleModelChange = useCallback(async (modelId: string | number) => {
+    pendingModelChangeRef.current = modelId
     if (modelChangeSavingRef.current) return
 
     modelChangeSavingRef.current = true
@@ -202,17 +223,29 @@ export default function App() {
       while (pendingModelChangeRef.current !== null) {
         const nextActiveModel = pendingModelChangeRef.current
         pendingModelChangeRef.current = null
-        const targetModel = useInterviewStore.getState().config?.models?.[nextActiveModel]
-        if (!targetModel) {
-          useInterviewStore.getState().setToastMessage('未找到该模型，请刷新配置后重试')
+        const current = useInterviewStore.getState().config
+        const entry = getAssistModelEntries(current).find(({ model, index }) => (
+          typeof nextActiveModel === 'string' ? model.id === nextActiveModel : index === nextActiveModel
+        ))
+        if (!entry) {
+          useInterviewStore.getState().setToastMessage('请先在实时辅助中勾选该模型')
           continue
         }
-        if (targetModel.enabled === false) {
-          useInterviewStore.getState().setToastMessage('该模型已停用，请先在设置中启用后再设为优先')
+        const { model: targetModel, index } = entry
+        if (!isConfiguredModel(targetModel)) {
+          useInterviewStore.getState().setToastMessage('请先在模型配置中启用并配置该模型')
           continue
         }
         try {
-          await updateConfigAndRefresh({ active_model: nextActiveModel })
+          const selected = current?.assist_model_ids
+          if (selected && targetModel.id) {
+            await updateConfigAndRefresh({ assist_model_ids: [
+              targetModel.id,
+              ...selected.filter((id) => id !== targetModel.id),
+            ] })
+          } else {
+            await updateConfigAndRefresh({ active_model: index })
+          }
           useInterviewStore.getState().setToastMessage(`已设为优先答题模型：${targetModel.name}`)
         } catch (error) {
           useInterviewStore.getState().setToastMessage(error instanceof Error ? error.message : '设置优先模型失败')
@@ -225,6 +258,11 @@ export default function App() {
 
   const handleServerScreenAsk = useCallback(async () => {
     if (serverScreenAskRef.current) return
+    const current = useInterviewStore.getState().config
+    if (current && !(current.written_exam_mode ? getWrittenExamModel(current) : getAssistScreenshotModel(current))) {
+      useInterviewStore.getState().setToastMessage(current.written_exam_mode ? missingWrittenExamModel : '请先在实时辅助中配置截图答题模型')
+      return
+    }
     serverScreenAskRef.current = true
     setServerScreenLoading(true)
     try {
@@ -246,7 +284,7 @@ export default function App() {
   const toasts = useInterviewStore((s) => s.toasts)
   const dismissToast = useInterviewStore((s) => s.dismissToast)
   const wsIsLeader = useInterviewStore((s) => s.wsIsLeader)
-  const currentAppModeLabel = APP_MODE_TABS.find(([key]) => key === appMode)?.[1] ?? '模块'
+  const currentAppModeLabel = APP_MODE_TABS.find(([key]) => key === activeTab)?.[1] ?? '模块'
 
   useEffect(() => {
     if (!fallbackToast) return
@@ -323,18 +361,16 @@ export default function App() {
                       key={key}
                       type="button"
                       role="menuitem"
-                      onClick={() => {
-                        setAppMode(key)
-                        setModuleMenuOpen(false)
-                      }}
+                      disabled={workspaceSwitching}
+                      onClick={() => void selectWorkspace(key)}
                       className={`flex w-full items-center justify-between rounded-xl px-3 py-2 text-left text-sm transition-colors ${
-                        appMode === key
+                        activeTab === key
                           ? 'bg-accent-blue text-white'
                           : 'text-text-secondary hover:bg-bg-hover hover:text-text-primary'
                       }`}
                     >
                       <span>{label}</span>
-                      {appMode === key ? <span className="text-[11px] font-semibold">当前</span> : null}
+                      {activeTab === key ? <span className="text-[11px] font-semibold">当前</span> : null}
                     </button>
                   ))}
                 </div>
@@ -344,8 +380,8 @@ export default function App() {
 
           <div className="hidden overflow-x-auto bg-bg-tertiary/60 rounded-xl p-0.5 ml-1 border border-bg-hover/30 scrollbar-none md:flex" role="tablist" aria-label="功能模块">
             {APP_MODE_TABS.map(([key, label]) => (
-              <button key={key} role="tab" aria-selected={appMode === key} onClick={() => setAppMode(key)}
-                className={`px-2.5 md:px-3 py-1.5 text-xs rounded-[10px] transition-all duration-200 whitespace-nowrap flex-shrink-0 font-medium ${appMode === key ? 'bg-accent-blue text-white shadow-sm shadow-accent-blue/20' : 'text-text-muted hover:text-text-primary hover:bg-bg-hover/50'}`}>
+              <button key={key} role="tab" aria-selected={activeTab === key} disabled={workspaceSwitching} onClick={() => void selectWorkspace(key)}
+                className={`px-2.5 md:px-3 py-1.5 text-xs rounded-[10px] transition-all duration-200 whitespace-nowrap flex-shrink-0 font-medium ${activeTab === key ? 'bg-accent-blue text-white shadow-sm shadow-accent-blue/20' : 'text-text-muted hover:text-text-primary hover:bg-bg-hover/50'}`}>
                 {label}
               </button>
             ))}
@@ -367,8 +403,8 @@ export default function App() {
               aria-live="polite"
               title={
                 isPaused
-                  ? isExamMode ? '笔试已暂停' : `录音已暂停 · STT ${sttLoaded ? (sttActiveProvider === 'whisper' ? 'Whisper' : '就绪') : sttLoading ? '加载中' : '未加载'}`
-                  : isExamMode ? '笔试进行中' : `正在录音中 · STT ${sttLoaded ? (sttActiveProvider === 'whisper' ? 'Whisper' : '就绪') : sttLoading ? '加载中' : '未加载'}`
+                  ? isExamMode ? '笔试已暂停' : `录音已暂停 · ASR ${speechStatus}`
+                  : isExamMode ? '笔试进行中' : `正在录音中 · ASR ${speechStatus}`
               }
             >
               <span className="relative inline-flex w-1.5 h-1.5 flex-shrink-0">
@@ -392,16 +428,12 @@ export default function App() {
               title={
                 isExamMode
                   ? '笔试模式 · 等待提问'
-                  : sttLoaded
-                  ? isWhisperFallback ? 'STT 已降级至 Whisper · 等待录音' : sttFallbackLoaded ? 'STT 就绪 · Whisper 降级已预加载' : 'STT 就绪 · 等待录音'
-                  : sttLoading
-                  ? isWhisperFallback ? 'Whisper 降级加载中…' : 'STT 模型加载中…'
-                  : 'STT 模型尚未加载,首次录音时会自动加载'
+                  : speechConfigured ? '语音引擎已配置 · 等待录音' : '请在实时辅助中选择已配置的语音引擎'
               }
             >
-              <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${sttLoaded ? (isWhisperFallback ? 'bg-accent-amber' : 'bg-accent-green') : sttLoading ? 'bg-accent-amber animate-pulse' : 'bg-accent-red'}`} />
+              <div className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${speechConfigured ? 'bg-accent-green' : 'bg-accent-amber'}`} />
               <span className="text-[10px] text-text-muted hidden md:inline font-medium">
-                {sttLoaded ? (sttActiveProvider === 'whisper' ? 'Whisper' : sttFallbackLoaded ? 'STT ✓' : 'STT 就绪') : sttLoading ? '加载中' : '未加载'}
+                {isExamMode ? '笔试待开始' : speechConfigured ? 'ASR 已配置' : 'ASR 待配置'}
               </span>
             </div>
           )}
@@ -409,7 +441,15 @@ export default function App() {
 
         <div className="flex items-center gap-1.5 md:gap-2 flex-shrink-0 flex-nowrap justify-end">
           <WindowOpacitySlider />
-          {config?.models && config.models.length > 0 && (
+          {activeTab === 'exam' ? (
+            <button type="button" aria-label={`笔试模型 ${examModel?.name ?? '未配置'}`}
+              title="打开笔试配置"
+              className="inline-flex max-w-[160px] items-center gap-1.5 rounded-xl border border-bg-hover/50 px-2.5 py-1.5 text-xs text-text-primary hover:bg-bg-hover"
+              onClick={() => useInterviewStore.setState({ settingsOpen: true, settingsDrawerTab: 'mode' })}>
+              <span className="truncate">{examModel?.name ?? '配置笔试模型'}</span>
+              {examModel?.supports_vision && <VisionBadge />}
+            </button>
+          ) : config?.models && config.models.length > 0 && (
             <ModelPriorityDropdown
               config={config}
               modelHealth={modelHealth}
@@ -436,7 +476,7 @@ export default function App() {
             >
               <SlidersHorizontal className="w-3.5 h-3.5" />
               <span className="font-medium hidden sm:inline">会场</span>
-              {config?.think_mode && (
+              {(config?.assist_think_mode ?? config?.think_mode) && (
                 <span
                   className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-accent-green ring-2 ring-bg-primary shadow-[0_0_6px] shadow-accent-green/60"
                   aria-hidden
@@ -451,7 +491,7 @@ export default function App() {
             />
           </div>
 
-          {appMode === 'assist' && (
+          {activeTab === 'assist' && (
             <button
               type="button"
               onClick={toggleAssistTranscriptCollapsed}
@@ -472,7 +512,7 @@ export default function App() {
           type="button"
           onClick={toggleSettings}
           className="inline-flex items-center justify-center min-h-[32px] min-w-[32px] p-1.5 rounded-xl hover:bg-bg-tertiary/60 text-text-muted hover:text-text-primary transition-all duration-200 border border-transparent hover:border-bg-hover/40"
-          title="设置中心 (常用 / 语音 / 模型 / 外观 / 快捷操作)"
+          title="设置中心 (实时辅助 / 语音配置 / 模型配置 / 外观 / 快捷操作)"
           aria-label="打开设置"
         >
           <Settings className="w-4 h-4" />
@@ -506,22 +546,22 @@ export default function App() {
       {appMode === 'assist' && (
         <>
           {/* Mobile tab switcher */}
-          <div className="flex md:hidden border-b border-bg-tertiary flex-shrink-0">
+          {!isExamMode && <div className="flex md:hidden border-b border-bg-tertiary flex-shrink-0">
             <button onClick={() => setMobileTab('transcript')}
               className={`flex-1 py-2 text-xs font-medium text-center transition-colors ${mobileTab === 'transcript' ? 'text-accent-blue border-b-2 border-accent-blue' : 'text-text-muted'}`}>
-              {isExamMode ? '答题记录' : '实时转录'}
+              实时转录
             </button>
             <button onClick={() => setMobileTab('answer')}
               className={`flex-1 py-2 text-xs font-medium text-center transition-colors ${mobileTab === 'answer' ? 'text-accent-blue border-b-2 border-accent-blue' : 'text-text-muted'}`}>
               AI 答案
             </button>
-          </div>
+          </div>}
 
           <div
             ref={assistSplitContainerRef}
-            className="flex-1 hidden md:flex overflow-hidden min-h-0"
+            className={`flex-1 ${isExamMode ? 'flex' : 'hidden md:flex'} overflow-hidden min-h-0`}
           >
-            {!assistTranscriptCollapsed && (
+            {!isExamMode && !assistTranscriptCollapsed && (
               <>
             <div
               className="flex flex-col min-w-0 flex-shrink-0 border-r border-bg-tertiary"
@@ -583,29 +623,30 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex-1 flex md:hidden overflow-hidden min-h-0">
-            {mobileTab === 'transcript' ? <TranscriptionPanel /> : <AnswerPanel />}
-          </div>
-
-          {/* 仅手机端：由服务端截本机主屏左半幅送 VL，手机不调用系统截图 */}
-          {mobileTab === 'answer' && (
-            <div className="md:hidden flex-shrink-0 px-3 py-3 border-t border-bg-tertiary bg-bg-secondary/95 backdrop-blur-sm">
-              <button
-                type="button"
-                disabled={serverScreenLoading}
-                onClick={handleServerScreenAsk}
-                className="w-full flex items-center justify-center gap-3 min-h-[52px] py-3.5 rounded-xl bg-accent-blue text-white text-base font-semibold shadow-sm disabled:opacity-60 active:scale-[0.99] transition-transform"
-              >
-                <MonitorSmartphone className="w-5 h-5 flex-shrink-0" />
-                {serverScreenLoading ? '截图审题提交中…' : '服务端截图审题'}
-              </button>
-              <p className="text-[10px] text-text-muted text-center mt-1.5 leading-snug px-0.5">
-                在后台子进程截主屏左半幅，该请求不写访问日志以减少终端抢焦点。若仍被终端打断，可用 <code className="text-[9px] bg-bg-tertiary px-0.5 rounded">IA_ACCESS_LOG=0</code> 启动后端关闭全部 HTTP 访问日志。须配置识图模型与屏幕录制权限。
-              </p>
+          {!isExamMode && (
+            <div className="flex-1 flex md:hidden overflow-hidden min-h-0">
+              {mobileTab === 'transcript' ? <TranscriptionPanel /> : <AnswerPanel />}
             </div>
           )}
 
-          <ControlBar />
+          {/* 当前截图区域由服务端配置。 */}
+          {(isExamMode || mobileTab === 'answer') && (
+            <div className={`shrink-0 border-t border-bg-tertiary bg-bg-secondary/95 px-3 py-3 ${isExamMode ? 'md:px-5 md:py-2' : 'md:hidden'}`}>
+              <button
+                type="button"
+                disabled={serverScreenLoading || workspaceSwitching}
+                onClick={handleServerScreenAsk}
+                className="flex min-h-[42px] w-full items-center justify-center gap-2 rounded-xl bg-accent-blue px-4 py-2 text-sm font-semibold text-white disabled:opacity-50 md:w-auto"
+              >
+                <MonitorSmartphone className="w-5 h-5 flex-shrink-0" />
+                {serverScreenLoading ? '截图审题提交中…' : isExamMode ? '截图答题' : '服务端截图审题'}
+              </button>
+            </div>
+          )}
+
+          <fieldset disabled={workspaceSwitching} className="min-w-0 shrink-0">
+            <ControlBar />
+          </fieldset>
         </>
       )}
 

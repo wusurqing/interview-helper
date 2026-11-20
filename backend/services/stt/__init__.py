@@ -1,7 +1,6 @@
 """Speech-to-text package: text utilities, engine implementations, and factory."""
 
 from .text_utils import (
-    TECH_VOCAB,
     TERM_CORRECTIONS,
     INTERVIEW_TERM_CORRECTIONS,
     _postprocess,
@@ -22,19 +21,20 @@ from .text_utils import (
 )
 
 from .engines import (
-    STTEngine,
     DoubaoSTT,
     GenericHTTPSTT,
+    STTError,
 )
 
 from .factory import (
     get_stt_engine,
-    set_whisper_language,
-    transcribe_with_fallback,
+    configured_stt_routes,
+    stt_configuration_error,
+    transcribe_segment,
 )
 
 __all__ = [
-    "TECH_VOCAB", "TERM_CORRECTIONS", "INTERVIEW_TERM_CORRECTIONS", "_postprocess",
+    "TERM_CORRECTIONS", "INTERVIEW_TERM_CORRECTIONS", "_postprocess",
     "postprocess_interview_transcription",
     "transcription_significant_len",
     "transcription_for_publish",
@@ -49,10 +49,11 @@ __all__ = [
     "build_asr_question_group_text",
     "classify_followup",
     "AsrQuestionCandidate",
-    "STTEngine",
     "DoubaoSTT",
     "GenericHTTPSTT",
+    "STTError",
     "get_stt_engine",
-    "set_whisper_language",
-    "transcribe_with_fallback",
+    "configured_stt_routes",
+    "stt_configuration_error",
+    "transcribe_segment",
 ]

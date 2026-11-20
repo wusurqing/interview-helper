@@ -148,7 +148,7 @@ def test_candidate_mmpg_rejects_a_final_from_the_cleared_capture(monkeypatch):
     monkeypatch.setattr(candidate_mmpg, "_pending", {})
     monkeypatch.setattr(candidate_mmpg, "_capture_epoch", session.transcript_epoch)
     monkeypatch.setattr(candidate_mmpg, "get_session", lambda: session)
-    monkeypatch.setattr(candidate_mmpg, "get_config", lambda: cfg)
+    monkeypatch.setattr(candidate_mmpg.pipeline, "get_capture_config", lambda: cfg)
     monkeypatch.setattr(pipeline, "broadcast", lambda _payload: None)
     candidate_mmpg._on_turn("started", "old")
 
@@ -204,16 +204,16 @@ def test_native_loopback_keeps_its_speaker_when_current_enumeration_misses_it(mo
     assert pipeline._device_is_loopback(_SC_ID_BASE)
 
 
-def test_short_legacy_interviewer_speech_is_captured_below_publication_threshold(monkeypatch):
+def test_short_segment_is_captured_below_publication_threshold(monkeypatch):
     session = Session()
     current = session.record_transcript("interviewer", "解释缓存？", started_at=1, question_group="current")
     runtime = pipeline._new_interviewer_runtime()
     runtime.transcript_epoch = session.transcript_epoch
     runtime.segment_queue.put(pipeline.InterviewerSegment(None, 16000, 3, 4, 1.0, "silence", False))
     runtime.drain_event.set()
-    cfg = SimpleNamespace(position="", language="zh", transcription_min_sig_chars=2)
+    cfg = SimpleNamespace(stt_provider="doubao", position="", language="zh", transcription_min_sig_chars=2)
     monkeypatch.setattr(pipeline, "get_config", lambda: cfg)
-    monkeypatch.setattr(pipeline, "transcribe_with_fallback", lambda *_args, **_kwargs: "好。")
+    monkeypatch.setattr(pipeline, "transcribe_segment", lambda *_args, **_kwargs: "好。")
     monkeypatch.setattr(pipeline, "broadcast", lambda _payload: None)
 
     pipeline._interviewer_asr_worker(runtime, session, cfg)
@@ -228,7 +228,7 @@ def test_clear_stops_recording_and_a_new_capture_cannot_reuse_old_speech(monkeyp
     session.is_recording = True
     old_epoch = session.transcript_epoch
     old_anchor = session.record_transcript("interviewer", "旧问题？", started_at=1)
-    cfg = SimpleNamespace(written_exam_mode=True, stt_provider="whisper", assist_stop_answer_wait_sec=0)
+    cfg = SimpleNamespace(written_exam_mode=True, stt_provider="", assist_stop_answer_wait_sec=0)
     broadcasts = []
     monkeypatch.setattr(routes, "get_config", lambda: cfg)
     monkeypatch.setattr(pipeline, "get_config", lambda: cfg)
@@ -239,7 +239,7 @@ def test_clear_stops_recording_and_a_new_capture_cannot_reuse_old_speech(monkeyp
     async def clear_then_start():
         await routes.api_clear()
         assert not session.is_recording
-        assert {"type": "recording", "value": False} in broadcasts
+        assert {"type": "recording", "value": False, "candidate_capture_provider": ""} in broadcasts
         await routes.api_start({})
         assert session.is_recording
 

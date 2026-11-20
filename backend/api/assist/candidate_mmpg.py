@@ -5,7 +5,7 @@ import time
 from fastapi.concurrency import run_in_threadpool
 
 from api.realtime.ws import broadcast
-from core.config import MMPG_STT_PROVIDER, get_config
+from core.config import MMPG_STT_PROVIDER
 from core.session import conversation_lock, get_session
 from services.audio import AudioBusyError
 from services.stt.mmpg import MmpgError, MmpgManager
@@ -24,7 +24,7 @@ def enabled(cfg):
 
 
 async def prepare(mode, device_ids, _candidate_mic_id, *, single_mic_id=None):
-    cfg = get_config()
+    cfg = pipeline.get_capture_config()
     session = get_session()
     if mode not in ("start", "resume"):
         raise MmpgError("invalid_command")
@@ -46,7 +46,7 @@ async def prepare(mode, device_ids, _candidate_mic_id, *, single_mic_id=None):
 
 async def _start_capture(_mode, device_ids, _candidate_mic_id, *, single_mic_id=None):
     global _capture_epoch
-    cfg = get_config()
+    cfg = pipeline.get_capture_config()
     session = get_session()
     device_id = device_ids[0]
     if not session.is_recording or session.last_candidate_mic_device_id != device_id or not enabled(cfg):
@@ -121,7 +121,7 @@ def _on_transcript(text, trace):
     try:
         with conversation_lock:
             epoch = _capture_epoch
-            accepted = session.is_recording and session.transcript_epoch == epoch and enabled(get_config())
+            accepted = session.is_recording and session.transcript_epoch == epoch and enabled(pipeline.get_capture_config())
             qa_id, started_at = _pending.get(trace) or (session.current_candidate_qa_id, time.monotonic())
         if accepted:
             pipeline._publish_candidate_transcription(
@@ -153,7 +153,7 @@ def _broadcast_state(state):
 
 
 manager = MmpgManager(
-    lambda: get_config().mmpg, _on_transcript, on_turn=_on_turn,
+    lambda: pipeline.get_capture_config().mmpg, _on_transcript, on_turn=_on_turn,
     on_state=_broadcast_state,
     on_capture_start=_start_capture, on_capture_stop=_stop_capture,
 )

@@ -15,20 +15,26 @@ exam_test = importlib.import_module("api.assist.exam_test")
 pipeline = importlib.import_module("api.assist.pipeline")
 
 
-def test_select_exam_preflight_model_requires_vision(monkeypatch: pytest.MonkeyPatch):
+def test_select_exam_preflight_requires_its_own_vision_model_even_from_interview():
     cfg = SimpleNamespace(
         active_model=0,
+        written_exam_mode=False,
+        written_exam_model_ids=["text", "exam"],
+        assist_screenshot_model_id="screenshot",
         models=[
-            SimpleNamespace(name="text", enabled=True, supports_vision=False, api_key="sk"),
-            SimpleNamespace(name="vision", enabled=True, supports_vision=True, api_key="sk"),
+            SimpleNamespace(id="screenshot", name="interview screenshot", enabled=True, supports_vision=True, api_key="sk"),
+            SimpleNamespace(id="exam", name="exam vision", enabled=True, supports_vision=True, api_key="sk"),
+            SimpleNamespace(id="text", name="text only", enabled=True, supports_vision=False, api_key="sk"),
         ],
     )
-    monkeypatch.setattr(exam_test, "get_model_health", lambda idx: None)
 
     idx, model = exam_test.select_exam_preflight_model(cfg)
 
     assert idx == 1
-    assert model.name == "vision"
+    assert model.name == "exam vision"
+    model.supports_vision = False
+    with pytest.raises(RuntimeError, match="笔试配置"):
+        exam_test.select_exam_preflight_model(cfg)
 
 
 def test_exam_preflight_task_uses_real_server_screen_worker_shape():
@@ -56,17 +62,17 @@ def test_run_exam_preflight_broadcasts_steps_and_status(monkeypatch: pytest.Monk
     events: list[dict] = []
     cfg = SimpleNamespace(
         active_model=0,
-        models=[SimpleNamespace(name="vision", enabled=True, supports_vision=True, api_key="sk")],
+        written_exam_model_ids=["vision"],
+        models=[SimpleNamespace(id="vision", name="vision", enabled=True, supports_vision=True, api_key="sk")],
     )
     monkeypatch.setattr(exam_test, "broadcast", lambda data: events.append(data))
     monkeypatch.setattr(exam_test, "get_config", lambda: cfg)
     monkeypatch.setattr(exam_test, "build_fixed_code_question_image_data_url", lambda: "data:image/png;base64,fake")
-    monkeypatch.setattr(exam_test, "get_model_health", lambda idx: None)
-    monkeypatch.setattr(pipeline, "pick_model_index", lambda task, busy: 0)
 
     submitted: list[tuple] = []
 
-    def fake_submit(task):
+    def fake_submit(task, *, config_snapshot):
+        assert config_snapshot is cfg
         submitted.append(task)
         return True
 
@@ -97,6 +103,12 @@ def test_run_exam_preflight_broadcasts_steps_and_status(monkeypatch: pytest.Monk
     assert status["steps"]["ws"]["status"] == "running"
 
     exam_test.record_exam_preflight_answer_event({
+        "type": "answer_retry", "id": "qa-preflight",
+        "exam_preflight_id": preflight_id, "model_name": "备用识图",
+    })
+    assert exam_test.get_exam_preflight_status()["model_name"] == "备用识图"
+
+    exam_test.record_exam_preflight_answer_event({
         "type": "answer_chunk",
         "id": "qa-preflight",
         "exam_preflight_id": preflight_id,
@@ -111,7 +123,7 @@ def test_run_exam_preflight_broadcasts_steps_and_status(monkeypatch: pytest.Monk
         "id": "qa-preflight",
         "exam_preflight_id": preflight_id,
         "answer": "```python\ndef two_sum(nums, target):\n    return []\n```",
-        "model_name": "vision",
+        "model_name": "备用识图",
         "first_token_ms": 100,
         "total_ms": 500,
     })
@@ -119,6 +131,8 @@ def test_run_exam_preflight_broadcasts_steps_and_status(monkeypatch: pytest.Monk
     status = exam_test.get_exam_preflight_status()
     assert status["running"] is False
     assert status["qa_id"] == "qa-preflight"
+    assert status["model_name"] == "备用识图"
+    assert status["steps"]["llm"]["model_name"] == "备用识图"
     assert status["steps"]["submit"]["status"] == "pass"
     assert status["steps"]["llm"]["status"] == "pass"
     assert status["steps"]["ws"]["status"] == "pass"
@@ -138,15 +152,14 @@ def test_run_exam_preflight_broadcasts_steps_and_status(monkeypatch: pytest.Monk
 def test_run_exam_preflight_keeps_pass_status_when_worker_returns_fast(monkeypatch: pytest.MonkeyPatch):
     cfg = SimpleNamespace(
         active_model=0,
-        models=[SimpleNamespace(name="vision", enabled=True, supports_vision=True, api_key="sk")],
+        written_exam_model_ids=["vision"],
+        models=[SimpleNamespace(id="vision", name="vision", enabled=True, supports_vision=True, api_key="sk")],
     )
     monkeypatch.setattr(exam_test, "broadcast", lambda data: None)
     monkeypatch.setattr(exam_test, "get_config", lambda: cfg)
     monkeypatch.setattr(exam_test, "build_fixed_code_question_image_data_url", lambda: "data:image/png;base64,fake")
-    monkeypatch.setattr(exam_test, "get_model_health", lambda idx: None)
-    monkeypatch.setattr(pipeline, "pick_model_index", lambda task, busy: 0)
-
-    def fake_submit(task):
+    def fake_submit(task, *, config_snapshot):
+        assert config_snapshot is cfg
         preflight_id = task[4]["exam_preflight_id"]
         exam_test.record_exam_preflight_answer_event({
             "type": "answer_start",
@@ -177,6 +190,31 @@ def test_run_exam_preflight_keeps_pass_status_when_worker_returns_fast(monkeypat
     assert status["steps"]["ws"]["status"] == "pass"
     assert status["steps"]["ui"]["status"] == "pass"
     assert status["steps"]["done"]["status"] == "done"
+
+
+def test_synchronously_failed_exam_preflight_does_not_publish_new_progress(monkeypatch):
+    cfg = SimpleNamespace(
+        written_exam_model_ids=["exam"],
+        models=[SimpleNamespace(id="exam", name="exam", enabled=True, supports_vision=True, api_key="sk")],
+    )
+    events = []
+    monkeypatch.setattr(exam_test, "get_config", lambda: cfg)
+    monkeypatch.setattr(exam_test, "broadcast", events.append)
+    monkeypatch.setattr(exam_test, "build_fixed_code_question_image_data_url", lambda: "data:image/png;base64,fake")
+
+    def fail_at_dispatch(task, **_kwargs):
+        exam_test.record_exam_preflight_answer_event({
+            "type": "answer_error", "exam_preflight_id": task[4]["exam_preflight_id"], "message": "主模型已变更",
+        })
+        return True
+
+    monkeypatch.setattr(pipeline, "submit_answer_task", fail_at_dispatch)
+    exam_test._run_exam_preflight("dispatched-failure")
+
+    status = exam_test.get_exam_preflight_status()
+    assert status["running"] is False and status["error"] == "主模型已变更"
+    assert "llm" not in status["steps"]
+    assert events[-1]["step"] == "error"
 
 
 def test_exam_preflight_timeout_unlocks_retry_and_ignores_late_worker_events(
