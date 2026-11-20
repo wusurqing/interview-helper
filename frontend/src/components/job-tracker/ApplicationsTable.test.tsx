@@ -177,4 +177,64 @@ describe('ApplicationsTable', () => {
 
     expect(openReviews).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }))
   })
+
+  it('edits and saves new duplicate-title todos even when crypto.randomUUID is unavailable', async () => {
+    const onPatch = vi.fn().mockResolvedValue(true)
+    const originalCrypto = globalThis.crypto
+    let counter = 0
+    Object.defineProperty(globalThis, 'crypto', {
+      configurable: true,
+      value: {
+        getRandomValues: (arr: Uint8Array) => {
+          counter += 1
+          for (let i = 0; i < arr.length; i += 1) arr[i] = (i * 37 + counter * 13) & 0xff
+          return arr
+        },
+      },
+    })
+
+    try {
+      render(
+        <ApplicationsTable
+          applications={[
+            app({
+              todos: [{ id: 'existing-1', title: '跟进 HR', done: true }],
+            }),
+          ]}
+          offerByAppId={new Map()}
+          onPatch={onPatch}
+          onDelete={vi.fn()}
+          onOpenOffer={vi.fn()}
+          onOpenReviews={vi.fn()}
+          search=""
+          selectedId={1}
+          onSelect={vi.fn()}
+          compactDetailLayout={false}
+        />,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /补充信息/ }))
+      fireEvent.change(screen.getByLabelText('待办清单'), {
+        target: { value: '跟进 HR\n跟进 HR\n准备二面' },
+      })
+
+      await act(async () => {
+        fireEvent.click(screen.getAllByRole('button', { name: '保存补充信息' })[0])
+      })
+
+      expect(onPatch).toHaveBeenCalledTimes(1)
+      const [, patchPayload] = onPatch.mock.calls[0]
+      expect(patchPayload.todos).toHaveLength(3)
+      expect(patchPayload.todos[0]).toMatchObject({ id: 'existing-1', title: '跟进 HR', done: true })
+      expect(patchPayload.todos[1].id).toBeTruthy()
+      expect(patchPayload.todos[1].id).not.toBe('existing-1')
+      expect(patchPayload.todos[2].id).toBeTruthy()
+      expect(patchPayload.todos[2].id).not.toBe(patchPayload.todos[1].id)
+    } finally {
+      Object.defineProperty(globalThis, 'crypto', {
+        configurable: true,
+        value: originalCrypto,
+      })
+    }
+  })
 })

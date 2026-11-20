@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import type { Application, ApplicationReviewSummary, Offer, Stage, TodoItem } from './types'
 import { filterApplicationsBySearch } from './search'
+import { todosFromText, withMaterializedTodoIds } from './todoDraft'
 import {
   getStageOrderIndex,
   isRejectedStage,
@@ -81,24 +82,6 @@ function createDraft(app: Application): EditorDraft {
     notes: app.notes,
     todoText: app.todos.map((todo) => todo.title).join('\n'),
   }
-}
-
-function todosFromText(text: string, currentTodos: TodoItem[]): TodoItem[] {
-  const lines = text
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-  const existingByTitle = new Map(currentTodos.map((todo) => [todo.title, todo]))
-  return lines.map((title, index) => {
-    const indexed = currentTodos[index]
-    const matched = indexed?.title === title ? indexed : existingByTitle.get(title)
-    return {
-      id: matched?.id ?? crypto.randomUUID(),
-      title,
-      done: matched?.done ?? false,
-      due: matched?.due,
-    }
-  })
 }
 
 function serializeTodos(todos: TodoItem[]): string {
@@ -396,7 +379,7 @@ export default function ApplicationsTable({
     savingRef.current = true
     setSaving(true)
     try {
-      const result = await Promise.resolve(onPatch(current.id, scopedPatch))
+      const result = await Promise.resolve(onPatch(current.id, withMaterializedTodoIds(scopedPatch)))
       if (result !== false) {
         setSaveNotice({
           message: scope === 'core' ? '已保存核心信息' : scope === 'extras' ? '已保存补充信息' : '已保存',
