@@ -1,6 +1,8 @@
 """KB HTTP API 集成测试 (用 minimal FastAPI app 挂载 router, 避开 main lifespan)。"""
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -174,3 +176,109 @@ def test_delete_doc_rejects_traversal(app_client):
 def test_delete_doc_rejects_empty_path(app_client):
     r = app_client.request("DELETE", "/api/kb/docs", params={"path": ""})
     assert r.status_code == 400
+
+
+def _make_dir_link(link: Path, target: Path) -> None:
+    """创建指向 target 的目录链接；Windows 无符号链接权限时退化为 junction。"""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError):
+        pass
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+        return
+    pytest.skip("cannot create directory link on this platform")
+
+
+@pytest.mark.parametrize(
+    ("subdir", "filename"),
+    [
+        ("C:evil", "a.md"),
+        ("D:foo/bar", "a.md"),
+        ("", "C:evil.md"),
+        ("sub", "C:evil.md"),
+        ("", "a.md:stream"),
+        ("sub\x00dir", "a.md"),
+        ("a/./b", "a.md"),
+    ],
+)
+def test_upload_rejects_drive_relative_unc_and_control_paths(app_client, subdir, filename):
+    from core.config import get_config
+
+    kb_dir = Path(get_config().kb_dir)
+    before = sorted(p.relative_to(kb_dir) for p in kb_dir.rglob("*"))
+    r = app_client.post(
+        "/api/kb/upload",
+        data={"subdir": subdir},
+        files={"file": (filename, b"# owned", "text/markdown")},
+    )
+    assert r.status_code == 400, r.text
+    after = sorted(p.relative_to(kb_dir) for p in kb_dir.rglob("*"))
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "C:target.txt",
+        "D:foo/bar.md",
+        "C:\\Windows\\win.ini",
+        "\\\\server\\share\\x.md",
+        "//server/share/x.md",
+        "/etc/passwd",
+        "\\rooted.md",
+        "redis.md:stream",
+        "sub/../../x.md",
+        "a\x00.md",
+    ],
+)
+def test_delete_doc_rejects_drive_relative_and_absolute_paths(app_client, path):
+    r = app_client.request("DELETE", "/api/kb/docs", params={"path": path})
+    assert r.status_code == 400, r.text
+
+
+def test_delete_doc_accepts_backslash_subdir_and_normalizes(app_client):
+    from core.config import get_config
+
+    r = app_client.post(
+        "/api/kb/upload",
+        data={"subdir": "notes"},
+        files={"file": ("x.md", b"# x\n\nbody\n", "text/markdown")},
+    )
+    assert r.status_code == 200
+    assert r.json()["path"] == "notes/x.md"
+    target = Path(get_config().kb_dir) / "notes" / "x.md"
+    assert target.exists()
+
+    r = app_client.request("DELETE", "/api/kb/docs", params={"path": "notes\\x.md"})
+    assert r.status_code == 200
+    assert r.json()["path"] == "notes/x.md"
+    assert not target.exists()
+    docs = app_client.get("/api/kb/docs").json()["items"]
+    assert not any(d["path"] == "notes/x.md" for d in docs)
+
+
+def test_upload_and_delete_reject_symlink_escape(app_client, tmp_path):
+    from core.config import get_config
+
+    kb_dir = Path(get_config().kb_dir)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.md"
+    victim.write_text("keep me", encoding="utf-8")
+    _make_dir_link(kb_dir / "link", outside)
+
+    r = app_client.post(
+        "/api/kb/upload",
+        data={"subdir": "link"},
+        files={"file": ("victim.md", b"# overwritten", "text/markdown")},
+    )
+    assert r.status_code == 400, r.text
+    assert victim.read_text(encoding="utf-8") == "keep me"
+
+    r = app_client.request("DELETE", "/api/kb/docs", params={"path": "link/victim.md"})
+    assert r.status_code == 400, r.text
+    assert victim.exists()

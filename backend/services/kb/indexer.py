@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import threading
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Optional
 
 from core.config import get_config
@@ -29,6 +29,43 @@ def resolve_path(path_str: str) -> Path:
     if p.is_absolute():
         return p
     return Path(backend_root()) / p
+
+
+def validate_rel_path(rel_path: str) -> str:
+    """校验 KB 内相对路径并返回以 ``/`` 分隔的规范形式；非法时抛 ``ValueError``。
+
+    拒绝：空串、控制字符、任何 ``:``（Windows 驱动器相对路径 ``C:evil``、
+    NTFS 备用数据流 ``a.md:ads``）、带 drive/root 的路径（含 UNC 与以
+    ``/``/``\\`` 开头）、``..``/``.``/空分段。
+    """
+    s = rel_path or ""
+    if not s.strip():
+        raise ValueError("path required")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in s):
+        raise ValueError("path must not contain control characters")
+    if ":" in s:
+        raise ValueError("path must not contain ':'")
+    win = PureWindowsPath(s)
+    if win.drive or win.root or PurePosixPath(s).root:
+        raise ValueError("absolute path not allowed")
+    parts = s.replace("\\", "/").split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise ValueError("path traversal detected")
+    return "/".join(parts)
+
+
+def resolve_kb_file(rel_path: str) -> Path:
+    """把 KB 相对路径解析为 kb_dir 内的绝对路径；越界（含符号链接逃逸）抛 ``ValueError``。
+
+    返回值为 ``<resolved kb_dir>/<rel>``（不跟随末级符号链接），调用方可直接写入或删除。
+    """
+    norm = validate_rel_path(rel_path)
+    root = resolve_path(get_config().kb_dir).resolve()
+    full = root / norm
+    resolved = full.resolve()
+    if resolved == root or not resolved.is_relative_to(root):
+        raise ValueError("path escapes kb_dir")
+    return full
 
 
 def _resolved_db_path() -> str:
@@ -147,22 +184,25 @@ def reindex() -> dict[str, Any]:
 
 def reindex_file(rel_path: str) -> dict[str, Any]:
     """按相对路径重建单文件索引；文件不存在时删除记录。"""
-    cfg = get_config()
-    path = resolve_path(cfg.kb_dir) / rel_path
+    path = resolve_kb_file(rel_path)
     store = _get_store()
     if not path.exists():
-        store.delete_doc(rel_path)
+        store.delete_doc(validate_rel_path(rel_path))
         return store.stats()
     return reindex()
 
 
 def remove_file(rel_path: str) -> None:
-    """删除索引 + 磁盘文件。失败不抛。"""
-    store = _get_store()
-    store.delete_doc(rel_path)
-    full = resolve_path(get_config().kb_dir) / rel_path
+    """删除索引 + 磁盘文件。非法路径（越出 kb_dir）直接拒绝、不做任何删除；其余失败不抛。"""
     try:
-        if full.exists():
+        full = resolve_kb_file(rel_path)
+    except ValueError as e:
+        _log.warning("kb indexer remove_file 拒绝非法路径 %r: %s", rel_path, e)
+        return
+    store = _get_store()
+    store.delete_doc(validate_rel_path(rel_path))
+    try:
+        if full.is_file() or full.is_symlink():
             full.unlink()
     except Exception as e:  # pragma: no cover
         _log.warning("kb indexer remove_file 删除磁盘文件失败 %s: %s", rel_path, e)
@@ -176,4 +216,6 @@ __all__ = [
     "reindex_file",
     "remove_file",
     "resolve_path",
+    "resolve_kb_file",
+    "validate_rel_path",
 ]

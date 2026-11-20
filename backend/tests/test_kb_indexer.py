@@ -103,6 +103,110 @@ def test_unknown_extension_silently_skipped(setup_kb):
     assert info["total_docs"] == 1  # weird.xyz 不应进库
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("a.md", "a.md"),
+        ("sub/a.md", "sub/a.md"),
+        ("sub\\deep\\a.md", "sub/deep/a.md"),
+    ],
+)
+def test_validate_rel_path_accepts_and_normalizes(setup_kb, raw, expected):
+    indexer, _, _ = setup_kb
+    assert indexer.validate_rel_path(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "   ",
+        "C:evil.md",
+        "C:evil/a.md",
+        "D:foo/bar.md",
+        "C:\\abs.md",
+        "\\\\server\\share\\a.md",
+        "//server/share/a.md",
+        "/etc/passwd",
+        "\\rooted.md",
+        "a.md:ads",
+        "../x.md",
+        "sub/../../x.md",
+        "sub/./a.md",
+        "sub//a.md",
+        "sub/",
+        "a\x00.md",
+        "a\x1f.md",
+        "a\x7f.md",
+    ],
+)
+def test_validate_rel_path_rejects_escape_vectors(setup_kb, raw):
+    indexer, _, _ = setup_kb
+    with pytest.raises(ValueError):
+        indexer.validate_rel_path(raw)
+    with pytest.raises(ValueError):
+        indexer.resolve_kb_file(raw)
+
+
+def test_resolve_kb_file_stays_inside_kb_dir(setup_kb):
+    indexer, kb_dir, _ = setup_kb
+    full = indexer.resolve_kb_file("sub/a.md")
+    assert full == kb_dir.resolve() / "sub" / "a.md"
+
+
+def _make_dir_link(link: Path, target: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=True)
+        return
+    except (OSError, NotImplementedError):
+        pass
+    if sys.platform == "win32":
+        import _winapi
+
+        _winapi.CreateJunction(str(target), str(link))
+        return
+    pytest.skip("cannot create directory link on this platform")
+
+
+def test_remove_file_refuses_symlink_escape(setup_kb, tmp_path):
+    indexer, kb_dir, _ = setup_kb
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "victim.md"
+    victim.write_text("keep", encoding="utf-8")
+    _make_dir_link(kb_dir / "link", outside)
+
+    with pytest.raises(ValueError):
+        indexer.resolve_kb_file("link/victim.md")
+    indexer.remove_file("link/victim.md")  # 不抛、也不删除
+    assert victim.exists()
+
+
+def test_remove_file_refuses_absolute_path(setup_kb, tmp_path):
+    indexer, _, _ = setup_kb
+    victim = tmp_path / "victim.md"
+    victim.write_text("keep", encoding="utf-8")
+    indexer.remove_file(str(victim))
+    assert victim.exists()
+
+
+def test_remove_file_deletes_in_kb_file_and_index(setup_kb):
+    indexer, kb_dir, _ = setup_kb
+    (kb_dir / "sub").mkdir()
+    (kb_dir / "sub" / "a.md").write_text("# A\n\nt", encoding="utf-8")
+    indexer.reindex()
+    assert any(d["path"] == "sub/a.md" for d in indexer.list_docs())
+    indexer.remove_file("sub\\a.md")
+    assert not (kb_dir / "sub" / "a.md").exists()
+    assert indexer.list_docs() == []
+
+
+def test_reindex_file_rejects_escape(setup_kb):
+    indexer, _, _ = setup_kb
+    with pytest.raises(ValueError):
+        indexer.reindex_file("C:evil.md")
+
+
 def test_cli_list_outputs_indexed_docs(setup_kb, capsys):
     indexer, kb_dir, _ = setup_kb
     (kb_dir / "a.md").write_text("# A\n\nt", encoding="utf-8")

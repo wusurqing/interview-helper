@@ -113,7 +113,7 @@ async def kb_hits_recent(limit: int = 50) -> dict:
 
 
 def _safe_rel_path(subdir: str, filename: str, allowed_exts: set[str]) -> Path:
-    """阻断 path traversal、绝对路径、不允许的扩展名 (.doc 单独 415)。"""
+    """阻断 path traversal、绝对路径、Windows 驱动器相对路径、不允许的扩展名 (.doc 单独 415)。"""
     name = (filename or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="filename required")
@@ -121,14 +121,12 @@ def _safe_rel_path(subdir: str, filename: str, allowed_exts: set[str]) -> Path:
         raise HTTPException(status_code=400, detail="filename must not contain path separators")
 
     sub = (subdir or "").strip().strip("/").strip("\\")
-    if sub:
-        if any(p in ("..", "") for p in Path(sub).parts) or Path(sub).is_absolute():
-            raise HTTPException(status_code=400, detail="path traversal detected")
-        rel = Path(sub) / name
-    else:
-        rel = Path(name)
-
-    if any(p in ("..", "") for p in rel.parts) or rel.is_absolute():
+    raw = f"{sub}/{name}" if sub else name
+    try:
+        rel = Path(indexer.validate_rel_path(raw))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid path: {e}") from e
+    if rel.drive or rel.is_absolute():  # 纵深防御：validate_rel_path 已拒绝
         raise HTTPException(status_code=400, detail="path traversal detected")
 
     ext = rel.suffix.lower()
@@ -156,12 +154,14 @@ async def kb_upload(
     if len(content) > max_bytes:
         raise HTTPException(status_code=413, detail=f"文件超过限额 {max_bytes} bytes")
 
-    kb_dir = Path(indexer.resolve_path(getattr(cfg, "kb_dir", "data/kb")))
-    dest = kb_dir / rel
+    rel_str = rel.as_posix()
+    try:
+        dest = indexer.resolve_kb_file(rel_str)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid path: {e}") from e
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(content)
 
-    rel_str = str(rel).replace("\\", "/")
     info = await _run_kb_low_priority(indexer.reindex_file, rel_str)
     return {
         "path": rel_str,
@@ -185,7 +185,10 @@ async def kb_delete_doc(path: str) -> dict:
     p = (path or "").strip()
     if not p:
         raise HTTPException(status_code=400, detail="path required")
-    if Path(p).is_absolute() or any(part in ("..",) for part in Path(p).parts):
-        raise HTTPException(status_code=400, detail="invalid path")
-    await _run_kb_low_priority(indexer.remove_file, p)
-    return {"ok": True, "path": p}
+    try:
+        rel = indexer.validate_rel_path(p)
+        indexer.resolve_kb_file(rel)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"invalid path: {e}") from e
+    await _run_kb_low_priority(indexer.remove_file, rel)
+    return {"ok": True, "path": rel}
