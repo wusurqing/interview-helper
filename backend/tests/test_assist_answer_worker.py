@@ -1803,3 +1803,184 @@ def test_exam_preflight_worker_events_do_not_pollute_session(monkeypatch: pytest
     session = get_session()
     assert session.qa_pairs == []
     assert session.conversation_history == []
+
+
+def test_cancel_during_kb_wait_preserves_newer_candidate_window_and_suppresses_ghost_start(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from services.kb import retriever as kb_retriever
+    from services.kb.types import KBHit
+
+    cfg = _cfg()
+    cfg.kb_enabled = True
+    cfg.kb_trigger_modes = ["manual_text"]
+    cfg.candidate_asr_enabled = True
+    monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
+
+    session = get_session()
+    session.add_qa("上一题", "上一答", qa_id="qa-prev")
+    session.open_candidate_answer_window("qa-prev")
+
+    aborted = {"flag": False}
+    broadcasts: list[dict] = []
+    skipped: list[int] = []
+
+    def fake_retrieve(*_args, **_kwargs):
+        # Simulate newer question opening its own window and cancelling this older worker during KB retrieve.
+        session.open_candidate_answer_window("qa-newer")
+        aborted["flag"] = True
+        return [KBHit(path="doc.md", section_path="H1", text="hit", score=0.9)]
+
+    monkeypatch.setattr(kb_retriever, "retrieve", fake_retrieve)
+    monkeypatch.setattr(
+        answer_worker,
+        "chat_stream_single_model",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("cancelled worker must not stream")),
+    )
+
+    answer_worker.process_question_parallel(
+        ("旧题问题？", None, True, "manual_text", {"origin": "manual"}),
+        seq=3,
+        model_idx=0,
+        sess_v=0,
+        deps=_deps(
+            broadcasts=broadcasts,
+            skipped=skipped,
+            abort_check=lambda: aborted["flag"],
+        ),
+    )
+
+    assert broadcasts == []
+    assert skipped == [3]
+    assert session.current_candidate_qa_id == "qa-newer"
+
+
+def test_cancelled_mmpg_request_does_not_broadcast_kb_hits(monkeypatch: pytest.MonkeyPatch):
+    from api.assist.mmpg_turns import MmpgRequest
+    from services.kb import retriever as kb_retriever
+    from services.kb.types import KBHit
+
+    cfg = _cfg()
+    cfg.kb_enabled = True
+    cfg.kb_trigger_modes = ["asr_realtime"]
+    monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
+    request = MmpgRequest("g1", 1, "Redis 缓存怎么防击穿？", ("t1",), 0.0, None)
+
+    broadcasts: list[dict] = []
+    skipped: list[int] = []
+
+    monkeypatch.setattr(
+        kb_retriever,
+        "retrieve",
+        lambda *_a, **_kw: [KBHit(path="redis.md", section_path="缓存", text="互斥锁防击穿", score=0.9)],
+    )
+
+    def intercept_broadcast(msg: dict) -> None:
+        broadcasts.append(msg)
+        # Cancel the MMPG request right as answer_start is sent, before kb_hits runs.
+        if msg["type"] == "answer_start":
+            request.cancel()
+
+    monkeypatch.setattr(
+        answer_worker,
+        "chat_stream_single_model",
+        lambda *_a, **_kw: iter(()),
+    )
+
+    base_deps = _deps(broadcasts=broadcasts, skipped=skipped, abort_check=lambda: request.cancelled)
+    answer_worker.process_question_parallel(
+        ("Redis 缓存怎么防击穿？", None, False, "conversation_loopback", {"origin": "mmpg", "mmpg_request": request}),
+        seq=4,
+        model_idx=0,
+        sess_v=0,
+        deps=answer_worker.AnswerWorkerDeps(
+            **{
+                **base_deps.__dict__,
+                "broadcast": intercept_broadcast,
+            }
+        ),
+    )
+
+    assert [event["type"] for event in broadcasts] == ["answer_start"]
+    assert skipped == [4]
+
+
+def test_commit_rolls_back_atomically_at_max_history_and_max_qa_pairs_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from api.assist.mmpg_turns import MmpgRequest
+
+    session = get_session()
+    # Fill both conversation_history (MAX_HISTORY=20) and qa_pairs (MAX_QA_PAIRS=80) to exact capacity.
+    session.conversation_history = [
+        {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg-{i}"}
+        for i in range(session.MAX_HISTORY)
+    ]
+    for i in range(session.MAX_QA_PAIRS):
+        session.add_qa(f"q-{i}", f"a-{i}", qa_id=f"qa-existing-{i}")
+    expected_history = list(session.conversation_history)
+    expected_qa_ids = [qa.id for qa in session.qa_pairs]
+
+    def fail_add_qa(*_args, **_kwargs):
+        raise RuntimeError("qa persistence failed")
+
+    monkeypatch.setattr(session, "add_qa", fail_add_qa)
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", lambda *_a, **_kw: iter([("text", "新答案")]))
+
+    request = MmpgRequest("g-cap", 1, "溢出边界问题？", ("t-cap",), 0.0, None)
+    broadcasts: list[dict] = []
+
+    answer_worker.process_question_parallel(
+        ("溢出边界问题？", None, True, "manual_text", {"origin": "manual", "mmpg_request": request}),
+        seq=6,
+        model_idx=0,
+        sess_v=0,
+        deps=_deps(broadcasts=broadcasts),
+    )
+
+    assert session.conversation_history == expected_history
+    assert [qa.id for qa in session.qa_pairs] == expected_qa_ids
+    assert request.completed_qa_id is None
+    assert not any(event["type"] == "answer_done" for event in broadcasts)
+    err = next(event for event in broadcasts if event["type"] == "answer_error")
+    assert err["stage"] == "persistence"
+
+
+def test_commit_post_answer_done_side_effect_failure_does_not_rollback_or_emit_error(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    broadcasts: list[dict] = []
+
+    def flaky_broadcast(msg: dict) -> None:
+        if msg["type"] == "token_update":
+            raise RuntimeError("ws token_update failed")
+        broadcasts.append(msg)
+
+    def fail_knowledge(*_args, **_kwargs):
+        raise RuntimeError("knowledge worker failed")
+
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", lambda *_a, **_kw: iter([("text", "已提交答案")]))
+    base_deps = _deps(broadcasts=broadcasts)
+    deps = answer_worker.AnswerWorkerDeps(
+        **{
+            **base_deps.__dict__,
+            "broadcast": flaky_broadcast,
+            "submit_knowledge_record": fail_knowledge,
+        }
+    )
+
+    answer_worker.process_question_parallel(
+        ("后置失败问题？", None, True, "manual_text", {"origin": "manual"}),
+        seq=7,
+        model_idx=0,
+        sess_v=0,
+        deps=deps,
+    )
+
+    session = get_session()
+    assert len(session.qa_pairs) == 1
+    assert session.qa_pairs[0].answer == "已提交答案"
+    assert len(session.conversation_history) == 2
+    event_types = [event["type"] for event in broadcasts]
+    assert "answer_done" in event_types
+    assert "answer_error" not in event_types

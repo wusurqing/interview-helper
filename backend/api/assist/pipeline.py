@@ -2369,7 +2369,7 @@ def _process_question_parallel(
             broadcast=broadcast,
             logger=_ilog,
             error_logger=_elog,
-            start_abort_check=aborted if request is not None else session_stale,
+            start_abort_check=aborted,
             model_cfg_snapshot=model_cfg_snapshot,
             config_snapshot=config_snapshot,
             resolve_exam_model=resolve_exam_model if routing is not None and routing.written_exam else None,

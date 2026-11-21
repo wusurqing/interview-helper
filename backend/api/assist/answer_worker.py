@@ -622,11 +622,18 @@ def _history_context_options(prompt_mode: PromptMode) -> dict[str, Any]:
     }
 
 
-def _wait_for_candidate_context_if_pending(session_ref, qa_id: str, wait_ms: int) -> None:
+def _wait_for_candidate_context_if_pending(
+    session_ref,
+    qa_id: str,
+    wait_ms: int,
+    abort_check: Optional[Callable[[], bool]] = None,
+) -> None:
     if wait_ms <= 0 or not qa_id:
         return
     deadline = time.monotonic() + (wait_ms / 1000.0)
     while time.monotonic() < deadline:
+        if abort_check is not None and abort_check():
+            return
         if not getattr(session_ref, "has_candidate_asr_pending_for_qa", lambda *_args, **_kwargs: False)(qa_id):
             return
         time.sleep(0.025)
@@ -720,7 +727,7 @@ def process_question_parallel(
         return
     if model_cfg is None:
         model_cfg = cfg.models[model_idx]
-    if deps.start_abort_check is not None and deps.start_abort_check():
+    if (deps.start_abort_check is not None and deps.start_abort_check()) or deps.abort_check():
         deps.mark_seq_skipped(seq)
         return
     if deps.resolve_exam_model is not None:
@@ -779,6 +786,10 @@ def process_question_parallel(
             kb_hits = []
             kb_degraded = True
 
+    if deps.abort_check():
+        deps.mark_seq_skipped(seq)
+        return
+
     images = _normalize_task_images(image)
     realtime_voice = prompt_mode == PROMPT_MODE_ASR_REALTIME and not images
     transcript_anchor = meta.get("transcript_anchor")
@@ -816,6 +827,7 @@ def process_question_parallel(
             history_stats = dict(getattr(session_ref, "last_llm_history_stats", {}) or {})
             written_followup_context = ""
         last_qa = session_ref.get_last_qa()
+        prior_candidate_qa_id = getattr(session_ref, "current_candidate_qa_id", "") or ""
         candidate_context_enabled, candidate_wait_ms, candidate_max_chars, candidate_min_chars = _candidate_context_settings(cfg)
         candidate_source_ok = _supports_candidate_context_source(source, meta)
         should_use_candidate_context = bool(
@@ -834,7 +846,18 @@ def process_question_parallel(
         )
 
     if should_use_candidate_context and last_qa:
-        _wait_for_candidate_context_if_pending(session_ref, last_qa.id, candidate_wait_ms)
+        try:
+            _wait_for_candidate_context_if_pending(
+                session_ref,
+                last_qa.id,
+                candidate_wait_ms,
+                abort_check=deps.abort_check,
+            )
+        except TypeError:
+            _wait_for_candidate_context_if_pending(session_ref, last_qa.id, candidate_wait_ms)
+        if deps.abort_check():
+            deps.mark_seq_skipped(seq)
+            return
         with conversation_lock:
             actual_spoken_answer = session_ref.get_candidate_answer_for_qa(
                 last_qa.id,
@@ -920,8 +943,15 @@ def process_question_parallel(
         else:
             user_for_llm = f"{written_followup_context}\n\n[当前题面]\n{question_text}"
 
+    aborted_before_start = False
     with conversation_lock:
-        session_ref.close_candidate_answer_window()
+        if deps.abort_check():
+            aborted_before_start = True
+        elif prior_candidate_qa_id and session_ref.current_candidate_qa_id == prior_candidate_qa_id:
+            session_ref.close_candidate_answer_window()
+    if aborted_before_start:
+        deps.mark_seq_skipped(seq)
+        return
 
     system_prompt = build_system_prompt(
         manual_input=manual_input,
@@ -989,6 +1019,10 @@ def process_question_parallel(
             customized_prompt,
         )
 
+    if deps.abort_check():
+        deps.mark_seq_skipped(seq)
+        return
+
     if len(images) > 1:
         display_question = f"{question_text} [📷 多图 x{len(images)}]"
     else:
@@ -1025,11 +1059,11 @@ def process_question_parallel(
             if not deps.abort_check():
                 get_session().open_candidate_answer_window(qa_id)
 
-    if kb_hits or kb_degraded:
+    if (kb_hits or kb_degraded) and not deps.abort_check():
         try:
             from services.kb.ws import build_kb_hits_payload as _kb_payload
 
-            deps.broadcast(
+            _broadcast(
                 _kb_payload(
                     qa_id=qa_id,
                     hits=kb_hits,
@@ -1278,29 +1312,60 @@ def process_question_parallel(
                 }
             )
             return
-        pre_user_len = len(session.conversation_history)
-        pre_qa_len = len(session.qa_pairs)
+        user_msg_content = f"{question_text} [图片已省略 x{len(images)}]" if images else question_text
+        stale_before_commit = False
         try:
             with conversation_lock:
-                if images:
-                    suffix = f" [图片已省略 x{len(images)}]"
-                    session.add_user_message(question_text + suffix)
+                if not deps.is_session_current(sess_v) or (mmpg_request and mmpg_request.cancelled):
+                    stale_before_commit = True
                 else:
-                    session.add_user_message(question_text)
-                session.add_assistant_message(full_answer)
-                session.add_qa(
-                    display_question,
-                    full_answer,
-                    qa_id=qa_id,
-                    source=source,
-                    model_name=model_cfg.name,
-                    written_exam=written_exam,
-                    **({"answer_format": "plain_text", "first_token_ms": int(first_token_ms),
-                        "total_ms": int(gen_elapsed)} if plain_text else {}),
-                    **({"updates_qa_id": mmpg_request.updates_qa_id} if mmpg_request and mmpg_request.updates_qa_id else {}),
-                )
-                if mmpg_request:
-                    mmpg_request.completed_qa_id = qa_id
+                    prev_history = list(session.conversation_history)
+                    prev_qa_pairs = list(session.qa_pairs)
+                    prev_completed_qa_id = mmpg_request.completed_qa_id if mmpg_request else None
+                    try:
+                        session.add_user_message(user_msg_content)
+                        session.add_assistant_message(full_answer)
+                        session.add_qa(
+                            display_question,
+                            full_answer,
+                            qa_id=qa_id,
+                            source=source,
+                            model_name=model_cfg.name,
+                            written_exam=written_exam,
+                            **({"answer_format": "plain_text", "first_token_ms": int(first_token_ms),
+                                "total_ms": int(gen_elapsed)} if plain_text else {}),
+                            **({"updates_qa_id": mmpg_request.updates_qa_id} if mmpg_request and mmpg_request.updates_qa_id else {}),
+                        )
+                        if mmpg_request:
+                            mmpg_request.completed_qa_id = qa_id
+                    except Exception:
+                        if mmpg_request:
+                            mmpg_request.completed_qa_id = prev_completed_qa_id
+                        session.qa_pairs[:] = [qa for qa in prev_qa_pairs if qa.id != qa_id]
+                        session.conversation_history[:] = prev_history
+                        raise
+        except Exception as exc:
+            deps.error_logger.error(
+                "_commit failed for id=%s seq=%d: %s",
+                qa_id, seq, exc, exc_info=True,
+            )
+            _broadcast({
+                "type": "answer_error",
+                "id": qa_id,
+                "stage": "persistence",
+                "message": "答案保存失败",
+            })
+            return
+
+        if stale_before_commit:
+            if plain_text:
+                _cancel_visible_answer()
+            return
+
+        # Persistence succeeded; post-commit side effects must degrade independently
+        # and never roll back the committed QA or emit a contradictory answer_error.
+        stats = None
+        try:
             stats = get_token_stats()
             deps.logger.info(
                 "ANSWER_DONE id=%s model=%s first_token=%.0fms total=%.0fms "
@@ -1317,6 +1382,10 @@ def process_question_parallel(
                 stats["prompt"],
                 stats["completion"],
             )
+        except Exception as exc:  # noqa: BLE001
+            deps.error_logger.warning("ANSWER_DONE stats/log failed id=%s: %s", qa_id, exc)
+
+        try:
             _broadcast(
                 {
                     "type": "answer_done",
@@ -1331,15 +1400,24 @@ def process_question_parallel(
                     **({"source": source} if plain_text else {}),
                 }
             )
-            deps.broadcast(
-                {
-                    "type": "token_update",
-                    "prompt": stats["prompt"],
-                    "completion": stats["completion"],
-                    "total": stats["total"],
-                    "by_model": stats.get("by_model", {}),
-                }
-            )
+        except Exception as exc:  # noqa: BLE001
+            deps.error_logger.warning("broadcast answer_done failed id=%s: %s", qa_id, exc)
+
+        if stats is not None:
+            try:
+                deps.broadcast(
+                    {
+                        "type": "token_update",
+                        "prompt": stats["prompt"],
+                        "completion": stats["completion"],
+                        "total": stats["total"],
+                        "by_model": stats.get("by_model", {}),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                deps.error_logger.warning("broadcast token_update failed id=%s: %s", qa_id, exc)
+
+        try:
             candidate_answer_for_record = ""
             with conversation_lock:
                 candidate_answer_for_record = session.get_candidate_answer_for_qa(
@@ -1352,41 +1430,26 @@ def process_question_parallel(
                     qa_id,
                     question_text[:80],
                 )
-            if prompt_mode in (PROMPT_MODE_SERVER_SCREEN, PROMPT_MODE_WRITTEN_EXAM) and images:
-                try:
-                    from services.vision_verify import schedule_self_verify
+        except Exception as exc:  # noqa: BLE001
+            deps.error_logger.warning("KNOWLEDGE_ENQUEUE_FAIL id=%s err=%s", qa_id, exc)
 
-                    schedule_self_verify(
-                        qa_id=qa_id,
-                        answer=full_answer,
-                        image_data_url=images,
-                        broadcast_callable=deps.broadcast,
-                        model_cfg=model_cfg,
-                    )
-                except Exception as exc: # noqa: BLE001
-                    deps.error_logger.warning(
-                        "VISION_VERIFY_SCHEDULE_FAIL id=%s err=%s",
-                        qa_id,
-                        exc,
-                    )
-        except Exception as exc:
-            if mmpg_request:
-                mmpg_request.completed_qa_id = None
-            with conversation_lock:
-                if len(session.qa_pairs) > pre_qa_len:
-                    session.qa_pairs.pop()
-                if len(session.conversation_history) > pre_user_len:
-                    del session.conversation_history[pre_user_len:]
-            deps.error_logger.error(
-                "_commit failed for id=%s seq=%d: %s",
-                qa_id, seq, exc, exc_info=True,
-            )
-            _broadcast({
-                "type": "answer_error",
-                "id": qa_id,
-                "stage": "persistence",
-                "message": "答案保存失败",
-            })
+        if prompt_mode in (PROMPT_MODE_SERVER_SCREEN, PROMPT_MODE_WRITTEN_EXAM) and images:
+            try:
+                from services.vision_verify import schedule_self_verify
+
+                schedule_self_verify(
+                    qa_id=qa_id,
+                    answer=full_answer,
+                    image_data_url=images,
+                    broadcast_callable=deps.broadcast,
+                    model_cfg=model_cfg,
+                )
+            except Exception as exc:  # noqa: BLE001
+                deps.error_logger.warning(
+                    "VISION_VERIFY_SCHEDULE_FAIL id=%s err=%s",
+                    qa_id,
+                    exc,
+                )
 
     def _commit_current_request():
         with mmpg_request.lock:
