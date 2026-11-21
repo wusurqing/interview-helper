@@ -277,3 +277,16 @@ def test_broadcast_is_safe_after_shutdown_and_on_closed_loop():
         ws_mod.broadcast({"type": "late"})
     finally:
         ws_mod.shutdown_broadcast()
+
+    # 仅实现 call_soon_threadsafe 的最小鸭子类型 loop 也能正常工作
+    class _InlineLoop:
+        def call_soon_threadsafe(self, fn, *args):
+            fn(*args)
+
+    q2: asyncio.Queue = asyncio.Queue(maxsize=2)
+    ws_mod.init_broadcast(_InlineLoop(), q2)  # type: ignore[arg-type]
+    try:
+        ws_mod.broadcast({"type": "ping"})
+        assert q2.qsize() == 1
+    finally:
+        ws_mod.shutdown_broadcast()

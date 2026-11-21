@@ -223,7 +223,8 @@ def broadcast(data: dict):
     if loop is None or queue is None:
         return
     try:
-        if loop.is_closed():
+        is_closed = getattr(loop, "is_closed", None)
+        if callable(is_closed) and is_closed():
             return
         loop.call_soon_threadsafe(_enqueue_broadcast, data, queue)
     except RuntimeError:
