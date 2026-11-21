@@ -62,6 +62,11 @@ class AudioBusyError(RuntimeError):
 # ---------------------------------------------------------------------------
 try:
     import soundcard as _sc
+    if platform.system() == "Windows":
+        from soundcard import mediafoundation
+        from services.soundcard_windows import configure_property_buffers
+
+        configure_property_buffers(mediafoundation)
     _HAS_SC = True
 except Exception:
     _HAS_SC = False
