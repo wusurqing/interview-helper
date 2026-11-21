@@ -76,6 +76,7 @@ def on_assist_start(
         logger.info("Review session not created: conditions not met")
         return None
 
+    created_archive = None
     try:
         session_id = review.create_session(
             started_at=time.time(),
@@ -135,12 +136,28 @@ def on_assist_start(
                 broadcast=archive_event,
                 on_complete=completed,
             )
+            created_archive = archive
+            review_archive.set_state(session_id, "recording")
             from core.session import get_session
             get_session().archive = archive
-            review_archive.set_state(session_id, "recording")
         logger.info("Review session created: session_id=%d", session_id)
         return session_id
     except Exception as e:
+        with _state_lock:
+            _current_review_session_id = None
+            _existing_qa_ids = frozenset()
+        if created_archive is not None:
+            try:
+                from core.session import get_session
+                session = get_session()
+                if getattr(session, "archive", None) is created_archive:
+                    session.archive = None
+            except Exception:
+                pass
+            try:
+                created_archive.stop(timeout=2)
+            except Exception:
+                pass
         logger.error("Failed to create review session: %s", e, exc_info=True)
         return None
 

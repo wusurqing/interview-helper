@@ -659,3 +659,34 @@ def test_single_mic_review_archives_only_new_turns(monkeypatch):
     result = review.get_session_detail(session_id)
     assert result["candidate_capture_enabled"] == 1
     assert [(turn["qa_id"], turn["seq"]) for turn in result["turns"]] == [(qa_pairs[1].id, 1)]
+
+
+def test_on_assist_start_cleans_up_archive_and_state_when_set_state_fails(monkeypatch):
+    from core.session import get_session
+    from services.interview_archive.manager import InterviewArchive
+    from services.storage import review_archive
+
+    stopped: list[object] = []
+    orig_stop = InterviewArchive.stop
+
+    def spy_stop(self, timeout=20.0):
+        stopped.append(self)
+        return orig_stop(self, timeout=timeout)
+
+    monkeypatch.setattr(InterviewArchive, "stop", spy_stop)
+    monkeypatch.setattr(
+        review_archive,
+        "set_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("sqlite set_state failed")),
+    )
+
+    result = review_integration.on_assist_start(
+        interviewer_device_id=1,
+        candidate_device_id=2,
+        candidate_asr_enabled=True,
+    )
+
+    assert result is None
+    assert get_session().archive is None
+    assert review_integration._current_review_session_id is None
+    assert len(stopped) == 1
