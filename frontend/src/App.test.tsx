@@ -380,6 +380,23 @@ describe('App bootstrap', () => {
       Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia })
     }
   })
+
+  it('tolerates minimal matchMedia objects without addEventListener or addListener', async () => {
+    const originalMatchMedia = window.matchMedia
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn().mockReturnValue({ matches: true, media: '(min-width: 768px)' }),
+    })
+
+    try {
+      render(<App />)
+      await screen.findByRole('tab', { name: '面试辅助', selected: true })
+      expect(screen.getAllByText('transcript')).toHaveLength(1)
+      expect(screen.getAllByText('answer')).toHaveLength(1)
+    } finally {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia })
+    }
+  })
 })
 
 describe('Window control buttons', () => {

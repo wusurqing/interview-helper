@@ -1247,7 +1247,10 @@ describe('InterviewOverlay', () => {
       render(<InterviewOverlay />)
 
       fireEvent.click(screen.getByRole('button', { name: /^截图审题/ }))
-      expect(await screen.findByText('后端截图失败')).toBeInTheDocument()
+      const toast = await screen.findByRole('status')
+      expect(toast).toHaveTextContent('后端截图失败')
+      expect(toast.className).toContain('max-w-[calc(100%-16px)]')
+      expect(toast.className).toContain('break-words')
 
       await act(async () => {
         vi.advanceTimersByTime(2600)

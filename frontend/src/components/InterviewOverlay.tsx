@@ -499,11 +499,14 @@ export default function InterviewOverlay() {
     // Pure functional update over combined questionView state so rapid successive
     // next/prev (one act / one key-repeat burst) advances cleanly without side effects.
     setQuestionView((current) => {
+      const currentReview = current.reviewQaId
+        ? qaPairs.find((item) => item.id === current.reviewQaId)
+        : null
       const currentLive = current.liveFocusQaId
         ? qaPairs.find((item) => item.id === current.liveFocusQaId)
         : null
       const baseId =
-        current.reviewQaId ??
+        currentReview?.id ??
         currentLive?.id ??
         latestQa?.id ??
         qaPairs[qaPairs.length - 1]?.id
@@ -576,7 +579,7 @@ export default function InterviewOverlay() {
     <div
       role="status"
       aria-live="polite"
-      className="ov-toast pointer-events-none fixed bottom-3 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-white/15 bg-slate-900/90 px-3 py-1.5 text-xs font-medium text-white shadow-lg backdrop-blur-sm"
+      className="ov-toast pointer-events-none fixed bottom-3 left-1/2 z-50 max-w-[calc(100%-16px)] -translate-x-1/2 break-words rounded-lg border border-white/15 bg-slate-900/90 px-3 py-1.5 text-center text-xs font-medium text-white shadow-lg backdrop-blur-sm"
     >
       {toastMessage}
     </div>

@@ -67,8 +67,11 @@ function useIsDesktopViewport(): boolean {
         mql.addEventListener('change', update)
         return () => mql.removeEventListener('change', update)
       }
-      mql.addListener(update)
-      return () => mql.removeListener(update)
+      if (typeof mql.addListener === 'function') {
+        mql.addListener(update)
+        return () => mql.removeListener?.(update)
+      }
+      return undefined
     }
     const onResize = () => setIsDesktop(window.innerWidth >= 768)
     onResize()
