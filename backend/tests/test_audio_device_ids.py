@@ -67,3 +67,17 @@ def test_enumeration_failure_preserves_last_successful_snapshot(enumerate_device
     monkeypatch.setattr(audio._sc, "all_speakers", unavailable)
     assert audio._get_sc_loopback_devices() == []
     assert audio._lookup_sc_speaker_guid(first["a"]) == "a"
+
+
+def test_default_speaker_query_failure_still_returns_enumerated_speakers(enumerate_devices, monkeypatch):
+    def fail_default():
+        raise RuntimeError("no default output")
+
+    monkeypatch.setattr(audio._sc, "default_speaker", fail_default)
+    mapped = enumerate_devices(("a", "Monitor"), ("b", "Headphones"))
+    assert len(mapped) == 2
+    entries = audio._get_sc_loopback_devices()
+    assert len(entries) == 2
+    assert all(entry["is_default_output"] is False for entry in entries)
+    assert audio._lookup_sc_speaker_guid(mapped["a"]) == "a"
+    assert audio._lookup_sc_speaker_guid(mapped["b"]) == "b"

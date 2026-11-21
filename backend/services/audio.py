@@ -126,10 +126,16 @@ def _get_sc_loopback_devices() -> list[dict]:
     with _SC_CACHE_LOCK:
         try:
             speakers = [(spk.id, spk.name, getattr(spk, "channels", 2)) for spk in _sc.all_speakers()]
-            default_id = _sc.default_speaker().id if speakers else None
         except Exception:
             # A failed native query is not evidence that all outputs disconnected.
             return []
+        default_id = None
+        if speakers:
+            try:
+                default_spk = _sc.default_speaker()
+                default_id = getattr(default_spk, "id", None)
+            except Exception:
+                default_id = None
 
         live_guids = {guid for guid, _, _ in speakers}
         live_names = Counter(name for _, name, _ in speakers)
@@ -153,7 +159,7 @@ def _get_sc_loopback_devices() -> list[dict]:
                 next_id += 1
             next_map[dev_id] = guid
             _SC_DEVICE_CACHE[dev_id] = {"guid": guid, "name": name}
-            is_default = (guid == default_id)
+            is_default = bool(default_id and guid == default_id)
             label = ("★ " if is_default else "") + name + " (系统音频)"
             result.append({
                 "id": dev_id,
@@ -629,22 +635,22 @@ class AudioCapture:
             try:
                 default_info = sd.query_devices(kind="input")
                 default_input = int(default_info["index"])
-            except (sd.PortAudioError, ValueError, TypeError, KeyError):
-                # No default input is available. Still try the selected device.
+                if default_input >= 0 and default_input != device_id:
+                    default_sr = int(default_info["default_samplerate"])
+                    default_host = str(sd.query_hostapis(default_info["hostapi"])["name"])
+                    attempts.append(
+                        {
+                            "device": default_input,
+                            "samplerate": default_sr,
+                            "native_sr": default_sr,
+                            "blocksize": self.BLOCK_SIZE * 2,
+                            "extra_settings": self._wasapi_shared_settings(default_host),
+                            "label": f"default:{default_input} shared",
+                        }
+                    )
+            except Exception:
+                # No usable default input fallback metadata; still try the selected device.
                 return attempts
-            if default_input >= 0 and default_input != device_id:
-                default_sr = int(default_info["default_samplerate"])
-                default_host = str(sd.query_hostapis(default_info["hostapi"])["name"])
-                attempts.append(
-                    {
-                        "device": default_input,
-                        "samplerate": default_sr,
-                        "native_sr": default_sr,
-                        "blocksize": self.BLOCK_SIZE * 2,
-                        "extra_settings": self._wasapi_shared_settings(default_host),
-                        "label": f"default:{default_input} shared",
-                    }
-                )
         return attempts
 
     def _start_sounddevice(self, device_id: int, mic_compatibility_mode: bool = False):

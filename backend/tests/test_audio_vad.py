@@ -540,3 +540,26 @@ def test_loopback_device_enumeration_preserves_speaker_channels(monkeypatch):
     assert device["is_default_output"] and device["is_loopback"]
     assert device["channels"] == 6 and device["sample_rate"] == 16000
     assert audio._lookup_sc_speaker_guid(device["id"]) == speaker.id
+
+
+def test_microphone_compatibility_ignores_broken_default_input_metadata(monkeypatch):
+    from services import audio
+
+    _patch_fake_sounddevice(monkeypatch)
+
+    def query(device=None, kind=None):
+        if device is None:
+            assert kind == "input"
+            return {"index": 3, "default_samplerate": 48000, "hostapi": 99}
+        return {"index": device, "default_samplerate": 48000, "hostapi": 0}
+
+    def query_hostapis(idx):
+        if idx == 99:
+            raise KeyError(99)
+        return {"name": "ALSA"}
+
+    monkeypatch.setattr(audio.sd, "query_devices", query)
+    monkeypatch.setattr(audio.sd, "query_hostapis", query_hostapis)
+
+    attempts = AudioCapture()._sounddevice_attempts(9, True)
+    assert [(item["device"], item["samplerate"]) for item in attempts] == [(9, 48000), (9, 16000)]
