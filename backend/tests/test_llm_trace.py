@@ -393,3 +393,138 @@ def test_sdk_records_provider_sse_error_as_failure(tmp_path, monkeypatch):
     assert result["attempt_id"] == request["attempt_id"]
     assert result["status"] == "failed"
     assert result["error"] == "fixture provider rejected [REDACTED]"
+
+
+def test_trace_disabled_via_env_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "0")
+    image = "data:image/png;base64,aGVsbG8="
+    attempt = trace.begin("https://example.com/v1", "openai", {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "private resume"}, {"type": "image_url", "image_url": {"url": image}}]}],
+    })
+    assert isinstance(attempt, trace._NullAttempt)
+    attempt.headers(200)
+    attempt.response({"choices": [{"message": {"content": "private reply"}}]})
+    attempt.finish()
+    assert not (tmp_path / "llm.jsonl").exists()
+    assert not (tmp_path / "llm_assets").exists()
+
+
+def test_trace_metadata_mode_omits_prompts_replies_and_assets(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "metadata")
+    image = "data:image/png;base64,aGVsbG8="
+    with trace.scope("resume_review", qa_id="qa-9"):
+        attempt = trace.begin("https://example.com/v1", "openai", {
+            "model": "gpt-4o",
+            "stream": True,
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "SUPER_PRIVATE_RESUME_TEXT"},
+                {"type": "image_url", "image_url": {"url": image}},
+            ]}],
+        })
+        attempt.headers(200)
+        attempt.stream_event({"choices": [{"delta": {"reasoning_content": "PRIVATE_THINK"}}]})
+        attempt.stream_event({"choices": [{"delta": {"content": "PRIVATE_ANSWER"}, "finish_reason": "stop"}],
+                              "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}})
+        attempt.finish()
+
+    raw_log = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    assert "SUPER_PRIVATE_RESUME_TEXT" not in raw_log
+    assert "PRIVATE_THINK" not in raw_log
+    assert "PRIVATE_ANSWER" not in raw_log
+    assert "aGVsbG8=" not in raw_log
+    assert not (tmp_path / "llm_assets").exists()
+
+    req, res = [json.loads(line) for line in raw_log.splitlines()]
+    assert req["trace_mode"] == "metadata"
+    assert req["request"]["redacted"] is True
+    assert req["request"]["model"] == "gpt-4o"
+    assert req["request"]["message_count"] == 1
+    assert req["request"]["image_count"] == 1
+    assert res["trace_mode"] == "metadata"
+    assert res["output_text"] is None
+    assert res["reasoning_text"] is None
+    assert res["response"] is None
+    assert res["stream_events"] is None
+    assert res["output_chars"] == len("PRIVATE_ANSWER")
+    assert res["reasoning_chars"] == len("PRIVATE_THINK")
+    assert res["stream_event_count"] == 2
+    assert res["tokens"]["input"] == 120
+    assert res["tokens"]["output"] == 30
+
+
+def test_trace_assets_quota_evicts_oldest_and_respects_zero_cap(tmp_path, monkeypatch):
+    import base64
+    import os
+
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+
+    # Zero cap: image is never written to disk
+    monkeypatch.setenv("IA_LLM_TRACE_MAX_ASSETS_MB", "0")
+    img_zero = "data:image/png;base64," + base64.b64encode(b"0123456789").decode("ascii")
+    a0 = trace.begin("https://example.com/v1", "openai", {"image": img_zero})
+    a0.finish()
+    req0 = json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert req0["request"]["image"]["path"] is None
+    assert req0["request"]["image"]["omitted"] == "asset_quota_exceeded"
+    assert not (tmp_path / "llm_assets").exists()
+
+    # Tight quota: keep at most ~25 bytes total so 3rd 12-byte image evicts the oldest
+    monkeypatch.setenv("IA_LLM_TRACE_MAX_ASSETS_MB", str(25 / (1024 * 1024)))
+    saved_paths = []
+    for idx, payload_bytes in enumerate((b"aaaaaaaaaaaa", b"bbbbbbbbbbbb", b"cccccccccccc")):
+        data_url = "data:image/png;base64," + base64.b64encode(payload_bytes).decode("ascii")
+        attempt = trace.begin("https://example.com/v1", "openai", {"image": data_url})
+        attempt.finish()
+        req = json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[-2])
+        p = tmp_path / req["request"]["image"]["path"]
+        saved_paths.append(p)
+        if p.exists():
+            os.utime(p, (1_700_000_000 + idx * 10, 1_700_000_000 + idx * 10))
+
+    remaining = list((tmp_path / "llm_assets").iterdir())
+    assert sum(f.stat().st_size for f in remaining) <= 25
+    assert not saved_paths[0].exists()
+    assert saved_paths[2].exists()
+
+
+def test_rollover_prunes_assets_asynchronously_without_blocking_emit(tmp_path, monkeypatch):
+    import logging
+    import threading
+    import time
+
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def slow_prune(log_dir=None, *, min_age_seconds=0.0):
+        calls.append((Path(log_dir), min_age_seconds, threading.current_thread().name))
+        started.set()
+        release.wait(timeout=3.0)
+
+    monkeypatch.setattr(trace, "prune_unused_assets", slow_prune)
+
+    handler = trace._TraceFileHandler(str(tmp_path / "llm.jsonl"), when="midnight", backupCount=5, encoding="utf-8")
+    try:
+        handler.rolloverAt = int(time.time()) - 10
+        record = logging.LogRecord("llm.trace", logging.INFO, __file__, 1, '{"event":"ping"}', (), None)
+        t0 = time.monotonic()
+        handler.emit(record)
+        elapsed = time.monotonic() - t0
+        # emit() must return immediately instead of waiting on slow_prune
+        assert elapsed < 1.0
+        assert started.wait(timeout=2.0)
+        assert calls[0][0] == tmp_path
+        assert calls[0][1] > 0
+        assert calls[0][2] == "llm-trace-asset-pruner"
+    finally:
+        release.set()
+        assert trace.wait_for_pending_prune(timeout=3.0)
+        handler.close()
