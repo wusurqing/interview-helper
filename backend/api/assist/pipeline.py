@@ -6,6 +6,7 @@ import numpy as np
 import queue
 import time
 import threading
+from collections import deque
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Callable, Literal, Optional
@@ -112,6 +113,8 @@ _skipped_commit_seqs: set[int] = set()
 _next_commit_seq = 0
 _next_submit_seq = 0
 _commit_lock = threading.Lock()
+_exam_cancel_lock = threading.Lock()
+_cancelled_exam_preflight_ids: deque[str] = deque(maxlen=128)
 
 _knowledge_worker: Optional[BoundedTaskWorker] = None
 _asr_state = AssistAsrStateMachine(
@@ -562,6 +565,42 @@ def _reset_answer_state(reset_session_data: bool = False, *, invalidate_capture:
 def cancel_answer_work(reset_session_data: bool = False, *, invalidate_capture: bool = False):
     _bump_generation()
     _reset_answer_state(reset_session_data, invalidate_capture=invalidate_capture)
+
+
+def _is_exam_preflight_cancelled(preflight_id: str) -> bool:
+    if not preflight_id:
+        return False
+    with _exam_cancel_lock:
+        return preflight_id in _cancelled_exam_preflight_ids
+
+
+def cancel_exam_preflight_task(preflight_id: str) -> bool:
+    """Cancel a timed-out or obsolete exam preflight task and release its slot & commit seq."""
+    target = (preflight_id or "").strip()
+    if not target:
+        return False
+    with _exam_cancel_lock:
+        if target not in _cancelled_exam_preflight_ids:
+            _cancelled_exam_preflight_ids.append(target)
+    skipped_seqs: list[int] = []
+    with _dispatch_lock:
+        kept: list[tuple[TaskPayload, int, int]] = []
+        for task, seq, tv in _pending:
+            if str(task_meta(task).get("exam_preflight_id") or "") == target:
+                skipped_seqs.append(seq)
+                continue
+            kept.append((task, seq, tv))
+        _pending[:] = kept
+        for seq, (_reservation, task) in list(_in_flight_tasks.items()):
+            if str(task_meta(task).get("exam_preflight_id") or "") == target:
+                _in_flight_tasks.pop(seq, None)
+                skipped_seqs.append(seq)
+        _dispatch_changed.notify_all()
+    for seq in skipped_seqs:
+        _mark_seq_skipped(seq)
+    if skipped_seqs:
+        _try_dispatch()
+    return bool(skipped_seqs)
 
 
 def init_background_workers():
@@ -2152,6 +2191,7 @@ def _process_question_parallel(
     my_gen = _capture_generation()
     my_asr_turn = int(_task_meta(task).get("asr_turn_id", 0)) if _is_asr_task(task) else 0
     request = _task_meta(task).get("mmpg_request")
+    exam_preflight_id = str(_task_meta(task).get("exam_preflight_id") or "")
     routing = task_meta(task).get("answer_routing")
 
     def resolve_exam_model(index):
@@ -2172,6 +2212,8 @@ def _process_question_parallel(
 
     def aborted() -> bool:
         if session_stale() or (request and request.cancelled):
+            return True
+        if exam_preflight_id and _is_exam_preflight_cancelled(exam_preflight_id):
             return True
         if my_gen != _answer_generation:
             return True
