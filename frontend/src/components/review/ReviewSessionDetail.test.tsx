@@ -791,4 +791,227 @@ describe('ReviewSessionDetail', () => {
     expect(screen.queryByText('旧复盘已完成')).not.toBeInTheDocument()
     expect(screen.queryByText('旧轮询结果')).not.toBeInTheDocument()
   })
+
+  it('omits prose-invert in light color schemes and keeps it in dark color schemes', async () => {
+    useUiPrefsStore.setState({ colorScheme: 'vscode-light-plus' } as any)
+    apiMock.reviewSessionDetail.mockResolvedValueOnce(baseDetail)
+
+    const { container, rerender } = render(<ReviewSessionDetail sessionId={7} onBack={vi.fn()} />)
+    await screen.findByText('整体表现稳定。')
+    expect(container.querySelector('.prose')?.className).not.toContain('prose-invert')
+
+    act(() => {
+      useUiPrefsStore.setState({ colorScheme: 'vscode-dark-plus' } as any)
+    })
+    rerender(<ReviewSessionDetail sessionId={7} onBack={vi.fn()} />)
+    expect(container.querySelector('.prose')?.className).toContain('prose-invert')
+  })
+
+  it('uses linked_review_count for short-sample summaries and refreshes applications after bind/unbind', async () => {
+    const shortSampleApp = {
+      ...application,
+      review_summary: {
+        review_count: 0,
+        latest_review_id: null,
+        latest_avg_score: null,
+        latest_review_at: null,
+        latest_status: null,
+        linked_review_count: 2,
+        latest_linked_review_id: 7,
+      },
+    }
+    apiMock.jobTrackerApplications
+      .mockResolvedValueOnce({ items: [application] })
+      .mockResolvedValueOnce({ items: [shortSampleApp] })
+      .mockResolvedValueOnce({ items: [application] })
+    apiMock.reviewSessionDetail
+      .mockResolvedValueOnce(baseDetail)
+      .mockResolvedValueOnce({
+        ...baseDetail,
+        application_id: application.id,
+        application: {
+          id: application.id,
+          company: application.company,
+          position: application.position,
+          city: application.city,
+          stage: application.stage,
+        },
+      })
+      .mockResolvedValueOnce(baseDetail)
+
+    render(<ReviewSessionDetail sessionId={7} onBack={vi.fn()} />)
+
+    fireEvent.click(await screen.findByRole('button', { name: /ByteDance/ }))
+    await waitFor(() => expect(apiMock.jobTrackerApplications).toHaveBeenCalledTimes(2))
+
+    expect(await screen.findByRole('button', { name: '全部复盘' })).toBeInTheDocument()
+    expect(screen.getByText('最近一场')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '解绑' }))
+    await waitFor(() => expect(apiMock.jobTrackerApplications).toHaveBeenCalledTimes(3))
+  })
+
+  it('keeps rebind panel open on bind failure, closes after success, and resets changing across sessions', async () => {
+    const secondApp = { ...application, id: 3, company: 'OpenAI', position: 'Infra' }
+    apiMock.jobTrackerApplications.mockResolvedValue({ items: [application, secondApp] })
+    apiMock.reviewSessionDetail
+      .mockResolvedValueOnce({
+        ...baseDetail,
+        application_id: application.id,
+        application: {
+          id: application.id,
+          company: application.company,
+          position: application.position,
+          city: application.city,
+          stage: application.stage,
+        },
+      })
+      .mockResolvedValueOnce({
+        ...baseDetail,
+        id: 8,
+        title: '另一场复盘',
+        application_id: secondApp.id,
+        application: {
+          id: secondApp.id,
+          company: secondApp.company,
+          position: secondApp.position,
+          city: secondApp.city,
+          stage: secondApp.stage,
+        },
+      })
+    apiMock.reviewUpdateSession.mockRejectedValueOnce(new Error('绑定失败'))
+
+    const { rerender } = render(<ReviewSessionDetail sessionId={7} onBack={vi.fn()} />)
+    await screen.findByText(/ByteDance · AI Engineer/)
+
+    fireEvent.click(screen.getByRole('button', { name: '改绑' }))
+    expect(screen.getByPlaceholderText('搜索公司、岗位、城市')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /OpenAI/ }))
+    expect(await screen.findByText('绑定失败')).toBeInTheDocument()
+    // Panel remains open so user can retry
+    expect(screen.getByPlaceholderText('搜索公司、岗位、城市')).toBeInTheDocument()
+
+    // Switching sessions resets changing state
+    rerender(<ReviewSessionDetail sessionId={8} onBack={vi.fn()} />)
+    await screen.findByText('另一场复盘')
+    expect(screen.queryByPlaceholderText('搜索公司、岗位、城市')).not.toBeInTheDocument()
+  })
+
+  it('updates CollapsibleSection when dynamic defaultOpen changes across sessions', async () => {
+    const turn = {
+      id: 99,
+      session_id: 7,
+      qa_id: 'qa-1',
+      seq: 1,
+      question_text: '动态展开题目内容',
+      candidate_answer_text: '候选人回答',
+      original_candidate_answer_text: null,
+      reference_answer_text: '',
+      code_text: null,
+      duration_ms: 10000,
+      is_partial: false,
+      analysis_status: 'completed' as const,
+      strengths: [],
+      risks: [],
+      evidence: null,
+      scorecard: {},
+      created_at: 1710000000,
+      updated_at: 1710000000,
+    }
+    apiMock.reviewSessionDetail
+      .mockResolvedValueOnce({
+        ...baseDetail,
+        id: 7,
+        turn_count: 1,
+        summary_markdown: '已有总结，初始折叠',
+        turns: [turn],
+      })
+      .mockResolvedValueOnce({
+        ...baseDetail,
+        id: 8,
+        status: 'recorded',
+        turn_count: 1,
+        summary_markdown: null,
+        avg_score: null,
+        turns: [{ ...turn, id: 100, session_id: 8, question_text: '短记录自动展开题目' }],
+      })
+
+    const { rerender } = render(<ReviewSessionDetail sessionId={7} onBack={vi.fn()} />)
+    await screen.findByText('逐题分析 · 1 题')
+    expect(screen.queryByText('动态展开题目内容')).not.toBeInTheDocument()
+
+    rerender(<ReviewSessionDetail sessionId={8} onBack={vi.fn()} />)
+    expect(await screen.findByText('短记录自动展开题目')).toBeInTheDocument()
+  })
+
+  it('polls serially without re-entry and pauses polling while document is hidden', async () => {
+    vi.useFakeTimers()
+    const inFlightPoll = createDeferred<typeof baseDetail>()
+    apiMock.reviewSessionDetail
+      .mockResolvedValueOnce({
+        ...baseDetail,
+        status: 'analyzing',
+        avg_score: null,
+        summary_markdown: null,
+      })
+      .mockReturnValueOnce(inFlightPoll.promise)
+      .mockResolvedValueOnce({
+        ...baseDetail,
+        status: 'completed',
+        avg_score: 8.5,
+        summary_markdown: '恢复可见后轮询完成',
+      })
+
+    let hidden = false
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden })
+    try {
+      render(<ReviewSessionDetail sessionId={7} onBack={vi.fn()} />)
+      await act(async () => {
+        await Promise.resolve()
+      })
+      expect(apiMock.reviewSessionDetail).toHaveBeenCalledTimes(1)
+
+      // First poll triggers at 5s and stays pending
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000)
+      })
+      expect(apiMock.reviewSessionDetail).toHaveBeenCalledTimes(2)
+
+      // Advancing another 15s while in-flight must NOT overlap another request
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15000)
+      })
+      expect(apiMock.reviewSessionDetail).toHaveBeenCalledTimes(2)
+
+      // Hide tab before first poll finishes -> no next timer should fire while hidden
+      hidden = true
+      document.dispatchEvent(new Event('visibilitychange'))
+      await act(async () => {
+        inFlightPoll.resolve({
+          ...baseDetail,
+          status: 'analyzing',
+          avg_score: null,
+          summary_markdown: null,
+        })
+        await inFlightPoll.promise
+      })
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15000)
+      })
+      expect(apiMock.reviewSessionDetail).toHaveBeenCalledTimes(2)
+
+      // Tab becomes visible again -> immediately resumes polling
+      hidden = false
+      await act(async () => {
+        document.dispatchEvent(new Event('visibilitychange'))
+        await Promise.resolve()
+      })
+      expect(apiMock.reviewSessionDetail).toHaveBeenCalledTimes(3)
+      expect(screen.getByText('恢复可见后轮询完成')).toBeInTheDocument()
+    } finally {
+      Object.defineProperty(document, 'hidden', { configurable: true, value: false })
+    }
+  })
 })
