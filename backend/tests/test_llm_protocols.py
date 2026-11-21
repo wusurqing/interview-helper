@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -428,7 +429,9 @@ def test_chat_stream_passes_sdk_timeout_and_closes_response_on_early_abort(monke
         aborted = True
 
     assert out == [("text", "first")]
-    assert captured_kwargs["timeout"] == 90.0
+    assert isinstance(captured_kwargs["timeout"], httpx.Timeout)
+    assert captured_kwargs["timeout"].connect == 10.0
+    assert captured_kwargs["timeout"].read == 90.0
     assert closed["called"] is True
 
 
@@ -628,5 +631,40 @@ async def test_async_client_reused_per_loop_with_redirects_disabled():
         c2 = protocols._get_async_client()
         assert c1 is c2
         assert c1.follow_redirects is False
+        # Set-Cookie headers from one provider must never persist on the shared async client
+        fake_resp = httpx.Response(
+            200,
+            headers={"Set-Cookie": "sid=secret; Path=/"},
+            request=httpx.Request("POST", "https://provider-a.example.com/v1/chat/completions"),
+        )
+        c1.cookies.extract_cookies(fake_resp)
+        assert dict(c1.cookies) == {}
     finally:
         await protocols.aclose_async_client()
+
+
+def test_chat_completion_create_preserves_connect_and_read_sdk_timeout(monkeypatch):
+    from types import SimpleNamespace
+    from services.llm import streaming
+
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    model = SimpleNamespace(
+        name="m1",
+        api_base_url="https://api.example.com/v1",
+        api_key="sk-test",
+        model="gpt-4o-mini",
+        api_type="openai",
+    )
+    monkeypatch.setattr(streaming, "get_client_for_model", lambda _m: fake_client)
+
+    streaming.chat_completion_create(model, [{"role": "user", "content": "hi"}], timeout=(7, 45))
+    assert isinstance(captured["timeout"], httpx.Timeout)
+    assert captured["timeout"].connect == 7.0
+    assert captured["timeout"].read == 45.0

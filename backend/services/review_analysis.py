@@ -293,7 +293,9 @@ def _request_review_json(scene: str, user_text: str, overrides: Mapping[str, str
         trace_context={"scene": scene},
     )
 
-    content = response.choices[0].message.content if response.choices else ""
+    choices = getattr(response, "choices", None) or []
+    first_message = getattr(choices[0], "message", None) if choices else None
+    content = getattr(first_message, "content", None) if first_message is not None else ""
     if not content:
         raise ValueError("复盘模型返回为空")
 

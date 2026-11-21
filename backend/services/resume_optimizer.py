@@ -188,7 +188,7 @@ def _stream_chat(
     """流式调用,逐 chunk yield 文本。usage 自动累加。api_type 任意协议可用。"""
     import openai
     from services.llm.protocols import build_chat_payload, get_api_type, post_chat_stream
-    from services.llm.streaming import _completion_token_kwargs
+    from services.llm.streaming import _build_sdk_timeout, _completion_token_kwargs
 
     api_type = get_api_type(model_cfg)
     think_params = _resume_think_params(model_cfg, max_tokens)
@@ -217,7 +217,7 @@ def _stream_chat(
             client = client.with_options(max_retries=0)
         extra_kwargs: dict[str, Any] = {
             "stream_options": {"include_usage": True},
-            "timeout": float(timeout[1] if isinstance(timeout, tuple) else timeout),
+            "timeout": _build_sdk_timeout(timeout),
         }
         if think_params:
             extra_kwargs["extra_body"] = {

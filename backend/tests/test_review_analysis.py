@@ -333,3 +333,11 @@ def test_request_review_json_tolerates_fences_with_prose_and_inner_code_blocks()
     assert result["summary_markdown"] == summary
     assert result["strong_points"] == ["清晰"]
 
+
+def test_request_review_json_handles_none_choices_or_missing_message():
+    for bad_resp in (MagicMock(choices=None), MagicMock(choices=[MagicMock(message=None)])):
+        with patch("services.review_analysis.get_config", return_value=_mock_review_config()), \
+             patch("services.llm.streaming.chat_completion_create", return_value=bad_resp):
+            with pytest.raises(ValueError, match="复盘模型返回为空"):
+                review_analysis.generate_summary([{"question_text": "题目"}])
+

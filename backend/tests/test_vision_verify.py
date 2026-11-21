@@ -112,6 +112,7 @@ def test_schedule_self_verify_persists_result_before_broadcast(monkeypatch):
 
 def test_parse_verdict_handles_non_dict_json_and_nested_braces():
     assert vision_verify._parse_verdict("[]")["verdict"] == "UNKNOWN"
+    assert vision_verify._parse_verdict('[{"verdict": "PASS", "reason": "wrapped"}]')["verdict"] == "UNKNOWN"
     assert vision_verify._parse_verdict('"PASS"')["verdict"] == "UNKNOWN"
     assert vision_verify._parse_verdict("123")["verdict"] == "UNKNOWN"
 

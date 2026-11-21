@@ -97,10 +97,15 @@ def _get_async_client() -> httpx.AsyncClient:
         or _async_client_loop is not loop
         or _async_client_factory is not factory
     ):
-        _async_client = factory(
+        client = factory(
             timeout=httpx.Timeout(90, connect=10),
             follow_redirects=False,
         )
+        cookies = getattr(client, "cookies", None)
+        jar = getattr(cookies, "jar", None)
+        if jar is not None and hasattr(jar, "set_policy"):
+            jar.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+        _async_client = client
         _async_client_loop = loop
         _async_client_factory = factory
     else:

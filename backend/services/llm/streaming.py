@@ -200,6 +200,15 @@ _client_cache: OrderedDict[tuple[str, str], OpenAI] = OrderedDict()
 _client_cache_lock = threading.Lock()
 
 
+def _build_sdk_timeout(timeout: tuple[float, float] | float | httpx.Timeout) -> httpx.Timeout:
+    """Preserve separate connect/read timeouts when passing request timeout to the OpenAI SDK."""
+    if isinstance(timeout, httpx.Timeout):
+        return timeout
+    if isinstance(timeout, tuple) and len(timeout) == 2:
+        return httpx.Timeout(float(timeout[1]), connect=float(timeout[0]))
+    return httpx.Timeout(float(timeout))
+
+
 def _close_client_quietly(client: Any) -> None:
     close = getattr(client, "close", None)
     if callable(close):
@@ -310,7 +319,7 @@ def chat_completion_create(
             extra_kwargs["extra_body"] = {key: value for key, value in think_params.items() if key != "messages"}
         # gpt-5/o1/o3/o4 只认 max_completion_tokens；timeout 必须显式传给 SDK，
         # 否则用 SDK 默认（600s 带重试），慢供应商会拖死调用方。
-        extra_kwargs["timeout"] = float(timeout[1] if isinstance(timeout, tuple) else timeout)
+        extra_kwargs["timeout"] = _build_sdk_timeout(timeout)
         try:
             return client.chat.completions.create(
                 model=model_cfg.model,
@@ -722,7 +731,7 @@ def _try_stream_with_model(
     if think_params:
         extra_kwargs["extra_body"] = {key: value for key, value in think_params.items() if key != "messages"}
     extra_kwargs["stream_options"] = {"include_usage": True}
-    extra_kwargs["timeout"] = float(timeout[1] if isinstance(timeout, tuple) else timeout)
+    extra_kwargs["timeout"] = _build_sdk_timeout(timeout)
     token_kwargs = _completion_token_kwargs(model_cfg, cfg.max_tokens)
     try:
         response = client.chat.completions.create(

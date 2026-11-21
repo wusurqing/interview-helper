@@ -265,7 +265,10 @@ def test_resume_stream_chat_passes_timeout_completion_tokens_and_think_params():
     ) == ["chunk"]
     assert captured["max_completion_tokens"] == 500
     assert "max_tokens" not in captured
-    assert captured["timeout"] == 90.0
+    import httpx
+    assert isinstance(captured["timeout"], httpx.Timeout)
+    assert captured["timeout"].connect == 10.0
+    assert captured["timeout"].read == 90.0
     assert closed["called"] is True
 
     captured.clear()

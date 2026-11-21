@@ -51,10 +51,12 @@ _JSON_FENCE = re.compile(r"^```(?:json)?|```$", re.IGNORECASE | re.MULTILINE)
 def _extract_json_dict(text: str) -> Optional[dict]:
     try:
         data = json.loads(text)
-        if isinstance(data, dict):
-            return data
     except json.JSONDecodeError:
         pass
+    else:
+        # Valid top-level JSON that is not an object (e.g. array/scalar) must not
+        # have inner objects scraped out of it.
+        return data if isinstance(data, dict) else None
     decoder = json.JSONDecoder()
     for idx, ch in enumerate(text):
         if ch != "{":
