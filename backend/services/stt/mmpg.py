@@ -433,7 +433,13 @@ class MmpgManager:
             )
 
     def _schedule_timeout_test(self, run):
-        if run is self._run and self._loop is not None and not self._loop.is_closed():
+        if (
+            run is self._run
+            and run.stop_reason is None
+            and run.timeout_task is None
+            and self._loop is not None
+            and not self._loop.is_closed()
+        ):
             task = self._loop.create_task(self._timeout_test(run))
             run.timeout_task = task
 

@@ -125,11 +125,13 @@ async def lifespan(app: FastAPI):
     try:
         from services.llm.streaming import close_cached_clients
         from services.llm import protocols as llm_protocols
+        from services.stt.engines import close_generic_stt_sessions
         await run_in_threadpool(close_cached_clients)
         await run_in_threadpool(llm_protocols._http.close)
         await llm_protocols.aclose_async_client()
+        await run_in_threadpool(close_generic_stt_sessions)
     except Exception as e:
-        _log.debug("LLM transport cleanup skipped: %s", e)
+        _log.debug("LLM/STT transport cleanup skipped: %s", e)
     ws.shutdown_broadcast()
     await ws.close_all_clients()
     dispatch_task.cancel()

@@ -276,3 +276,19 @@ def test_doubao_stt_non_16khz_resampling_handles_empty_and_non_empty_arrays(monk
     high_rms = float(np.sqrt(np.mean(high_resampled[200:-200].astype(np.float64) ** 2)))
     assert low_rms > 8000.0
     assert high_rms < low_rms * 0.05
+
+    # Multi-channel (stereo) 2D PCM downmixes to 1D mono cleanly without raising ValueError
+    stereo = np.column_stack([
+        np.full(4800, 1000, dtype=np.int16),
+        np.full(4800, 3000, dtype=np.int16),
+    ])
+    stereo_resampled = engines._resample_pcm_int16(stereo, 48000, 16000)
+    assert stereo_resampled.ndim == 1
+    assert len(stereo_resampled) == 1600
+    assert abs(int(stereo_resampled[800]) - 2000) <= 5
+
+    # Short buffer preserves exact rate step (sample index 0 and 3, not endpoint-stretched 0 and 5)
+    short = np.array([100, 200, 300, 400, 500, 600], dtype=np.int16)
+    short_resampled = engines._resample_pcm_int16(short, 48000, 16000)
+    assert len(short_resampled) == 2
+    assert short_resampled[1] < 500

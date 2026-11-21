@@ -962,3 +962,53 @@ def test_mmpg_test_timeout_tracks_and_cleans_up_timeout_task():
             await mgr.detach(owner)
 
     asyncio.run(check_timeout())
+
+
+def test_mmpg_schedule_timeout_test_skips_when_stopping_and_handles_concurrent_slow_close():
+    from services.stt.mmpg import MmpgManager
+
+    async def check_race():
+        class SlowCloseCloud(CloudSocket):
+            async def close(self):
+                await asyncio.sleep(0.08)
+                await super().close()
+
+        cloud = SlowCloseCloud()
+        controls = []
+
+        async def connector(_):
+            cloud.push("session.created")
+            return cloud
+
+        async def send(msg):
+            if isinstance(msg, dict):
+                controls.append(msg)
+
+        mgr = MmpgManager(lambda: CONFIG, str, connector=connector, test_timeout=0.04)
+        owner = object()
+        mgr.attach(owner, send)
+        mgr.start(owner, "test", [1])
+        run = mgr._run
+        try:
+            await wait_until(lambda: any(m["type"] == "rtc_join" for m in controls))
+            await asyncio.sleep(0.045)
+            await mgr.stop("user_stop")
+            await wait_until(lambda: run.timeout_task is None)
+            assert mgr.status()["state"] == "idle"
+            assert run.timeout_task is None
+        finally:
+            await mgr.detach(owner)
+
+        # Calling _schedule_timeout_test after stop_reason is set must be a no-op
+        mgr2 = MmpgManager(lambda: CONFIG, str, connector=connector, test_timeout=10.0)
+        mgr2.attach(owner, send)
+        mgr2.start(owner, "test", [1])
+        run2 = mgr2._run
+        try:
+            run2.stop_reason = "user_stop"
+            mgr2._schedule_timeout_test(run2)
+            assert run2.timeout_task is None
+        finally:
+            await mgr2.detach(owner)
+
+    asyncio.run(check_race())

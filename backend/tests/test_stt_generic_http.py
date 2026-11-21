@@ -185,3 +185,37 @@ def test_generic_http_stt_strips_content_type_from_custom_headers_and_reuses_ses
         lowered_keys = {k.lower() for k in captured["headers"]}
         assert "content-type" not in lowered_keys
         assert "x-custom" in lowered_keys
+
+
+def test_generic_http_stt_session_blocks_cookies_and_closes_on_shutdown():
+    import gc
+    import threading
+    from services.stt import engines
+
+    engines.close_generic_stt_sessions()
+    session = engines._get_generic_stt_session()
+    session.cookies.set("sid", "secret", domain="asr.example.com")
+    assert dict(session.cookies) == {}
+
+    def worker():
+        s = engines._get_generic_stt_session()
+        s.cookies.set("worker_sid", "secret", domain="asr.example.com")
+        assert dict(s.cookies) == {}
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    gc.collect()
+
+    closed = {"called": False}
+    orig_close = session.close
+
+    def tracked_close():
+        closed["called"] = True
+        orig_close()
+
+    session.close = tracked_close
+    engines.close_generic_stt_sessions()
+    assert closed["called"] is True
+    assert engines._get_generic_stt_session() is not session
+    engines.close_generic_stt_sessions()

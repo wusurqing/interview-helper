@@ -8,6 +8,7 @@ import struct
 import threading
 import uuid
 import wave
+import weakref
 import numpy as np
 from typing import Optional, Any
 
@@ -19,20 +20,46 @@ from .text_utils import _postprocess
 _log = get_logger("stt.engines")
 _ORIG_REQUESTS_POST = requests.post
 _stt_http_local = threading.local()
+_stt_http_lock = threading.Lock()
+_stt_http_sessions: weakref.WeakSet[requests.Session] = weakref.WeakSet()
+
+
+class _NullCookieJar(requests.cookies.RequestsCookieJar):
+    """Cookie jar that never stores or forwards cookies across STT providers/requests."""
+
+    def set_cookie(self, cookie, *args, **kwargs):
+        return None
 
 
 def _get_generic_stt_session() -> requests.Session:
     session = getattr(_stt_http_local, "session", None)
     if session is None:
         session = requests.Session()
+        session.cookies = _NullCookieJar()
         session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
         adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8)
         session.mount("https://", adapter)
         session.mount("http://", adapter)
         _stt_http_local.session = session
+        with _stt_http_lock:
+            _stt_http_sessions.add(session)
     else:
         session.cookies.clear()
     return session
+
+
+def close_generic_stt_sessions() -> None:
+    """Close and clear all active thread-local GenericHTTPSTT sessions."""
+    global _stt_http_local
+    with _stt_http_lock:
+        sessions = list(_stt_http_sessions)
+        _stt_http_sessions.clear()
+    _stt_http_local = threading.local()
+    for session in sessions:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 try:
     import websocket
@@ -74,13 +101,24 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int = 16000) -> bytes:
 
 
 def _resample_pcm_int16(pcm: np.ndarray, sample_rate: int, target_rate: int = 16000) -> np.ndarray:
-    if not pcm.size or sample_rate <= 0 or sample_rate == target_rate:
-        return pcm
-    n_orig = len(pcm)
+    arr = np.asarray(pcm)
+    if not arr.size:
+        return np.empty(0, dtype=np.int16)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    elif arr.ndim > 1:
+        arr = np.clip(
+            np.rint(arr.astype(np.float64).mean(axis=tuple(range(1, arr.ndim)))),
+            -32768,
+            32767,
+        ).astype(np.int16)
+    if sample_rate <= 0 or sample_rate == target_rate:
+        return arr.astype(np.int16, copy=False)
+    n_orig = len(arr)
     if n_orig == 1:
-        return pcm
+        return arr.astype(np.int16, copy=False)
     n_new = max(1, int(round(n_orig * target_rate / sample_rate)))
-    samples = pcm.astype(np.float64)
+    samples = arr.astype(np.float64)
     if sample_rate > target_rate and n_orig > 4:
         cutoff_norm = 0.47 * (target_rate / sample_rate)
         num_taps = min(63, n_orig if n_orig % 2 == 1 else max(3, n_orig - 1))
@@ -91,7 +129,7 @@ def _resample_pcm_int16(pcm: np.ndarray, sample_rate: int, target_rate: int = 16
             fir /= fir_sum
         samples = np.convolve(samples, fir, mode="same")
     x_old = np.arange(n_orig, dtype=np.float64)
-    x_new = np.linspace(0.0, float(n_orig - 1), n_new)
+    x_new = np.arange(n_new, dtype=np.float64) * (float(sample_rate) / float(target_rate))
     resampled = np.interp(x_new, x_old, samples)
     return np.clip(np.rint(resampled), -32768, 32767).astype(np.int16)
 
