@@ -122,6 +122,8 @@ async def lifespan(app: FastAPI):
         await run_in_threadpool(shutdown_resource_lanes, wait=False)
     except Exception as e:
         _log.debug("Resource lanes shutdown skipped: %s", e)
+    ws.shutdown_broadcast()
+    await ws.close_all_clients()
     dispatch_task.cancel()
     heartbeat_task.cancel()
     await asyncio.gather(dispatch_task, heartbeat_task, return_exceptions=True)

@@ -16,8 +16,8 @@ class FakeWebSocket {
   readyState = FakeWebSocket.CONNECTING
   onopen: (() => void) | null = null
   onmessage: ((event: MessageEvent) => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
+  onclose: ((ev?: CloseEvent) => void) | null = null
+  onerror: ((ev?: Event) => void) | null = null
   sent: string[] = []
   closed = false
 
@@ -34,9 +34,13 @@ class FakeWebSocket {
     this.onmessage?.({ data: JSON.stringify(data) } as MessageEvent)
   }
 
-  emitClose() {
+  emitClose(ev?: Partial<CloseEvent>) {
     this.readyState = FakeWebSocket.CONNECTING
-    this.onclose?.()
+    this.onclose?.((ev ?? {}) as CloseEvent)
+  }
+
+  emitError(ev?: Event) {
+    this.onerror?.(ev ?? ({} as Event))
   }
 
   send(payload: string) {
@@ -459,5 +463,119 @@ describe('useInterviewWS', () => {
     const state = useInterviewStore.getState()
     expect(state.resumeOptResult).toBe('后台分析完成')
     expect(state.resumeOptLoading).toBe(false)
+  })
+
+  it('ignores stale ws.onerror from a replaced or deactivated socket', () => {
+    const { rerender } = render(<Harness active />)
+    const first = FakeWebSocket.instances[0]
+
+    act(() => {
+      first.emitOpen()
+      first.emitClose()
+      vi.advanceTimersByTime(1000)
+    })
+
+    const second = FakeWebSocket.instances[1]
+    const firstCloseSpy = vi.spyOn(first, 'close')
+    const secondCloseSpy = vi.spyOn(second, 'close')
+    act(() => {
+      second.emitOpen()
+      first.emitError()
+    })
+    expect(firstCloseSpy).not.toHaveBeenCalled()
+    expect(secondCloseSpy).not.toHaveBeenCalled()
+    expect(useInterviewStore.getState().wsConnected).toBe(true)
+
+    rerender(<Harness active={false} />)
+    secondCloseSpy.mockClear()
+    act(() => {
+      second.emitError()
+    })
+    expect(secondCloseSpy).not.toHaveBeenCalled()
+  })
+
+  it('resets the 5s error auto-clear timer on consecutive errors and clears it on unmount', () => {
+    const screen = render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+
+    act(() => {
+      ws.emitOpen()
+      ws.emitMessage({ type: 'error', message: '第一次错误' })
+    })
+    expect(useInterviewStore.getState().lastWSError).toBe('第一次错误')
+
+    act(() => {
+      vi.advanceTimersByTime(3000)
+      ws.emitMessage({ type: 'error', message: '第二次错误' })
+    })
+    expect(useInterviewStore.getState().lastWSError).toBe('第二次错误')
+
+    // 若未清理旧定时器，t=5000ms 时会被提前清空；修复后仍保留
+    act(() => {
+      vi.advanceTimersByTime(2500)
+    })
+    expect(useInterviewStore.getState().lastWSError).toBe('第二次错误')
+
+    act(() => {
+      vi.advanceTimersByTime(2500)
+    })
+    expect(useInterviewStore.getState().lastWSError).toBeNull()
+
+    // 卸载时取消尚未触发的 5s 定时器，不污染后续状态
+    act(() => {
+      ws.emitMessage({ type: 'error', message: '卸载前错误' })
+    })
+    screen.unmount()
+    act(() => {
+      useInterviewStore.getState().setLastWSError('后续错误')
+      vi.advanceTimersByTime(6000)
+    })
+    expect(useInterviewStore.getState().lastWSError).toBe('后续错误')
+  })
+
+  it('notifies user and stops reconnecting on 1008 policy violation', () => {
+    render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+
+    act(() => {
+      ws.emitOpen()
+      ws.emitClose({ code: 1008 })
+      vi.advanceTimersByTime(60000)
+    })
+
+    const state = useInterviewStore.getState()
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(state.wsConnected).toBe(false)
+    expect(state.lastWSError).toContain('鉴权失败')
+    expect(state.toasts).toContainEqual(expect.objectContaining({
+      level: 'error',
+      message: expect.stringContaining('鉴权失败'),
+    }))
+  })
+
+  it('dispatches preflight_step and exam_preflight events without polluting qaPairs', async () => {
+    const { subscribeSoundPreflight, subscribeExamPreflight } = await import('@/lib/preflightWsBus')
+    const soundEvents: unknown[] = []
+    const examEvents: unknown[] = []
+    const unsubSound = subscribeSoundPreflight((m) => soundEvents.push(m))
+    const unsubExam = subscribeExamPreflight((m) => examEvents.push(m))
+
+    try {
+      render(<Harness />)
+      const ws = FakeWebSocket.instances[0]
+      act(() => {
+        ws.emitOpen()
+        ws.emitMessage({ type: 'preflight_step', step: 'playback', status: 'pass', detail: 'ok' })
+        ws.emitMessage({ type: 'exam_preflight_step', step: 'screenshot', status: 'pass', detail: 'ok' })
+        ws.emitMessage({ type: 'answer_start', id: 'pf-1', exam_preflight_id: 'pf-1', question: 'Q' })
+      })
+
+      expect(soundEvents).toHaveLength(1)
+      expect(examEvents).toHaveLength(2)
+      expect(useInterviewStore.getState().qaPairs).toEqual([])
+    } finally {
+      unsubSound()
+      unsubExam()
+    }
   })
 })

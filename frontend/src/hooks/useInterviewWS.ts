@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { useInterviewStore } from '@/stores/configStore'
 import { useKbStore } from '@/stores/kbStore'
 import { buildWsUrl } from '@/lib/backendUrl'
+import { emitExamPreflight, emitSoundPreflight } from '@/lib/preflightWsBus'
 import { subscribeLeader } from '@/lib/wsLeader'
 import { isMmpgState, mmpgErrorMessage } from '@/lib/mmpg/rtcController'
 
@@ -21,11 +22,13 @@ interface WsMsg {
 export function useInterviewWS(active = true) {
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<number | null>(null)
+  const errorClearTimer = useRef<number | null>(null)
   const reconnectAttempts = useRef(0)
   const shouldReconnect = useRef(true)
   const lastServerPongAt = useRef(0)
   const pendingWorkspace = useRef<boolean | undefined>(undefined)
   const workspaceChannel = useRef<BroadcastChannel | null>(null)
+  const preflightChannel = useRef<BroadcastChannel | null>(null)
 
   const applyWorkspace = (exam: boolean) => {
     const { config, setConfig } = useInterviewStore.getState()
@@ -99,14 +102,23 @@ export function useInterviewWS(active = true) {
       useInterviewStore.getState().setWsConnected(false)
       if (!shouldReconnect.current) return
       if (ev && ev.code === 1008) {
-        // policy violation (鉴权失败)，重试也无效，停止
+        // policy violation (鉴权失败)，重试也无效，停止并向用户显式提示
         console.warn('[ws] closed by server with policy violation; stop reconnecting')
         shouldReconnect.current = false
+        if (errorClearTimer.current !== null) {
+          clearTimeout(errorClearTimer.current)
+          errorClearTimer.current = null
+        }
+        const authMsg = '实时连接鉴权失败（访问令牌无效或已过期），请重新扫码或刷新授权后重试'
+        const store = useInterviewStore.getState()
+        store.setLastWSError(authMsg)
+        store.pushToast(authMsg, 'error', 10000)
         return
       }
       scheduleReconnect()
     }
     ws.onerror = (ev) => {
+      if (wsRef.current !== ws) return
       console.warn('[ws] error event', ev)
       try { ws.close() } catch (err) { console.warn('[ws] close after error failed', err) }
     }
@@ -117,6 +129,16 @@ export function useInterviewWS(active = true) {
     if ((msg.type === 'init' || msg.type === 'workspace_mode') && typeof msg.written_exam_mode === 'boolean') {
       applyWorkspace(msg.written_exam_mode)
       workspaceChannel.current?.postMessage(msg.written_exam_mode)
+    }
+    if (msg.type === 'preflight_step') {
+      emitSoundPreflight(msg)
+      preflightChannel.current?.postMessage({ target: 'sound', msg })
+      return
+    }
+    if (msg.type === 'exam_preflight_step' || msg.exam_preflight_id) {
+      emitExamPreflight(msg)
+      preflightChannel.current?.postMessage({ target: 'exam', msg })
+      return
     }
     switch (msg.type) {
       case 'init':
@@ -282,7 +304,13 @@ export function useInterviewWS(active = true) {
         break
       case 'error':
         s.setLastWSError((msg.message as string) || '未知错误')
-        setTimeout(() => useInterviewStore.getState().setLastWSError(null), 5000)
+        if (errorClearTimer.current !== null) {
+          clearTimeout(errorClearTimer.current)
+        }
+        errorClearTimer.current = window.setTimeout(() => {
+          errorClearTimer.current = null
+          useInterviewStore.getState().setLastWSError(null)
+        }, 5000)
         break
       case 'kb_hits':
         useKbStore.getState().appendHits({
@@ -307,6 +335,10 @@ export function useInterviewWS(active = true) {
         clearTimeout(reconnectTimer.current)
         reconnectTimer.current = null
       }
+      if (errorClearTimer.current !== null) {
+        clearTimeout(errorClearTimer.current)
+        errorClearTimer.current = null
+      }
       if (wsRef.current) {
         try { wsRef.current.close() } catch (err) { console.warn('[ws] teardown close failed', err) }
         wsRef.current = null
@@ -320,12 +352,22 @@ export function useInterviewWS(active = true) {
       return teardown
     }
 
-    // Follower tabs share the leader's socket. Relay only the workspace flag.
+    // Follower tabs share the leader's socket. Relay workspace mode and preflight events.
     const channel = typeof window.BroadcastChannel === 'function'
       ? new window.BroadcastChannel('ia-workspace-mode') : null
     workspaceChannel.current = channel
     if (channel) channel.onmessage = (event) => {
       if (!useInterviewStore.getState().wsIsLeader && typeof event.data === 'boolean') applyWorkspace(event.data)
+    }
+    const pfChannel = typeof window.BroadcastChannel === 'function'
+      ? new window.BroadcastChannel('ia-preflight-events') : null
+    preflightChannel.current = pfChannel
+    if (pfChannel) pfChannel.onmessage = (event) => {
+      if (useInterviewStore.getState().wsIsLeader) return
+      const payload = event.data as { target?: string; msg?: WsMsg } | null
+      if (!payload || !payload.msg || typeof payload.msg.type !== 'string') return
+      if (payload.target === 'sound') emitSoundPreflight(payload.msg)
+      else if (payload.target === 'exam') emitExamPreflight(payload.msg)
     }
     const unsubscribeBootstrap = useInterviewStore.subscribe((state) => {
       if (!state.config || pendingWorkspace.current === undefined) return
@@ -367,6 +409,8 @@ export function useInterviewWS(active = true) {
       pendingWorkspace.current = undefined
       workspaceChannel.current = null
       channel?.close()
+      preflightChannel.current = null
+      pfChannel?.close()
       if (pingTimer) clearInterval(pingTimer)
       teardown()
     }

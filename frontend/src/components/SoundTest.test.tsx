@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import SoundTest from './SoundTest'
+import { useInterviewWS } from '@/hooks/useInterviewWS'
 import { useInterviewStore } from '@/stores/configStore'
 
 const apiMock = vi.hoisted(() => ({
@@ -14,7 +15,13 @@ vi.mock('@/lib/backendUrl', () => ({ buildWsUrl: () => 'ws://example.test/ws' })
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = []
+  static OPEN = 1
+  static CONNECTING = 0
+  readyState = FakeWebSocket.OPEN
+  onopen: (() => void) | null = null
   onmessage: ((event: MessageEvent) => void) | null = null
+  onclose: ((ev?: CloseEvent) => void) | null = null
+  onerror: ((ev?: Event) => void) | null = null
   sent: string[] = []
   constructor(public url: string) {
     FakeWebSocket.instances.push(this)
@@ -26,6 +33,11 @@ class FakeWebSocket {
   emit(data: unknown) {
     this.onmessage?.({ data: JSON.stringify(data) } as MessageEvent)
   }
+}
+
+function SoundTestWithSharedWS() {
+  useInterviewWS(true)
+  return <SoundTest />
 }
 
 function deferred<T>() {
@@ -58,8 +70,18 @@ describe('SoundTest', () => {
     })
   })
 
-  it('starts real preflight and renders transcript result', async () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('does not open its own raw WebSocket when rendered standalone', async () => {
     render(<SoundTest />)
+    await waitFor(() => expect(screen.getByRole('button', { name: '开始检测' })).toBeInTheDocument())
+    expect(FakeWebSocket.instances).toHaveLength(0)
+  })
+
+  it('starts real preflight and renders transcript result', async () => {
+    render(<SoundTestWithSharedWS />)
     await waitFor(() => expect(screen.getByRole('button', { name: '开始检测' })).toBeInTheDocument())
 
     fireEvent.click(screen.getByRole('button', { name: '开始检测' }))
@@ -78,7 +100,7 @@ describe('SoundTest', () => {
   })
 
   it('replies to backend websocket heartbeats while idle', async () => {
-    render(<SoundTest />)
+    render(<SoundTestWithSharedWS />)
     await waitFor(() => expect(screen.getByRole('button', { name: '开始检测' })).toBeInTheDocument())
 
     const ws = FakeWebSocket.instances[0]
@@ -99,7 +121,7 @@ describe('SoundTest', () => {
       ],
     } as any)
 
-    render(<SoundTest />)
+    render(<SoundTestWithSharedWS />)
     await waitFor(() => expect(screen.getByRole('button', { name: '开始检测' })).toBeInTheDocument())
 
     fireEvent.click(screen.getByRole('button', { name: '开始检测' }))
@@ -108,7 +130,7 @@ describe('SoundTest', () => {
   })
 
   it('starts another preflight when clicking retry after completion', async () => {
-    render(<SoundTest />)
+    render(<SoundTestWithSharedWS />)
     await waitFor(() => expect(screen.getByRole('button', { name: '开始检测' })).toBeInTheDocument())
 
     fireEvent.click(screen.getByRole('button', { name: '开始检测' }))
@@ -131,7 +153,7 @@ describe('SoundTest', () => {
     const pendingRun = deferred<{ ok: boolean }>()
     apiMock.preflightRun.mockReturnValueOnce(pendingRun.promise)
 
-    render(<SoundTest />)
+    render(<SoundTestWithSharedWS />)
     await waitFor(() => expect(screen.getByRole('button', { name: '开始检测' })).toBeInTheDocument())
 
     const startButton = screen.getByRole('button', { name: '开始检测' })
@@ -176,7 +198,7 @@ describe('SoundTest', () => {
       },
     })
 
-    render(<SoundTest />)
+    render(<SoundTestWithSharedWS />)
     await waitFor(() => expect(screen.getByRole('button', { name: '开始检测' })).toBeInTheDocument())
     fireEvent.click(screen.getByRole('button', { name: '开始检测' }))
 
@@ -205,7 +227,7 @@ describe('SoundTest', () => {
       },
     })
 
-    render(<SoundTest />)
+    render(<SoundTestWithSharedWS />)
     await waitFor(() => expect(screen.getByRole('button', { name: '开始检测' })).toBeInTheDocument())
     fireEvent.click(screen.getByRole('button', { name: '开始检测' }))
 
