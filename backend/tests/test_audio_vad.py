@@ -486,6 +486,8 @@ def test_soundcard_device_cache_concurrent_read_write_is_thread_safe(monkeypatch
 
     monkeypatch.setattr(audio, "_HAS_SC", True)
     monkeypatch.setattr(audio, "_sc", _FakeSC, raising=False)
+    monkeypatch.setattr(audio, "_SC_DEVICE_CACHE", {})
+    monkeypatch.setattr(audio, "_SC_ID_MAP", {})
 
     errors: list[Exception] = []
     barrier = threading.Barrier(6)

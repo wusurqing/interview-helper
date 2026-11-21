@@ -32,8 +32,12 @@ def _microphone_com():
         yield
         return
 
-    # WASAPI stream operations can run on different server worker threads.
-    ole = ctypes.windll.ole32
+    ole = getattr(getattr(ctypes, "windll", None), "ole32", None)
+    if ole is None:
+        yield
+        return
+
+    # WASAPI enumeration and stream operations can run on different server worker threads.
     initialized = ole.CoInitializeEx(None, 0) >= 0  # COINIT_MULTITHREADED
     try:
         yield
@@ -124,18 +128,19 @@ def _get_sc_loopback_devices() -> list[dict]:
     if not _HAS_SC:
         return []
     with _SC_CACHE_LOCK:
-        try:
-            speakers = [(spk.id, spk.name, getattr(spk, "channels", 2)) for spk in _sc.all_speakers()]
-        except Exception:
-            # A failed native query is not evidence that all outputs disconnected.
-            return []
-        default_id = None
-        if speakers:
+        with _microphone_com():
             try:
-                default_spk = _sc.default_speaker()
-                default_id = getattr(default_spk, "id", None)
-            except Exception:
-                default_id = None
+                speakers = [(spk.id, spk.name, getattr(spk, "channels", 2)) for spk in _sc.all_speakers()]
+            except Exception as exc:
+                # A failed native query is not evidence that all outputs disconnected.
+                _alog.warning("soundcard loopback enumeration failed: %s", exc)
+                return []
+            default_id = None
+            if speakers:
+                try:
+                    default_id = getattr(_sc.default_speaker(), "id", None)
+                except Exception:
+                    default_id = None
 
         live_guids = {guid for guid, _, _ in speakers}
         live_names = Counter(name for _, name, _ in speakers)
@@ -1020,5 +1025,6 @@ def load_wav_file(path: str | Path) -> tuple[np.ndarray, int]:
 
 def play_audio_file(path: str | Path):
     audio, sr = load_wav_file(path)
-    sd.play(audio, sr)
-    sd.wait()
+    with _microphone_com():
+        sd.play(audio, sr)
+        sd.wait()

@@ -81,3 +81,64 @@ def test_default_speaker_query_failure_still_returns_enumerated_speakers(enumera
     assert all(entry["is_default_output"] is False for entry in entries)
     assert audio._lookup_sc_speaker_guid(mapped["a"]) == "a"
     assert audio._lookup_sc_speaker_guid(mapped["b"]) == "b"
+
+
+def test_loopback_enumeration_initializes_and_uninitializes_windows_com(enumerate_devices, monkeypatch):
+    import ctypes
+
+    operations: list[str] = []
+    ole = SimpleNamespace(
+        CoInitializeEx=lambda *_: operations.append("init") or 0,
+        CoUninitialize=lambda: operations.append("uninit"),
+    )
+    monkeypatch.setattr(audio.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(ole32=ole), raising=False)
+
+    speaker = SimpleNamespace(id="a", name="Monitor", channels=2)
+    monkeypatch.setattr(
+        audio._sc,
+        "all_speakers",
+        lambda: operations.append("all_speakers") or [speaker],
+    )
+    monkeypatch.setattr(
+        audio._sc,
+        "default_speaker",
+        lambda: operations.append("default_speaker") or speaker,
+    )
+
+    entries = audio._get_sc_loopback_devices()
+    assert len(entries) == 1
+    assert operations == ["init", "all_speakers", "default_speaker", "uninit"]
+
+
+def test_loopback_enumeration_works_on_fresh_worker_thread_in_windows(monkeypatch):
+    import ctypes
+    import platform
+    import threading
+
+    if platform.system() != "Windows" or not audio._HAS_SC:
+        # On non-Windows (e.g. Linux CI), verify _microphone_com stays safe when ctypes.windll is absent.
+        monkeypatch.setattr(audio.platform, "system", lambda: "Windows")
+        monkeypatch.delattr(ctypes, "windll", raising=False)
+        with audio._microphone_com():
+            pass
+        return
+
+    monkeypatch.setattr(audio, "_SC_DEVICE_CACHE", {})
+    monkeypatch.setattr(audio, "_SC_ID_MAP", {})
+    main_entries = audio._get_sc_loopback_devices()
+    assert len(main_entries) >= 0
+    worker_result: dict[str, object] = {}
+
+    def _run():
+        try:
+            worker_result["entries"] = audio._get_sc_loopback_devices()
+        except Exception as exc:
+            worker_result["error"] = exc
+
+    t = threading.Thread(target=_run)
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive()
+    assert "error" not in worker_result
+    assert len(worker_result["entries"]) == len(main_entries)
