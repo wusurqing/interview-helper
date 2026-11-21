@@ -23,6 +23,13 @@ _DEFAULT_REVIEW_TITLES = {"", "手动复盘", "面试详情", "复盘"}
 _DEFAULT_COMPANY_VALUES = {"", "新公司", "未命名公司"}
 _DEFAULT_ROLE_VALUES = {"", "岗位", "岗位未填写"}
 MAX_REVIEW_PAGE_SIZE = 100
+ANALYZABLE_SESSION_STATUSES = (
+    "recorded",
+    "recording",
+    "completed",
+    "partial_capture",
+    "analysis_failed",
+)
 _TERMINAL_APPLICATION_STAGES = {
     "written_rejected",
     "interview1_rejected",
@@ -415,6 +422,88 @@ def update_session_status(session_id: int, status: str):
             (status, now, session_id),
         )
     sync_application_todos_for_session(session_id)
+
+
+def claim_session_for_analysis(session_id: int) -> bool:
+    """原子条件占位：仅当会话处于可分析状态（且非已完成有效复盘）时切换为 analyzing。"""
+    now = time.time()
+    with _db_lock, _connect(transactional=True) as conn:
+        cur = conn.execute(
+            """
+            UPDATE review_sessions
+            SET status = 'analyzing', updated_at = ?
+            WHERE id = ?
+              AND (
+                status IN ('recorded', 'recording', 'partial_capture', 'analysis_failed')
+                OR (
+                    status = 'completed'
+                    AND COALESCE(summary_markdown, '') = ''
+                    AND avg_score IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM review_turns t
+                        WHERE t.session_id = review_sessions.id
+                          AND t.analysis_status = 'completed'
+                          AND (
+                              COALESCE(t.strengths_json, '') NOT IN ('', '[]')
+                              OR COALESCE(t.risks_json, '') NOT IN ('', '[]')
+                              OR COALESCE(t.scorecard_json, '') NOT IN ('', '{}')
+                          )
+                    )
+                )
+              )
+            """,
+            (now, int(session_id)),
+        )
+        claimed = cur.rowcount == 1
+    if claimed:
+        sync_application_todos_for_session(session_id)
+    return claimed
+
+
+def ensure_session_analyzing(session_id: int) -> bool:
+    """幂等置为 analyzing（仅当当前并非 analyzing 时写入）。"""
+    now = time.time()
+    with _db_lock, _connect(transactional=True) as conn:
+        cur = conn.execute(
+            """
+            UPDATE review_sessions
+            SET status = 'analyzing', updated_at = ?
+            WHERE id = ? AND status != 'analyzing'
+            """,
+            (now, int(session_id)),
+        )
+        changed = cur.rowcount == 1
+    if changed:
+        sync_application_todos_for_session(session_id)
+    return changed
+
+
+def recover_stale_sessions_on_startup() -> dict[str, int]:
+    """服务启动时将遗留的 analyzing 复位为 analysis_failed，recording 复位为 partial_capture。"""
+    now = time.time()
+    with _db_lock, _connect(transactional=True) as conn:
+        cur_analyzing = conn.execute(
+            """
+            UPDATE review_sessions
+            SET status = 'analysis_failed', updated_at = ?
+            WHERE status = 'analyzing'
+            """,
+            (now,),
+        )
+        cur_recording = conn.execute(
+            """
+            UPDATE review_sessions
+            SET status = 'partial_capture',
+                ended_at = COALESCE(ended_at, ?),
+                updated_at = ?
+            WHERE status = 'recording'
+            """,
+            (now, now),
+        )
+        return {
+            "analyzing_recovered": cur_analyzing.rowcount,
+            "recording_recovered": cur_recording.rowcount,
+        }
 
 
 def update_turn_analysis(

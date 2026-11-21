@@ -2,17 +2,19 @@
 Review 模块与 Assist 生命周期集成
 在 assist start/stop 时自动创建和结束 review session
 """
+import threading
 import time
 from typing import Optional
 
 from core.logger import get_logger
-from core.session import Session
+from core.session import Session, conversation_lock
 from core.config import get_config
 from services.storage import review
 from services import review_async_analysis
 
 logger = get_logger(__name__)
 
+_state_lock = threading.Lock()
 _current_review_session_id: Optional[int] = None
 _existing_qa_ids: frozenset[str] = frozenset()
 
@@ -90,8 +92,9 @@ def on_assist_start(
             ),
             source="written_exam" if written_exam_mode else "assist",
         )
-        _current_review_session_id = session_id
-        _existing_qa_ids = existing_qa_ids
+        with _state_lock:
+            _current_review_session_id = session_id
+            _existing_qa_ids = existing_qa_ids
         logger.info("Review session created: session_id=%d", session_id)
         return session_id
     except Exception as e:
@@ -106,25 +109,36 @@ def on_assist_stop(session: Session) -> Optional[int]:
     """
     global _current_review_session_id, _existing_qa_ids
 
-    if _current_review_session_id is None:
-        return None
+    with _state_lock:
+        session_id = _current_review_session_id
+        if session_id is None:
+            return None
+        existing_qa_ids = _existing_qa_ids
+        _current_review_session_id = None
+        _existing_qa_ids = frozenset()
 
-    session_id = _current_review_session_id
-    _current_review_session_id = None
-    qa_pairs = [qa for qa in session.qa_pairs if qa.id not in _existing_qa_ids]
-    _existing_qa_ids = frozenset()
+    with conversation_lock:
+        qa_snapshots = [
+            (
+                qa.id,
+                qa.question,
+                qa.answer,
+                session.get_candidate_answer_for_qa(qa.id, max_chars=2000),
+                _build_turn_evidence(qa),
+            )
+            for qa in session.qa_pairs
+            if qa.id not in existing_qa_ids
+        ]
 
     try:
-        for idx, qa in enumerate(qa_pairs, start=1):
-            candidate_answer = session.get_candidate_answer_for_qa(qa.id, max_chars=2000)
-            evidence = _build_turn_evidence(qa)
+        for idx, (qa_id, question, answer, candidate_answer, evidence) in enumerate(qa_snapshots, start=1):
             review.add_turn(
                 session_id=session_id,
-                qa_id=qa.id,
+                qa_id=qa_id,
                 seq=idx,
-                question_text=qa.question,
+                question_text=question,
                 candidate_answer_text=candidate_answer,
-                reference_answer_text=qa.answer,  # LLM 给出的参考答案
+                reference_answer_text=answer,  # LLM 给出的参考答案
                 duration_ms=0,  # 暂时无法精确计算每题时长
                 is_partial=False,
                 analysis_status="pending",
@@ -135,7 +149,7 @@ def on_assist_stop(session: Session) -> Optional[int]:
         # recorded, 保留 ended_at, 等待前端手动触发 (POST /review/sessions/{id}/generate)。
         # 笔试练习即使只有 1 题也自动生成报告；看板自动同步仍由 AUTO_REVIEW_SYNC_MIN_TURNS 控制。
         # completed 只表示分析结果已经生成。
-        turn_count = len(qa_pairs)
+        turn_count = len(qa_snapshots)
         source = str((review.get_session_detail(session_id) or {}).get("source") or "assist")
         auto_analyze = _should_auto_analyze(
             review_enabled=bool(get_config().review_enabled),
@@ -156,8 +170,17 @@ def on_assist_stop(session: Session) -> Optional[int]:
         )
 
         if auto_analyze:
-            # 启动后台分析
-            review_async_analysis.analyze_session_async(session_id)
+            try:
+                # 启动后台分析
+                review_async_analysis.analyze_session_async(session_id)
+            except Exception as submit_err:
+                logger.error(
+                    "Failed to enqueue background analysis for session %d: %s",
+                    session_id,
+                    submit_err,
+                    exc_info=True,
+                )
+                review.update_session_status(session_id, "analysis_failed")
         else:
             logger.info(
                 "Review session %d recorded (auto-analysis skipped; review_enabled=%s, turn_count=%d, min_turns=%d)",
@@ -170,12 +193,17 @@ def on_assist_stop(session: Session) -> Optional[int]:
         return session_id
     except Exception as e:
         logger.error("Failed to end review session %d: %s", session_id, e, exc_info=True)
+        try:
+            review.end_session(session_id=session_id, status="partial_capture", ended_at=time.time())
+        except Exception:
+            pass
         return None
 
 
 def get_current_review_session_id() -> Optional[int]:
     """返回当前进行中的 review session id"""
-    return _current_review_session_id
+    with _state_lock:
+        return _current_review_session_id
 
 
 def _build_turn_evidence(qa) -> dict:

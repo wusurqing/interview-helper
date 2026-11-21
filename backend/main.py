@@ -86,6 +86,17 @@ async def lifespan(app: FastAPI):
     heartbeat_task = asyncio.create_task(ws.ws_heartbeat())
     assist.init_background_workers()
     try:
+        from services.storage.review import recover_stale_sessions_on_startup
+        recovered = recover_stale_sessions_on_startup()
+        if recovered["analyzing_recovered"] or recovered["recording_recovered"]:
+            _log.warning(
+                "Recovered stale review sessions on startup: analyzing->analysis_failed=%d recording->partial_capture=%d",
+                recovered["analyzing_recovered"],
+                recovered["recording_recovered"],
+            )
+    except Exception as e:
+        _log.warning("Review startup recovery skipped: %s", e)
+    try:
         from services.storage.resume_history import restore_active_resume
         if restore_active_resume():
             _log.info("Resume auto-restored from history (id=%s)", cfg.resume_active_history_id)
@@ -96,6 +107,11 @@ async def lifespan(app: FastAPI):
     await asyncio.gather(mmpg_integration.manager.stop("shutdown"), candidate_mmpg.stop("shutdown", drain=True))
     assist.stop_interview_loop()
     assist.shutdown_background_workers()
+    try:
+        from services.review_async_analysis import shutdown_executor as shutdown_review_analysis_executor
+        shutdown_review_analysis_executor(wait=False)
+    except Exception as e:
+        _log.debug("Review analysis executor shutdown skipped: %s", e)
     dispatch_task.cancel()
     heartbeat_task.cancel()
 

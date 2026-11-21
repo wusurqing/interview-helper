@@ -4,10 +4,12 @@ import time
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from core.logger import get_logger
 from services.storage import review
 from services.storage import job_tracker
 from services import review_analysis, review_async_analysis
 
+logger = get_logger(__name__)
 router = APIRouter()
 
 
@@ -122,7 +124,15 @@ async def create_manual_review(req: ManualReviewRequest):
     review.end_session(session_id, status="analyzing" if req.analyze else "completed", ended_at=time.time())
 
     if req.analyze:
-        review_async_analysis.analyze_session_async(session_id)
+        try:
+            review_async_analysis.analyze_session_async(session_id)
+        except Exception:
+            logger.exception("Failed to submit manual review analysis for session_id=%d", session_id)
+            try:
+                review.update_session_status(session_id, "analysis_failed")
+            except Exception:
+                pass
+            raise HTTPException(500, "复盘分析启动失败，请稍后重试")
 
     return {"session_id": session_id, "turn_count": len(turns), "status": "started" if req.analyze else "created"}
 
@@ -216,12 +226,30 @@ async def trigger_review_analysis(session_id: int):
         return {"status": "done", "message": "复盘已完成"}
 
     # 允许触发的状态：已录制待分析、历史 completed 空复盘、部分录制、分析失败或旧的 recording 归档。
-    if status not in ["recorded", "recording", "completed", "partial_capture", "analysis_failed"]:
+    if status not in review.ANALYZABLE_SESSION_STATUSES:
         raise HTTPException(400, f"当前状态 {status} 不支持触发分析")
 
+    # 原子条件 SQL 占位，防止并发双击重复启动分析任务
+    claimed = review.claim_session_for_analysis(session_id)
+    if not claimed:
+        latest = review.get_session_detail(session_id)
+        if not latest:
+            raise HTTPException(404, "Session not found")
+        latest_status = latest.get("status", "")
+        if latest_status == "analyzing":
+            return {"status": "pending", "message": "分析正在进行中"}
+        if latest_status == "completed" and _has_generated_analysis(latest):
+            return {"status": "done", "message": "复盘已完成"}
+        raise HTTPException(400, f"当前状态 {latest_status} 不支持触发分析")
+
     try:
-        # 调用异步分析任务
+        # 调用异步分析任务（有界线程池）
         review_async_analysis.analyze_session_async(session_id)
         return {"status": "started", "message": "复盘分析已开始"}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    except Exception:
+        logger.exception("Failed to submit review analysis for session_id=%d", session_id)
+        try:
+            review.update_session_status(session_id, status)
+        except Exception:
+            pass
+        raise HTTPException(500, "复盘分析启动失败，请稍后重试")
