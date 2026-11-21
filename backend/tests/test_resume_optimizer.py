@@ -231,3 +231,76 @@ def test_resume_transports_keep_system_prompts_and_input_separate(monkeypatch, a
         assert "JD 输入" not in system
         assert [message["role"] for message in messages] == ["user"]
         assert "JD" in messages[0]["content"]
+
+
+def test_resume_stream_chat_passes_timeout_completion_tokens_and_think_params():
+    from core.config import ModelConfig
+
+    captured = {}
+    closed = {"called": False}
+
+    class FakeStream:
+        def __iter__(self):
+            yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="chunk"))], usage=None)
+
+        def close(self):
+            closed["called"] = True
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                create=lambda **kwargs: captured.update(kwargs) or FakeStream(),
+            )
+        )
+    )
+    o3_model = ModelConfig(model="o3-mini", api_key="sk-test", api_type="openai")
+    assert list(
+        resume_optimizer._stream_chat(
+            client,
+            o3_model,
+            [{"role": "user", "content": "hi"}],
+            temperature=0.3,
+            max_tokens=500,
+        )
+    ) == ["chunk"]
+    assert captured["max_completion_tokens"] == 500
+    assert "max_tokens" not in captured
+    assert captured["timeout"] == 90.0
+    assert closed["called"] is True
+
+    captured.clear()
+    r1_model = ModelConfig(model="deepseek-r1", api_key="sk-test", api_type="openai")
+    list(
+        resume_optimizer._stream_chat(
+            client,
+            r1_model,
+            [{"role": "user", "content": "hi"}],
+            temperature=0.3,
+            max_tokens=500,
+        )
+    )
+    assert captured["extra_body"] == {
+        "thinking": {"type": "disabled"},
+        "think_mode": False,
+        "enable_thinking": False,
+    }
+
+
+def test_resume_router_closes_stream_when_job_becomes_stale(monkeypatch):
+    events: list[dict] = []
+    closed = {"called": False}
+    monkeypatch.setattr(resume_router, "broadcast", events.append)
+
+    def fake_stream(_jd: str, *, system_prompts):
+        try:
+            yield "first-chunk"
+            resume_router._resume_opt_current_job_id = "job-newer"
+            yield "second-chunk"
+        finally:
+            closed["called"] = True
+
+    monkeypatch.setattr(resume_router, "optimize_resume_stream", fake_stream)
+    monkeypatch.setattr(resume_router, "_resume_opt_current_job_id", "job-old")
+
+    resume_router._run_optimize("JD", "job-old", {})
+    assert closed["called"] is True

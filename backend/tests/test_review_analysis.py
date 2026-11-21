@@ -309,3 +309,27 @@ def test_get_active_llm_client():
         assert model_name == "test-model"
         assert "api.example.com" in str(client.base_url)
 
+
+def test_run_asr_correction_check_handles_empty_choices():
+    empty_response = MagicMock(choices=[])
+    with patch("services.review_analysis.get_config", return_value=_mock_review_config()), \
+         patch("services.review_analysis.get_review_model_cfg", return_value=_mock_review_config().get_review_model()), \
+         patch("services.llm.streaming.chat_completion_create", return_value=empty_response):
+        result = review_analysis.run_asr_correction_check(
+            question="请介绍缓存优化",
+            candidate_answer="我做过 red 地址缓存，麦 SQL 查询会先看布隆过绿器。",
+        )
+    assert result["ok"] is False
+    assert result["detail"] == "模型返回为空"
+
+
+def test_request_review_json_tolerates_fences_with_prose_and_inner_code_blocks():
+    summary = "## 建议\n\n```python\nprint('ok')\n```"
+    fenced_with_inner_fence = f"这里是复盘 JSON：\n```json\n{json.dumps({'summary_markdown': summary, 'strong_points': ['清晰'], 'weak_points': []})}\n```\n以上。"
+    response = MagicMock(choices=[MagicMock(message=MagicMock(content=fenced_with_inner_fence))])
+    with patch("services.review_analysis.get_config", return_value=_mock_review_config()), \
+         patch("services.llm.streaming.chat_completion_create", return_value=response):
+        result = review_analysis.generate_summary([{"question_text": "题目"}])
+    assert result["summary_markdown"] == summary
+    assert result["strong_points"] == ["清晰"]
+

@@ -11,8 +11,10 @@ SDK 路径会先规范化，裸 HTTP 路径按候选列表依次探测（404 自
 """
 
 import asyncio
+from http.cookiejar import DefaultCookiePolicy
 import json
 import re
+import threading
 from types import SimpleNamespace
 from typing import Any, Generator, Optional
 
@@ -24,14 +26,97 @@ from services.llm import trace
 
 _log = get_logger("llm.protocols")
 
-# 连接复用：答题/探测每次都建新连接会重复付 TLS 握手成本，池化后远程
-# 调用显著提速（对每题都请求 LLM 的实时链路收益最大）。
-_http = requests.Session()
-# 默认 urllib3 池 10/host；并行答题（最多 8 路）+ 健康探测会逼近上限，
-# 超限时 urllib3 丢弃连接重建，白付握手成本——抬高到 32。
-_adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=32)
-_http.mount("https://", _adapter)
-_http.mount("http://", _adapter)
+
+class _NullCookieJar(requests.cookies.RequestsCookieJar):
+    """Cookie jar that never stores or forwards cookies across providers/requests."""
+
+    def set_cookie(self, cookie, *args, **kwargs):
+        return None
+
+
+class _StatelessHttpClient:
+    """Thread-local requests Session pool with cookie persistence disabled."""
+
+    def __init__(self, *, pool_connections: int = 8, pool_maxsize: int = 32):
+        self._pool_connections = pool_connections
+        self._pool_maxsize = pool_maxsize
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._sessions: list[requests.Session] = []
+
+    def _get_session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.cookies = _NullCookieJar()
+            session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=self._pool_connections,
+                pool_maxsize=self._pool_maxsize,
+            )
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            self._local.session = session
+            with self._lock:
+                self._sessions.append(session)
+        else:
+            session.cookies.clear()
+        return session
+
+    def post(self, url: str, **kwargs):
+        return self._get_session().post(url, **kwargs)
+
+    def close(self) -> None:
+        with self._lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        self._local = threading.local()
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+
+# 连接复用：按线程隔离 Session 并禁用 Cookie，避免跨线程/跨供应商串状态。
+_http = _StatelessHttpClient(pool_connections=8, pool_maxsize=32)
+
+_async_client: Optional[httpx.AsyncClient] = None
+_async_client_loop: Optional[asyncio.AbstractEventLoop] = None
+_async_client_factory: Any = None
+
+
+def _get_async_client() -> httpx.AsyncClient:
+    global _async_client, _async_client_loop, _async_client_factory
+    loop = asyncio.get_running_loop()
+    factory = httpx.AsyncClient
+    if (
+        _async_client is None
+        or getattr(_async_client, "is_closed", False)
+        or _async_client_loop is not loop
+        or _async_client_factory is not factory
+    ):
+        _async_client = factory(
+            timeout=httpx.Timeout(90, connect=10),
+            follow_redirects=False,
+        )
+        _async_client_loop = loop
+        _async_client_factory = factory
+    else:
+        cookies = getattr(_async_client, "cookies", None)
+        if cookies is not None and hasattr(cookies, "clear"):
+            cookies.clear()
+    return _async_client
+
+
+async def aclose_async_client() -> None:
+    global _async_client, _async_client_loop, _async_client_factory
+    client = _async_client
+    _async_client = None
+    _async_client_loop = None
+    _async_client_factory = None
+    if client is not None and not getattr(client, "is_closed", False):
+        await client.aclose()
 
 API_TYPE_OPENAI = "openai"
 API_TYPE_ANTHROPIC = "anthropic"
@@ -500,50 +585,50 @@ async def post_cancellable_chat_stream(api_base_url, api_type, api_key, payload,
     candidates, header_variants = _stream_targets(api_base_url, api_type, api_key)
     parser = _CHUNK_PARSERS.get(api_type, _openai_chunk)
     first = True
-    async with httpx.AsyncClient(timeout=httpx.Timeout(90, connect=10), follow_redirects=True) as client:
-        for url in candidates:
-            for headers in header_variants:
-                if first:
-                    on_started()
-                    first = False
-                attempt = trace.begin(url, api_type, payload, api_key=api_key, context=trace_context)
-                complete = False
-                try:
-                    async with client.stream("POST", url, headers=headers, json=payload) as response:
-                        status = response.status_code
-                        attempt.headers(status)
-                        if status in (401, 403) and headers is not header_variants[-1]:
-                            await response.aread()
-                            attempt.response(_trace_http_error_body(response))
-                            continue
-                        if status in (404, 405):
-                            await response.aread()
-                            attempt.response(_trace_http_error_body(response))
-                            break
-                        if status >= 400:
-                            await response.aread()
-                            attempt.response(_trace_http_error_body(response))
-                            raise_for_llm_status(status, response.text)
-                        async for line in response.aiter_lines():
-                            _trace_sse_line(attempt, line)
-                            chunk, done = _parse_sse_data(line, api_type, parser)
-                            if chunk is not None:
-                                yield chunk
-                            if done:
-                                complete = True
-                                break
-                        else:
+    client = _get_async_client()
+    for url in candidates:
+        for headers in header_variants:
+            if first:
+                on_started()
+                first = False
+            attempt = trace.begin(url, api_type, payload, api_key=api_key, context=trace_context)
+            complete = False
+            try:
+                async with client.stream("POST", url, headers=headers, json=payload) as response:
+                    status = response.status_code
+                    attempt.headers(status)
+                    if status in (401, 403) and headers is not header_variants[-1]:
+                        await response.aread()
+                        attempt.response(_trace_http_error_body(response))
+                        continue
+                    if status in (404, 405):
+                        await response.aread()
+                        attempt.response(_trace_http_error_body(response))
+                        break
+                    if status >= 400:
+                        await response.aread()
+                        attempt.response(_trace_http_error_body(response))
+                        raise_for_llm_status(status, response.text)
+                    async for line in response.aiter_lines():
+                        _trace_sse_line(attempt, line)
+                        chunk, done = _parse_sse_data(line, api_type, parser)
+                        if chunk is not None:
+                            yield chunk
+                        if done:
                             complete = True
-                        return
-                except (GeneratorExit, asyncio.CancelledError):
-                    attempt.finish("cancelled")
-                    raise
-                except Exception as exc:
-                    attempt.finish("failed", exc)
-                    raise
-                finally:
-                    attempt.finish("failed" if (attempt.status_code or 0) >= 400 else
-                                   "completed" if complete else "incomplete")
+                            break
+                    else:
+                        complete = True
+                    return
+            except (GeneratorExit, asyncio.CancelledError):
+                attempt.finish("cancelled")
+                raise
+            except Exception as exc:
+                attempt.finish("failed", exc)
+                raise
+            finally:
+                attempt.finish("failed" if (attempt.status_code or 0) >= 400 else
+                               "completed" if complete else "incomplete")
     from services.llm.streaming import LLMError
 
     raise LLMError("未找到可用的对话接口地址")

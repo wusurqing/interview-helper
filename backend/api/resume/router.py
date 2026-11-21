@@ -54,11 +54,17 @@ def _run_optimize(jd: str, job_id: str, system_prompts: Mapping[str, str]):
     try:
         from services.llm import trace
         with trace.scope("resume_optimization", job_id=job_id):
-            for chunk in optimize_resume_stream(jd, system_prompts=system_prompts):
-                if not _is_current_resume_opt_job(job_id):
-                    return
-                full_text += chunk
-                broadcast(_resume_opt_payload("resume_opt_chunk", job_id, chunk=chunk))
+            stream = optimize_resume_stream(jd, system_prompts=system_prompts)
+            try:
+                for chunk in stream:
+                    if not _is_current_resume_opt_job(job_id):
+                        return
+                    full_text += chunk
+                    broadcast(_resume_opt_payload("resume_opt_chunk", job_id, chunk=chunk))
+            finally:
+                close = getattr(stream, "close", None)
+                if callable(close):
+                    close()
     except Exception as e:
         if not _is_current_resume_opt_job(job_id):
             return

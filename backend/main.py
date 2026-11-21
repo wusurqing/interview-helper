@@ -122,6 +122,14 @@ async def lifespan(app: FastAPI):
         await run_in_threadpool(shutdown_resource_lanes, wait=False)
     except Exception as e:
         _log.debug("Resource lanes shutdown skipped: %s", e)
+    try:
+        from services.llm.streaming import close_cached_clients
+        from services.llm import protocols as llm_protocols
+        await run_in_threadpool(close_cached_clients)
+        await run_in_threadpool(llm_protocols._http.close)
+        await llm_protocols.aclose_async_client()
+    except Exception as e:
+        _log.debug("LLM transport cleanup skipped: %s", e)
     ws.shutdown_broadcast()
     await ws.close_all_clients()
     dispatch_task.cancel()

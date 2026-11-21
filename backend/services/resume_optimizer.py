@@ -165,6 +165,16 @@ def _rewrite_needs_line_reference_warning(text: str) -> bool:
     return _LINE_REF_RE.search(cleaned) is None
 
 
+def _resume_think_params(model_cfg, max_tokens: int) -> dict[str, Any]:
+    from types import SimpleNamespace
+    from services.llm.streaming import _build_think_params
+
+    return _build_think_params(
+        model_cfg,
+        SimpleNamespace(think_mode=False, think_effort="off", max_tokens=max_tokens),
+    )
+
+
 @trace.traced("resume_optimization")
 def _stream_chat(
     client,
@@ -173,11 +183,15 @@ def _stream_chat(
     *,
     temperature: float,
     max_tokens: int,
+    timeout: tuple[float, float] = (10, 90),
 ) -> Generator[str, None, None]:
     """流式调用,逐 chunk yield 文本。usage 自动累加。api_type 任意协议可用。"""
+    import openai
     from services.llm.protocols import build_chat_payload, get_api_type, post_chat_stream
+    from services.llm.streaming import _completion_token_kwargs
 
     api_type = get_api_type(model_cfg)
+    think_params = _resume_think_params(model_cfg, max_tokens)
     if api_type != "openai":
         payload = build_chat_payload(
             api_type,
@@ -186,24 +200,49 @@ def _stream_chat(
             temperature=temperature,
             max_tokens=max_tokens,
             stream=True,
+            think_params=think_params,
         )
-        response = post_chat_stream(model_cfg.api_base_url, api_type, model_cfg.api_key, payload)
+        if timeout == (10, 90):
+            response = post_chat_stream(model_cfg.api_base_url, api_type, model_cfg.api_key, payload)
+        else:
+            response = post_chat_stream(
+                model_cfg.api_base_url,
+                api_type,
+                model_cfg.api_key,
+                payload,
+                timeout=timeout,
+            )
     else:
+        if isinstance(client, openai.OpenAI) and getattr(client, "max_retries", 0) != 0:
+            client = client.with_options(max_retries=0)
+        extra_kwargs: dict[str, Any] = {
+            "stream_options": {"include_usage": True},
+            "timeout": float(timeout[1] if isinstance(timeout, tuple) else timeout),
+        }
+        if think_params:
+            extra_kwargs["extra_body"] = {
+                key: value for key, value in think_params.items() if key != "messages"
+            }
         response = client.chat.completions.create(
             model=model_cfg.model,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
             stream=True,
-            stream_options={"include_usage": True},
+            **_completion_token_kwargs(model_cfg, max_tokens),
+            **extra_kwargs,
         )
-    for chunk in response:
-        choices = getattr(chunk, "choices", None) or []
-        if choices and choices[0].delta and choices[0].delta.content:
-            yield choices[0].delta.content
-        usage = getattr(chunk, "usage", None)
-        if usage:
-            _add_tokens(usage.prompt_tokens or 0, usage.completion_tokens or 0)
+    try:
+        for chunk in response:
+            choices = getattr(chunk, "choices", None) or []
+            if choices and choices[0].delta and choices[0].delta.content:
+                yield choices[0].delta.content
+            usage = getattr(chunk, "usage", None)
+            if usage:
+                _add_tokens(usage.prompt_tokens or 0, usage.completion_tokens or 0)
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
 
 
 def _non_stream_chat(
@@ -222,6 +261,7 @@ def _non_stream_chat(
         messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        think_params=_resume_think_params(model_cfg, max_tokens),
         trace_context=trace_context,
     )
     usage = getattr(response, "usage", None)

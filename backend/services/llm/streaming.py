@@ -1,6 +1,7 @@
 """LLM client management, token tracking, and streaming generation."""
 
 import asyncio
+from collections import OrderedDict
 from concurrent.futures import CancelledError
 import threading
 import json
@@ -10,7 +11,7 @@ from openai import OpenAI
 import openai
 import requests
 import httpx
-from typing import Callable, Generator, Optional
+from typing import Any, Callable, Generator, Optional
 from core.config import get_config
 from core.logger import get_logger
 from services.llm import trace
@@ -193,8 +194,28 @@ def _classify_exception(e: BaseException) -> LLMError:
 # Client helpers (pooled by api_key + base_url)
 # ---------------------------------------------------------------------------
 
-_client_cache: dict[tuple[str, str], OpenAI] = {}
+_CLIENT_CACHE_MAX_SIZE = 32
+_DEFAULT_SDK_TIMEOUT = httpx.Timeout(90.0, connect=10.0)
+_client_cache: OrderedDict[tuple[str, str], OpenAI] = OrderedDict()
 _client_cache_lock = threading.Lock()
+
+
+def _close_client_quietly(client: Any) -> None:
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def close_cached_clients() -> None:
+    """Close and clear all cached OpenAI SDK clients."""
+    with _client_cache_lock:
+        clients = list(_client_cache.values())
+        _client_cache.clear()
+    for client in clients:
+        _close_client_quietly(client)
 
 
 def _openai_compat_headers() -> dict[str, str]:
@@ -218,17 +239,32 @@ def get_client_for_model(model_cfg) -> OpenAI:
     """
     base = normalize_api_base_url(model_cfg.api_base_url, get_api_type(model_cfg))
     key = (model_cfg.api_key, base)
+    evicted_clients: list[Any] = []
     with _client_cache_lock:
         client = _client_cache.get(key)
-        if client is None:
-            client = OpenAI(
-                api_key=model_cfg.api_key,
-                base_url=base,
-                default_headers=_openai_compat_headers(),
-                http_client=trace.TracingHttpxClient(),
-            )
-            _client_cache[key] = client
-        return client
+        if client is not None:
+            if isinstance(_client_cache, OrderedDict):
+                _client_cache.move_to_end(key)
+            return client
+        client = OpenAI(
+            api_key=model_cfg.api_key,
+            base_url=base,
+            timeout=_DEFAULT_SDK_TIMEOUT,
+            max_retries=0,
+            default_headers=_openai_compat_headers(),
+            http_client=trace.TracingHttpxClient(),
+        )
+        _client_cache[key] = client
+        while len(_client_cache) > _CLIENT_CACHE_MAX_SIZE:
+            if isinstance(_client_cache, OrderedDict):
+                _, evicted = _client_cache.popitem(last=False)
+            else:
+                oldest_key = next(iter(_client_cache))
+                evicted = _client_cache.pop(oldest_key)
+            evicted_clients.append(evicted)
+    for evicted in evicted_clients:
+        _close_client_quietly(evicted)
+    return client
 
 
 def has_vision_model() -> bool:
@@ -267,6 +303,8 @@ def chat_completion_create(
     api_type = get_api_type(model_cfg)
     if api_type == "openai":
         client = get_client_for_model(model_cfg)
+        if isinstance(client, OpenAI) and getattr(client, "max_retries", 0) != 0:
+            client = client.with_options(max_retries=0)
         extra_kwargs: dict = {}
         if think_params:
             extra_kwargs["extra_body"] = {key: value for key, value in think_params.items() if key != "messages"}
@@ -648,7 +686,14 @@ def _should_emit_think(model_cfg, cfg) -> bool:
     )
 
 
-def _try_stream_with_model(model_cfg, full_messages, cfg, *, think_params=None):
+def _try_stream_with_model(
+    model_cfg,
+    full_messages,
+    cfg,
+    *,
+    think_params=None,
+    timeout: tuple[float, float] = (10, 90),
+):
     api_type = get_api_type(model_cfg)
     if think_params is None:
         think_params = _build_think_params(model_cfg, cfg)
@@ -665,10 +710,13 @@ def _try_stream_with_model(model_cfg, full_messages, cfg, *, think_params=None):
         )
         return post_chat_stream(model_cfg.api_base_url, api_type, model_cfg.api_key, payload)
     client = get_client_for_model(model_cfg)
+    if isinstance(client, OpenAI) and getattr(client, "max_retries", 0) != 0:
+        client = client.with_options(max_retries=0)
     extra_kwargs: dict = {}
     if think_params:
         extra_kwargs["extra_body"] = {key: value for key, value in think_params.items() if key != "messages"}
     extra_kwargs["stream_options"] = {"include_usage": True}
+    extra_kwargs["timeout"] = float(timeout[1] if isinstance(timeout, tuple) else timeout)
     token_kwargs = _completion_token_kwargs(model_cfg, cfg.max_tokens)
     try:
         response = client.chat.completions.create(
@@ -756,26 +804,31 @@ def chat_stream(
                 full_messages_adj = full_messages
 
             response = _try_stream_with_model(model, full_messages_adj, cfg)
-            last_usage = (0, 0)
-            for chunk in response:
-                if abort_check and abort_check():
-                    return
-                if chunk.choices:
-                    delta = chunk.choices[0].delta
-                    reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-                    if reasoning and _should_emit_think(model, cfg):
-                        yield ("think", reasoning)
-                    if delta.content:
-                        yield ("text", delta.content)
-                if hasattr(chunk, "usage") and chunk.usage:
-                    prompt_delta, completion_delta, last_usage = _usage_delta(
-                        chunk.usage.prompt_tokens or 0,
-                        chunk.usage.completion_tokens or 0,
-                        last_usage,
-                    )
-                    _add_tokens(prompt_delta, completion_delta, model.name)
-                    _broadcast_tokens()
-            return
+            try:
+                last_usage = (0, 0)
+                for chunk in response:
+                    if abort_check and abort_check():
+                        return
+                    if chunk.choices:
+                        delta = chunk.choices[0].delta
+                        reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                        if reasoning and _should_emit_think(model, cfg):
+                            yield ("think", reasoning)
+                        if delta.content:
+                            yield ("text", delta.content)
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        prompt_delta, completion_delta, last_usage = _usage_delta(
+                            chunk.usage.prompt_tokens or 0,
+                            chunk.usage.completion_tokens or 0,
+                            last_usage,
+                        )
+                        _add_tokens(prompt_delta, completion_delta, model.name)
+                        _broadcast_tokens()
+                return
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
 
         except _RETRYABLE_ERRORS as e:
             err = _classify_exception(e)
@@ -860,7 +913,10 @@ def _mmpg_stream(model, messages, cfg, request, abort_check, *, think_params=Non
             raise
     finally:
         if loop.is_running():
-            asyncio.run_coroutine_threadsafe(stream.aclose(), loop).result()
+            try:
+                asyncio.run_coroutine_threadsafe(stream.aclose(), loop).result(timeout=5.0)
+            except (RuntimeError, TimeoutError, Exception) as exc:
+                _log.debug("mmpg stream aclose cleanup ignored: %s", exc)
         get_logger("mmpg.diagnostics").info(
             "group=%s revision=%s event=request_released cancelled=%s",
             request.group_id, request.revision, request.cancelled,
