@@ -90,6 +90,8 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
   const latestLoadIdRef = useRef(0)
   const reviewToggleSaveSeqRef = useRef(0)
   const reviewModelSaveSeqRef = useRef(0)
+  const reviewToggleCommittedSeqRef = useRef(0)
+  const reviewModelCommittedSeqRef = useRef(0)
   const triggeringIdsRef = useRef<Set<number>>(new Set())
   const [loading, setLoading] = useState(true)
   const [data, setData] = useState<ReviewSessionsResponse | null>(null)
@@ -166,14 +168,14 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
   const handleToggleReview = async (enabled: boolean) => {
     const toggleSaveSeq = reviewToggleSaveSeqRef.current + 1
     reviewToggleSaveSeqRef.current = toggleSaveSeq
-    const modelSeqAtStart = reviewModelSaveSeqRef.current
+    const committedModelSeqAtStart = reviewModelCommittedSeqRef.current
     setPendingReviewEnabled(enabled)
     try {
       const updated = await api.updateConfig({ review_enabled: enabled })
       if (toggleSaveSeq !== reviewToggleSaveSeqRef.current) return
       const latestConfig = useInterviewStore.getState().config
       const nextConfig =
-        latestConfig && reviewModelSaveSeqRef.current > modelSeqAtStart
+        latestConfig && reviewModelCommittedSeqRef.current > committedModelSeqAtStart
           ? {
               ...updated,
               review_model_index: latestConfig.review_model_index,
@@ -182,6 +184,7 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
                 : {}),
             }
           : updated
+      reviewToggleCommittedSeqRef.current += 1
       setConfig(nextConfig)
       setToastMessage(enabled ? '已开启自动生成复盘' : '已关闭自动生成复盘')
     } catch (err) {
@@ -198,7 +201,7 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
   const handleChangeModel = async (modelIndex: number | null) => {
     const modelSaveSeq = reviewModelSaveSeqRef.current + 1
     reviewModelSaveSeqRef.current = modelSaveSeq
-    const toggleSeqAtStart = reviewToggleSaveSeqRef.current
+    const committedToggleSeqAtStart = reviewToggleCommittedSeqRef.current
     setPendingReviewModelIndex(modelIndex)
     try {
       const model = modelIndex === null ? undefined : models[modelIndex]
@@ -209,12 +212,13 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
       if (modelSaveSeq !== reviewModelSaveSeqRef.current) return
       const latestConfig = useInterviewStore.getState().config
       const nextConfig =
-        latestConfig && reviewToggleSaveSeqRef.current > toggleSeqAtStart
+        latestConfig && reviewToggleCommittedSeqRef.current > committedToggleSeqAtStart
           ? {
               ...updated,
               review_enabled: latestConfig.review_enabled,
             }
           : updated
+      reviewModelCommittedSeqRef.current += 1
       setConfig(nextConfig)
       setToastMessage(model ? `已切换复盘模型为 ${model.name}` : '已清除复盘模型')
     } catch (err) {

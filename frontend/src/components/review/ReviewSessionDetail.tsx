@@ -89,6 +89,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
   const colorScheme = useUiPrefsStore((s) => s.colorScheme)
   const isLight = isLightColorScheme(colorScheme)
   const mountedRef = useRef(true)
+  const applicationsLoadSeqRef = useRef(0)
   useEffect(() => {
     mountedRef.current = true
     return () => {
@@ -137,6 +138,21 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
     }
   }, [sessionId])
 
+  const refreshApplications = useCallback(async (clearOnError = false) => {
+    const reqSeq = applicationsLoadSeqRef.current + 1
+    applicationsLoadSeqRef.current = reqSeq
+    try {
+      const res = await api.jobTrackerApplications()
+      if (mountedRef.current && applicationsLoadSeqRef.current === reqSeq) {
+        setApplications((res.items as Record<string, unknown>[]).map(parseApplication))
+      }
+    } catch {
+      if (clearOnError && mountedRef.current && applicationsLoadSeqRef.current === reqSeq) {
+        setApplications([])
+      }
+    }
+  }, [])
+
   useEffect(() => {
     if (detail?.status !== 'analyzing') return undefined
 
@@ -163,6 +179,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
 
     const pollDetail = async () => {
       if (cancelled || inFlight || document.hidden) return
+      clearTimer()
       inFlight = true
       let stillAnalyzing = true
       try {
@@ -171,6 +188,9 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
         setDetail(data)
         stillAnalyzing = data.status === 'analyzing'
         if (data.status === 'completed') {
+          if (data.application_id != null) {
+            void refreshApplications(false)
+          }
           setInlineNotice({ tone: 'success', message: '复盘分析已完成' })
         } else if (data.status === 'analysis_failed') {
           setInlineNotice({ tone: 'error', message: '复盘分析失败，可重试生成' })
@@ -202,18 +222,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
       clearTimer()
       document.removeEventListener('visibilitychange', onVisibilityChange)
     }
-  }, [detail?.status, sessionId])
-
-  const refreshApplications = useCallback(async (clearOnError = false) => {
-    try {
-      const res = await api.jobTrackerApplications()
-      if (mountedRef.current) {
-        setApplications((res.items as Record<string, unknown>[]).map(parseApplication))
-      }
-    } catch {
-      if (clearOnError && mountedRef.current) setApplications([])
-    }
-  }, [])
+  }, [detail?.status, refreshApplications, sessionId])
 
   useEffect(() => {
     void refreshApplications(true)
@@ -672,7 +681,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
             ) : null}
 
             {scoreDimensions.length > 0 ? (
-              <CollapsibleSection title="能力维度">
+              <CollapsibleSection title="能力维度" resetKey={detail.id}>
                 <div className="space-y-3">
                   {scoreDimensions.map((item) => (
                     <div key={item.name}>
@@ -696,6 +705,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
             {followUpDrills.length > 0 ? (
               <CollapsibleSection
                 title={`追问训练 · ${followUpDrills.length}`}
+                resetKey={detail.id}
               >
                 <ol className="divide-y divide-bg-hover/70">
                   {followUpDrills.map((item) => (

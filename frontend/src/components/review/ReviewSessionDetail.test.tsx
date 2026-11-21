@@ -1014,4 +1014,77 @@ describe('ReviewSessionDetail', () => {
       Object.defineProperty(document, 'hidden', { configurable: true, value: false })
     }
   })
+
+  it('ignores stale initial jobTrackerApplications responses after a newer bind refresh resolves', async () => {
+    const initialAppsDeferred = createDeferred<{ items: unknown[] }>()
+    const freshApp = {
+      id: 9,
+      company: 'OpenAI',
+      position: 'Research Engineer',
+      city: 'Remote',
+      stage: 'interview1',
+      applied_at: 1710000000,
+      next_followup_at: null,
+      interviewer_info: '',
+      feedback: '',
+      todos: [],
+      notes: '',
+      created_at: 1710000000,
+      updated_at: 1710003600,
+      sort_order: 0,
+      review_summary: {
+        review_count: 1,
+        latest_review_id: 7,
+        latest_avg_score: 7.4,
+        latest_review_at: 1710003600,
+        latest_status: 'completed',
+        linked_review_count: 2,
+        latest_linked_review_id: 7,
+        latest_linked_avg_score: 7.4,
+        latest_linked_review_at: 1710003600,
+        latest_linked_status: 'completed',
+      },
+    }
+    const staleApp = {
+      ...freshApp,
+      review_summary: {
+        ...freshApp.review_summary,
+        review_count: 0,
+        linked_review_count: 0,
+        latest_linked_review_id: null,
+      },
+    }
+    apiMock.reviewSessionDetail
+      .mockResolvedValueOnce({
+        ...baseDetail,
+        application_id: 9,
+        application: { id: 9, company: 'OpenAI', position: 'Research Engineer', city: 'Remote', stage: 'interview1' },
+      })
+      .mockResolvedValueOnce({
+        ...baseDetail,
+        application_id: 9,
+        application: { id: 9, company: 'OpenAI', position: 'Research Engineer', city: 'Remote', stage: 'interview1' },
+      })
+    apiMock.jobTrackerApplications
+      .mockReturnValueOnce(initialAppsDeferred.promise)
+      .mockResolvedValueOnce({ items: [freshApp] })
+    apiMock.reviewUpdateSession.mockResolvedValueOnce({ ok: true, auto_sync_eligible: true })
+
+    render(<ReviewSessionDetail sessionId={7} onBack={vi.fn()} />)
+    await screen.findByText('OpenAI · Research Engineer')
+
+    // Trigger bind/unbind refresh (request #2) while initial mount fetch (request #1) is still pending
+    fireEvent.click(screen.getByRole('button', { name: '解绑' }))
+    await screen.findByRole('button', { name: '全部复盘' })
+    expect(screen.getByText('2')).toBeInTheDocument()
+
+    // Now the stale request #1 finishes late with linked_review_count: 0 -> must be ignored
+    await act(async () => {
+      initialAppsDeferred.resolve({ items: [staleApp] })
+      await initialAppsDeferred.promise
+    })
+
+    expect(screen.getByRole('button', { name: '全部复盘' })).toBeInTheDocument()
+    expect(screen.getByText('2')).toBeInTheDocument()
+  })
 })

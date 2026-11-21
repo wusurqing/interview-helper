@@ -708,4 +708,51 @@ describe('ReviewSessionList', () => {
     expect(useInterviewStore.getState().config?.review_model_index).toBe(0)
     expect(useInterviewStore.getState().toastMessage).toBe('模型保存失败')
   })
+
+  it('preserves both fields when concurrent toggle and model saves succeed with out-of-order server state', async () => {
+    const toggleDeferred = createDeferred<any>()
+    const modelDeferred = createDeferred<any>()
+    const models = [
+      { name: 'lite-ark', enabled: true },
+      { name: 'deepseek', enabled: true },
+    ]
+    useInterviewStore.setState({
+      config: {
+        review_enabled: false,
+        review_model_index: 0,
+        models,
+      },
+      setConfig: (next: any) => useInterviewStore.setState({ config: next }),
+    } as any)
+    apiMock.updateConfig
+      .mockReturnValueOnce(toggleDeferred.promise)
+      .mockReturnValueOnce(modelDeferred.promise)
+
+    render(<ReviewSessionList onViewDetail={vi.fn()} />)
+    await screen.findByText('OpenAI 一面')
+    fireEvent.click(screen.getByRole('button', { name: '配置' }))
+
+    // Start toggle ON first, then concurrently switch model to deepseek (index 1)
+    fireEvent.click(screen.getByRole('switch'))
+    fireEvent.click(screen.getByRole('button', { name: '复盘分析模型' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'deepseek' }))
+
+    // Toggle response arrives first (server already applied toggle, model still 0)
+    await act(async () => {
+      toggleDeferred.resolve({ review_enabled: true, review_model_index: 0, models })
+      await toggleDeferred.promise
+    })
+    expect(useInterviewStore.getState().config?.review_enabled).toBe(true)
+    expect(useInterviewStore.getState().config?.review_model_index).toBe(0)
+
+    // Model response arrives second, carrying stale review_enabled: false (server committed model before toggle)
+    await act(async () => {
+      modelDeferred.resolve({ review_enabled: false, review_model_index: 1, models })
+      await modelDeferred.promise
+    })
+
+    // Store must retain committed review_enabled: true AND apply review_model_index: 1
+    expect(useInterviewStore.getState().config?.review_enabled).toBe(true)
+    expect(useInterviewStore.getState().config?.review_model_index).toBe(1)
+  })
 })
