@@ -614,7 +614,7 @@ describe('JobTracker', () => {
     render(<JobTracker />)
     await waitFor(() => expect(screen.getAllByText('Acme').length).toBeGreaterThan(0))
 
-    fireEvent.click(screen.getByRole('button', { name: '补 1 条待办' }))
+    fireEvent.click(await screen.findByRole('button', { name: '补 1 条待办' }))
     fireEvent.change(
       screen.getByLabelText('待办清单'),
       { target: { value: '周五前跟进 recruiter' } },

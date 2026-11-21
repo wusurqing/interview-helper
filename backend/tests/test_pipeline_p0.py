@@ -1121,6 +1121,13 @@ def test_stop_interview_loop_stops_runtime_flush_thread_and_uses_single_drain_de
     monkeypatch.setattr(pipeline, "_wait_for_answer_work_idle", lambda _timeout: True)
     monkeypatch.setattr(pipeline, "cancel_answer_work", lambda **_kwargs: None)
     monkeypatch.setattr(pipeline.review_integration, "on_assist_stop", lambda _s: None)
+    monkeypatch.setattr(pipeline.gc, "collect", lambda: 0)
+    drain_calls: list[float] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_drain_interviewer_segments",
+        lambda timeout, **_kwargs: drain_calls.append(timeout),
+    )
     monkeypatch.setattr(
         pipeline,
         "get_config",
@@ -1128,7 +1135,7 @@ def test_stop_interview_loop_stops_runtime_flush_thread_and_uses_single_drain_de
             stt_provider="doubao",
             doubao_stt_api_key="test-asr",
             assist_stop_answer_wait_sec=0,
-            assist_interviewer_asr_drain_timeout_sec=0.5,
+            assist_interviewer_asr_drain_timeout_sec=0.6,
         ),
     )
 
@@ -1159,8 +1166,10 @@ def test_stop_interview_loop_stops_runtime_flush_thread_and_uses_single_drain_de
         # Flush thread must have been explicitly stopped by stop_interview_loop even with no _interview_thread.
         assert runtime.flush_stop_event.is_set() is True
         assert not flush_thread.is_alive()
-        # Unified single deadline (0.5s): must NOT double-wait (~1.0s+).
-        assert elapsed < 0.9, f"Expected single drain deadline (~0.5s), took {elapsed:.2f}s"
+        # Live asr_thread must be joined directly rather than adding a second _drain_interviewer_segments wait.
+        assert drain_calls == []
+        # Unified single deadline (0.6s): must NOT double-wait (~1.2s+).
+        assert elapsed < 1.05, f"Expected single drain deadline (~0.6s), took {elapsed:.2f}s"
     finally:
         release_stuck_asr.set()
         asr_thread.join(timeout=1.0)
