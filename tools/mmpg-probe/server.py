@@ -56,6 +56,11 @@ ERROR_MESSAGES = {
     "invalid_command": "不支持此命令或消息格式。",
     "local_io_error": "本地日志或连接发生错误，已请求关闭云端会话。",
 }
+# Keep transport wire logs permanently silenced so SigV4 handshake headers and
+# raw WebSocket payloads can never leak even when root logging is DEBUG.
+_WIRE_LOGGER = logging.Logger("mmpg_probe.wire", logging.CRITICAL + 1)
+_WIRE_LOGGER.addHandler(logging.NullHandler())
+_WIRE_LOGGER.propagate = False
 
 
 class ProbeError(ValueError):
@@ -253,7 +258,8 @@ async def connect_mmpg(config):
     SignerV4.sign(MMPG_PATH, "GET", headers, "", None, {},
                   config["volc_access_key"], config["volc_secret_key"], "cn-north-1", "rtc")
     return await connect(MMPG_URL, additional_headers=headers, open_timeout=12,
-                         close_timeout=3, ping_interval=20, ping_timeout=20, max_size=1024 * 1024)
+                         close_timeout=3, ping_interval=20, ping_timeout=20, max_size=1024 * 1024,
+                         logger=_WIRE_LOGGER)
 
 
 class ProbeRun:
@@ -437,6 +443,9 @@ def local_request_allowed(host, origin=None, client_host=None, require_origin=Fa
 
 
 def create_app(config_path=CONFIG_PATH, logs_dir=LOGS_DIR, connector=None):
+    # Enforce websockets log suppression inside create_app() so uvicorn --factory
+    # launches cannot bypass it and leak handshake headers or wire frames.
+    logging.getLogger("websockets").setLevel(logging.WARNING)
     from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
     from fastapi.responses import FileResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
@@ -579,7 +588,6 @@ def create_app(config_path=CONFIG_PATH, logs_dir=LOGS_DIR, connector=None):
 if __name__ == "__main__":
     try:
         import uvicorn
-        logging.getLogger("websockets").setLevel(logging.WARNING)
         uvicorn.run(create_app(), host="127.0.0.1", port=PORT, access_log=False, log_level="warning")
     except ImportError:
         raise SystemExit("缺少依赖，请先按 README 安装 tools/mmpg-probe/requirements.txt。") from None
