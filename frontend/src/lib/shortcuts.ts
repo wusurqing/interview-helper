@@ -198,7 +198,6 @@ export function getShortcutDisplay(accelerator: string) {
   return out.join(isMacPlatform() ? '' : '+')
 }
 
-const VALID_ACTIONS = new Set<string>(Object.keys(defaultShortcuts))
 const SUPPORTED_KEY_RE = /^CommandOrControl(\+Shift)?(\+Alt)?\+([A-Za-z0-9./\\\- =;,'`\[\]\{\}]|Enter|Escape|Up|Down|Left|Right)$/
 
 export function mergeShortcutConfigs(

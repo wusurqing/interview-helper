@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api, getErrorMessage } from './api'
+import { api, buildHeaders, getErrorMessage, request } from './api'
 
 function jsonResponse(body: unknown, init: ResponseInit) {
   return new Response(JSON.stringify(body), {
@@ -66,5 +66,57 @@ describe('api error handling', () => {
     expect(getErrorMessage(new Error('boom'))).toBe('boom')
     expect(getErrorMessage({ detail: 'backend says no' })).toBe('backend says no')
     expect(getErrorMessage(null, '兜底失败')).toBe('兜底失败')
+  })
+
+  it('merges Headers instances, tuple arrays, and plain records in buildHeaders', () => {
+    const fromHeaders = buildHeaders(new Headers({ 'X-Custom': '1', 'content-type': 'text/plain' }))
+    expect(fromHeaders.get('x-custom')).toBe('1')
+    expect(fromHeaders.get('content-type')).toBe('text/plain')
+
+    const fromTuples = buildHeaders([
+      ['X-Tuple', 'yes'],
+      ['Accept', 'application/json'],
+    ])
+    expect(fromTuples.get('x-tuple')).toBe('yes')
+    expect(fromTuples.get('accept')).toBe('application/json')
+    expect(fromTuples.get('content-type')).toBe('application/json')
+
+    const fromRecord = buildHeaders({ 'X-Obj': 'ok' })
+    expect(fromRecord.get('x-obj')).toBe('ok')
+  })
+
+  it('aborts hung requests when timeoutMs elapses', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.stubGlobal('fetch', vi.fn((_input: string, init?: RequestInit) => (
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(new DOMException('Aborted', 'AbortError'))
+          })
+        })
+      )))
+
+      const pending = request('/api/slow', { timeoutMs: 250 })
+      const expectation = expect(pending).rejects.toThrow('请求超时，请检查后端服务或网络后重试')
+      await vi.advanceTimersByTimeAsync(300)
+      await expectation
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('preserves caller AbortSignal cancellation without masking it as timeout', async () => {
+    const caller = new AbortController()
+    vi.stubGlobal('fetch', vi.fn((_input: string, init?: RequestInit) => (
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          reject(new DOMException('Caller aborted', 'AbortError'))
+        })
+      })
+    )))
+
+    const pending = request('/api/cancel-me', { signal: caller.signal, timeoutMs: 30_000 })
+    caller.abort()
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
   })
 })

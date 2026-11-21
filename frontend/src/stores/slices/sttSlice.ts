@@ -56,11 +56,11 @@ export const createSttSlice: StateCreator<RootState, [], [], SttSlice> = (set) =
     sttLoading: loading,
     ...(provider != null ? { sttActiveProvider: provider } : {}),
   }),
-  setCandidateSttStatus: (loaded, loading, provider) => set((s) => ({
+  setCandidateSttStatus: (loaded, loading, provider) => set({
     candidateSttLoaded: loaded,
     candidateSttLoading: loading,
     ...(provider != null ? { candidateSttProvider: provider } : {}),
-  })),
+  }),
   setMmpgStatus: (mmpgPhase, mmpgError) => set({ mmpgPhase, mmpgError }),
   setModelHealth: (index, status, detail, latencyMs, modelFingerprint) => set((s) => {
     const currentFingerprint = s.config?.models?.[index]?.health_fingerprint

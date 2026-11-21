@@ -9,7 +9,7 @@ import {
   MapPin,
   Trash2,
 } from 'lucide-react'
-import type { Application, ApplicationReviewSummary, Offer, Stage, TodoItem } from './types'
+import type { Application, ApplicationReviewSummary, Offer, TodoItem } from './types'
 import { filterApplicationsBySearch } from './search'
 import { todosFromText, withMaterializedTodoIds } from './todoDraft'
 import {
@@ -287,7 +287,6 @@ export default function ApplicationsTable({
   onConsumeDetailIntent,
   hiddenApplicationsCount = 0,
   hiddenApplicationsPreview = [],
-  focusFilterLabel = '当前筛选',
   onShowAll,
 }: Props) {
   const colorScheme = useUiPrefsStore((s) => s.colorScheme)
@@ -1522,45 +1521,6 @@ function DesktopSignalChip({
       {actionLabel ? (
         <span className="font-medium text-accent-blue">{actionLabel}</span>
       ) : null}
-    </div>
-  )
-}
-
-function DesktopSignalLine({
-  label,
-  value,
-  hint,
-  tone,
-  className,
-  actionLabel,
-}: {
-  label: string
-  value: string
-  hint: string
-  tone: string
-  className: string
-  actionLabel?: string | null
-}) {
-  return (
-    <div className={`rounded-md border px-3 py-2.5 ${className}`}>
-      <div className="flex items-start gap-3">
-        <div className="w-11 shrink-0 pt-0.5 text-[11px] font-medium text-text-muted">
-          {label}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-start justify-between gap-3">
-            <div className={`min-w-0 text-[14px] font-semibold ${tone}`}>
-              {value}
-            </div>
-            {actionLabel ? (
-              <div className="shrink-0 text-[11px] font-medium text-accent-blue">{actionLabel}</div>
-            ) : null}
-          </div>
-          <div className="mt-0.5 line-clamp-1 text-[11px] leading-relaxed text-text-muted">
-            {hint}
-          </div>
-        </div>
-      </div>
     </div>
   )
 }

@@ -1,6 +1,15 @@
 import { buildApiUrl } from './backendUrl'
 import { getAuthToken } from './auth'
-import type { SingleMicRole, SingleMicState } from '@/stores/slices/types'
+import type {
+  AppConfig,
+  DeviceItem,
+  ModelFullInfo,
+  OptionsInfo,
+  PlatformInfo,
+  SingleMicRole,
+  SingleMicState,
+} from '@/stores/slices/types'
+import type { HistoryRecord } from '@/components/knowledge-map/mergeHistory'
 
 export type KnowledgeThinkEffort = 'off' | 'low' | 'medium' | 'high' | 'xhigh'
 
@@ -43,6 +52,13 @@ export interface KnowledgeAnalysisState {
 }
 
 const BACKEND_UNREACHABLE_MESSAGE = '无法连接后端服务，请确认应用服务已启动后重试'
+const BACKEND_TIMEOUT_MESSAGE = '请求超时，请检查后端服务或网络后重试'
+export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000
+const LONG_REQUEST_TIMEOUT_MS = 120_000
+
+export interface ApiRequestInit extends RequestInit {
+  timeoutMs?: number
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value)
@@ -100,12 +116,40 @@ async function buildResponseErrorMessage(res: Response, fallback?: string): Prom
   return `请求失败 (${res.status}): ${detailText}`
 }
 
-async function fetchBackend(input: string, init?: RequestInit): Promise<Response> {
+async function fetchBackend(input: string, init?: ApiRequestInit): Promise<Response> {
+  const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal: callerSignal, ...rest } = init ?? {}
+  const controller = new AbortController()
+  let timedOut = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let onCallerAbort: (() => void) | undefined
+
+  if (callerSignal) {
+    if (callerSignal.aborted) {
+      controller.abort(callerSignal.reason)
+    } else {
+      onCallerAbort = () => controller.abort(callerSignal.reason)
+      callerSignal.addEventListener('abort', onCallerAbort, { once: true })
+    }
+  }
+
+  if (!controller.signal.aborted && Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, timeoutMs)
+  }
+
   try {
-    return await fetch(input, init)
+    return await fetch(input, { ...rest, signal: controller.signal })
   } catch (error) {
-    if (init?.signal?.aborted) throw error
+    if (callerSignal?.aborted) throw error
+    if (timedOut) throw new Error(BACKEND_TIMEOUT_MESSAGE)
     throw new Error(BACKEND_UNREACHABLE_MESSAGE)
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (callerSignal && onCallerAbort) {
+      callerSignal.removeEventListener('abort', onCallerAbort)
+    }
   }
 }
 
@@ -116,11 +160,17 @@ export function getErrorMessage(error: unknown, fallback = '操作失败'): stri
   return fallback
 }
 
-function buildHeaders(extra?: HeadersInit): HeadersInit {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+export function buildHeaders(extra?: HeadersInit): Headers {
+  const headers = new Headers({ 'Content-Type': 'application/json' })
   const token = getAuthToken()
-  if (token) headers.Authorization = `Bearer ${token}`
-  return { ...headers, ...(extra as Record<string, string> | undefined) }
+  if (token) headers.set('Authorization', `Bearer ${token}`)
+  if (extra) {
+    const extraHeaders = new Headers(extra)
+    extraHeaders.forEach((value, key) => {
+      headers.set(key, value)
+    })
+  }
+  return headers
 }
 
 export class ApiRequestError extends Error {
@@ -129,7 +179,7 @@ export class ApiRequestError extends Error {
   }
 }
 
-export async function request<T = any>(url: string, opts?: RequestInit): Promise<T> {
+export async function request<T = unknown>(url: string, opts?: ApiRequestInit): Promise<T> {
   const res = await fetchBackend(buildApiUrl(url), {
     ...opts,
     headers: buildHeaders(opts?.headers),
@@ -227,10 +277,25 @@ export interface SystemPromptScene {
   max_output_tokens: number
 }
 
+export interface KnowledgeSummaryTag {
+  tag: string
+  count: number
+  avg_score: number | null
+  trend: 'up' | 'down' | 'stable'
+}
+
+export interface PreflightStatusResponse {
+  running?: boolean
+  steps?: Record<string, unknown> | unknown[]
+  captured_transcript?: string
+  expected_phrase?: string
+  [key: string]: unknown
+}
+
 export const api = {
-  getConfig: () => request('/api/config'),
-  updateConfig: (data: Record<string, any>) =>
-    request('/api/config', { method: 'POST', body: JSON.stringify(data) }),
+  getConfig: () => request<AppConfig>('/api/config'),
+  updateConfig: (data: Record<string, unknown>) =>
+    request<AppConfig>('/api/config', { method: 'POST', body: JSON.stringify(data) }),
   getSystemPromptScenes: () => request<{ scenes: SystemPromptScene[] }>('/api/prompts'),
   importMmpgProbe: () => request<{ ok: boolean }>('/api/stt/mmpg/import-probe', { method: 'POST' }),
   modelsLayout: (data: {
@@ -238,10 +303,10 @@ export const api = {
     enabled?: boolean[]
     max_parallel_answers?: number
     active_model?: number
-  }) => request('/api/config/models-layout', { method: 'POST', body: JSON.stringify(data) }),
-  getModelsFull: () => request<{ models: import('@/stores/configStore').ModelFullInfo[] }>('/api/config/models-full'),
-  getOptions: () => request('/api/options'),
-  getDevices: () => request('/api/devices'),
+  }) => request<AppConfig>('/api/config/models-layout', { method: 'POST', body: JSON.stringify(data) }),
+  getModelsFull: () => request<{ models: ModelFullInfo[] }>('/api/config/models-full'),
+  getOptions: () => request<OptionsInfo>('/api/options'),
+  getDevices: () => request<{ devices: DeviceItem[]; platform: PlatformInfo }>('/api/devices'),
   uploadResume: async (file: File): Promise<ResumeUploadResult> => {
     const fd = new FormData()
     fd.append('file', file)
@@ -252,13 +317,14 @@ export const api = {
       method: 'POST',
       body: fd,
       headers,
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
     })
     if (!res.ok) {
       throw new Error(await buildResponseErrorMessage(res, '上传失败'))
     }
     return res.json()
   },
-  deleteResume: () => request('/api/resume', { method: 'DELETE' }),
+  deleteResume: () => request<{ ok: boolean }>('/api/resume', { method: 'DELETE' }),
   resumeHistory: () => request<{ items: ResumeHistoryItem[]; max: number }>('/api/resume/history'),
   resumeHistoryApply: (id: number) =>
     request<{ ok: boolean; history_id: number; length: number; preview: string }>(
@@ -274,7 +340,7 @@ export const api = {
       body: JSON.stringify({ summary }),
     }),
   start: (device_id?: number | null, candidate_mic_device_id?: number | null, single_mic_id?: string) =>
-    request('/api/start', {
+    request<{ ok: boolean }>('/api/start', {
       method: 'POST',
       body: JSON.stringify({
         ...(device_id != null ? { device_id } : {}),
@@ -282,12 +348,12 @@ export const api = {
         ...(single_mic_id ? { single_mic_id } : {}),
       }),
     }),
-  stop: () => request('/api/stop', { method: 'POST' }),
-  pause: (single_mic_id?: string) => request('/api/pause', {
+  stop: () => request<{ ok: boolean }>('/api/stop', { method: 'POST' }),
+  pause: (single_mic_id?: string) => request<{ ok: boolean }>('/api/pause', {
     method: 'POST',
     ...(single_mic_id ? { body: JSON.stringify({ single_mic_id }) } : {}),
   }),
-  resume: (device_id?: number, candidate_mic_device_id?: number | null, single_mic_id?: string) => request('/api/unpause', {
+  resume: (device_id?: number, candidate_mic_device_id?: number | null, single_mic_id?: string) => request<{ ok: boolean }>('/api/unpause', {
     method: 'POST',
     body: JSON.stringify({
       ...(device_id != null ? { device_id } : {}),
@@ -300,19 +366,31 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ session_id, role }),
     }),
-  clear: () => request('/api/clear', { method: 'POST' }),
+  clear: () => request<{ ok: boolean }>('/api/clear', { method: 'POST' }),
   ask: (text: string, image?: string, purpose?: 'knowledge_practice') =>
-    request('/api/ask', { method: 'POST', body: JSON.stringify({ text, image, purpose }) }),
-  cancelAsk: () => request('/api/ask/cancel', { method: 'POST' }),
+    request<{ ok: boolean }>('/api/ask', { method: 'POST', body: JSON.stringify({ text, image, purpose }) }),
+  cancelAsk: () => request<{ ok: boolean }>('/api/ask/cancel', { method: 'POST' }),
   preflightScenarios: () => request<{ scenarios: { id: string; label: string; question: string; recommended: boolean }[] }>('/api/preflight/scenarios'),
   preflightRun: (scenario_id: string, device_id?: number | null) =>
-    request('/api/preflight/run', { method: 'POST', body: JSON.stringify({ scenario_id, device_id: device_id ?? undefined }) }),
-  preflightStatus: () => request('/api/preflight/status'),
+    request<Record<string, unknown>>('/api/preflight/run', {
+      method: 'POST',
+      body: JSON.stringify({ scenario_id, device_id: device_id ?? undefined }),
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    }),
+  preflightStatus: () => request<PreflightStatusResponse>('/api/preflight/status'),
   examPreflightRun: () =>
-    request<{ ok: boolean; preflight_id: string }>('/api/exam-preflight/run', { method: 'POST', body: '{}' }),
-  examPreflightStatus: () => request('/api/exam-preflight/status'),
+    request<{ ok: boolean; preflight_id: string }>('/api/exam-preflight/run', {
+      method: 'POST',
+      body: '{}',
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    }),
+  examPreflightStatus: () => request<Record<string, unknown>>('/api/exam-preflight/status'),
   audioOutputTest: () =>
-    request<{ ok: boolean; elapsed_sec: number }>('/api/audio-test/output', { method: 'POST', body: '{}' }),
+    request<{ ok: boolean; elapsed_sec: number }>('/api/audio-test/output', {
+      method: 'POST',
+      body: '{}',
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    }),
   audioInputTest: (device_id: number, duration_sec = 1.2) =>
     request<{
       ok: boolean
@@ -323,7 +401,11 @@ export const api = {
       peak: number
       has_signal: boolean
       detail: string
-    }>('/api/audio-test/input', { method: 'POST', body: JSON.stringify({ device_id, duration_sec }) }),
+    }>('/api/audio-test/input', {
+      method: 'POST',
+      body: JSON.stringify({ device_id, duration_sec }),
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    }),
   audioInputMonitorStart: (device_id: number) =>
     request<{
       running: boolean
@@ -348,16 +430,31 @@ export const api = {
     request<{ running: boolean }>('/api/audio-test/input/stop', { method: 'POST', body: '{}' }),
   /** 服务端截取本机主屏左半幅 + VL 写码（手机端用，不经过手机截图 API） */
   askFromServerScreen: () =>
-    request('/api/ask-from-server-screen', { method: 'POST', body: '{}' }),
-  captureServerScreen: () =>
-    request<{ ok: boolean; image: string; written_exam_mode: boolean }>('/api/capture-server-screen', { method: 'POST', body: '{}' }),
-  askFromServerScreens: (images: string[], expectedWrittenExamMode?: boolean) =>
-    request('/api/ask-from-server-screens', {
-      method: 'POST', body: JSON.stringify({ images, expected_written_exam_mode: expectedWrittenExamMode }),
+    request<Record<string, unknown>>('/api/ask-from-server-screen', {
+      method: 'POST',
+      body: '{}',
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
     }),
-  getSttStatus: () => request('/api/stt/status'),
+  captureServerScreen: () =>
+    request<{ ok: boolean; image: string; written_exam_mode: boolean }>('/api/capture-server-screen', {
+      method: 'POST',
+      body: '{}',
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    }),
+  askFromServerScreens: (images: string[], expectedWrittenExamMode?: boolean) =>
+    request<Record<string, unknown>>('/api/ask-from-server-screens', {
+      method: 'POST',
+      body: JSON.stringify({ images, expected_written_exam_mode: expectedWrittenExamMode }),
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    }),
+  getSttStatus: () => request<Record<string, unknown>>('/api/stt/status'),
   checkModelsHealth: (indices?: number[]) => request<import('@/stores/slices/types').ModelCatalogSnapshot>(
-    '/api/models/health', { method: 'POST', body: indices ? JSON.stringify({ indices }) : undefined },
+    '/api/models/health',
+    {
+      method: 'POST',
+      body: indices ? JSON.stringify({ indices }) : undefined,
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    },
   ),
   /** 当前各模型健康状态（检测中/可用/不可用） */
   getModelsHealth: () => request<{
@@ -367,8 +464,16 @@ export const api = {
     fingerprint?: Record<string, string>
   }>('/api/models/health'),
   listRemoteModels: (payload: { api_base_url: string; api_key: string; model_id?: string; model_index?: number; api_type?: string }) =>
-    request<{ models: { id: string; owned_by?: string | null }[] }>('/api/models/list', { method: 'POST', body: JSON.stringify(payload) }),
-  checkSingleModelHealth: (index: number) => request('/api/models/health/' + index, { method: 'POST' }),
+    request<{ models: { id: string; owned_by?: string | null }[] }>('/api/models/list', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    }),
+  checkSingleModelHealth: (index: number) =>
+    request<Record<string, unknown>>('/api/models/health/' + index, {
+      method: 'POST',
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    }),
   probeModelCapabilities: (index: number, modelId?: string) =>
     request<{
       ok: boolean
@@ -382,9 +487,16 @@ export const api = {
       vision_detail?: string
       think_detail?: string
       think_disabled_detail?: string
-    }>(`/api/models/probe/${index}${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`, { method: 'POST' }),
+    }>(`/api/models/probe/${index}${modelId ? `?model_id=${encodeURIComponent(modelId)}` : ''}`, {
+      method: 'POST',
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    }),
   sttTest: (payload: { provider: import('@/lib/speechProviders').SegmentedSpeechProvider }) =>
-    request<{ ok: boolean; detail?: string; text?: string }>('/api/stt/test', { method: 'POST', body: JSON.stringify(payload) }),
+    request<{ ok: boolean; detail?: string; text?: string }>('/api/stt/test', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    }),
 
   // Knowledge
   knowledgeSettings: () => request<KnowledgeSettingsPayload>('/api/knowledge/settings'),
@@ -392,18 +504,18 @@ export const api = {
     request<KnowledgeSettingsPayload>('/api/knowledge/settings', { method: 'PUT', body: JSON.stringify(settings) }),
   knowledgeAnalysisStatus: () => request<KnowledgeAnalysisState>('/api/knowledge/analysis'),
   startKnowledgeAnalysis: () => request<KnowledgeAnalysisState>('/api/knowledge/analysis', { method: 'POST' }),
-  knowledgeSummary: () => request('/api/knowledge/summary'),
+  knowledgeSummary: () => request<{ tags: KnowledgeSummaryTag[] }>('/api/knowledge/summary'),
   knowledgeHistory: (page: number = 1, pageSize: number = 20) =>
-    request(`/api/knowledge/history?page=${page}&page_size=${pageSize}`),
-  knowledgeReset: () => request('/api/knowledge/reset', { method: 'DELETE' }),
+    request<{ records: HistoryRecord[]; total: number }>(`/api/knowledge/history?page=${page}&page_size=${pageSize}`),
+  knowledgeReset: () => request<{ ok: boolean }>('/api/knowledge/reset', { method: 'DELETE' }),
 
   // Review (面试复盘)
   reviewSessions: (page: number = 1, pageSize: number = 20) =>
-    request(`/api/review/sessions?page=${page}&page_size=${pageSize}`),
+    request<Record<string, unknown>>(`/api/review/sessions?page=${page}&page_size=${pageSize}`),
   reviewSessionDetail: (sessionId: number) =>
-    request(`/api/review/sessions/${sessionId}`),
+    request<Record<string, unknown>>(`/api/review/sessions/${sessionId}`),
   reviewUpdateSession: (sessionId: number, data: { title?: string; company?: string; role?: string; application_id?: number | null }) =>
-    request(`/api/review/sessions/${sessionId}`, { method: 'PATCH', body: JSON.stringify(data) }),
+    request<Record<string, unknown>>(`/api/review/sessions/${sessionId}`, { method: 'PATCH', body: JSON.stringify(data) }),
   reviewTriggerAnalysis: (sessionId: number) =>
     request<{ status: string; message: string }>(`/api/review/sessions/${sessionId}/generate`, { method: 'POST', body: '{}' }),
   reviewCreateManual: (data: { transcript: string; title?: string; company?: string; role?: string; analyze?: boolean }) =>
@@ -423,18 +535,23 @@ export const api = {
     }>('/api/review/asr-correction-test', {
       method: 'POST',
       body: JSON.stringify(data ?? {}),
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
     }),
   reviewCurrent: () =>
-    request('/api/review/current'),
+    request<Record<string, unknown>>('/api/review/current'),
   reviewProfile: () =>
-    request('/api/review/profile'),
+    request<Record<string, unknown>>('/api/review/profile'),
 
   // Resume optimizer
   resumeOptimize: (jd: string) =>
-    request('/api/resume/optimize', { method: 'POST', body: JSON.stringify({ jd }) }),
+    request<Record<string, unknown>>('/api/resume/optimize', {
+      method: 'POST',
+      body: JSON.stringify({ jd }),
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    }),
 
   // Token
-  tokenStats: () => request('/api/token/stats'),
+  tokenStats: () => request<Record<string, unknown>>('/api/token/stats'),
 
   // Job tracker (desktop / local SQLite)
   jobTrackerStages: () => request<{ stages: string[] }>('/api/job-tracker/stages'),
@@ -448,15 +565,15 @@ export const api = {
     return request<{ items: Record<string, unknown>[] }>(`/api/job-tracker/applications${qs ? `?${qs}` : ''}`)
   },
   jobTrackerCreateApplication: (body: Record<string, unknown>) =>
-    request('/api/job-tracker/applications', { method: 'POST', body: JSON.stringify(body) }),
+    request<Record<string, unknown>>('/api/job-tracker/applications', { method: 'POST', body: JSON.stringify(body) }),
   jobTrackerPatchApplication: (id: number, body: Record<string, unknown>) =>
-    request(`/api/job-tracker/applications/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+    request<Record<string, unknown>>(`/api/job-tracker/applications/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   jobTrackerDeleteApplication: (id: number) =>
-    request(`/api/job-tracker/applications/${id}`, { method: 'DELETE' }),
+    request<{ ok: boolean }>(`/api/job-tracker/applications/${id}`, { method: 'DELETE' }),
   jobTrackerApplicationReviews: (id: number) =>
     request<{ items: Record<string, unknown>[] }>(`/api/job-tracker/applications/${id}/reviews`),
   jobTrackerBatchStage: (ids: number[], stage: string) =>
-    request('/api/job-tracker/applications/batch-stage', {
+    request<Record<string, unknown>>('/api/job-tracker/applications/batch-stage', {
       method: 'PATCH',
       body: JSON.stringify({ ids, stage }),
     }),
@@ -467,11 +584,11 @@ export const api = {
     }),
   jobTrackerListOffers: () => request<{ items: Record<string, unknown>[] }>('/api/job-tracker/offers'),
   jobTrackerUpsertOffer: (body: Record<string, unknown>) =>
-    request('/api/job-tracker/offers', { method: 'POST', body: JSON.stringify(body) }),
+    request<Record<string, unknown>>('/api/job-tracker/offers', { method: 'POST', body: JSON.stringify(body) }),
   jobTrackerPatchOffer: (id: number, body: Record<string, unknown>) =>
-    request(`/api/job-tracker/offers/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+    request<Record<string, unknown>>(`/api/job-tracker/offers/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
   jobTrackerDeleteOffer: (id: number) =>
-    request(`/api/job-tracker/offers/${id}`, { method: 'DELETE' }),
+    request<{ ok: boolean }>(`/api/job-tracker/offers/${id}`, { method: 'DELETE' }),
   jobTrackerCompare: (offer_ids: number[]) =>
     request<{ items: Record<string, unknown>[] }>('/api/job-tracker/compare', {
       method: 'POST',
@@ -489,7 +606,11 @@ export const api = {
     }),
   kbHitsRecent: (limit = 50) =>
     request<{ items: KBRecentHit[] }>(`/api/kb/hits/recent?limit=${limit}`),
-  kbReindex: () => request<Record<string, unknown>>('/api/kb/reindex', { method: 'POST', body: '{}' }),
+  kbReindex: () => request<Record<string, unknown>>('/api/kb/reindex', {
+    method: 'POST',
+    body: '{}',
+    timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+  }),
   kbDelete: (path: string) =>
     request<{ ok: boolean }>(`/api/kb/docs?path=${encodeURIComponent(path)}`, { method: 'DELETE' }),
   kbUpload: async (file: File, subdir = ''): Promise<{ path: string; size: number }> => {
@@ -499,7 +620,12 @@ export const api = {
     const token = getAuthToken()
     const headers: Record<string, string> = {}
     if (token) headers.Authorization = `Bearer ${token}`
-    const res = await fetchBackend(buildApiUrl('/api/kb/upload'), { method: 'POST', body: fd, headers })
+    const res = await fetchBackend(buildApiUrl('/api/kb/upload'), {
+      method: 'POST',
+      body: fd,
+      headers,
+      timeoutMs: LONG_REQUEST_TIMEOUT_MS,
+    })
     if (!res.ok) {
       throw new Error(await buildResponseErrorMessage(res, '上传失败'))
     }

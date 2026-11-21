@@ -244,8 +244,6 @@ function getFocusFilterForStage(stage: string): FocusFilter {
 }
 
 function describeCreateNotice(notice: CreateNotice): { rail: string } {
-  const stageLabel = STAGE_LABELS[notice.stage] ?? notice.stage
-
   if (isRejectedStage(notice.stage)) {
     return {
       rail: '已归到“挂了”',

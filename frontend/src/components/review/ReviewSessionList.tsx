@@ -1131,7 +1131,7 @@ function sessionRailTone(status: ReviewSession['status']) {
   }
 }
 
-function sessionRowTone(status: ReviewSession['status']) {
+function sessionRowTone(_status: ReviewSession['status']) {
   return ''
 }
 
@@ -1205,13 +1205,6 @@ function describeTimelinePosition(index: number, total: number) {
   if (index === 0) return '最近一场'
   if (index === total - 1) return '更早一场'
   return '中间场'
-}
-
-function formatRelativeDate(ts: number) {
-  const diffDays = Math.floor((Date.now() / 1000 - ts) / 86400)
-  if (diffDays <= 0) return '今天'
-  if (diffDays === 1) return '昨天'
-  return `${diffDays} 天前`
 }
 
 function buildSessionGroups(

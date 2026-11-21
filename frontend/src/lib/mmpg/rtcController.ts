@@ -215,8 +215,9 @@ class MmpgController {
     try {
       const audioReady = Promise.all([
         ready, owner.context.audioWorklet.addModule(pcmWorkletUrl), owner.cleanup,
-      ]).then(() => window.clearTimeout(owner.connectTimer))
+      ])
       const [prepared] = await Promise.all([prepare?.() ?? true, audioReady])
+      window.clearTimeout(owner.connectTimer)
       if (this.owner !== owner) return
       if (!prepared) {
         this.finish(owner, 'invalid_command')
@@ -228,6 +229,7 @@ class MmpgController {
       return
     }
     try {
+      window.clearTimeout(owner.connectTimer)
       owner.connectTimer = window.setTimeout(() => this.finish(owner, 'connect_timeout'), 15_000)
       const socket = new WebSocket(buildWsUrl(this.path))
       owner.socket = socket
