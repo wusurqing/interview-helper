@@ -1382,4 +1382,39 @@ describe('JobTracker', () => {
       vi.useRealTimers()
     }
   })
+
+  it('resolves deep link cleanly when a refresh loads the newly created target record', async () => {
+    let resolveReloadApps!: (value: { items: unknown[] }) => void
+    const reloadAppsPromise = new Promise<{ items: unknown[] }>((res) => { resolveReloadApps = res })
+
+    apiMock.jobTrackerApplications
+      .mockResolvedValueOnce({ items: [applicationRow(1, 'ExistingCo')] })
+      .mockReturnValueOnce(reloadAppsPromise)
+    apiMock.jobTrackerListOffers
+      .mockResolvedValueOnce({ items: [] })
+      .mockResolvedValueOnce({ items: [] })
+
+    render(<JobTracker />)
+    await waitFor(() => expect(screen.getAllByText('ExistingCo').length).toBeGreaterThan(0))
+
+    // Start a refresh, then set a deep link pointing to record #99 coming in that refresh
+    fireEvent.click(screen.getByTitle('刷新'))
+    act(() => {
+      useUiPrefsStore.setState({
+        appMode: 'job-tracker',
+        jobTrackerDeepLink: { applicationId: 99, openReviews: false },
+      })
+    })
+
+    await act(async () => {
+      resolveReloadApps({
+        items: [applicationRow(1, 'ExistingCo'), applicationRow(99, 'FreshLinkedCo')],
+      })
+      await reloadAppsPromise
+    })
+
+    await waitFor(() => expect(screen.getByText(/已定位到 FreshLinkedCo/)).toBeInTheDocument())
+    expect(useInterviewStore.getState().toastMessage).not.toBe('未找到对应的求职记录，可能已被删除')
+    expect(useUiPrefsStore.getState().jobTrackerDeepLink).toBeNull()
+  })
 })

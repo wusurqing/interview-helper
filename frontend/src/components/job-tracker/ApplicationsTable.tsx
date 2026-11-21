@@ -315,7 +315,12 @@ export default function ApplicationsTable({
   const savingRef = useRef(false)
   const deletingRef = useRef(false)
   const prevAppRef = useRef<Application | null>(null)
-  const pendingSubmitRef = useRef<{ appId: number; submittedValues: Partial<EditorDraft> } | null>(null)
+  const draftRef = useRef<EditorDraft | null>(null)
+  draftRef.current = draft
+  const submittedFieldsRef = useRef<{
+    appId: number
+    fields: Partial<Record<keyof EditorDraft, { value: string; committed: boolean }>>
+  } | null>(null)
   const patch = useMemo(
     () => (current && draft ? buildPatch(current, draft) : {}),
     [current, draft],
@@ -325,7 +330,7 @@ export default function ApplicationsTable({
     const prevApp = prevAppRef.current
     prevAppRef.current = current
     if (!current) {
-      pendingSubmitRef.current = null
+      submittedFieldsRef.current = null
       setDraft(null)
       setSaveNotice(null)
       setEditCoreOpen(false)
@@ -334,7 +339,7 @@ export default function ApplicationsTable({
       return
     }
     if (!prevApp || prevApp.id !== current.id) {
-      pendingSubmitRef.current = null
+      submittedFieldsRef.current = null
       setDraft(createDraft(current))
       setSaveNotice(null)
       setEditCoreOpen(false)
@@ -344,19 +349,34 @@ export default function ApplicationsTable({
     }
     const prevBase = createDraft(prevApp)
     const nextBase = createDraft(current)
-    const pendingSubmit =
-      pendingSubmitRef.current?.appId === current.id ? pendingSubmitRef.current : null
-    pendingSubmitRef.current = null
+    const tracked =
+      submittedFieldsRef.current?.appId === current.id
+        ? { ...submittedFieldsRef.current.fields }
+        : null
+    if (tracked && submittedFieldsRef.current?.appId === current.id) {
+      const latestDraft = draftRef.current
+      for (const key of DRAFT_KEYS) {
+        const entry = tracked[key]
+        if (!entry) continue
+        const serverChangedField = nextBase[key] !== prevBase[key]
+        const matchesSubmitted = latestDraft != null && latestDraft[key] === entry.value
+        if ((matchesSubmitted && (serverChangedField || entry.committed)) || (!matchesSubmitted && entry.committed)) {
+          delete submittedFieldsRef.current.fields[key]
+        }
+      }
+    }
     setDraft((prevDraft) => {
       if (!prevDraft) return nextBase
       const merged: EditorDraft = { ...prevDraft }
       for (const key of DRAFT_KEYS) {
-        const wasSubmittedAndUnchanged =
-          pendingSubmit !== null &&
-          key in pendingSubmit.submittedValues &&
-          prevDraft[key] === pendingSubmit.submittedValues[key]
         const wasUntouched = prevDraft[key] === prevBase[key]
-        if (wasSubmittedAndUnchanged || wasUntouched) {
+        const entry = tracked?.[key]
+        const serverChangedField = nextBase[key] !== prevBase[key]
+        const wasSubmittedAndLanded =
+          entry != null &&
+          prevDraft[key] === entry.value &&
+          (serverChangedField || entry.committed)
+        if (wasUntouched || wasSubmittedAndLanded) {
           merged[key] = nextBase[key]
         }
       }
@@ -437,30 +457,57 @@ export default function ApplicationsTable({
       })
       return
     }
-    const submittedValues: Partial<EditorDraft> = {}
+    const saveAppId = current.id
+    const submittedEntries: Partial<Record<keyof EditorDraft, { value: string; committed: boolean }>> = {}
     for (const key of Object.keys(scopedPatch) as Array<keyof Application>) {
       const draftKey = PATCH_KEY_TO_DRAFT_KEY[key]
       if (draftKey) {
-        submittedValues[draftKey] = draft[draftKey]
+        submittedEntries[draftKey] = { value: draft[draftKey], committed: false }
       }
     }
-    pendingSubmitRef.current = { appId: current.id, submittedValues }
+    const existingFields =
+      submittedFieldsRef.current?.appId === saveAppId
+        ? submittedFieldsRef.current.fields
+        : {}
+    submittedFieldsRef.current = {
+      appId: saveAppId,
+      fields: { ...existingFields, ...submittedEntries },
+    }
+    const clearFailedEntries = () => {
+      if (submittedFieldsRef.current?.appId !== saveAppId) return
+      for (const [k, entry] of Object.entries(submittedEntries) as Array<
+        [keyof EditorDraft, { value: string; committed: boolean }]
+      >) {
+        if (submittedFieldsRef.current.fields[k] === entry) {
+          delete submittedFieldsRef.current.fields[k]
+        }
+      }
+    }
     savingRef.current = true
     setSaving(true)
     try {
-      const result = await Promise.resolve(onPatch(current.id, withMaterializedTodoIds(scopedPatch)))
+      const result = await Promise.resolve(onPatch(saveAppId, withMaterializedTodoIds(scopedPatch)))
       if (result !== false) {
+        if (submittedFieldsRef.current?.appId === saveAppId) {
+          for (const [k, entry] of Object.entries(submittedEntries) as Array<
+            [keyof EditorDraft, { value: string; committed: boolean }]
+          >) {
+            if (submittedFieldsRef.current.fields[k] === entry) {
+              submittedFieldsRef.current.fields[k] = { ...entry, committed: true }
+            }
+          }
+        }
         setSaveNotice({
           message: scope === 'core' ? '已保存核心信息' : scope === 'extras' ? '已保存补充信息' : '已保存',
           tone: 'info',
         })
         if (scope === 'core' || scope === 'all') setEditCoreOpen(false)
       } else {
-        pendingSubmitRef.current = null
+        clearFailedEntries()
         setSaveNotice({ message: '保存失败，请重试', tone: 'error' })
       }
     } catch (error) {
-      pendingSubmitRef.current = null
+      clearFailedEntries()
       setSaveNotice({ message: getSaveErrorMessage(error), tone: 'error' })
     } finally {
       savingRef.current = false

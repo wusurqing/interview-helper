@@ -400,6 +400,7 @@ export default function JobTracker() {
       listLoadSeqRef.current === requestSeq &&
       listMutationSeqRef.current === mutationSeq
 
+    let handedOffToTransition = false
     setLoading(true)
     try {
       const [aRes, oRes] = await Promise.all([
@@ -409,7 +410,11 @@ export default function JobTracker() {
       if (!isCurrentLoad()) return
       const nextApplications = (aRes.items as Record<string, unknown>[]).map(parseApplication)
       const nextOffers = (oRes.items as Record<string, unknown>[]).map(parseOffer)
+      handedOffToTransition = true
       startTransition(() => {
+        if (listLoadSeqRef.current === requestSeq) {
+          setLoading(false)
+        }
         if (!isCurrentLoad()) return
         setApplications(nextApplications)
         setOffers(nextOffers)
@@ -420,7 +425,7 @@ export default function JobTracker() {
         setToastMessage(e instanceof Error ? e.message : '加载失败')
       }
     } finally {
-      if (listLoadSeqRef.current === requestSeq) {
+      if (!handedOffToTransition && listLoadSeqRef.current === requestSeq) {
         setLoading(false)
       }
     }
@@ -1265,9 +1270,9 @@ function DesktopOverviewSummary({
 }) {
   return (
     <div className="flex max-w-full flex-wrap items-center gap-x-3 gap-y-1">
-        {items.map((item) => (
+        {items.map((item, idx) => (
           <DesktopOverviewInlineStat
-            key={item.label}
+            key={`${item.label}-${idx}`}
             label={item.label}
             value={item.value}
             tone={item.tone}

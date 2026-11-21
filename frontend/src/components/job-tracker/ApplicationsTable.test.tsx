@@ -411,4 +411,142 @@ describe('ApplicationsTable', () => {
       confirmSpy.mockRestore()
     }
   })
+
+  it('does not revert an in-flight edit when an unrelated same-id refresh arrives before the save settles', async () => {
+    const initial = app({
+      id: 1,
+      company: 'ByteDance',
+      notes: 'old note',
+      updated_at: 1710000000,
+    })
+    const pendingCore = deferred<boolean>()
+    const onPatch = vi.fn(() => pendingCore.promise)
+
+    const { rerender } = render(
+      <ApplicationsTable
+        applications={[initial]}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑核心信息' }))
+    fireEvent.change(screen.getByLabelText('公司名称'), { target: { value: 'Acme Corp' } })
+    fireEvent.click(screen.getAllByRole('button', { name: '保存核心信息' })[0])
+
+    // Unrelated refresh delivers a new object reference for id=1 before onPatch resolves
+    rerender(
+      <ApplicationsTable
+        applications={[{ ...initial, updated_at: 1710000010 }]}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+
+    // In-flight company edit must remain intact
+    expect((screen.getByLabelText('公司名称') as HTMLInputElement).value).toBe('Acme Corp')
+
+    // Even if the in-flight save fails, user edit must stay so they can retry
+    await act(async () => {
+      pendingCore.resolve(false)
+      await pendingCore.promise
+    })
+
+    expect((screen.getByLabelText('公司名称') as HTMLInputElement).value).toBe('Acme Corp')
+  })
+
+  it('preserves in-flight extras edits when an earlier committed core update arrives asynchronously', async () => {
+    const initial = app({
+      id: 1,
+      company: 'ByteDance',
+      notes: 'old note',
+      updated_at: 1710000000,
+    })
+    const extrasSave = deferred<boolean>()
+    const onPatch = vi.fn()
+      .mockResolvedValueOnce(true) // core resolves before parent commits transition
+      .mockImplementationOnce(() => extrasSave.promise)
+
+    const { rerender } = render(
+      <ApplicationsTable
+        applications={[initial]}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑核心信息' }))
+    fireEvent.click(screen.getByRole('button', { name: /补充信息/ }))
+    fireEvent.change(screen.getByLabelText('公司名称'), { target: { value: 'Acme Corp' } })
+    fireEvent.change(screen.getByLabelText('备注'), { target: { value: 'new note' } })
+
+    // 1. Save core (resolves true before applications prop updates)
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole('button', { name: '保存核心信息' })[0])
+    })
+
+    // 2. Immediately save extras while core's prop update hasn't landed yet
+    fireEvent.click(screen.getAllByRole('button', { name: '保存补充信息' })[0])
+
+    // 3. Core's prop update lands (still has old note!)
+    rerender(
+      <ApplicationsTable
+        applications={[{ ...initial, company: 'Acme Corp', notes: 'old note', updated_at: 1710000020 }]}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+
+    // In-flight notes must NOT be wiped back to 'old note'
+    expect((screen.getByLabelText('备注') as HTMLTextAreaElement).value).toBe('new note')
+
+    // 4. Extras save settles and commits
+    await act(async () => {
+      extrasSave.resolve(true)
+      await extrasSave.promise
+    })
+    rerender(
+      <ApplicationsTable
+        applications={[{ ...initial, company: 'Acme Corp', notes: 'new note', updated_at: 1710000030 }]}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+    expect((screen.getByLabelText('备注') as HTMLTextAreaElement).value).toBe('new note')
+  })
 })
