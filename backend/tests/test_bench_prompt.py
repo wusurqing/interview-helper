@@ -112,3 +112,51 @@ def test_word_count_cn_counts_chinese_and_english():
     assert word_count_cn("Redis 的 RDB 是快照") >= 5
     assert word_count_cn("") == 0
     assert word_count_cn("纯中文测试") == 5
+
+
+def test_followup_chain_injects_real_prior_qa_turns_not_placeholder(monkeypatch):
+    from core.config import AppConfig
+    from scripts.bench_prompt import RunResult
+
+    monkeypatch.setattr("core.config.get_config", lambda: AppConfig(resume_text=None))
+    case_a = next(c for c in BENCH_CASES if c["id"] == "E-1a")
+    case_b = next(c for c in BENCH_CASES if c["id"] == "E-1b")
+    case_c = next(c for c in BENCH_CASES if c["id"] == "E-1c")
+
+    captured_calls: list[list[dict[str, str]]] = []
+
+    def fake_stream(_model, *, messages, system_prompt):
+        captured_calls.append(list(messages))
+        if len(captured_calls) == 1:
+            yield "text", "互斥锁 + 逻辑过期防止热点 key 击穿"
+        elif len(captured_calls) == 2:
+            yield "text", "雪崩用随机 TTL + 多级缓存 + 熔断降级"
+        else:
+            yield "text", "监控看命中率曲线和热点 key QPS"
+
+    monkeypatch.setattr("services.llm.chat_stream_single_model", fake_stream)
+    model = SimpleNamespace(name="mock")
+    prompts = {"NEW": lambda _case: "prompt"}
+    prior_results: dict[str, RunResult] = {}
+
+    for c in (case_a, case_b, case_c):
+        res = _run_one_case(model, c, "NEW", prompts, prior_results=prior_results)
+        prior_results[c["id"]] = res
+
+    # E-1c should carry real Q&A for both E-1a and E-1b, never literal "(case E-1b)"
+    msgs_c = captured_calls[2]
+    assert len(msgs_c) == 5
+    assert msgs_c[0] == {"role": "user", "content": case_a["input"]}
+    assert msgs_c[1] == {"role": "assistant", "content": "互斥锁 + 逻辑过期防止热点 key 击穿"}
+    assert msgs_c[2] == {"role": "user", "content": case_b["input"]}
+    assert msgs_c[3] == {"role": "assistant", "content": "雪崩用随机 TTL + 多级缓存 + 熔断降级"}
+    assert msgs_c[4]["role"] == "user"
+    assert case_c["input"] in msgs_c[4]["content"]
+    assert "(case E-1" not in str(msgs_c)
+
+    # Even without prior_results, fallback injects real prior question text rather than "(case E-1a)"
+    captured_calls.clear()
+    _run_one_case(model, case_b, "NEW", prompts, prior_results={})
+    fallback_content = captured_calls[0][0]["content"]
+    assert case_a["input"] in fallback_content
+    assert "(case E-1a)" not in fallback_content

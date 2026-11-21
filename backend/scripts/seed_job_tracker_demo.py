@@ -15,7 +15,6 @@
 from __future__ import annotations
 
 import argparse
-import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -44,37 +43,31 @@ def _days_from_now(days: float) -> float:
 
 
 def _clear_demo_review_sessions() -> int:
-    conn = sqlite3.connect(review.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT id FROM review_sessions WHERE jd_snapshot = ?",
-        (DEMO_SESSION_MARKER,),
-    ).fetchall()
-    session_ids = [int(row["id"]) for row in rows]
-    if session_ids:
-        placeholders = ",".join("?" * len(session_ids))
-        conn.execute(f"DELETE FROM review_turns WHERE session_id IN ({placeholders})", session_ids)
-        conn.execute(f"DELETE FROM review_sessions WHERE id IN ({placeholders})", session_ids)
-    conn.commit()
-    conn.close()
-    return len(session_ids)
+    with review._db_lock, review._connect(transactional=True) as conn:
+        rows = conn.execute(
+            "SELECT id FROM review_sessions WHERE jd_snapshot = ?",
+            (DEMO_SESSION_MARKER,),
+        ).fetchall()
+        session_ids = [int(row["id"]) for row in rows]
+        if session_ids:
+            placeholders = ",".join("?" * len(session_ids))
+            conn.execute(f"DELETE FROM review_turns WHERE session_id IN ({placeholders})", session_ids)
+            conn.execute(f"DELETE FROM review_sessions WHERE id IN ({placeholders})", session_ids)
+        return len(session_ids)
 
 
 def _clear_demo_applications() -> int:
-    conn = sqlite3.connect(jt.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        "SELECT id FROM applications WHERE notes LIKE ?",
-        (f"%{DEMO_APP_MARKER}%",),
-    ).fetchall()
-    app_ids = [int(row["id"]) for row in rows]
-    if app_ids:
-        placeholders = ",".join("?" * len(app_ids))
-        conn.execute(f"DELETE FROM offers WHERE application_id IN ({placeholders})", app_ids)
-        conn.execute(f"DELETE FROM applications WHERE id IN ({placeholders})", app_ids)
-    conn.commit()
-    conn.close()
-    return len(app_ids)
+    with jt._db_lock, jt._connect(transactional=True) as conn:
+        rows = conn.execute(
+            "SELECT id FROM applications WHERE notes LIKE ?",
+            (f"%{DEMO_APP_MARKER}%",),
+        ).fetchall()
+        app_ids = [int(row["id"]) for row in rows]
+        if app_ids:
+            placeholders = ",".join("?" * len(app_ids))
+            conn.execute(f"DELETE FROM offers WHERE application_id IN ({placeholders})", app_ids)
+            conn.execute(f"DELETE FROM applications WHERE id IN ({placeholders})", app_ids)
+        return len(app_ids)
 
 
 def clear_demo_data() -> tuple[int, int]:
