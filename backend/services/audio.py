@@ -94,9 +94,16 @@ def _sc_showwarning(message, category, filename, lineno, file=None, line=None):
     if sink is not None:
         sink.append(str(message))
         return
+    if getattr(_SC_WARNING_LOCAL, "dispatching", False):
+        warnings._showwarning_orig(message, category, filename, lineno, file=file, line=line)
+        return
     prev = _SC_PREV_SHOWWARNING
     if prev is not None and prev is not _sc_showwarning:
-        prev(message, category, filename, lineno, file=file, line=line)
+        _SC_WARNING_LOCAL.dispatching = True
+        try:
+            prev(message, category, filename, lineno, file=file, line=line)
+        finally:
+            _SC_WARNING_LOCAL.dispatching = False
         return
     warnings._showwarning_orig(message, category, filename, lineno, file=file, line=line)
 

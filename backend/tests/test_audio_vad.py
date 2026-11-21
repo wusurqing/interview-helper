@@ -677,3 +677,47 @@ def test_soundcard_discontinuity_hook_marks_archive_and_passes_other_threads_thr
     assert recorded[0][0].discontinuity is False
     assert recorded[1][0].discontinuity is True
     assert any("unrelated worker warning" in w for w in other_thread_warnings)
+
+
+def test_sc_showwarning_handles_nested_outer_wrapper_without_recursion(monkeypatch):
+    import threading
+    import warnings
+    from services import audio
+
+    orig_seen: list[str] = []
+    outer_seen: list[str] = []
+
+    def fake_orig_showwarning(message, category, filename, lineno, file=None, line=None):
+        orig_seen.append(str(message))
+
+    monkeypatch.setattr(warnings, "_showwarning_orig", fake_orig_showwarning)
+    monkeypatch.setattr(audio, "_SC_PREV_SHOWWARNING", None)
+    monkeypatch.setattr(warnings, "showwarning", fake_orig_showwarning)
+
+    audio._ensure_soundcard_warning_hook()
+    first_hook = warnings.showwarning
+    assert first_hook is audio._sc_showwarning
+
+    def outer_wrapper(message, category, filename, lineno, file=None, line=None):
+        outer_seen.append(str(message))
+        first_hook(message, category, filename, lineno, file=file, line=line)
+
+    monkeypatch.setattr(warnings, "showwarning", outer_wrapper)
+    audio._ensure_soundcard_warning_hook()
+
+    errors: list[Exception] = []
+
+    def run_in_other_thread():
+        try:
+            warnings.warn("nested warning", UserWarning)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_in_other_thread)
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not errors
+    assert any("nested warning" in msg for msg in outer_seen)
+    assert any("nested warning" in msg for msg in orig_seen)
+    assert getattr(audio._SC_WARNING_LOCAL, "dispatching", False) is False
