@@ -200,3 +200,79 @@ def test_disconnect_before_final_packet_is_not_a_successful_transcription(monkey
     with pytest.raises(TimeoutError):
         DoubaoSTT(api_key="test-key").transcribe(np.zeros(16000, dtype=np.float32))
     assert calls["closed"]
+
+
+def test_doubao_stt_never_puts_secrets_in_user_uid_and_fixes_default_resource_id(monkeypatch):
+    sent_frames: list[bytes] = []
+
+    class FakeWebSocket:
+        def send_binary(self, frame):
+            sent_frames.append(frame)
+
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self):
+            return _server_text_frame("测试通过", with_sequence=True, is_last=True)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        engines,
+        "websocket",
+        SimpleNamespace(create_connection=lambda *_a, **_k: FakeWebSocket()),
+    )
+
+    engine = DoubaoSTT(api_key="sk-secret-api-key", access_token="tok-secret", resource_id="")
+    assert engine.resource_id == "volc.seedasr.sauc.duration"
+    assert engine.transcribe(np.zeros(1600, dtype=np.float32), sample_rate=16000) == "测试通过"
+
+    first_frame = sent_frames[0]
+    payload_size = struct.unpack(">I", first_frame[8:12])[0]
+    req_json = json.loads(gzip.decompress(first_frame[12 : 12 + payload_size]).decode("utf-8"))
+    assert req_json["user"]["uid"] == "interview-helper"
+    assert "sk-secret-api-key" not in json.dumps(req_json)
+    assert "tok-secret" not in json.dumps(req_json)
+
+
+def test_doubao_stt_non_16khz_resampling_handles_empty_and_non_empty_arrays(monkeypatch):
+    sent_frames: list[bytes] = []
+
+    class FakeWebSocket:
+        def send_binary(self, frame):
+            sent_frames.append(frame)
+
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self):
+            return _server_text_frame("重采样正常", with_sequence=True, is_last=True)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        engines,
+        "websocket",
+        SimpleNamespace(create_connection=lambda *_a, **_k: FakeWebSocket()),
+    )
+
+    engine = DoubaoSTT(api_key="sk-test")
+    # Empty array at 48kHz must not raise IndexError
+    assert engine.transcribe(np.empty(0, dtype=np.float32), sample_rate=48000) == "重采样正常"
+    assert len(sent_frames) == 2  # full request + 1 padded audio frame
+
+    # 1 second at 48kHz -> resampled to 16000 samples with anti-aliasing filter
+    t = np.linspace(0, 1.0, 48000, endpoint=False, dtype=np.float32)
+    low_freq = 0.5 * np.sin(2 * np.pi * 440.0 * t)
+    high_freq = 0.5 * np.sin(2 * np.pi * 14000.0 * t)  # above 8kHz Nyquist of 16kHz
+    low_resampled = engines._resample_pcm_int16(engines._audio_to_pcm_int16(low_freq), 48000, 16000)
+    high_resampled = engines._resample_pcm_int16(engines._audio_to_pcm_int16(high_freq), 48000, 16000)
+    assert len(low_resampled) == 16000
+    assert low_resampled.dtype == np.int16
+    # Passband 440Hz should retain strong RMS energy; stopband 14kHz should be heavily attenuated
+    low_rms = float(np.sqrt(np.mean(low_resampled[200:-200].astype(np.float64) ** 2)))
+    high_rms = float(np.sqrt(np.mean(high_resampled[200:-200].astype(np.float64) ** 2)))
+    assert low_rms > 8000.0
+    assert high_rms < low_rms * 0.05

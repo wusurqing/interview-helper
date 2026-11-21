@@ -148,3 +148,40 @@ def test_only_short_interviewer_empty_segment_is_retried_with_silence(monkeypatc
     monkeypatch.setattr(stt_factory, "get_stt_engine", lambda *_args, **_options: SimpleNamespace(transcribe=transcribe))
     assert stt_factory.transcribe_segment(np.zeros(16000), 16000, config_snapshot=cfg, scope=scope) == ""
     assert lengths == expected
+
+
+def test_generic_http_stt_strips_content_type_from_custom_headers_and_reuses_session(monkeypatch):
+    from services.stt import engines
+
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        def json(self):
+            return {"text": "自定义头测试"}
+
+    session = engines._get_generic_stt_session()
+    assert engines._get_generic_stt_session() is session
+
+    def fake_session_post(url, headers=None, files=None, data=None, timeout=None):
+        captured["headers"] = headers
+        return _Resp()
+
+    monkeypatch.setattr(session, "post", fake_session_post)
+
+    for raw_custom in (
+        '{"Content-Type": "application/json", "X-Custom": "val1"}',
+        "content-type: multipart/form-data\nX-Custom: val2",
+    ):
+        engine = GenericHTTPSTT(
+            api_base_url="https://asr.example.com/v1",
+            api_key="sk-test",
+            model="whisper-1",
+            custom_headers=raw_custom,
+        )
+        assert engine.transcribe(np.zeros(320, dtype=np.float32)) == "自定义头测试"
+        lowered_keys = {k.lower() for k in captured["headers"]}
+        assert "content-type" not in lowered_keys
+        assert "x-custom" in lowered_keys

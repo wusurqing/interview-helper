@@ -1,9 +1,11 @@
 """Segmented cloud ASR connections for Doubao and OpenAI-compatible services."""
 
+from http.cookiejar import DefaultCookiePolicy
 import io
 import gzip
 import json
 import struct
+import threading
 import uuid
 import wave
 import numpy as np
@@ -15,6 +17,22 @@ from core.logger import get_logger
 from .text_utils import _postprocess
 
 _log = get_logger("stt.engines")
+_ORIG_REQUESTS_POST = requests.post
+_stt_http_local = threading.local()
+
+
+def _get_generic_stt_session() -> requests.Session:
+    session = getattr(_stt_http_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.cookies.set_policy(DefaultCookiePolicy(allowed_domains=[]))
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=8)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        _stt_http_local.session = session
+    else:
+        session.cookies.clear()
+    return session
 
 try:
     import websocket
@@ -55,6 +73,29 @@ def _audio_to_wav_bytes(audio: np.ndarray, sample_rate: int = 16000) -> bytes:
     return buf.getvalue()
 
 
+def _resample_pcm_int16(pcm: np.ndarray, sample_rate: int, target_rate: int = 16000) -> np.ndarray:
+    if not pcm.size or sample_rate <= 0 or sample_rate == target_rate:
+        return pcm
+    n_orig = len(pcm)
+    if n_orig == 1:
+        return pcm
+    n_new = max(1, int(round(n_orig * target_rate / sample_rate)))
+    samples = pcm.astype(np.float64)
+    if sample_rate > target_rate and n_orig > 4:
+        cutoff_norm = 0.47 * (target_rate / sample_rate)
+        num_taps = min(63, n_orig if n_orig % 2 == 1 else max(3, n_orig - 1))
+        n = np.arange(num_taps) - (num_taps - 1) / 2.0
+        fir = 2.0 * cutoff_norm * np.sinc(2.0 * cutoff_norm * n) * np.blackman(num_taps)
+        fir_sum = fir.sum()
+        if fir_sum != 0:
+            fir /= fir_sum
+        samples = np.convolve(samples, fir, mode="same")
+    x_old = np.arange(n_orig, dtype=np.float64)
+    x_new = np.linspace(0.0, float(n_orig - 1), n_new)
+    resampled = np.interp(x_new, x_old, samples)
+    return np.clip(np.rint(resampled), -32768, 32767).astype(np.int16)
+
+
 # ---------------------------------------------------------------------------
 # DoubaoSTT – Volcengine streaming ASR
 # ---------------------------------------------------------------------------
@@ -85,12 +126,12 @@ def _doubao_language(language: str) -> str:
 
 
 def _build_ws_frame_full_request(
-    app_key: str,
+    uid: str,
     boosting_table_id: str,
     language: str = "zh-CN",
 ) -> bytes:
     req: dict[str, Any] = {
-        "user": {"uid": app_key},
+        "user": {"uid": (uid or "").strip() or "interview-helper"},
         "audio": {
             "format": "pcm",
             "rate": 16000,
@@ -178,7 +219,7 @@ class DoubaoSTT:
         self.app_id = app_id or ""
         self.access_token = access_token or ""
         self.api_key = api_key or ""
-        self.resource_id = resource_id or "volc.bigasr.sauc.duration"
+        self.resource_id = (resource_id or "").strip() or "volc.seedasr.sauc.duration"
         self.boosting_table_id = boosting_table_id or ""
 
     @property
@@ -196,9 +237,8 @@ class DoubaoSTT:
                 "X-Api-Resource-Id": self.resource_id,
                 "X-Api-Connect-Id": str(uuid.uuid4()),
             }
-        app_key = self.app_id or self.access_token
         return {
-            "X-Api-App-Key": app_key,
+            "X-Api-App-Key": self.app_id,
             "X-Api-Access-Key": self.access_token,
             "X-Api-Resource-Id": self.resource_id,
             "X-Api-Connect-Id": str(uuid.uuid4()),
@@ -210,18 +250,13 @@ class DoubaoSTT:
             raise STTError("请输入火山原生豆包的 API Key 或 App ID 与 Access Token")
         if websocket is None:
             raise STTError("火山原生豆包的 WebSocket 客户端不可用")
-        app_key = self.app_id or self.access_token or self.api_key
+        user_uid = (self.app_id or "").strip() or "interview-helper"
         pcm = _audio_to_pcm_int16(audio)
         if sample_rate != 16000:
-            n_orig = len(pcm)
-            n_new = int(round(n_orig * 16000 / sample_rate))
-            if n_new < 1:
-                n_new = 1
-            indices = np.linspace(0, n_orig - 1, n_new).astype(np.int32)
-            pcm = pcm[indices]
+            pcm = _resample_pcm_int16(pcm, sample_rate, 16000)
 
         first_frame = _build_ws_frame_full_request(
-            app_key,
+            user_uid,
             self.boosting_table_id,
             language=_doubao_language(language),
         )
@@ -339,17 +374,27 @@ class GenericHTTPSTT:
             try:
                 extra = json.loads(self.custom_headers)
                 if isinstance(extra, dict):
-                    headers.update({k: str(v) for k, v in extra.items()})
+                    for k, v in extra.items():
+                        key_clean = str(k).strip()
+                        if key_clean and key_clean.lower() != "content-type":
+                            headers[key_clean] = str(v)
             except (json.JSONDecodeError, ValueError):
                 for line in self.custom_headers.strip().splitlines():
                     line = line.strip()
                     if ":" in line:
                         k, v = line.split(":", 1)
-                        headers[k.strip()] = v.strip()
+                        key_clean = k.strip()
+                        if key_clean and key_clean.lower() != "content-type":
+                            headers[key_clean] = v.strip()
         files = {"file": ("audio.wav", wav_bytes, "audio/wav")}
         data = {"model": self.model, "response_format": "json"}
+        post_fn = (
+            requests.post
+            if requests.post is not _ORIG_REQUESTS_POST
+            else _get_generic_stt_session().post
+        )
         try:
-            resp = requests.post(url, headers=headers, files=files, data=data, timeout=(10, 60))
+            resp = post_fn(url, headers=headers, files=files, data=data, timeout=(10, 60))
             if resp.status_code >= 400:
                 status = resp.status_code
                 raise STTError(
