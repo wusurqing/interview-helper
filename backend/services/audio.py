@@ -72,6 +72,12 @@ _SC_ID_BASE = 20000
 _SC_ID_MAP: dict[int, str] = {}   # id -> speaker.id (GUID)
 _SC_DEVICE_CACHE: dict[int, dict[str, str]] = {}   # id -> stable device metadata
 
+# Process-wide per-device occupancy registry so separate AudioCapture instances
+# (e.g. assist main/candidate pipelines and sound_test local captures) cannot
+# open the same physical device concurrently.
+_ACTIVE_DEVICES_LOCK = threading.Lock()
+_ACTIVE_DEVICES: dict[int, tuple["AudioCapture", Optional[str]]] = {}
+
 
 def _audio_device_sort_key(device: dict) -> tuple[int, str]:
     """Keep the current system output first, then other loopbacks, then mics."""
@@ -221,6 +227,7 @@ class AudioCapture:
         self._use_agc: bool = False
         # Ownership token: only one caller (for example "assist") may hold the device
         self._owner: Optional[str] = None
+        self._claimed_device_ids: set[int] = set()
         self._dropped_chunks_count = 0
         self._loopback_discontinuity_count = 0
         self._max_queue_chunk_samples = 0
@@ -322,6 +329,46 @@ class AudioCapture:
         return audio
 
     # ------------------------------------------------------------------
+    # Global per-device occupancy registry
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def active_device_owner(device_id: int) -> Optional[str]:
+        with _ACTIVE_DEVICES_LOCK:
+            entry = _ACTIVE_DEVICES.get(int(device_id))
+            return entry[1] if entry is not None else None
+
+    @staticmethod
+    def is_device_busy(device_id: int) -> bool:
+        with _ACTIVE_DEVICES_LOCK:
+            return int(device_id) in _ACTIVE_DEVICES
+
+    def _claim_device(self, device_id: int, owner: Optional[str]) -> None:
+        dev_key = int(device_id)
+        with _ACTIVE_DEVICES_LOCK:
+            existing = _ACTIVE_DEVICES.get(dev_key)
+            if existing is not None and existing[0] is not self:
+                raise AudioBusyError(existing[1], owner)
+            _ACTIVE_DEVICES[dev_key] = (self, owner)
+            self._claimed_device_ids.add(dev_key)
+
+    def _update_claimed_owner(self, owner: Optional[str]) -> None:
+        with _ACTIVE_DEVICES_LOCK:
+            for dev_key in list(self._claimed_device_ids):
+                existing = _ACTIVE_DEVICES.get(dev_key)
+                if existing is not None and existing[0] is self:
+                    _ACTIVE_DEVICES[dev_key] = (self, owner)
+
+    def _release_devices(self, device_ids: Optional[set[int]] = None) -> None:
+        with _ACTIVE_DEVICES_LOCK:
+            targets = list(self._claimed_device_ids if device_ids is None else device_ids)
+            for dev_key in targets:
+                existing = _ACTIVE_DEVICES.get(dev_key)
+                if existing is not None and existing[0] is self:
+                    _ACTIVE_DEVICES.pop(dev_key, None)
+                self._claimed_device_ids.discard(dev_key)
+
+    # ------------------------------------------------------------------
     # Start / Stop
     # ------------------------------------------------------------------
 
@@ -340,6 +387,7 @@ class AudioCapture:
         - 已运行且 owner 不一致:抛出 AudioBusyError(409)
         - 已运行且 owner 相同:静默 no-op(等价旧行为)
         - 已运行但当前无 owner 标签:沿用旧行为 no-op
+        - 若其他 AudioCapture 实例已占用同一 device_id:抛出 AudioBusyError(409)
         """
         with self._lock:
             if self._running:
@@ -347,7 +395,10 @@ class AudioCapture:
                     raise AudioBusyError(self._owner, owner)
                 if owner is not None and self._owner is None:
                     self._owner = owner
+                    self._update_claimed_owner(owner)
                 return
+            norm_device_id = int(device_id)
+            self._claim_device(norm_device_id, owner)
             self._callback = on_audio
             self._queue_audio = queue_audio
             self._running = True
@@ -362,13 +413,19 @@ class AudioCapture:
             self._last_queue_chunk_samples = 0
             self._seen_soundcard_warning_messages = set()
 
-            if _is_sc_id(device_id):
-                self._use_agc = True
-                self._start_soundcard(int(device_id))
-            else:
-                self._use_agc = False
-                with _microphone_com():
-                    self._start_sounddevice(int(device_id), mic_compatibility_mode=mic_compatibility_mode)
+            try:
+                if _is_sc_id(norm_device_id):
+                    self._use_agc = True
+                    self._start_soundcard(norm_device_id)
+                else:
+                    self._use_agc = False
+                    with _microphone_com():
+                        self._start_sounddevice(norm_device_id, mic_compatibility_mode=mic_compatibility_mode)
+            except Exception:
+                self._running = False
+                self._owner = None
+                self._release_devices()
+                raise
 
     def _iter_queueable_chunks(self, audio: np.ndarray):
         limit = max(1, int(getattr(self, "MAX_QUEUE_CHUNK_SAMPLES", self.BLOCK_SIZE * 4) or 1))
@@ -488,6 +545,7 @@ class AudioCapture:
                 _alog.error("soundcard error: %s", e, exc_info=True)
                 if self._sc_stop is stop_event:
                     self._running = False
+                    self._release_devices({device_id})
             finally:
                 try:
                     ctypes.windll.ole32.CoUninitialize()
@@ -582,6 +640,16 @@ class AudioCapture:
             raise RuntimeError(f"无法查询麦克风设备: {e}")
 
         for attempt in attempts:
+            attempt_dev = int(attempt["device"])
+            claimed_extra = False
+            if attempt_dev != device_id:
+                try:
+                    self._claim_device(attempt_dev, self._owner)
+                    claimed_extra = True
+                except AudioBusyError as e:
+                    last_error = e
+                    _alog.warning("sounddevice mic fallback busy (%s): %s", attempt["label"], e)
+                    continue
             try:
                 self._native_sr = int(attempt["native_sr"])
                 kwargs = {
@@ -599,6 +667,8 @@ class AudioCapture:
                 _alog.info("sounddevice mic opened: %s", attempt["label"])
                 return
             except Exception as e:
+                if claimed_extra:
+                    self._release_devices({attempt_dev})
                 last_error = e
                 if self._stream:
                     try:
@@ -644,6 +714,7 @@ class AudioCapture:
                 self._sc_thread.join(timeout=1.0)
             self._sc_thread = None
             self._owner = None
+            self._release_devices()
             if clear_queue:
                 # H1: 清空音频队列，避免长时间录音后内存泄漏
                 with self._audio_queue.mutex:

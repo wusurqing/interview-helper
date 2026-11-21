@@ -449,12 +449,19 @@ def get_input_level_status() -> dict:
         return dict(_level_status)
 
 
-def _run_input_level_monitor(device_id: int, stop_event: threading.Event) -> None:
-    cap = AudioCapture()
+def _run_input_level_monitor(
+    device_id: int,
+    stop_event: threading.Event,
+    cap: Optional[AudioCapture] = None,
+) -> None:
+    started_here = cap is None
+    if cap is None:
+        cap = AudioCapture()
     rms = 0.0
     peak = 0.0
     try:
-        cap.start(int(device_id), owner="audio-level-test", mic_compatibility_mode=True)
+        if started_here:
+            cap.start(int(device_id), owner="audio-level-test", mic_compatibility_mode=True)
         _set_level_status(running=True, error=None)
         while not stop_event.is_set():
             chunk = cap.get_audio_chunk(max_chunks=4)
@@ -487,6 +494,12 @@ def _run_input_level_monitor(device_id: int, stop_event: threading.Event) -> Non
 def start_input_level_monitor(device_id: int) -> dict:
     global _level_thread, _level_stop_event, _level_status
     stop_input_level_monitor()
+    cap = AudioCapture()
+    try:
+        cap.start(int(device_id), owner="audio-level-test", mic_compatibility_mode=True)
+    except Exception as exc:
+        _set_level_status(device_id=int(device_id), running=False, error=str(exc))
+        raise
     with _level_lock:
         _level_stop_event = threading.Event()
         _level_status = {
@@ -502,12 +515,21 @@ def start_input_level_monitor(device_id: int) -> dict:
         }
         thread = threading.Thread(
             target=_run_input_level_monitor,
-            args=(int(device_id), _level_stop_event),
+            args=(int(device_id), _level_stop_event, cap),
             daemon=True,
             name="audio-level-test",
         )
         _level_thread = thread
-    thread.start()
+    try:
+        thread.start()
+    except Exception:
+        with _level_lock:
+            if _level_thread is thread:
+                _level_thread = None
+            _level_status["running"] = False
+            _level_status["updated_at"] = time.time()
+        cap.stop(owner="audio-level-test")
+        raise
     return get_input_level_status()
 
 
@@ -619,7 +641,10 @@ def _run_preflight(device_id: Optional[int], scenario_id: str):
         _set_step("playback", "running", "准备播放测试音频…")
         _set_step("capture", "running", "准备捕获真实音频…")
         try:
-            cap.start(device_id)
+            try:
+                cap.start(device_id, owner="audio-preflight")
+            except TypeError:
+                cap.start(device_id)
             time.sleep(0.15)
             captured, playback_elapsed = collect_capture_audio_during_playback(
                 cap,
@@ -628,7 +653,10 @@ def _run_preflight(device_id: Optional[int], scenario_id: str):
             )
             _set_step("playback", "pass", f"测试音频已播放（{playback_elapsed:.2f}s）")
         finally:
-            cap.stop()
+            try:
+                cap.stop(owner="audio-preflight")
+            except TypeError:
+                cap.stop()
 
         if captured is None or len(captured) == 0:
             _set_step("capture", "fail", "未捕获到有效音频")

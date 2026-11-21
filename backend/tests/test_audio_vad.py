@@ -179,3 +179,130 @@ def test_windows_microphone_initializes_com_on_stream_open_and_close(monkeypatch
     capture.stop(owner="assist")
 
     assert operations == ["init", "start", "uninit", "init", "stop", "close", "uninit"]
+
+
+def _patch_fake_sounddevice(monkeypatch, *, fail_devices: set[int] | None = None):
+    from types import SimpleNamespace
+    from services import audio
+
+    fail = fail_devices or set()
+    monkeypatch.setattr(audio.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        audio.sd,
+        "query_devices",
+        lambda dev=None, *_args: {"default_samplerate": 16000, "hostapi": 0},
+    )
+    monkeypatch.setattr(audio.sd, "query_hostapis", lambda *_: {"name": "ALSA"})
+
+    def make_stream(**kwargs):
+        if kwargs["device"] in fail:
+            raise OSError(f"device {kwargs['device']} failed")
+        return SimpleNamespace(start=lambda: None, stop=lambda: None, close=lambda: None)
+
+    monkeypatch.setattr(audio.sd, "InputStream", make_stream)
+
+
+def test_global_device_lock_blocks_separate_audio_capture_instances_on_same_device(monkeypatch):
+    import pytest
+    from services.audio import AudioBusyError
+
+    _patch_fake_sounddevice(monkeypatch)
+    first = AudioCapture()
+    second = AudioCapture()
+    other_dev = AudioCapture()
+
+    first.start(7, owner="assist")
+    try:
+        assert AudioCapture.is_device_busy(7) is True
+        assert AudioCapture.active_device_owner(7) == "assist"
+
+        # Different device on a second instance must still succeed (e.g. loopback + candidate mic).
+        other_dev.start(8, owner="assist-candidate")
+        assert AudioCapture.is_device_busy(8) is True
+
+        # Same device on another instance must raise AudioBusyError even with same or different owner.
+        with pytest.raises(AudioBusyError) as exc:
+            second.start(7, owner="audio-test")
+        assert exc.value.current_owner == "assist"
+        assert exc.value.requested_owner == "audio-test"
+
+        # Calling stop() on the failed second instance must NOT release first's claim.
+        second.stop(owner="audio-test")
+        assert AudioCapture.is_device_busy(7) is True
+        assert AudioCapture.active_device_owner(7) == "assist"
+    finally:
+        other_dev.stop(owner="assist-candidate")
+        first.stop(owner="assist")
+
+    assert AudioCapture.is_device_busy(7) is False
+    assert AudioCapture.is_device_busy(8) is False
+
+
+def test_global_device_lock_releases_on_startup_failure(monkeypatch):
+    import pytest
+
+    _patch_fake_sounddevice(monkeypatch, fail_devices={11})
+    cap1 = AudioCapture()
+    with pytest.raises(RuntimeError):
+        cap1.start(11, owner="audio-test")
+
+    assert AudioCapture.is_device_busy(11) is False
+    assert cap1.is_running is False
+    assert cap1.current_owner is None
+
+    # Now allow device 11 to succeed and verify another instance can acquire it.
+    _patch_fake_sounddevice(monkeypatch)
+    cap2 = AudioCapture()
+    cap2.start(11, owner="assist")
+    try:
+        assert AudioCapture.is_device_busy(11) is True
+    finally:
+        cap2.stop(owner="assist")
+    assert AudioCapture.is_device_busy(11) is False
+
+
+def test_sound_test_local_captures_raise_audio_busy_and_routes_map_to_409(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    import pytest
+    from fastapi import HTTPException
+    from api.assist import routes, sound_test
+    from services.audio import AudioBusyError
+
+    _patch_fake_sounddevice(monkeypatch)
+    monkeypatch.setattr(routes, "get_session", lambda: SimpleNamespace(is_recording=False, is_paused=False))
+    monkeypatch.setattr(
+        routes,
+        "get_config",
+        lambda: SimpleNamespace(stt_provider="doubao", doubao_stt_api_key="test-key"),
+    )
+
+    holder = AudioCapture()
+    holder.start(12, owner="assist")
+    try:
+        with pytest.raises(AudioBusyError) as input_busy:
+            sound_test.test_input_audio(12, duration_sec=0.5)
+        assert input_busy.value.current_owner == "assist"
+
+        with pytest.raises(AudioBusyError) as monitor_busy:
+            sound_test.start_input_level_monitor(12)
+        assert monitor_busy.value.current_owner == "assist"
+
+        with pytest.raises(AudioBusyError) as replay_busy:
+            sound_test.replay_preflight_capture_stt(12, repeats=1)
+        assert replay_busy.value.current_owner == "assist"
+
+        with pytest.raises(HTTPException) as route_input:
+            asyncio.run(routes.api_audio_test_input({"device_id": 12}))
+        assert route_input.value.status_code == 409
+
+        with pytest.raises(HTTPException) as route_monitor:
+            asyncio.run(routes.api_audio_test_input_start({"device_id": 12}))
+        assert route_monitor.value.status_code == 409
+
+        with pytest.raises(HTTPException) as route_replay:
+            asyncio.run(routes.api_preflight_replay({"device_id": 12, "repeats": 1}))
+        assert route_replay.value.status_code == 409
+    finally:
+        holder.stop(owner="assist")
+    assert AudioCapture.is_device_busy(12) is False

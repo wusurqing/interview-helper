@@ -619,6 +619,8 @@ async def api_audio_test_input_start(body: dict):
     try:
         from .sound_test import start_input_level_monitor
         return await run_in_threadpool(start_input_level_monitor, device_id)
+    except AudioBusyError as e:
+        raise HTTPException(409, str(e))
     except Exception as e:
         _rlog.warning("audio input monitor start failed device=%s: %s", device_id, e, exc_info=True)
         raise HTTPException(503, f"麦克风输入监听失败: {e}")
