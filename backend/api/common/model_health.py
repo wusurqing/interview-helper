@@ -382,7 +382,7 @@ def _think_probe_candidates(model) -> list[tuple[str, dict]]:
     if style == "gpt":
         ordered.append(("gpt_reasoning_effort", {"reasoning_effort": "low"}))
     elif style == "claude":
-        ordered.append(("claude_thinking_budget", {"thinking": {"type": "enabled", "budget_tokens": 102}, "think_mode": True}))
+        ordered.append(("claude_thinking_budget", {"thinking": {"type": "enabled", "budget_tokens": 1024}, "think_mode": True}))
     ordered.extend(
         [
             ("generic_thinking", {"thinking": {"type": "enabled"}, "think_mode": True}),
@@ -471,6 +471,7 @@ def _probe_disable_think(model) -> tuple[dict, str]:
             last_detail = detail
             if _is_expected_param_error(detail):
                 continue
+            break
     return {}, last_detail or "未检测到可靠的显式关闭 Think 参数"
 
 
@@ -480,19 +481,26 @@ def _probe_think(model) -> tuple[bool, str, dict, str]:
     messages = [{"role": "user", "content": "请用最短思考回答：1+1 等于几？最后只输出 2。"}]
     last_detail = ""
     for style, params in _think_probe_candidates(model):
-        payload = _chat_payload(model, messages, 64, params)
+        thinking_cfg = params.get("thinking") if isinstance(params, dict) else None
+        budget_tokens = (
+            int(thinking_cfg.get("budget_tokens") or 0)
+            if isinstance(thinking_cfg, dict)
+            else 0
+        )
+        max_tokens = max(64, budget_tokens + 64) if budget_tokens > 0 else 64
+        payload = _chat_payload(model, messages, max_tokens, params)
         try:
             body, _latency_ms = _post_chat(model, payload, timeout=12)
             text, reasoning = _extract_health_probe_text_and_reasoning(body, get_api_type(model))
-            if reasoning or _is_strong_reasoning_model(model):
+            if reasoning or text:
                 return True, style, params, "Think 参数已接受"
-            if text:
-                last_detail = f"{style} 参数被接受，但未返回 reasoning"
+            last_detail = f"{style} 参数被接受，但未返回有效内容"
         except Exception as e:
             detail = str(e)[:160]
             last_detail = detail
-            if not _is_expected_param_error(detail):
+            if _is_expected_param_error(detail):
                 continue
+            break
     return False, "", {}, last_detail or "未检测到可用 Think 参数"
 
 
@@ -645,7 +653,13 @@ def start_all_model_checks() -> bool:
         if getattr(model, "enabled", True) is not False
     ]
     disabled_indexes = set(range(len(cfg.models))) - set(enabled_indexes)
-    stale_indexes = set(_model_health) - set(range(len(cfg.models)))
+    with _model_health_lock:
+        stale_indexes = (
+            set(_model_health)
+            | set(_model_health_detail)
+            | set(_model_health_latency)
+            | set(_model_health_fingerprint)
+        ) - set(range(len(cfg.models)))
     for i in disabled_indexes | stale_indexes:
         _clear_model_health(i)
     for i in enabled_indexes:
