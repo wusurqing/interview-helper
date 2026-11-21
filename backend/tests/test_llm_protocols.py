@@ -424,7 +424,8 @@ def test_chat_stream_passes_sdk_timeout_and_closes_response_on_early_abort(monke
 
     aborted = False
     out = []
-    for item in streaming.chat_stream([{"role": "user", "content": "hi"}], abort_check=lambda: aborted):
+    stream = streaming.chat_stream([{"role": "user", "content": "hi"}], abort_check=lambda: aborted)
+    for item in stream:
         out.append(item)
         aborted = True
 
@@ -584,12 +585,13 @@ def test_chat_stream_single_model_closes_aborted_stream(monkeypatch):
 
     aborted = False
     out = []
-    for item in streaming.chat_stream_single_model(
+    stream = streaming.chat_stream_single_model(
         model,
         [{"role": "user", "content": "hi"}],
         abort_check=lambda: aborted,
         config_snapshot=cfg,
-    ):
+    )
+    for item in stream:
         out.append(item)
         aborted = True
 

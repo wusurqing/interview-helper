@@ -46,6 +46,11 @@ def _patch_common(monkeypatch, tmp_path, *, ready, poll_results):
     start = load_start()
     log_path = tmp_path / "startup-console.log"
     monkeypatch.setattr(start, "STARTUP_LOG", str(log_path))
+    monkeypatch.setattr(start, "_find_npx", lambda: "npx")
+    monkeypatch.setattr(start, "ensure_electron", lambda: True)
+    monkeypatch.setattr(start, "kill_port", lambda _port: None)
+    monkeypatch.setattr(start, "get_local_ip", lambda: "127.0.0.1")
+    monkeypatch.delenv(start.HIDE_CONSOLE_ENV, raising=False)
     monkeypatch.setattr(start.platform, "system", lambda: "Windows")
     monkeypatch.setattr(start, "_app_ready", lambda port, timeout=1.5: ready())
     popen_calls = []
@@ -69,10 +74,8 @@ def _patch_common(monkeypatch, tmp_path, *, ready, poll_results):
 
     def _popen(*a, **k):
         proc = FakeProc()
-        if "env" in k:
-            # 只记录 respawn 的 Popen（kill_port 的 netstat/taskkill 没有 env kwarg）
-            popen_calls.append(k)
-            procs.append(proc)
+        popen_calls.append(k)
+        procs.append(proc)
         return proc
 
     monkeypatch.setattr(start.subprocess, "Popen", _popen)

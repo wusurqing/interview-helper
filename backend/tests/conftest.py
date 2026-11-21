@@ -71,7 +71,10 @@ def _reset_default_config_state() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_default_config():
+def _isolate_default_config(monkeypatch):
+    # Each test starts with the application defaults in the isolated log directory.
+    monkeypatch.delenv("IA_LLM_TRACE", raising=False)
+    monkeypatch.delenv("IA_LLM_TRACE_MAX_ASSETS_MB", raising=False)
     _reset_default_config_state()
     yield
     _reset_default_config_state()
