@@ -49,6 +49,7 @@ PREFLIGHT_REPLAY_FIXTURES: dict[str, Path] = {
 }
 
 _running = False
+_replay_running = False
 _lock = threading.Lock()
 _log = get_logger("assist.preflight")
 _status: dict = {
@@ -117,6 +118,26 @@ def _set_step(step: str, status: str, detail: str = "", extra: Optional[dict] = 
     if extra:
         msg.update(extra)
     broadcast(msg)
+
+
+def is_preflight_replay_running() -> bool:
+    with _lock:
+        return bool(_replay_running)
+
+
+def begin_preflight_replay() -> bool:
+    global _replay_running
+    with _lock:
+        if _running or _replay_running:
+            return False
+        _replay_running = True
+        return True
+
+
+def end_preflight_replay() -> None:
+    global _replay_running
+    with _lock:
+        _replay_running = False
 
 
 def get_preflight_status() -> dict:
@@ -678,12 +699,34 @@ def _run_preflight(device_id: Optional[int], scenario_id: str):
 
 def start_preflight(device_id: Optional[int] = None, scenario_id: str = "self_intro"):
     global _running
+    scenario = resolve_preflight_scenario(scenario_id)
+    resolved_scenario_id = scenario.get("id", scenario_id)
+    expected_phrase = scenario.get("expected_phrase") or PREFLIGHT_EXPECTED_PHRASE
     with _lock:
-        if _running:
+        if _running or _replay_running:
             return False
         _running = True
-    t = threading.Thread(target=_run_preflight, args=(device_id, scenario_id), daemon=True)
-    t.start()
+        _status.update(
+            running=True,
+            scenario_id=resolved_scenario_id,
+            device_id=device_id,
+            expected_phrase=expected_phrase,
+            captured_transcript=None,
+            match_ok=None,
+            steps={},
+            error=None,
+            started_at=time.time(),
+            finished_at=None,
+        )
+    try:
+        t = threading.Thread(target=_run_preflight, args=(device_id, scenario_id), daemon=True)
+        t.start()
+    except Exception:
+        with _lock:
+            _running = False
+            _status["running"] = False
+            _status["finished_at"] = time.time()
+        raise
     return True
 
 

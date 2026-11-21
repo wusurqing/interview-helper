@@ -68,9 +68,12 @@ async def api_start(body: dict):
 
 async def _api_start(body: dict):
     from .exam_test import is_exam_preflight_running
+    from .sound_test import get_preflight_status, is_preflight_replay_running
 
     if is_exam_preflight_running():
         raise HTTPException(409, "笔试链路检测正在运行，请等待检测结束后再开始")
+    if get_preflight_status()["running"] or is_preflight_replay_running():
+        raise HTTPException(409, "音频链路检测正在运行，请等待检测结束后再开始")
     cfg = get_config()
     written_exam = bool(getattr(cfg, "written_exam_mode", False))
     if mmpg.manager.active:
@@ -106,6 +109,7 @@ async def _api_start(body: dict):
         candidate_dev = None
     if not written_exam and (detail := stt_configuration_error(cfg, cfg.stt_provider)):
         raise HTTPException(422, detail)
+    mmpg.bump_lifecycle_epoch()
     try:
         await candidate_mmpg.stop("stopped")
         if single_mic_id is not None:
@@ -134,6 +138,7 @@ async def _api_start(body: dict):
 @router.post("/stop")
 async def api_stop():
     async with mmpg.http_lifecycle_lock:
+        mmpg.bump_lifecycle_epoch()
         single_mic = get_session().single_mic
         if single_mic is not None:
             await mmpg.drain_single_mic_transports(single_mic, "stopped")
@@ -155,11 +160,13 @@ async def api_pause(body: dict | None = None):
         if session.single_mic is not None:
             if not session.is_recording or session.is_paused:
                 raise HTTPException(400, "单人测试未在收音")
+            mmpg.bump_lifecycle_epoch()
             await mmpg.drain_single_mic_transports(session.single_mic, "paused")
             await run_in_threadpool(pause_interview)
             await asyncio.gather(mmpg.manager.stop("paused"), candidate_mmpg.stop("paused"))
             return {"ok": True}
         if is_streaming_interview() or mmpg.manager.active:
+            mmpg.bump_lifecycle_epoch()
             await asyncio.gather(mmpg.manager.stop("paused"), candidate_mmpg.stop("paused", drain=True))
             return {"ok": True}
         session = get_session()
@@ -167,6 +174,7 @@ async def api_pause(body: dict | None = None):
             raise HTTPException(400, "面试未在进行中")
         if is_paused():
             raise HTTPException(400, "已经处于暂停状态")
+        mmpg.bump_lifecycle_epoch()
         await asyncio.gather(run_in_threadpool(pause_interview), candidate_mmpg.stop("paused", drain=True))
     return {"ok": True}
 
@@ -178,6 +186,11 @@ async def api_resume_interview(body: Optional[dict] = None):
 
 
 async def _api_resume_interview(body: Optional[dict] = None):
+    from .exam_test import is_exam_preflight_running
+    from .sound_test import get_preflight_status, is_preflight_replay_running
+
+    if is_exam_preflight_running() or get_preflight_status()["running"] or is_preflight_replay_running():
+        raise HTTPException(409, "链路检测正在运行，请等待检测结束后再恢复")
     if is_streaming_interview():
         raise HTTPException(409, "请从桌面主窗口或本机浏览器恢复豆包语义判停")
     session = get_session()
@@ -189,6 +202,7 @@ async def _api_resume_interview(body: Optional[dict] = None):
     if session.single_mic is not None or single_mic_id is not None:
         if session.single_mic is None or session.single_mic.id != single_mic_id:
             raise HTTPException(409, "单人测试会话已变化")
+        mmpg.bump_lifecycle_epoch()
         try:
             await run_in_threadpool(unpause_interview)
         except (AudioBusyError, SingleMicConflict) as e:
@@ -198,6 +212,7 @@ async def _api_resume_interview(body: Optional[dict] = None):
             raise HTTPException(500, "麦克风启动失败，请检查设备后重试")
         return {"ok": True}
     if getattr(get_config(), "written_exam_mode", False):
+        mmpg.bump_lifecycle_epoch()
         await run_in_threadpool(unpause_interview)
         return {"ok": True}
     device_id = (body or {}).get("device_id")
@@ -212,6 +227,7 @@ async def _api_resume_interview(body: Optional[dict] = None):
             int(candidate_mic_device_id)
         except (TypeError, ValueError):
             raise HTTPException(400, "candidate_mic_device_id \u5fc5\u987b\u662f\u6574\u6570")
+    mmpg.bump_lifecycle_epoch()
     try:
         if candidate_mic_device_id is None:
             await run_in_threadpool(
@@ -283,6 +299,7 @@ async def api_single_mic_role(body: SingleMicRoleRequest):
 async def api_clear():
     from api.realtime.ws import broadcast
     async with mmpg.http_lifecycle_lock:
+        mmpg.bump_lifecycle_epoch()
         single_mic = get_session().single_mic
         if single_mic is not None:
             single_mic.pause()
@@ -403,7 +420,9 @@ async def api_preflight_scenarios():
 
 @router.post("/preflight/run")
 async def api_preflight_run(body: dict):
-    from .sound_test import start_preflight
+    from .exam_test import is_exam_preflight_running
+    from .sound_test import is_preflight_replay_running, start_preflight
+
     scenario_id = body.get("scenario_id", "self_intro")
     device_id = body.get("device_id")
     if device_id is not None:
@@ -411,13 +430,20 @@ async def api_preflight_run(body: dict):
             device_id = int(device_id)
         except (TypeError, ValueError):
             raise HTTPException(400, "device_id 必须是整数")
-    _check_segment_preflight()
-    ok = start_preflight(
-        device_id=device_id,
-        scenario_id=scenario_id,
-    )
-    if not ok:
-        raise HTTPException(409, "链路检测已在运行中")
+    async with mmpg.http_lifecycle_lock:
+        session = get_session()
+        if session.is_recording and not session.is_paused:
+            raise HTTPException(409, "请先暂停或结束面试，再运行链路检测")
+        if is_exam_preflight_running() or is_preflight_replay_running():
+            raise HTTPException(409, "链路检测已在运行中")
+        _check_segment_preflight()
+        ok = start_preflight(
+            device_id=device_id,
+            scenario_id=scenario_id,
+        )
+        if not ok:
+            raise HTTPException(409, "链路检测已在运行中")
+        mmpg.bump_lifecycle_epoch()
     return {"ok": True}
 
 
@@ -429,42 +455,57 @@ async def api_preflight_status():
 
 @router.post("/preflight/replay")
 async def api_preflight_replay(body: dict):
-    session = get_session()
-    if session.is_recording and not session.is_paused:
-        raise HTTPException(409, "请先暂停或结束面试，再做高频回放检测")
-    device_id = body.get("device_id")
-    if device_id is None or isinstance(device_id, bool):
-        raise HTTPException(400, "device_id 必须是整数")
-    try:
-        device_id = int(device_id)
-    except (TypeError, ValueError):
-        raise HTTPException(400, "device_id 必须是整数")
-    if body.get("audio_path") is not None:
-        raise HTTPException(400, "不允许通过 HTTP 指定自定义 audio_path，请使用受控 fixture_id")
-    repeats = body.get("repeats", 3)
-    gap_sec = body.get("gap_sec", 0.25)
-    fixture_id = body.get("fixture_id")
-    expected_phrase = body.get("expected_phrase")
-    if expected_phrase is not None and not isinstance(expected_phrase, str):
-        raise HTTPException(400, "expected_phrase 必须是字符串")
-    if isinstance(repeats, bool):
-        raise HTTPException(400, "repeats 必须是整数")
-    try:
-        repeats = int(repeats)
-    except (TypeError, ValueError):
-        raise HTTPException(400, "repeats 必须是整数")
-    if isinstance(gap_sec, bool):
-        raise HTTPException(400, "gap_sec 必须是数字")
-    try:
-        gap_sec = float(gap_sec)
-    except (TypeError, ValueError):
-        raise HTTPException(400, "gap_sec 必须是数字")
-    from .sound_test import replay_preflight_capture_stt, resolve_preflight_fixture
-    try:
-        fixture_path = resolve_preflight_fixture(fixture_id)
-    except ValueError as e:
-        raise HTTPException(400, str(e)) from e
-    _check_segment_preflight()
+    from .exam_test import is_exam_preflight_running
+    from .sound_test import (
+        begin_preflight_replay,
+        end_preflight_replay,
+        get_preflight_status,
+        is_preflight_replay_running,
+        replay_preflight_capture_stt,
+        resolve_preflight_fixture,
+    )
+
+    async with mmpg.http_lifecycle_lock:
+        session = get_session()
+        if session.is_recording and not session.is_paused:
+            raise HTTPException(409, "请先暂停或结束面试，再做高频回放检测")
+        device_id = body.get("device_id")
+        if device_id is None or isinstance(device_id, bool):
+            raise HTTPException(400, "device_id 必须是整数")
+        try:
+            device_id = int(device_id)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "device_id 必须是整数")
+        if body.get("audio_path") is not None:
+            raise HTTPException(400, "不允许通过 HTTP 指定自定义 audio_path，请使用受控 fixture_id")
+        repeats = body.get("repeats", 3)
+        gap_sec = body.get("gap_sec", 0.25)
+        fixture_id = body.get("fixture_id")
+        expected_phrase = body.get("expected_phrase")
+        if expected_phrase is not None and not isinstance(expected_phrase, str):
+            raise HTTPException(400, "expected_phrase 必须是字符串")
+        if isinstance(repeats, bool):
+            raise HTTPException(400, "repeats 必须是整数")
+        try:
+            repeats = int(repeats)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "repeats 必须是整数")
+        if isinstance(gap_sec, bool):
+            raise HTTPException(400, "gap_sec 必须是数字")
+        try:
+            gap_sec = float(gap_sec)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "gap_sec 必须是数字")
+        try:
+            fixture_path = resolve_preflight_fixture(fixture_id)
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        if is_exam_preflight_running() or get_preflight_status()["running"] or is_preflight_replay_running():
+            raise HTTPException(409, "链路检测已在运行中")
+        _check_segment_preflight()
+        if not begin_preflight_replay():
+            raise HTTPException(409, "链路检测已在运行中")
+        mmpg.bump_lifecycle_epoch()
     try:
         result = await run_in_threadpool(
             replay_preflight_capture_stt,
@@ -482,20 +523,27 @@ async def api_preflight_replay(body: dict):
     except Exception as e:
         _rlog.warning("preflight replay failed device=%s: %s", device_id, e, exc_info=True)
         raise HTTPException(503, "高频回放检测失败，请检查音频设备与语音配置")
+    finally:
+        end_preflight_replay()
 
 
 @router.post("/exam-preflight/run")
 async def api_exam_preflight_run():
     from .exam_test import start_exam_preflight
+    from .sound_test import get_preflight_status, is_preflight_replay_running
 
-    session = get_session()
-    if session.is_recording or mmpg.manager.active:
-        raise HTTPException(409, "请先结束当前面试或笔试，再运行链路检测")
-    preflight_id = start_exam_preflight()
-    if not preflight_id:
-        if get_session().is_recording:
+    async with mmpg.http_lifecycle_lock:
+        session = get_session()
+        if session.is_recording or mmpg.manager.active:
             raise HTTPException(409, "请先结束当前面试或笔试，再运行链路检测")
-        raise HTTPException(409, "笔试链路检测已在运行中")
+        if get_preflight_status()["running"] or is_preflight_replay_running():
+            raise HTTPException(409, "音频链路检测已在运行中")
+        preflight_id = start_exam_preflight()
+        if not preflight_id:
+            if get_session().is_recording:
+                raise HTTPException(409, "请先结束当前面试或笔试，再运行链路检测")
+            raise HTTPException(409, "笔试链路检测已在运行中")
+        mmpg.bump_lifecycle_epoch()
     return {"ok": True, "preflight_id": preflight_id}
 
 
