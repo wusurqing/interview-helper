@@ -65,6 +65,7 @@ _status: dict = {
     "finished_at": None,
 }
 _level_lock = threading.Lock()
+_level_lifecycle_lock = threading.Lock()
 _level_stop_event = threading.Event()
 _level_thread: Optional[threading.Thread] = None
 _level_status: dict = {
@@ -488,52 +489,14 @@ def _run_input_level_monitor(
         try:
             cap.stop(owner="audio-level-test")
         finally:
-            _set_level_status(running=False)
+            current = threading.current_thread()
+            with _level_lock:
+                if _level_thread is current or _level_thread is None:
+                    _level_status["running"] = False
+                    _level_status["updated_at"] = time.time()
 
 
-def start_input_level_monitor(device_id: int) -> dict:
-    global _level_thread, _level_stop_event, _level_status
-    stop_input_level_monitor()
-    cap = AudioCapture()
-    try:
-        cap.start(int(device_id), owner="audio-level-test", mic_compatibility_mode=True)
-    except Exception as exc:
-        _set_level_status(device_id=int(device_id), running=False, error=str(exc))
-        raise
-    with _level_lock:
-        _level_stop_event = threading.Event()
-        _level_status = {
-            "running": True,
-            "device_id": int(device_id),
-            "rms": 0.0,
-            "peak": 0.0,
-            "level_pct": 0,
-            "has_signal": False,
-            "error": None,
-            "started_at": time.time(),
-            "updated_at": time.time(),
-        }
-        thread = threading.Thread(
-            target=_run_input_level_monitor,
-            args=(int(device_id), _level_stop_event, cap),
-            daemon=True,
-            name="audio-level-test",
-        )
-        _level_thread = thread
-    try:
-        thread.start()
-    except Exception:
-        with _level_lock:
-            if _level_thread is thread:
-                _level_thread = None
-            _level_status["running"] = False
-            _level_status["updated_at"] = time.time()
-        cap.stop(owner="audio-level-test")
-        raise
-    return get_input_level_status()
-
-
-def stop_input_level_monitor() -> dict:
+def _stop_input_level_monitor_locked() -> dict:
     global _level_thread
     with _level_lock:
         thread = _level_thread
@@ -546,6 +509,54 @@ def stop_input_level_monitor() -> dict:
         _level_status["running"] = False
         _level_status["updated_at"] = time.time()
     return get_input_level_status()
+
+
+def start_input_level_monitor(device_id: int) -> dict:
+    global _level_thread, _level_stop_event, _level_status
+    with _level_lifecycle_lock:
+        _stop_input_level_monitor_locked()
+        cap = AudioCapture()
+        try:
+            cap.start(int(device_id), owner="audio-level-test", mic_compatibility_mode=True)
+        except Exception as exc:
+            _set_level_status(device_id=int(device_id), running=False, error=str(exc))
+            raise
+        with _level_lock:
+            _level_stop_event = threading.Event()
+            _level_status = {
+                "running": True,
+                "device_id": int(device_id),
+                "rms": 0.0,
+                "peak": 0.0,
+                "level_pct": 0,
+                "has_signal": False,
+                "error": None,
+                "started_at": time.time(),
+                "updated_at": time.time(),
+            }
+            thread = threading.Thread(
+                target=_run_input_level_monitor,
+                args=(int(device_id), _level_stop_event, cap),
+                daemon=True,
+                name="audio-level-test",
+            )
+            _level_thread = thread
+        try:
+            thread.start()
+        except Exception:
+            with _level_lock:
+                if _level_thread is thread:
+                    _level_thread = None
+                _level_status["running"] = False
+                _level_status["updated_at"] = time.time()
+            cap.stop(owner="audio-level-test")
+            raise
+        return get_input_level_status()
+
+
+def stop_input_level_monitor() -> dict:
+    with _level_lifecycle_lock:
+        return _stop_input_level_monitor_locked()
 
 
 def resolve_preflight_scenario(scenario_id: str) -> dict:

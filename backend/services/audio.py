@@ -76,7 +76,7 @@ _SC_DEVICE_CACHE: dict[int, dict[str, str]] = {}   # id -> stable device metadat
 # (e.g. assist main/candidate pipelines and sound_test local captures) cannot
 # open the same physical device concurrently.
 _ACTIVE_DEVICES_LOCK = threading.Lock()
-_ACTIVE_DEVICES: dict[int, tuple["AudioCapture", Optional[str]]] = {}
+_ACTIVE_DEVICES: dict[int, tuple["AudioCapture", Optional[str], Optional[threading.Event]]] = {}
 
 
 def _audio_device_sort_key(device: dict) -> tuple[int, str]:
@@ -345,11 +345,12 @@ class AudioCapture:
 
     def _claim_device(self, device_id: int, owner: Optional[str]) -> None:
         dev_key = int(device_id)
+        token = self._sc_stop
         with _ACTIVE_DEVICES_LOCK:
             existing = _ACTIVE_DEVICES.get(dev_key)
             if existing is not None and existing[0] is not self:
                 raise AudioBusyError(existing[1], owner)
-            _ACTIVE_DEVICES[dev_key] = (self, owner)
+            _ACTIVE_DEVICES[dev_key] = (self, owner, token)
             self._claimed_device_ids.add(dev_key)
 
     def _update_claimed_owner(self, owner: Optional[str]) -> None:
@@ -357,16 +358,27 @@ class AudioCapture:
             for dev_key in list(self._claimed_device_ids):
                 existing = _ACTIVE_DEVICES.get(dev_key)
                 if existing is not None and existing[0] is self:
-                    _ACTIVE_DEVICES[dev_key] = (self, owner)
+                    _ACTIVE_DEVICES[dev_key] = (self, owner, existing[2])
 
-    def _release_devices(self, device_ids: Optional[set[int]] = None) -> None:
+    def _release_devices(
+        self,
+        device_ids: Optional[set[int]] = None,
+        *,
+        token: Optional[threading.Event] = None,
+    ) -> None:
         with _ACTIVE_DEVICES_LOCK:
             targets = list(self._claimed_device_ids if device_ids is None else device_ids)
             for dev_key in targets:
                 existing = _ACTIVE_DEVICES.get(dev_key)
-                if existing is not None and existing[0] is self:
+                if (
+                    existing is not None
+                    and existing[0] is self
+                    and (token is None or existing[2] is token)
+                ):
                     _ACTIVE_DEVICES.pop(dev_key, None)
-                self._claimed_device_ids.discard(dev_key)
+                    self._claimed_device_ids.discard(dev_key)
+                elif token is None:
+                    self._claimed_device_ids.discard(dev_key)
 
     # ------------------------------------------------------------------
     # Start / Stop
@@ -398,7 +410,13 @@ class AudioCapture:
                     self._update_claimed_owner(owner)
                 return
             norm_device_id = int(device_id)
-            self._claim_device(norm_device_id, owner)
+            prev_stop_event = self._sc_stop
+            self._sc_stop = threading.Event()
+            try:
+                self._claim_device(norm_device_id, owner)
+            except Exception:
+                self._sc_stop = prev_stop_event
+                raise
             self._callback = on_audio
             self._queue_audio = queue_audio
             self._running = True
@@ -406,7 +424,6 @@ class AudioCapture:
             self._audio_queue = queue.Queue(maxsize=940)
             self._resample_state = [None]
             self._agc_peak = 0.0
-            self._sc_stop = threading.Event()
             self._dropped_chunks_count = 0
             self._loopback_discontinuity_count = 0
             self._max_queue_chunk_samples = 0
@@ -543,9 +560,14 @@ class AudioCapture:
                     self._push(np.concatenate(pending_chunks))
             except Exception as e:
                 _alog.error("soundcard error: %s", e, exc_info=True)
-                if self._sc_stop is stop_event:
-                    self._running = False
-                    self._release_devices({device_id})
+                with _ACTIVE_DEVICES_LOCK:
+                    if self._sc_stop is stop_event:
+                        existing = _ACTIVE_DEVICES.get(device_id)
+                        if existing is not None and existing[0] is self and existing[2] is stop_event:
+                            _ACTIVE_DEVICES.pop(device_id, None)
+                        self._claimed_device_ids.discard(device_id)
+                        self._owner = None
+                        self._running = False
             finally:
                 try:
                     ctypes.windll.ole32.CoUninitialize()

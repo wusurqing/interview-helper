@@ -316,3 +316,96 @@ def test_preflight_routes_serialize_with_http_lifecycle_lock_and_block_concurren
         assert sound_test.is_preflight_replay_running() is False
 
     asyncio.run(exercise())
+
+
+def test_single_mic_start_capture_and_api_pause_race_pauses_session_without_deadlock(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """If api_pause races with single-mic start_capture before session.single_mic is set,
+    stale rollback must pause the newly started single-mic capture so api_pause does not
+    return 200 OK while leaving recording unpaused and capture open.
+    """
+    cfg = _mmpg_cfg()
+    monkeypatch.setattr(config, "_config", cfg)
+    monkeypatch.setattr(mmpg_integration, "_turns", None)
+    monkeypatch.setattr(mmpg_integration, "_capture_epoch", None)
+    monkeypatch.setattr(pipeline, "_device_is_loopback", lambda _dev: False)
+
+    worker_entered = asyncio.Event()
+    release_worker = asyncio.Event()
+    pause_calls: list[str] = []
+
+    async def fake_run_in_threadpool(fn, *args, **kwargs):
+        if fn is pipeline.start_nonblocking:
+            worker_entered.set()
+            await release_worker.wait()
+            session = get_session()
+            session.single_mic = SingleMicSession("sm-race", device_id=1)
+            session.is_recording = True
+            session.is_paused = False
+            monkeypatch.setattr(pipeline, "is_streaming_interview", lambda: True)
+            monkeypatch.setattr(pipeline, "is_paused", lambda: session.is_paused)
+            return None
+        if fn is pipeline.pause_interview:
+            pause_calls.append("paused")
+            session = get_session()
+            session.is_paused = True
+            if session.single_mic is not None:
+                session.single_mic.pause()
+            return None
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(mmpg_integration, "run_in_threadpool", fake_run_in_threadpool)
+    monkeypatch.setattr(routes, "run_in_threadpool", fake_run_in_threadpool)
+
+    async def exercise():
+        reset_session()
+        cloud = _FakeCloudSocket()
+        controls: list[dict] = []
+
+        async def connect(_cfg):
+            cloud.push("session.created")
+            return cloud
+
+        async def send(payload):
+            if isinstance(payload, dict):
+                controls.append(payload)
+
+        mgr = MmpgManager(
+            mmpg_integration._settings,
+            lambda *_args: None,
+            connector=connect,
+            on_capture_start=mmpg_integration.start_capture,
+            on_capture_stop=mmpg_integration.stop_capture,
+            retry_delays=(),
+        )
+        monkeypatch.setattr(mmpg_integration, "manager", mgr)
+        monkeypatch.setattr(candidate_mmpg, "stop", AsyncMock())
+
+        owner = object()
+        mgr.attach(owner, send)
+        mgr.start(owner, "start", [1], preflight=mmpg_integration.prepare, single_mic_id="sm-race")
+        try:
+            for _ in range(100):
+                if any(msg.get("type") == "rtc_join" for msg in controls):
+                    break
+                await asyncio.sleep(0.01)
+            join = next(msg for msg in controls if msg.get("type") == "rtc_join")
+            await mgr.rtc_event(owner, {"type": "rtc_ready", "generation": join["generation"]})
+            await asyncio.wait_for(worker_entered.wait(), timeout=2.0)
+
+            pause_task = asyncio.create_task(routes.api_pause())
+            await asyncio.sleep(0.02)
+            release_worker.set()
+            result = await asyncio.wait_for(pause_task, timeout=2.0)
+
+            assert result == {"ok": True}
+            assert not mgr.active
+            assert pause_calls == ["paused"]
+            assert get_session().is_paused is True
+            assert mmpg_integration._turns is None
+        finally:
+            await mgr.detach(owner)
+            reset_session()
+
+    asyncio.run(exercise())

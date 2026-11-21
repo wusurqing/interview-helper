@@ -306,3 +306,78 @@ def test_sound_test_local_captures_raise_audio_busy_and_routes_map_to_409(monkey
     finally:
         holder.stop(owner="assist")
     assert AudioCapture.is_device_busy(12) is False
+
+
+def test_soundcard_reader_crash_clears_owner_and_stale_token_cannot_revoke_restarted_claim(monkeypatch):
+    import threading
+    from services import audio
+
+    _patch_fake_sounddevice(monkeypatch)
+    cap = AudioCapture()
+    cap.start(15, owner="assist")
+    try:
+        old_token = cap._sc_stop
+        cap.stop(owner="assist")
+        assert AudioCapture.is_device_busy(15) is False
+
+        # Restart same instance on device 15 -> gets a fresh token.
+        cap.start(15, owner="assist-v2")
+        assert cap._sc_stop is not old_token
+        # Simulated delayed release from an older reader token must NOT revoke the active claim.
+        cap._release_devices({15}, token=old_token)
+        assert AudioCapture.is_device_busy(15) is True
+        assert AudioCapture.active_device_owner(15) == "assist-v2"
+    finally:
+        cap.stop(owner="assist-v2")
+    assert AudioCapture.is_device_busy(15) is False
+
+    # Also exercise actual soundcard _reader crash path releasing _ACTIVE_DEVICES and clearing owner.
+    crashed = threading.Event()
+    monkeypatch.setitem(audio._SC_ID_MAP, 20099, "fake-guid")
+
+    class _BoomSC:
+        @staticmethod
+        def get_microphone(_guid, include_loopback=True):
+            crashed.set()
+            raise RuntimeError("WASAPI device disconnected")
+
+    monkeypatch.setattr(audio, "_sc", _BoomSC, raising=False)
+    sc_cap = AudioCapture()
+    sc_cap.start(20099, owner="assist")
+    assert crashed.wait(timeout=2.0)
+    sc_cap._sc_thread.join(timeout=2.0)
+    assert sc_cap.is_running is False
+    assert sc_cap.current_owner is None
+    assert AudioCapture.is_device_busy(20099) is False
+
+
+def test_concurrent_input_level_monitor_start_serializes_and_never_orphans_device(monkeypatch):
+    import threading
+    from api.assist import sound_test
+
+    _patch_fake_sounddevice(monkeypatch)
+    orig_start = AudioCapture.start
+    entered_first = threading.Event()
+    release_first = threading.Event()
+
+    def slow_start(self, dev_id, *args, **kwargs):
+        orig_start(self, dev_id, *args, **kwargs)
+        if dev_id == 41:
+            entered_first.set()
+            release_first.wait(timeout=2.0)
+
+    monkeypatch.setattr(AudioCapture, "start", slow_start)
+
+    t1 = threading.Thread(target=sound_test.start_input_level_monitor, args=(41,), daemon=True)
+    t2 = threading.Thread(target=sound_test.start_input_level_monitor, args=(42,), daemon=True)
+    t1.start()
+    assert entered_first.wait(timeout=2.0)
+    t2.start()
+    release_first.set()
+    t1.join(timeout=3.0)
+    t2.join(timeout=3.0)
+
+    sound_test.stop_input_level_monitor()
+    assert AudioCapture.is_device_busy(41) is False
+    assert AudioCapture.is_device_busy(42) is False
+    assert sound_test.get_input_level_status()["running"] is False

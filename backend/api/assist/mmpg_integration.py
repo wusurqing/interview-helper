@@ -291,9 +291,11 @@ async def start_capture(mode, device_ids, candidate_mic_id, *, single_mic_id=Non
                 if mode == "test":
                     with suppress(Exception):
                         await run_in_threadpool(audio_capture.stop, owner="mmpg-test")
-                elif single_mic_id is None and pipeline.is_streaming_interview() and not pipeline.is_paused():
-                    with suppress(Exception):
-                        await run_in_threadpool(pipeline.pause_interview)
+                elif pipeline.is_streaming_interview() and not pipeline.is_paused():
+                    current_sm = get_session().single_mic
+                    if single_mic_id is None or (current_sm is not None and current_sm.id == single_mic_id):
+                        with suppress(Exception):
+                            await run_in_threadpool(pipeline.pause_interview)
                 raise MmpgError(stale_error)
             if mode != "test":
                 clear_turns()
