@@ -2483,13 +2483,13 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
             return False
         finally:
             with conversation_lock:
-                if current_segment_id:
-                    session.discard_unfinished_transcript(f"{transcript_epoch}:candidate:{current_segment_id}")
                 if session.archive and current_segment_id:
                     session.archive.discard(
                         f"{transcript_epoch}:candidate:{current_segment_id}",
                         audio_end=getattr(final_audio, "source_end_mono", None),
                     )
+                if current_segment_id:
+                    session.discard_unfinished_transcript(f"{transcript_epoch}:candidate:{current_segment_id}")
                 if is_current():
                     session.mark_candidate_asr_idle()
             current_segment_id = ""

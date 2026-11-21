@@ -313,3 +313,72 @@ def test_disconnected_candidate_keeps_an_untranscribed_tail_after_a_successful_f
         assert [clip["sample_start"] for clip in turn["media"]["candidate"]] == [RATE, 3 * RATE]
     finally:
         archive.stop()
+
+
+def test_candidate_worker_stt_error_preserves_quiet_candidate_audio_in_archive(monkeypatch):
+    from types import SimpleNamespace
+    from api.assist import pipeline
+    from core.session import get_session, reset_session
+    from services.stt import STTError
+
+    reset_session()
+    saved = []
+    archive = InterviewArchive(77, candidate_enabled=True, save=saved.append)
+    anchor = time.monotonic() - 2.0
+    session = get_session()
+    session.archive = archive
+    pipeline._stop_event.clear()
+    pipeline._pause_event.clear()
+    pipeline._candidate_flush_event.clear()
+
+    cfg = SimpleNamespace(
+        candidate_stt_provider="doubao",
+        silence_threshold=0.0005,
+        silence_duration=0.05,
+        language="zh",
+        position="后端",
+        doubao_stt_api_key="test-asr",
+    )
+
+    # Amplitude 0.001 triggers VAD (0.0005) while staying below archive QUIET_RMS (0.0015),
+    # verifying archive.discard(..., audio_end=...) runs before session.discard_unfinished_transcript().
+    quiet_chunk = CapturedAudio(np.full(RATE, 0.001, dtype=np.float32), "cand-mic", 0, anchor)
+    archive.capture(quiet_chunk, "candidate")
+
+    drained = {"step": 0}
+
+    class _FakeCandidateCapture:
+        is_running = True
+
+        def drain_audio_chunks(self, timeout=0.1, max_chunks=6):
+            drained["step"] += 1
+            if drained["step"] == 1:
+                return [quiet_chunk]
+            pipeline._stop_event.set()
+            return []
+
+        def stop(self, owner=None, clear_queue=True):
+            self.is_running = False
+
+    monkeypatch.setattr(pipeline, "get_capture_config", lambda: cfg)
+    monkeypatch.setattr(pipeline, "_candidate_audio_capture", _FakeCandidateCapture())
+    monkeypatch.setattr(pipeline, "broadcast", lambda _event: None)
+    monkeypatch.setattr(pipeline, "report_stt_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        pipeline,
+        "transcribe_segment",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(STTError("mock stt failure")),
+    )
+
+    try:
+        archive.transcript("interviewer", "请介绍一下你自己？", "q1", anchor, audio_end=anchor + 0.2)
+        pipeline._candidate_worker(transcript_epoch=session.transcript_epoch, config_snapshot=cfg)
+        assert archive.stop()
+        turn, = saved
+        assert turn["candidate_status"] == "transcription_failed"
+        assert turn["audio_status"]["candidate"] == {"state": "ready", "duration_ms": 1000}
+        assert sum(clip["sample_count"] for clip in turn["media"]["candidate"]) == RATE
+    finally:
+        pipeline._stop_event.clear()
+        session.archive = None
+        archive.stop()
