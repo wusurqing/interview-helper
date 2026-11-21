@@ -97,7 +97,7 @@ def test_desktop_run_hides_console_when_ready(monkeypatch, tmp_path):
     # 子进程带隐藏标志启动且输出进日志文件
     kwargs = popen_calls[0]
     assert kwargs["env"][start.HIDE_CONSOLE_ENV] == "1"
-    assert kwargs["creationflags"] == start.subprocess.CREATE_NO_WINDOW
+    assert kwargs["creationflags"] == getattr(start.subprocess, "CREATE_NO_WINDOW", 0x08000000)
     assert kwargs["stdout"] != start.subprocess.DEVNULL
 
 

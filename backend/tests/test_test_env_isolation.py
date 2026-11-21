@@ -52,3 +52,16 @@ def test_sqlite_path_does_not_migrate_legacy_root_db_when_data_dir_overridden(tm
     assert legacy_db.exists()
     assert not resolved.exists()
     assert os.path.isdir(isolated_data)
+
+
+def test_realistic_interview_script_imports_without_optional_aiohttp(monkeypatch):
+    import importlib.util
+    import sys
+
+    monkeypatch.setitem(sys.modules, "aiohttp", None)
+    script_path = Path(__file__).with_name("test_realistic_interview.py")
+    spec = importlib.util.spec_from_file_location("test_realistic_interview_probe", script_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert hasattr(module, "run_test")

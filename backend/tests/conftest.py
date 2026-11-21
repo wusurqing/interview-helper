@@ -12,9 +12,17 @@ import atexit
 import logging
 import os
 import shutil
+import sys
 import tempfile
 
 import pytest
+
+_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
+# 手动压测脚本（依赖可选 aiohttp 且连接真实本地服务），不纳入 pytest 自动收集。
+collect_ignore = ["test_realistic_interview.py"]
 
 _TEST_ENV_ROOT = tempfile.mkdtemp(prefix="ia-pytest-env-")
 _TEST_LOG_DIR = os.path.join(_TEST_ENV_ROOT, "logs")
@@ -49,6 +57,9 @@ _config.CONFIG_FILE = _TEST_CONFIG_PATH
 
 
 def _reset_default_config_state() -> None:
+    os.environ["IA_CONFIG_PATH"] = _TEST_CONFIG_PATH
+    os.environ["IA_DATA_DIR"] = _TEST_DATA_DIR
+    _logger.LOG_DIR = _TEST_LOG_DIR
     _config.CONFIG_FILE = _TEST_CONFIG_PATH
     _config._config = None
     _config._config_corrupt_state = None
