@@ -86,10 +86,11 @@ export default function ControlBar() {
     config,
     platformInfo,
     clearSession,
-    streamingIds,
-    qaPairs,
-    transcriptions,
-    candidateTranscriptions,
+    streamingCount,
+    qaPairsCount,
+    hasTranscriptions,
+    hasCandidateTranscriptions,
+    lastCandidateTranscription,
     setToastMessage,
     lastWSError,
     setLastWSError,
@@ -112,10 +113,14 @@ export default function ControlBar() {
       config: s.config,
       platformInfo: s.platformInfo,
       clearSession: s.clearSession,
-      streamingIds: s.streamingIds,
-      qaPairs: s.qaPairs,
-      transcriptions: s.transcriptions,
-      candidateTranscriptions: s.candidateTranscriptions,
+      streamingCount: s.streamingIds.length,
+      qaPairsCount: s.qaPairs.length,
+      hasTranscriptions: s.transcriptions.length > 0,
+      hasCandidateTranscriptions: s.candidateTranscriptions.length > 0,
+      lastCandidateTranscription:
+        s.candidateTranscriptions.length > 0
+          ? s.candidateTranscriptions[s.candidateTranscriptions.length - 1]
+          : null,
       setToastMessage: s.setToastMessage,
       lastWSError: s.lastWSError,
       setLastWSError: s.setLastWSError,
@@ -172,10 +177,10 @@ export default function ControlBar() {
     !isExamMode &&
     !singleMicMode &&
     !isRecording &&
-    transcriptions.length === 0 &&
-    qaPairs.length === 0 &&
+    !hasTranscriptions &&
+    qaPairsCount === 0 &&
     (devices.length === 0 || selectedDevice === null)
-  const showExamStartHint = isExamMode && !isRecording && qaPairs.length === 0
+  const showExamStartHint = isExamMode && !isRecording && qaPairsCount === 0
   const inputRef = useRef<HTMLInputElement>(null)
   const isComposingRef = useRef(false)
   const askingRef = useRef(false)
@@ -537,7 +542,7 @@ export default function ControlBar() {
   }, [selectedDevice, effectiveCandidateMic, isExamMode, interviewerStreaming, platformInfo?.platform, connectCandidateMmpg, singleMic])
   const handleClear = useCallback(async () => {
     if (clearingRef.current) return
-    if (qaPairs.length > 0 || transcriptions.length > 0 || candidateTranscriptions.length > 0) {
+    if (qaPairsCount > 0 || hasTranscriptions || hasCandidateTranscriptions) {
       const contents = isExamMode ? '答案' : '转录与答案'
       if (!window.confirm(`确定要清空当前页的${contents}吗？清空后不可恢复。`)) return
     }
@@ -553,7 +558,7 @@ export default function ControlBar() {
       clearingRef.current = false
       setClearing(false)
     }
-  }, [qaPairs.length, transcriptions.length, candidateTranscriptions.length, clearSession, isExamMode, setToastMessage])
+  }, [qaPairsCount, hasTranscriptions, hasCandidateTranscriptions, clearSession, isExamMode, setToastMessage])
 
   const handleCancelAsk = useCallback(async () => {
     if (cancellingAskRef.current) return
@@ -835,10 +840,10 @@ export default function ControlBar() {
           </div>
         </div>
       )}
-      {!isExamMode && candidateTranscriptions.length > 0 && (
+      {!isExamMode && hasCandidateTranscriptions && (
         <div className="flex items-start gap-2 text-xs text-accent-green bg-accent-green/10 px-3 py-1.5 rounded-lg">
           <Mic className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
-          <span className="min-w-0 break-all">我的回答记录：{candidateTranscriptions[candidateTranscriptions.length - 1]}</span>
+          <span className="min-w-0 break-all">我的回答记录：{lastCandidateTranscription}</span>
         </div>
       )}
 
@@ -1009,32 +1014,32 @@ export default function ControlBar() {
 
         {!isExamMode && <ResumeMountInline className="bg-bg-primary/45" />}
 
-        {streamingIds.length > 0 && (
+        {streamingCount > 0 && (
           <button onClick={handleCancelAsk} disabled={cancellingAsk}
             className="flex items-center gap-1 min-h-[36px] min-w-[36px] justify-center px-2 py-2 bg-accent-amber/20 hover:bg-accent-amber/30 text-accent-amber text-xs rounded-lg transition-colors flex-shrink-0 disabled:opacity-50"
             aria-label={cancellingAsk ? '正在取消生成' : '取消正在生成的回答'}
             title="取消全部正在生成的回答">
             {cancellingAsk ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}
             <span className="hidden sm:inline">
-              {cancellingAsk ? '取消中' : streamingIds.length > 1 ? `取消生成 (${streamingIds.length})` : '取消生成'}
+              {cancellingAsk ? '取消中' : streamingCount > 1 ? `取消生成 (${streamingCount})` : '取消生成'}
             </span>
           </button>
         )}
         <button
           onClick={handleClear}
           disabled={clearing}
-          title={qaPairs.length > 30 ? `当前会话较长 (${qaPairs.length} 条), 建议清空以保持流畅` : isExamMode ? '清空当前页的 AI 答案 (不影响历史)' : '清空当前页的实时转录与 AI 答案 (不影响历史)'}
-          aria-label={`清空当前${qaPairs.length > 30 ? ` ${qaPairs.length} 条` : ''}${isExamMode ? '答案' : '转录与答案'}`}
+          title={qaPairsCount > 30 ? `当前会话较长 (${qaPairsCount} 条), 建议清空以保持流畅` : isExamMode ? '清空当前页的 AI 答案 (不影响历史)' : '清空当前页的实时转录与 AI 答案 (不影响历史)'}
+          aria-label={`清空当前${qaPairsCount > 30 ? ` ${qaPairsCount} 条` : ''}${isExamMode ? '答案' : '转录与答案'}`}
           className={`relative flex items-center gap-1 min-h-[36px] min-w-[36px] justify-center px-2 py-2 text-xs rounded-lg transition-colors flex-shrink-0 disabled:opacity-50 ${
-            qaPairs.length > 30
+            qaPairsCount > 30
               ? 'bg-accent-amber/20 hover:bg-accent-amber/30 text-accent-amber'
               : 'bg-bg-tertiary hover:bg-bg-hover hover:text-accent-red text-text-secondary'
           }`}
         >
           {clearing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
           <span className="hidden sm:inline">{clearing ? '清空中' : '清空内容'}</span>
-          {qaPairs.length > 30 && !clearing && (
-            <span className="ml-0.5 text-[10px] tabular-nums hidden md:inline">({qaPairs.length})</span>
+          {qaPairsCount > 30 && !clearing && (
+            <span className="ml-0.5 text-[10px] tabular-nums hidden md:inline">({qaPairsCount})</span>
           )}
         </button>
         </div>

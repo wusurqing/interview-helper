@@ -4,8 +4,16 @@ import AnswerPanel from './AnswerPanel'
 import { useInterviewStore } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 
+const kbBannerRenders = vi.hoisted(() => new Map<string, number>())
+
 vi.mock('./SoundTest', () => ({ default: () => <div>sound-test-ready</div> }))
 vi.mock('./WrittenExamTest', () => ({ default: () => <div>written-exam-test-ready</div> }))
+vi.mock('@/components/kb/KbReferenceBanner', () => ({
+  default: ({ qaId }: { qaId: string }) => {
+    kbBannerRenders.set(qaId, (kbBannerRenders.get(qaId) ?? 0) + 1)
+    return null
+  },
+}))
 
 function resetStores(writtenExamMode = false) {
   useInterviewStore.setState({
@@ -32,6 +40,7 @@ function resetStores(writtenExamMode = false) {
 describe('AnswerPanel empty recording state', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    kbBannerRenders.clear()
     resetStores(false)
   })
 
@@ -163,6 +172,86 @@ describe('AnswerPanel empty recording state', () => {
       }
       scrollHeightSpy.mockRestore()
       clientHeightSpy.mockRestore()
+    }
+  })
+
+  it('preserves QACard memo for completed cards and keeps scroll/ResizeObserver stable across new questions', () => {
+    const observeSpy = vi.fn()
+    const disconnectSpy = vi.fn()
+    const originalRO = globalThis.ResizeObserver
+    class TrackingResizeObserver {
+      observe = observeSpy
+      unobserve = vi.fn()
+      disconnect = disconnectSpy
+    }
+    globalThis.ResizeObserver = TrackingResizeObserver as unknown as typeof ResizeObserver
+
+    try {
+      const qa1 = {
+        id: 'qa-1',
+        question: '第一题',
+        answer: '第一题答案',
+        thinkContent: '',
+        isThinking: false,
+        timestamp: 1710000000,
+        status: 'done' as const,
+      }
+      useInterviewStore.setState({
+        qaPairs: [qa1],
+        streamingIds: [],
+      } as any)
+
+      render(<AnswerPanel />)
+      expect(kbBannerRenders.get('qa-1')).toBe(1)
+      expect(observeSpy).toHaveBeenCalledTimes(1)
+      expect(disconnectSpy).toHaveBeenCalledTimes(0)
+
+      act(() => {
+        useInterviewStore.setState({
+          qaPairs: [
+            qa1,
+            {
+              id: 'qa-2',
+              question: '第二题',
+              answer: '流式生成中',
+              thinkContent: '',
+              isThinking: false,
+              timestamp: 1710000001,
+              status: 'streaming' as const,
+            },
+          ],
+          streamingIds: ['qa-2'],
+        } as any)
+      })
+
+      expect(kbBannerRenders.get('qa-1')).toBe(1)
+      expect(kbBannerRenders.get('qa-2')).toBe(1)
+      expect(observeSpy).toHaveBeenCalledTimes(1)
+      expect(disconnectSpy).toHaveBeenCalledTimes(0)
+
+      act(() => {
+        useInterviewStore.setState((state) => ({
+          qaPairs: [
+            ...state.qaPairs,
+            {
+              id: 'qa-3',
+              question: '第三题',
+              answer: '第三题流式',
+              thinkContent: '',
+              isThinking: false,
+              timestamp: 1710000002,
+              status: 'streaming' as const,
+            },
+          ],
+          streamingIds: ['qa-2', 'qa-3'],
+        }))
+      })
+
+      expect(kbBannerRenders.get('qa-1')).toBe(1)
+      expect(observeSpy).toHaveBeenCalledTimes(1)
+      expect(disconnectSpy).toHaveBeenCalledTimes(0)
+    } finally {
+      globalThis.ResizeObserver = originalRO
     }
   })
 })
