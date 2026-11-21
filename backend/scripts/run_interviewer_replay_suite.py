@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.generate_interviewer_mix_fixture import DEFAULT_VOICE_NAME, SCENARIOS, main as generate_fixture_main  # noqa: E402
 from scripts.replay_interviewer_pipeline import run_interviewer_pipeline_replay  # noqa: E402
-from core.config import SEGMENT_STT_PROVIDERS, get_config, update_config  # noqa: E402
+from core.config import SEGMENT_STT_PROVIDERS, get_config, temporary_config_override  # noqa: E402
 from api.assist.scheduler import dispatch_model_order  # noqa: E402
 
 
@@ -29,12 +29,9 @@ def _temporary_stt_provider(provider: str):
         return
     if selected not in SEGMENT_STT_PROVIDERS:
         raise ValueError("高频回放只支持火山原生豆包或 OpenAI 兼容 ASR")
-    original = get_config().stt_provider
-    update_config({"stt_provider": selected})
-    try:
+    # 仅做进程内内存覆写，严禁改写磁盘上的生产 backend/config.json。
+    with temporary_config_override({"stt_provider": selected}):
         yield
-    finally:
-        update_config({"stt_provider": original})
 
 
 def _find_model_index_by_name(model_name: str) -> int | None:
@@ -63,11 +60,6 @@ def _temporary_answer_runtime(
 ):
     updates: dict[str, object] = {}
     cfg = get_config()
-    original = {
-        "active_model": int(getattr(cfg, "active_model", 0) or 0),
-        "max_parallel_answers": int(getattr(cfg, "max_parallel_answers", 2) or 2),
-        "assist_stop_answer_wait_sec": float(getattr(cfg, "assist_stop_answer_wait_sec", 3.0)),
-    }
     model_idx = _find_model_index_by_name(answer_model_name)
     if answer_model_name and model_idx is None:
         raise RuntimeError(f"找不到 answer model: {answer_model_name}")
@@ -75,7 +67,6 @@ def _temporary_answer_runtime(
         model_id = getattr(cfg.models[model_idx], "id", "")
         selected = getattr(cfg, "assist_model_ids", None)
         if model_id and selected is not None:
-            original["assist_model_ids"] = list(selected)
             updates["assist_model_ids"] = [model_id] + [other_id for other_id in selected if other_id != model_id]
         else:
             updates["active_model"] = model_idx
@@ -86,11 +77,9 @@ def _temporary_answer_runtime(
     if not updates:
         yield
         return
-    update_config(updates)
-    try:
+    # 仅做进程内内存覆写，严禁改写磁盘上的生产 backend/config.json。
+    with temporary_config_override(updates):
         yield
-    finally:
-        update_config({key: original[key] for key in updates})
 
 
 def run_replay_suite(

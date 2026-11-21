@@ -17,7 +17,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.config import get_config  # noqa: E402
-from services.llm.streaming import chat_completion_create, chat_stream  # noqa: E402
+from services.llm.streaming import chat_completion_create, chat_stream_single_model  # noqa: E402
 
 
 def smoke_model(model_cfg) -> bool:
@@ -34,7 +34,9 @@ def smoke_model(model_cfg) -> bool:
             temperature=0.1,
             max_tokens=16,
         )
-        text = (resp.choices[0].message.content or "").strip()
+        choices = getattr(resp, "choices", None) or []
+        first_msg = getattr(choices[0], "message", None) if choices else None
+        text = (getattr(first_msg, "content", None) or "").strip()
         print(f"  非流式 OK ({time.perf_counter() - t0:.1f}s): {text[:40]!r}")
         if not text:
             ok = False
@@ -42,35 +44,46 @@ def smoke_model(model_cfg) -> bool:
         print(f"  非流式 FAIL: {type(e).__name__}: {str(e)[:160]}")
         return False
 
-    # 2) 流式（openai 走 SDK/裸 HTTP，anthropic/responses 走 SSE 解析）
+    # 2) 流式（直接测目标模型，避免 chat_stream 退回默认模型或跨模型降级）
     try:
         t0 = time.perf_counter()
         chunks = 0
+        text_chunks = 0
         first_ms = None
-        for _kind, piece in chat_stream(
+        for kind, piece in chat_stream_single_model(
+            model_cfg,
             [{"role": "user", "content": "用一句话介绍 Redis"}],
             override_think_mode=False,
         ):
-            if first_ms is None and piece.strip():
-                first_ms = (time.perf_counter() - t0) * 1000
             chunks += 1
+            if piece and piece.strip():
+                if first_ms is None:
+                    first_ms = (time.perf_counter() - t0) * 1000
+                if kind == "text":
+                    text_chunks += 1
         if chunks == 0:
             raise RuntimeError("流式返回 0 个 chunk")
-        print(f"  流式 OK ({time.perf_counter() - t0:.1f}s, 首字 {first_ms:.0f}ms, {chunks} chunks)")
+        if first_ms is None or text_chunks == 0:
+            raise RuntimeError("流式仅返回空白或无有效正文内容")
+        first_ms_label = f"{first_ms:.0f}ms" if first_ms is not None else "n/a"
+        print(f"  流式 OK ({time.perf_counter() - t0:.1f}s, 首字 {first_ms_label}, {chunks} chunks)")
     except Exception as e:
         print(f"  流式 FAIL: {type(e).__name__}: {str(e)[:160]}")
         ok = False
     return ok
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="LLM 协议真烟测")
     parser.add_argument("--index", type=int, default=None, help="只测指定模型下标")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     cfg = get_config()
     targets = []
     if args.index is not None:
+        if args.index < 0 or args.index >= len(cfg.models):
+            print(f"模型下标越界: {args.index}（可用范围 0..{max(0, len(cfg.models) - 1)}）")
+            return 1
         targets = [cfg.models[args.index]]
     else:
         targets = [m for m in cfg.models if m.enabled and m.api_key]

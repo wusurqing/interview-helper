@@ -226,26 +226,78 @@ def test_run_interviewer_pipeline_replay_requires_min_segment_emitted(monkeypatc
 
 
 def test_temporary_replay_pipeline_config_restores_original_values(monkeypatch):
-    cfg = type("Cfg", (), {"auto_detect": True, "assist_stop_answer_wait_sec": 3.0})()
-    updates: list[dict] = []
+    from core import config as config_mod
 
-    monkeypatch.setattr(replay_script, "get_config", lambda: cfg)
+    original_cfg = config_mod.AppConfig(auto_detect=True, assist_stop_answer_wait_sec=3.0)
+    monkeypatch.setattr(config_mod, "_config", original_cfg)
 
-    def fake_update_config(values):
-        updates.append(dict(values))
-        for key, value in values.items():
-            setattr(cfg, key, value)
-        return cfg
+    def forbid_disk_write(*_args, **_kwargs):
+        raise AssertionError("replay config override must never write config.json to disk")
 
-    monkeypatch.setattr(replay_script, "update_config", fake_update_config)
+    monkeypatch.setattr(config_mod, "_save_config", forbid_disk_write)
+    monkeypatch.setattr(config_mod, "update_config", forbid_disk_write)
 
     with replay_script._temporary_replay_pipeline_config(isolate_answers=True):
-        assert cfg.auto_detect is False
-        assert cfg.assist_stop_answer_wait_sec == 0.0
+        active = config_mod.get_config()
+        assert active.auto_detect is False
+        assert active.assist_stop_answer_wait_sec == 0.0
 
-    assert cfg.auto_detect is True
-    assert cfg.assist_stop_answer_wait_sec == 3.0
-    assert updates == [
-        {"auto_detect": False, "assist_stop_answer_wait_sec": 0.0},
-        {"auto_detect": True, "assist_stop_answer_wait_sec": 3.0},
-    ]
+    restored = config_mod.get_config()
+    assert restored is original_cfg
+    assert restored.auto_detect is True
+    assert restored.assist_stop_answer_wait_sec == 3.0
+
+    # Also restores on exception without touching disk
+    try:
+        with replay_script._temporary_replay_pipeline_config(isolate_answers=True):
+            assert config_mod.get_config().auto_detect is False
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
+    assert config_mod.get_config() is original_cfg
+
+
+def test_temporary_config_override_supports_nested_overrides_and_provider_layout(monkeypatch):
+    from core import config as config_mod
+
+    provider = config_mod.ModelProvider(
+        id="prov-1",
+        name="TestProvider",
+        api_base_url="https://api.example.com/v1",
+        api_key="sk-test",
+        api_type="openai",
+    )
+    original_cfg = config_mod.AppConfig(
+        stt_provider="doubao",
+        auto_detect=True,
+        model_providers=[provider],
+        models=[
+            config_mod.ModelConfig(id="m1", name="m1", model="model-1", provider_id="prov-1", enabled=True),
+            config_mod.ModelConfig(id="m2", name="m2", model="model-2", provider_id="prov-1", enabled=True),
+        ],
+        active_model_id="m1",
+    )
+    monkeypatch.setattr(config_mod, "_config", original_cfg)
+    monkeypatch.setattr(
+        config_mod,
+        "_save_config",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("must not write config.json")),
+    )
+
+    with config_mod.temporary_config_override({"stt_provider": "generic", "active_model": 1}):
+        outer = config_mod.get_config()
+        assert outer.stt_provider == "generic"
+        assert outer.active_model == 1
+        assert outer.active_model_id == "m2"
+        with config_mod.temporary_config_override({"auto_detect": False}):
+            inner = config_mod.get_config()
+            assert inner.stt_provider == "generic"
+            assert inner.active_model == 1
+            assert inner.auto_detect is False
+        after_inner = config_mod.get_config()
+        assert after_inner.stt_provider == "generic"
+        assert after_inner.auto_detect is True
+
+    assert config_mod.get_config() is original_cfg
+    assert config_mod.get_config().active_model == 0
+    assert config_mod.get_config().active_model_id == "m1"

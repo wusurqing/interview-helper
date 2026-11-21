@@ -1,9 +1,11 @@
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Annotated, Callable, Literal, Optional, Any, get_args
+from typing import Annotated, Callable, Iterator, Literal, Optional, Any, get_args
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, uuid4, uuid5
+import copy
 import hashlib
 import hmac
 import json
@@ -527,6 +529,41 @@ def get_config() -> AppConfig:
         if _config is None:
             _config = _load_config()
         return _config
+
+
+@contextmanager
+def temporary_config_override(updates: dict[str, Any]) -> Iterator[AppConfig]:
+    """Temporarily override in-memory config fields without writing config.json."""
+    global _config
+    if not updates:
+        yield get_config()
+        return
+    with _config_lock:
+        previous = get_config()
+        if isinstance(previous, AppConfig):
+            data = previous.model_dump()
+            data.update(updates)
+            if "active_model" in updates and "active_model_id" not in updates:
+                idx = updates["active_model"]
+                if previous.model_providers is not None:
+                    data["active_model_id"] = (
+                        previous.models[idx].id
+                        if isinstance(idx, int) and 0 <= idx < len(previous.models)
+                        else None
+                    )
+                else:
+                    data.pop("active_model_id", None)
+            overridden = AppConfig(**data)
+        else:
+            overridden = copy.copy(previous)
+            for key, value in updates.items():
+                setattr(overridden, key, value)
+        _config = overridden
+    try:
+        yield overridden
+    finally:
+        with _config_lock:
+            _config = previous
 
 
 class ModelListChanged(ValueError):

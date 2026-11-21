@@ -75,29 +75,41 @@ def test_run_replay_suite_aggregates_scenario_results(monkeypatch, tmp_path):
 
 
 def test_run_replay_suite_can_temporarily_select_generic_and_lite_ark(monkeypatch, tmp_path):
+    from core import config as config_mod
+
     scenario_ids = ["a"]
     monkeypatch.setattr(suite_script, "SCENARIOS", {key: {} for key in scenario_ids})
 
-    models = [
-        SimpleNamespace(name="main", model="main-model"),
-        SimpleNamespace(name="lite-ark", model="doubao-seed-lite"),
-    ]
-    state = {
-        "stt_provider": "doubao",
-        "active_model": 0,
-        "max_parallel_answers": 2,
-        "assist_stop_answer_wait_sec": 3.0,
-        "assist_interviewer_asr_drain_timeout_sec": 6.0,
-        "models": models,
-    }
-    updates_seen: list[dict] = []
+    original_cfg = config_mod.AppConfig(
+        stt_provider="doubao",
+        active_model=0,
+        max_parallel_answers=2,
+        assist_stop_answer_wait_sec=3.0,
+        assist_interviewer_asr_drain_timeout_sec=6.0,
+        models=[
+            config_mod.ModelConfig(
+                id="m-main",
+                name="main",
+                api_base_url="https://api.example.com/v1",
+                api_key="sk-main",
+                model="main-model",
+            ),
+            config_mod.ModelConfig(
+                id="m-lite",
+                name="lite-ark",
+                api_base_url="https://api.example.com/v1",
+                api_key="sk-lite",
+                model="doubao-seed-lite",
+            ),
+        ],
+    )
+    monkeypatch.setattr(config_mod, "_config", original_cfg)
 
-    def fake_get_config():
-        return SimpleNamespace(**state)
+    def forbid_disk_write(*_args, **_kwargs):
+        raise AssertionError("replay suite must never write config.json to disk")
 
-    def fake_update_config(update):
-        updates_seen.append(dict(update))
-        state.update(update)
+    monkeypatch.setattr(config_mod, "_save_config", forbid_disk_write)
+    monkeypatch.setattr(config_mod, "update_config", forbid_disk_write)
 
     def fake_generate_fixture_main(argv):
         out_idx = argv.index("--out") + 1
@@ -121,7 +133,12 @@ def test_run_replay_suite_can_temporarily_select_generic_and_lite_ark(monkeypatc
     replay_seen: dict[str, object] = {}
 
     def fake_run_interviewer_pipeline_replay(_device_id, **kwargs):
+        live_cfg = config_mod.get_config()
         replay_seen.update(kwargs)
+        replay_seen["live_stt_provider"] = live_cfg.stt_provider
+        replay_seen["live_max_parallel"] = live_cfg.max_parallel_answers
+        replay_seen["live_wait_sec"] = live_cfg.assist_stop_answer_wait_sec
+        replay_seen["live_assist_model_ids"] = list(live_cfg.assist_model_ids or [])
         return {
             "repeats": 1,
             "success_count": 1,
@@ -137,8 +154,6 @@ def test_run_replay_suite_can_temporarily_select_generic_and_lite_ark(monkeypatc
             },
         }
 
-    monkeypatch.setattr(suite_script, "get_config", fake_get_config)
-    monkeypatch.setattr(suite_script, "update_config", fake_update_config)
     monkeypatch.setattr(suite_script, "generate_fixture_main", fake_generate_fixture_main)
     monkeypatch.setattr(suite_script, "run_interviewer_pipeline_replay", fake_run_interviewer_pipeline_replay)
     monkeypatch.setattr(Path, "resolve", lambda self: self)
@@ -159,11 +174,14 @@ def test_run_replay_suite_can_temporarily_select_generic_and_lite_ark(monkeypatc
     assert result["max_parallel_answers"] == 3
     assert result["isolate_answers"] is False
     assert replay_seen["isolate_answers"] is False
-    assert {"stt_provider": "generic"} in updates_seen
-    assert {
-        "active_model": 1,
-        "max_parallel_answers": 3,
-        "assist_stop_answer_wait_sec": 12.0,
-    } in updates_seen
-    assert state["stt_provider"] == "doubao"
-    assert state["active_model"] == 0
+    assert replay_seen["live_stt_provider"] == "generic"
+    assert replay_seen["live_max_parallel"] == 3
+    assert replay_seen["live_wait_sec"] == 12.0
+    assert replay_seen["live_assist_model_ids"][0] == "m-lite"
+    # Original config restored untouched in memory
+    restored = config_mod.get_config()
+    assert restored is original_cfg
+    assert restored.stt_provider == "doubao"
+    assert restored.active_model == 0
+    assert restored.max_parallel_answers == 2
+    assert restored.assist_stop_answer_wait_sec == 3.0
