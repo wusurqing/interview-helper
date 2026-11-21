@@ -1,10 +1,10 @@
 import asyncio
 import logging
 import os
-import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -22,7 +22,6 @@ from core.auth import (
 from core.config import get_config
 from core.env import env_int
 from core.logger import setup_logging, get_logger
-from services.stt import get_stt_engine
 from api.realtime import ws
 from api.realtime.mmpg import bind_mmpg_routes
 from api.assist import candidate_mmpg, mmpg_integration
@@ -40,9 +39,9 @@ FRONTEND_DIR = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist")
 
 def _is_path_within_dir(base_dir: str, candidate_path: str) -> bool:
     try:
-        base_abs = os.path.abspath(base_dir)
-        candidate_abs = os.path.abspath(candidate_path)
-        return os.path.commonpath([base_abs, candidate_abs]) == base_abs
+        base_real = os.path.realpath(base_dir)
+        candidate_real = os.path.realpath(candidate_path)
+        return os.path.commonpath([base_real, candidate_real]) == base_real
     except ValueError:
         return False
 
@@ -74,7 +73,7 @@ async def lifespan(app: FastAPI):
     cfg = get_config()
     from services.storage.review_archive import recover_interrupted
     try:
-        recover_interrupted()
+        await run_in_threadpool(recover_interrupted)
     except Exception:
         _log.exception("Could not reconcile interrupted interview archives")
     models_summary = ", ".join(
@@ -92,45 +91,55 @@ async def lifespan(app: FastAPI):
     dispatch_task = asyncio.create_task(ws.ws_dispatcher())
     heartbeat_task = asyncio.create_task(ws.ws_heartbeat())
     assist.init_background_workers()
-    threading.Thread(target=_preload_stt, daemon=True).start()
-    assist.preload_candidate_asr_if_enabled()
+    try:
+        from services.storage.review import recover_stale_sessions_on_startup
+        recovered = await run_in_threadpool(recover_stale_sessions_on_startup)
+        if recovered["analyzing_recovered"] or recovered["recording_recovered"]:
+            _log.warning(
+                "Recovered stale review sessions on startup: analyzing->analysis_failed=%d recording->partial_capture=%d",
+                recovered["analyzing_recovered"],
+                recovered["recording_recovered"],
+            )
+    except Exception as e:
+        _log.warning("Review startup recovery skipped: %s", e)
     try:
         from services.storage.resume_history import restore_active_resume
-        if restore_active_resume():
+        if await run_in_threadpool(restore_active_resume):
             _log.info("Resume auto-restored from history (id=%s)", cfg.resume_active_history_id)
     except Exception as e:
         _log.debug("Resume auto-restore skipped: %s", e)
     yield
     _log.info("SHUTDOWN cleaning up")
-    await assist.finish_interview("shutdown")
-    assist.shutdown_background_workers()
+    try:
+        await assist.finish_interview("shutdown")
+    except Exception as e:
+        _log.warning("Assist shutdown cleanup failed: %s", e)
+    await run_in_threadpool(assist.shutdown_background_workers)
+    try:
+        from services.review_async_analysis import shutdown_executor as shutdown_review_analysis_executor
+        await run_in_threadpool(shutdown_review_analysis_executor, wait=False)
+    except Exception as e:
+        _log.debug("Review analysis executor shutdown skipped: %s", e)
+    try:
+        from core.resource_lanes import shutdown_resource_lanes
+        await run_in_threadpool(shutdown_resource_lanes, wait=False)
+    except Exception as e:
+        _log.debug("Resource lanes shutdown skipped: %s", e)
+    try:
+        from services.llm.streaming import close_cached_clients
+        from services.llm import protocols as llm_protocols
+        from services.stt.engines import close_generic_stt_sessions
+        await run_in_threadpool(close_cached_clients)
+        await run_in_threadpool(llm_protocols._http.close)
+        await llm_protocols.aclose_async_client()
+        await run_in_threadpool(close_generic_stt_sessions)
+    except Exception as e:
+        _log.debug("LLM/STT transport cleanup skipped: %s", e)
+    ws.shutdown_broadcast()
+    await ws.close_all_clients()
     dispatch_task.cancel()
     heartbeat_task.cancel()
-
-
-def _preload_stt():
-    try:
-        cfg = get_config()
-        if cfg.stt_provider == mmpg_integration.PROVIDER:
-            ws.broadcast({"type": "stt_status", **mmpg_integration.stt_status()})
-            return
-        engine = get_stt_engine()
-        _log.info("STT preload start provider=%s", cfg.stt_provider)
-        is_remote = cfg.stt_provider in ("doubao", "generic")
-        if not is_remote:
-            ws.broadcast({"type": "stt_status", "loaded": False, "loading": True, "provider": cfg.stt_provider})
-        engine.load_model()
-        loaded = bool(engine.is_loaded) if not is_remote else True
-        _log.info("STT preload done provider=%s loaded=%s", cfg.stt_provider, loaded)
-        ws.broadcast({"type": "stt_status", "loaded": loaded, "loading": False, "provider": cfg.stt_provider})
-    except Exception as e:
-        _log.error("STT preload failed: %s", e, exc_info=True)
-        ws.broadcast({"type": "stt_status", "loaded": False, "loading": False, "provider": get_config().stt_provider, "error": str(e)})
-    try:
-        from services.stt.factory import preload_whisper_fallback
-        preload_whisper_fallback()
-    except Exception as e:
-        _log.debug("Whisper fallback preload skipped: %s", e)
+    await asyncio.gather(dispatch_task, heartbeat_task, return_exceptions=True)
 
 
 app = FastAPI(title="学习助手", lifespan=lifespan)
@@ -238,9 +247,18 @@ async def api_auth_info(request: Request):
     client_host = request.client.host if request.client else None
     if is_auth_disabled():
         return {"required": False, "token": None}
-    if not is_loopback_host(client_host):
+    if not (
+        is_loopback_host(request.url.hostname)
+        and loopback_bypass_allowed(
+            client_host,
+            request.headers.get("origin"),
+            request.url.hostname,
+            request.url.scheme,
+            request.url.port,
+        )
+    ):
         return JSONResponse(
-            {"detail": "auth/info 仅允许环回访问,LAN 端请扫码获取带 token 的 URL。"},
+            {"detail": "auth/info 仅允许环回同源访问,LAN 端请扫码获取带 token 的 URL。"},
             status_code=403,
         )
     return {"required": True, "token": get_token()}
@@ -264,7 +282,7 @@ if os.path.isdir(FRONTEND_DIR):
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         # Prevent path traversal: resolve to realpath and ensure under FRONTEND_DIR
-        file_path = os.path.abspath(os.path.join(FRONTEND_DIR, full_path))
+        file_path = os.path.realpath(os.path.join(FRONTEND_DIR, full_path))
         if not _is_path_within_dir(FRONTEND_DIR, file_path):
             return FileResponse(os.path.join(FRONTEND_DIR, "index.html"))
         if os.path.isfile(file_path):

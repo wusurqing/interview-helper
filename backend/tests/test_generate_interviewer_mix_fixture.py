@@ -20,6 +20,18 @@ def test_build_scenario_ssml_includes_breaks_and_voice():
     assert "请先做一个简单的自我介绍。" in ssml
 
 
+def test_build_scenario_ssml_escapes_voice_name_attribute():
+    import xml.etree.ElementTree as ET
+
+    tricky_voice = """O'Connor & "Test" <Voice>"""
+    ssml = fixture_script.build_scenario_ssml("separated_cn", voice_name=tricky_voice)
+
+    root = ET.fromstring(ssml)
+    voice_elem = root.find("{http://www.w3.org/2001/10/synthesis}voice")
+    assert voice_elem is not None
+    assert voice_elem.attrib["name"] == tricky_voice
+
+
 def test_build_scenario_manifest_carries_expected_metadata():
     manifest = fixture_script.build_scenario_manifest(
         "mixed_followups_cn",

@@ -24,7 +24,11 @@ describe('KnowledgeMap', () => {
       settings: { model_index: 1, system_prompt: null, temperature: 0.3, max_tokens: 1024, think_effort: 'off' },
       default_system_prompt: '默认知识点提示词',
       output_contract: 'JSON 数组',
-      models: [{ index: 1, name: '知识模型', fingerprint: 'model-1', available: true, supports_think: true }],
+      models: [
+        { index: 1, name: '知识模型', fingerprint: 'model-1', available: true, supports_think: true, supports_vision: true },
+        { index: 2, name: '纯文本', fingerprint: 'model-2', available: true, supports_think: false },
+        { index: 3, name: '停用模型', fingerprint: 'model-3', available: false, supports_think: false },
+      ],
     })
     apiMock.knowledgeAnalysisStatus.mockResolvedValue({ pending_count: 2, job: null })
     useInterviewStore.setState({
@@ -95,6 +99,16 @@ describe('KnowledgeMap', () => {
     })
     render(<KnowledgeMap />)
     fireEvent.click(await screen.findByRole('button', { name: '分析设置' }))
+    const picker = screen.getByRole('button', { name: '分析模型' })
+    expect(picker).toHaveTextContent('识图')
+    fireEvent.click(picker)
+    expect(screen.queryByRole('radio', { name: '停用模型' })).not.toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('推理强度'), { target: { value: 'high' } })
+    fireEvent.click(screen.getByRole('radio', { name: '纯文本' }))
+    expect(picker).not.toHaveTextContent('识图')
+    expect(screen.getByLabelText('推理强度')).toBeDisabled()
+    expect(screen.getByLabelText('推理强度')).toHaveValue('off')
+    fireEvent.click(screen.getByRole('radio', { name: '知识模型' }))
     fireEvent.change(screen.getByLabelText('系统提示词'), { target: { value: '自定义知识点提示词' } })
     fireEvent.change(screen.getByLabelText('温度'), { target: { value: '0.7' } })
     fireEvent.change(screen.getByLabelText('最大输出 token'), { target: { value: '2048' } })

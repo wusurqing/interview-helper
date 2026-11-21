@@ -1,4 +1,4 @@
-import { lazy, memo, Suspense, useEffect, useRef, useState, useCallback } from 'react'
+import { lazy, memo, Suspense, useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import { Bot, Loader2, ChevronRight, Brain, Ban, AlertCircle, Layers, ArrowDown, Sparkles, ShieldCheck, ShieldAlert, Shield, Keyboard, ClipboardPaste, Mic, MonitorSmartphone } from 'lucide-react'
 import { useInterviewStore, QAPair } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
@@ -163,10 +163,10 @@ function renderAnswerBody(
             <AnswerMarkdownContent answer={qa.answer} colorScheme={colorScheme} stream={stream} />
           </Suspense>
         )
-      ) : isStreaming && !qa.isThinking ? (
+      ) : isStreaming && (qa.retrying || !qa.isThinking) ? (
         <div className="flex items-center gap-2 text-text-muted text-sm">
           <Loader2 className="w-4 h-4 animate-spin" />
-          {'生成中…'}
+          {qa.retrying ? plainAnswerStatus(qa, true) : '生成中…'}
         </div>
       ) : null}
       {qa.visionVerify && qaStatus !== 'cancelled' && qaStatus !== 'error' && (
@@ -346,7 +346,15 @@ export default function AnswerPanel() {
     }
   }, [qaPairs, scrollToLatest])
 
+  const hasQaPairs = qaPairs.length > 0
+  const streamingIdSet = useMemo(() => new Set(streamingIds), [streamingIds])
+
   useEffect(() => {
+    if (!hasQaPairs) {
+      autoFollowRef.current = true
+      setNearBottom(true)
+      return
+    }
     const el = scrollContainerRef.current
     if (!el) return
     updateNearBottom(false)
@@ -366,7 +374,7 @@ export default function AnswerPanel() {
       el.removeEventListener('scroll', onScroll)
       ro.disconnect()
     }
-  }, [qaPairs.length, scrollToLatest, updateNearBottom])
+  }, [hasQaPairs, scrollToLatest, updateNearBottom])
 
   const hasActiveGeneration =
     streamingIds.length > 0 || qaPairs.some((q) => q.isThinking)
@@ -468,11 +476,8 @@ export default function AnswerPanel() {
         ref={scrollContainerRef}
         className={`flex-1 min-h-0 overflow-y-auto px-3 py-3 md:px-4 md:py-4 ${stream ? 'space-y-10' : 'space-y-5'}`}
       >
-      {qaPairs.map((qa, idx) => {
-        const isStreaming = streamingIds.includes(qa.id)
-        const isLatest = idx === qaPairs.length - 1
-        // 只给最新一项播入场动画,避免历史项在 store 更新时反复重播
-        const animate = isLatest
+      {qaPairs.map((qa) => {
+        const isStreaming = streamingIdSet.has(qa.id)
         return (
           <QACard
             key={qa.id}
@@ -480,7 +485,7 @@ export default function AnswerPanel() {
             isStreaming={isStreaming}
             stream={stream}
             colorScheme={colorScheme}
-            animate={animate}
+            animate={isStreaming}
             animateDelayMs={0}
           />
         )

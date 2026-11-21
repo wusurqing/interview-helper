@@ -39,7 +39,6 @@ export default defineConfig({
       maxDiffPixelRatio: 0.005,
       threshold: 0.2,
       animations: 'disabled',
-      // index.css 拉 Google Fonts，部分环境等待 document.fonts 较慢
       timeout: 30_000,
     },
   },

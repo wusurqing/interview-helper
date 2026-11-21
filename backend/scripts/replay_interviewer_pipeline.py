@@ -24,7 +24,7 @@ from api.assist.pipeline import (  # noqa: E402
     stop_interview_loop,
 )
 from api.assist.sound_test import PREFLIGHT_AUDIO_PATH, match_phrase, play_audio_fixture  # noqa: E402
-from core.config import get_config, update_config  # noqa: E402
+from core.config import get_config, temporary_config_override  # noqa: E402
 from core.session import get_session, reset_session  # noqa: E402
 
 
@@ -41,19 +41,12 @@ def _temporary_replay_pipeline_config(*, isolate_answers: bool):
         yield
         return
 
-    cfg = get_config()
-    original = {
-        "auto_detect": bool(getattr(cfg, "auto_detect", True)),
-        "assist_stop_answer_wait_sec": float(getattr(cfg, "assist_stop_answer_wait_sec", 3.0) or 0.0),
-    }
-    update_config({
+    # 仅做进程内内存覆写，严禁通过 update_config 改写磁盘上的生产 backend/config.json。
+    with temporary_config_override({
         "auto_detect": False,
         "assist_stop_answer_wait_sec": 0.0,
-    })
-    try:
+    }):
         yield
-    finally:
-        update_config(original)
 
 
 def run_interviewer_pipeline_replay(

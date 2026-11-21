@@ -16,8 +16,8 @@ class FakeWebSocket {
   readyState = FakeWebSocket.CONNECTING
   onopen: (() => void) | null = null
   onmessage: ((event: MessageEvent) => void) | null = null
-  onclose: (() => void) | null = null
-  onerror: (() => void) | null = null
+  onclose: ((ev?: CloseEvent) => void) | null = null
+  onerror: ((ev?: Event) => void) | null = null
   sent: string[] = []
   closed = false
 
@@ -34,9 +34,13 @@ class FakeWebSocket {
     this.onmessage?.({ data: JSON.stringify(data) } as MessageEvent)
   }
 
-  emitClose() {
+  emitClose(ev?: Partial<CloseEvent>) {
     this.readyState = FakeWebSocket.CONNECTING
-    this.onclose?.()
+    this.onclose?.((ev ?? {}) as CloseEvent)
+  }
+
+  emitError(ev?: Event) {
+    this.onerror?.(ev ?? ({} as Event))
   }
 
   send(payload: string) {
@@ -60,6 +64,7 @@ describe('useInterviewWS', () => {
     vi.useFakeTimers()
     vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket)
     useInterviewStore.setState({
+      config: null,
       qaPairs: [],
       streamingIds: [],
       currentStreamingId: null,
@@ -144,6 +149,79 @@ describe('useInterviewWS', () => {
 
     act(() => ws.emitMessage({ type: 'recording', value: false }))
     expect(useInterviewStore.getState().singleMic).toBeNull()
+  })
+
+  it('retains the server capture route across pause and clears it on stop', () => {
+    render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+    act(() => {
+      ws.emitOpen()
+      ws.emitMessage({ type: 'init', is_recording: true, candidate_capture_provider: 'doubao_mmpg' })
+      ws.emitMessage({ type: 'paused', value: true })
+    })
+    expect(useInterviewStore.getState().candidateCaptureProvider).toBe('doubao_mmpg')
+    act(() => ws.emitMessage({ type: 'recording', value: false, candidate_capture_provider: '' }))
+    expect(useInterviewStore.getState().candidateCaptureProvider).toBeNull()
+    act(() => ws.emitMessage({ type: 'recording', value: true, candidate_capture_provider: 'generic' }))
+    expect(useInterviewStore.getState().candidateCaptureProvider).toBe('generic')
+  })
+
+  it('uses the shared workspace from init and applies later mode changes independently', () => {
+    useInterviewStore.setState({ config: { models: [], position: '测试', written_exam_mode: false } as any })
+    render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+    act(() => ws.emitMessage({ type: 'init', written_exam_mode: true }))
+    expect(useInterviewStore.getState().config?.written_exam_mode).toBe(true)
+    act(() => ws.emitMessage({ type: 'workspace_mode', written_exam_mode: false }))
+    expect(useInterviewStore.getState().config).toMatchObject({ position: '测试', written_exam_mode: false })
+  })
+
+  it('relays only the mode flag to follower tabs and releases their channel', () => {
+    const channels = new Map<string, MockChannel>()
+    class MockChannel {
+      onmessage: ((event: MessageEvent) => void) | null = null
+      postMessage = vi.fn()
+      close = vi.fn()
+
+      constructor(name: string) {
+        channels.set(name, this)
+      }
+    }
+    vi.stubGlobal('BroadcastChannel', MockChannel)
+    useInterviewStore.setState({ config: { models: [], written_exam_mode: false } as any })
+    const screen = render(<Harness />)
+    const channel = channels.get('ia-workspace-mode')!
+    act(() => FakeWebSocket.instances[0].emitMessage({ type: 'workspace_mode', written_exam_mode: true }))
+    expect(channel.postMessage).toHaveBeenCalledWith(true)
+    act(() => {
+      useInterviewStore.getState().setWsIsLeader(false)
+      channel.onmessage?.(new MessageEvent('message', { data: false }))
+    })
+    expect(useInterviewStore.getState().config?.written_exam_mode).toBe(false)
+    screen.unmount()
+    expect(channel.close).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the latest workspace event when initial HTTP config is still in flight', () => {
+    render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+    act(() => ws.emitMessage({ type: 'workspace_mode', written_exam_mode: true }))
+    expect(useInterviewStore.getState().config).toBeNull()
+    act(() => useInterviewStore.getState().setConfig({ models: [], written_exam_mode: false } as any))
+    expect(useInterviewStore.getState().config?.written_exam_mode).toBe(true)
+  })
+
+  it('reports a segment recognition failure on the affected role', () => {
+    render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+    act(() => {
+      ws.emitOpen()
+      ws.emitMessage({ type: 'stt_error', provider: 'generic', role: 'candidate', message: '网络连接失败' })
+    })
+    expect(useInterviewStore.getState().toasts).toContainEqual(expect.objectContaining({
+      level: 'warn',
+      message: '我的回答识别失败 · 网络连接失败',
+    }))
   })
 
   it('labels generation and persistence answer failures accurately', () => {
@@ -276,7 +354,7 @@ describe('useInterviewWS', () => {
 
     const state = useInterviewStore.getState()
     expect(state.candidateSttLoaded).toBe(false)
-    expect(state.toastMessage).toContain('候选人口述记录已关闭，不影响面试录音')
+    expect(state.toastMessage).toContain('我的回答识别失败')
   })
 
   it('warns immediately when screenshot self-check fails', () => {
@@ -385,5 +463,119 @@ describe('useInterviewWS', () => {
     const state = useInterviewStore.getState()
     expect(state.resumeOptResult).toBe('后台分析完成')
     expect(state.resumeOptLoading).toBe(false)
+  })
+
+  it('ignores stale ws.onerror from a replaced or deactivated socket', () => {
+    const { rerender } = render(<Harness active />)
+    const first = FakeWebSocket.instances[0]
+
+    act(() => {
+      first.emitOpen()
+      first.emitClose()
+      vi.advanceTimersByTime(1000)
+    })
+
+    const second = FakeWebSocket.instances[1]
+    const firstCloseSpy = vi.spyOn(first, 'close')
+    const secondCloseSpy = vi.spyOn(second, 'close')
+    act(() => {
+      second.emitOpen()
+      first.emitError()
+    })
+    expect(firstCloseSpy).not.toHaveBeenCalled()
+    expect(secondCloseSpy).not.toHaveBeenCalled()
+    expect(useInterviewStore.getState().wsConnected).toBe(true)
+
+    rerender(<Harness active={false} />)
+    secondCloseSpy.mockClear()
+    act(() => {
+      second.emitError()
+    })
+    expect(secondCloseSpy).not.toHaveBeenCalled()
+  })
+
+  it('resets the 5s error auto-clear timer on consecutive errors and clears it on unmount', () => {
+    const screen = render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+
+    act(() => {
+      ws.emitOpen()
+      ws.emitMessage({ type: 'error', message: '第一次错误' })
+    })
+    expect(useInterviewStore.getState().lastWSError).toBe('第一次错误')
+
+    act(() => {
+      vi.advanceTimersByTime(3000)
+      ws.emitMessage({ type: 'error', message: '第二次错误' })
+    })
+    expect(useInterviewStore.getState().lastWSError).toBe('第二次错误')
+
+    // 若未清理旧定时器，t=5000ms 时会被提前清空；修复后仍保留
+    act(() => {
+      vi.advanceTimersByTime(2500)
+    })
+    expect(useInterviewStore.getState().lastWSError).toBe('第二次错误')
+
+    act(() => {
+      vi.advanceTimersByTime(2500)
+    })
+    expect(useInterviewStore.getState().lastWSError).toBeNull()
+
+    // 卸载时取消尚未触发的 5s 定时器，不污染后续状态
+    act(() => {
+      ws.emitMessage({ type: 'error', message: '卸载前错误' })
+    })
+    screen.unmount()
+    act(() => {
+      useInterviewStore.getState().setLastWSError('后续错误')
+      vi.advanceTimersByTime(6000)
+    })
+    expect(useInterviewStore.getState().lastWSError).toBe('后续错误')
+  })
+
+  it('notifies user and stops reconnecting on 1008 policy violation', () => {
+    render(<Harness />)
+    const ws = FakeWebSocket.instances[0]
+
+    act(() => {
+      ws.emitOpen()
+      ws.emitClose({ code: 1008 })
+      vi.advanceTimersByTime(60000)
+    })
+
+    const state = useInterviewStore.getState()
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(state.wsConnected).toBe(false)
+    expect(state.lastWSError).toContain('鉴权失败')
+    expect(state.toasts).toContainEqual(expect.objectContaining({
+      level: 'error',
+      message: expect.stringContaining('鉴权失败'),
+    }))
+  })
+
+  it('dispatches preflight_step and exam_preflight events without polluting qaPairs', async () => {
+    const { subscribeSoundPreflight, subscribeExamPreflight } = await import('@/lib/preflightWsBus')
+    const soundEvents: unknown[] = []
+    const examEvents: unknown[] = []
+    const unsubSound = subscribeSoundPreflight((m) => soundEvents.push(m))
+    const unsubExam = subscribeExamPreflight((m) => examEvents.push(m))
+
+    try {
+      render(<Harness />)
+      const ws = FakeWebSocket.instances[0]
+      act(() => {
+        ws.emitOpen()
+        ws.emitMessage({ type: 'preflight_step', step: 'playback', status: 'pass', detail: 'ok' })
+        ws.emitMessage({ type: 'exam_preflight_step', step: 'screenshot', status: 'pass', detail: 'ok' })
+        ws.emitMessage({ type: 'answer_start', id: 'pf-1', exam_preflight_id: 'pf-1', question: 'Q' })
+      })
+
+      expect(soundEvents).toHaveLength(1)
+      expect(examEvents).toHaveLength(2)
+      expect(useInterviewStore.getState().qaPairs).toEqual([])
+    } finally {
+      unsubSound()
+      unsubExam()
+    }
   })
 })

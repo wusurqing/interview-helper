@@ -21,20 +21,11 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 pipeline = importlib.import_module("api.assist.pipeline")
+from core.config import AppConfig, Mmpg
 from core.session import Session
 
 
 # ---------- 共享 fakes -------------------------------------------------------
-
-
-class _FakeEngine:
-    is_loaded = True
-
-    def load_model(self):
-        pass
-
-    def transcribe(self, *args, **kwargs):
-        return ""
 
 
 class _FakeSession(Session):
@@ -89,7 +80,8 @@ def _wire_common_fakes(monkeypatch, audio_capture, session, *, gc_counter=None):
 
     monkeypatch.setattr(pipeline, "audio_capture", audio_capture)
     monkeypatch.setattr(pipeline.AudioCapture, "list_devices", lambda: [])
-    monkeypatch.setattr(pipeline, "get_stt_engine", lambda: _FakeEngine())
+    monkeypatch.setattr(pipeline, "get_config", lambda: AppConfig(stt_provider="doubao", doubao_stt_api_key="test-asr"))
+    monkeypatch.setattr(pipeline, "_interviewer_config", None)
     monkeypatch.setattr(pipeline, "get_session", lambda: session)
     monkeypatch.setattr(pipeline, "broadcast", lambda *a, **kw: None)
     monkeypatch.setattr(pipeline, "_try_flush_asr_merge_buffer", lambda *a, **kw: None)
@@ -254,37 +246,6 @@ def test_gc_daemon_thread_terminates_when_worker_exits(monkeypatch):
     assert leaked == [], f"gc daemon 线程应该已退出; 残留: {leaked}"
 
 
-# ---------- 兜底: 仅供 sanity ------------------------------------------------
-
-
-def test_worker_stop_on_load_failure_does_not_call_audio_stop(monkeypatch):
-    """模型加载失败的早退路径不会进入 try 块, audio_capture 也没 start 过,
-    因此不应误调 stop (避免与外部 stop 顺序竞争)."""
-
-    audio = _RecordingAudioCapture()
-    session = _FakeSession()
-
-    class _BrokenEngine:
-        is_loaded = False
-
-        def load_model(self):
-            raise RuntimeError("model load failed")
-
-    monkeypatch.setattr(pipeline, "audio_capture", audio)
-    monkeypatch.setattr(pipeline, "get_stt_engine", lambda: _BrokenEngine())
-    monkeypatch.setattr(pipeline, "get_session", lambda: session)
-    monkeypatch.setattr(pipeline, "broadcast", lambda *a, **kw: None)
-
-    pipeline._interview_worker()
-
-    # 早退路径没有 try/finally 保护, audio.stop 不会从 worker 内部触发
-    # (外部 stop_interview_loop 自己会调). 这条用例锁定行为, 防止以后
-    # "保险起见" 在错误路径乱加 stop 反而干扰外部 owner 一致性。
-    assert audio.stop_calls == [], (
-        f"模型加载失败的早退路径不应调用 audio.stop; 实际 stop_calls={audio.stop_calls}"
-    )
-
-
 # ---------- Written exam mode: start without audio ---------------------------
 
 
@@ -297,7 +258,7 @@ def test_start_nonblocking_skips_audio_in_exam_mode(monkeypatch):
 
     monkeypatch.setattr(
         pipeline, "get_config",
-        lambda: type("Cfg", (), {"written_exam_mode": True})(),
+        lambda: AppConfig(written_exam_mode=True),
     )
 
     pipeline.start_nonblocking(device_id=None)
@@ -314,7 +275,7 @@ def test_start_nonblocking_skips_audio_in_exam_mode(monkeypatch):
 
 
 def test_start_nonblocking_with_device_in_exam_mode(monkeypatch):
-    """笔试模式仍允许传 device_id 走正常音频路径（用户想同时录音）."""
+    """笔试始终不采集音频，即使调用方保留了上次面试的设备。"""
 
     audio = _RecordingAudioCapture()
     session = _FakeSession()
@@ -322,14 +283,13 @@ def test_start_nonblocking_with_device_in_exam_mode(monkeypatch):
 
     monkeypatch.setattr(
         pipeline, "get_config",
-        lambda: type("Cfg", (), {"written_exam_mode": True})(),
+        lambda: AppConfig(written_exam_mode=True, stt_provider="doubao", doubao_stt_api_key="test-asr"),
     )
 
     pipeline.start_nonblocking(device_id=1)
 
-    assert audio.start_calls == [(1, "assist", {})], (
-        f"传了 device_id 时应走音频路径; 实际 start_calls={audio.start_calls}"
-    )
+    assert audio.start_calls == []
+    assert session.last_device_id == -1
 
     pipeline.stop_interview_loop()
 
@@ -351,6 +311,9 @@ def test_start_nonblocking_keeps_session_idle_when_audio_start_fails(monkeypatch
     monkeypatch.setattr(pipeline, "get_session", lambda: session)
     monkeypatch.setattr(pipeline, "broadcast", broadcasts.append)
     monkeypatch.setattr(pipeline, "_device_is_loopback", lambda _device_id: True)
+
+    cfg = AppConfig(stt_provider="doubao", doubao_stt_api_key="test-asr")
+    monkeypatch.setattr(pipeline, "get_config", lambda: cfg)
 
     with pytest.raises(RuntimeError, match="boom"):
         pipeline.start_nonblocking(device_id=7)
@@ -398,6 +361,7 @@ def test_pause_unpause_keeps_interview_worker_alive_without_capture_error(monkey
         {
             "position": "",
             "language": "zh",
+            "stt_provider": "doubao",
             "transcription_min_sig_chars": 1,
         },
     )()
@@ -444,7 +408,7 @@ def test_interviewer_slow_asr_does_not_block_segment_production(monkeypatch):
         {
             "position": "",
             "language": "zh",
-            "stt_provider": "whisper",
+            "stt_provider": "doubao",
             "silence_threshold": 0.01,
             "silence_duration": 1.0,
             "assist_vad_min_speech_sec": 0.1,
@@ -481,7 +445,7 @@ def test_interviewer_slow_asr_does_not_block_segment_production(monkeypatch):
         return "第一题"
 
     audio._chunk_provider = _chunk_provider
-    monkeypatch.setattr(pipeline, "transcribe_with_fallback", _slow_asr)
+    monkeypatch.setattr(pipeline, "transcribe_segment", _slow_asr)
     monkeypatch.setattr(
         pipeline,
         "_append_transcription_fragment",
@@ -511,8 +475,14 @@ def test_stop_interview_loop_drains_pending_interviewer_segment_before_review_ar
     session = _FakeSession()
     session.is_recording = True
     archived_counts: list[int] = []
+    captured_cfg = AppConfig(stt_provider="doubao", assist_transcription_merge_gap_sec=3)
+    future_cfg = AppConfig(stt_provider="generic", assist_transcription_merge_gap_sec=0)
+    stop_flush_gaps = []
+    monkeypatch.setattr(pipeline, "_interviewer_config", captured_cfg)
+    monkeypatch.setattr(pipeline, "get_config", lambda: future_cfg)
 
     runtime = pipeline._new_interviewer_runtime()
+    runtime.transcript_epoch = session.transcript_epoch
     pipeline._set_interviewer_runtime(runtime)
     runtime.segment_queue.put(
         pipeline.InterviewerSegment(
@@ -540,9 +510,12 @@ def test_stop_interview_loop_drains_pending_interviewer_segment_before_review_ar
     monkeypatch.setattr(pipeline, "broadcast", lambda _data: None)
     monkeypatch.setattr(pipeline.audio_capture, "stop", lambda owner=None: None)
     monkeypatch.setattr(pipeline._candidate_audio_capture, "stop", lambda owner=None: None)
-    monkeypatch.setattr(pipeline, "transcribe_with_fallback", lambda *_a, **_k: "最后 flush 出来的问题")
+    monkeypatch.setattr(pipeline, "transcribe_segment", lambda *_a, **_k: "最后 flush 出来的问题")
     monkeypatch.setattr(pipeline, "_append_transcription_fragment", _append)
-    monkeypatch.setattr(pipeline, "_try_flush_asr_merge_buffer", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        pipeline, "_try_flush_asr_merge_buffer",
+        lambda cfg, *_args, **_kwargs: stop_flush_gaps.append(cfg.assist_transcription_merge_gap_sec),
+    )
     monkeypatch.setattr(pipeline, "_try_flush_asr_question_group", lambda *a, **kw: None)
     monkeypatch.setattr(pipeline, "_wait_for_answer_work_idle", lambda _timeout: True)
     monkeypatch.setattr(pipeline, "cancel_answer_work", lambda **_kwargs: None)
@@ -555,7 +528,7 @@ def test_stop_interview_loop_drains_pending_interviewer_segment_before_review_ar
     pipeline._interview_thread = _JoinThread()
     pipeline._interviewer_asr_thread = threading.Thread(
         target=pipeline._interviewer_asr_worker,
-        args=(runtime, session, type("Cfg", (), {"position": "", "language": "zh", "transcription_min_sig_chars": 1})()),
+        args=(runtime, session, AppConfig(stt_provider="doubao", language="zh", transcription_min_sig_chars=1)),
         daemon=True,
     )
     pipeline._interviewer_asr_thread.start()
@@ -563,6 +536,67 @@ def test_stop_interview_loop_drains_pending_interviewer_segment_before_review_ar
     pipeline.stop_interview_loop()
 
     assert archived_counts == [1]
+    assert stop_flush_gaps == [3]
+
+
+def test_in_flight_segment_keeps_publication_threshold_from_capture_config(monkeypatch):
+    session = _FakeSession()
+    runtime = pipeline._new_interviewer_runtime()
+    runtime.transcript_epoch = session.transcript_epoch
+    runtime.segment_queue.put(
+        pipeline.InterviewerSegment(np.zeros(16000), 16000, 1.0, 2.0, 1.0, "silence", False),
+    )
+    runtime.drain_event.set()
+    captured_cfg = AppConfig(stt_provider="doubao", transcription_min_sig_chars=1)
+    future_cfg = AppConfig(stt_provider="generic", transcription_min_sig_chars=5)
+    published = []
+    monkeypatch.setattr(pipeline, "get_config", lambda: future_cfg)
+    monkeypatch.setattr(pipeline, "transcribe_segment", lambda *_args, **_kwargs: "好。")
+    monkeypatch.setattr(pipeline, "broadcast", lambda _event: None)
+    monkeypatch.setattr(
+        pipeline, "_append_transcription_fragment",
+        lambda cfg, *_args, **meta: published.append((cfg.stt_provider, meta["publish"])),
+    )
+
+    pipeline._interviewer_asr_worker(runtime, session, captured_cfg)
+
+    assert published == [("doubao", True)]
+
+
+@pytest.mark.parametrize("same_rtc_user", [True, False])
+def test_candidate_manual_token_can_renew_on_resume_for_the_same_rtc_identity(monkeypatch, same_rtc_user):
+    session = _FakeSession()
+    session.is_paused = True
+    session.last_device_id = 7
+    session.last_candidate_mic_device_id = 8
+    capture = _RecordingAudioCapture()
+    _wire_common_fakes(monkeypatch, capture, session)
+    original = Mmpg(
+        volc_access_key="test-rtc-access", volc_secret_key="test-rtc-secret",
+        rtc_app_id="x" * 24, rtc_room_id="room", rtc_user_id="candidate", rtc_bot_id="bot",
+        doubao_api_key="test-asr", token_mode="manual", rtc_token="old-token",
+        rtc_token_expires_at=1,
+    )
+    snapshot = AppConfig(
+        stt_provider="doubao", candidate_stt_provider="doubao_mmpg", candidate_asr_enabled=True, mmpg=original,
+    )
+    future_cfg = AppConfig(
+        stt_provider="generic", candidate_stt_provider="", candidate_asr_enabled=False,
+        mmpg=original.model_copy(update={
+            "rtc_user_id": "candidate" if same_rtc_user else "different-user",
+            "rtc_token": "renewed-test-token", "rtc_token_expires_at": int(time.time()) + 3600,
+        }),
+    )
+    monkeypatch.setattr(pipeline, "_interviewer_config", snapshot)
+    monkeypatch.setattr(pipeline, "get_config", lambda: future_cfg)
+    monkeypatch.setattr(pipeline, "_start_interview_worker_thread_if_needed", lambda: None)
+
+    pipeline.unpause_interview()
+
+    assert pipeline.get_capture_config().stt_provider == "doubao"
+    assert pipeline.candidate_capture_provider() == "doubao_mmpg"
+    assert pipeline.get_capture_config().mmpg.rtc_token == ("renewed-test-token" if same_rtc_user else "old-token")
+    assert session.last_candidate_mic_device_id == (8 if same_rtc_user else -1)
 
 
 def test_interviewer_segment_respects_assist_vad_min_speech_sec(monkeypatch):
@@ -576,7 +610,7 @@ def test_interviewer_segment_respects_assist_vad_min_speech_sec(monkeypatch):
         {
             "position": "",
             "language": "zh",
-            "stt_provider": "whisper",
+            "stt_provider": "doubao",
             "silence_threshold": 0.01,
             "silence_duration": 0.0,
             "assist_vad_min_speech_sec": 0.1,
@@ -602,7 +636,7 @@ def test_interviewer_segment_respects_assist_vad_min_speech_sec(monkeypatch):
         return None
 
     audio._chunk_provider = _chunk_provider
-    monkeypatch.setattr(pipeline, "transcribe_with_fallback", lambda *_a, **_k: "短问题")
+    monkeypatch.setattr(pipeline, "transcribe_segment", lambda *_a, **_k: "短问题")
     monkeypatch.setattr(
         pipeline,
         "_append_transcription_fragment",
@@ -734,7 +768,7 @@ def test_audio_capture_drain_chunks_feeds_interviewer_vad_per_chunk(monkeypatch)
         {
             "position": "",
             "language": "zh",
-            "stt_provider": "whisper",
+            "stt_provider": "doubao",
             "silence_threshold": 0.01,
             "silence_duration": 0.0,
             "assist_vad_min_speech_sec": 0.1,
@@ -757,7 +791,7 @@ def test_audio_capture_drain_chunks_feeds_interviewer_vad_per_chunk(monkeypatch)
 
     audio.drain_audio_chunks = _drain_audio_chunks
     audio.get_audio_chunk = lambda timeout=0.1: None
-    monkeypatch.setattr(pipeline, "transcribe_with_fallback", lambda *_a, **_k: "逐块问题")
+    monkeypatch.setattr(pipeline, "transcribe_segment", lambda *_a, **_k: "逐块问题")
     monkeypatch.setattr(
         pipeline,
         "_append_transcription_fragment",
@@ -780,7 +814,7 @@ def test_interviewer_large_chunk_is_split_into_smaller_vad_feed_chunks(monkeypat
         {
             "position": "",
             "language": "zh",
-            "stt_provider": "whisper",
+            "stt_provider": "doubao",
             "silence_threshold": 0.01,
             "silence_duration": 0.0,
             "assist_vad_min_speech_sec": 0.1,
@@ -819,7 +853,7 @@ def test_interviewer_large_chunk_is_split_into_smaller_vad_feed_chunks(monkeypat
     audio.drain_audio_chunks = _drain_audio_chunks
     audio.get_audio_chunk = lambda timeout=0.1: None
     monkeypatch.setattr(pipeline, "VADBuffer", FakeVAD)
-    monkeypatch.setattr(pipeline, "transcribe_with_fallback", lambda *_a, **_k: "拆小帧问题")
+    monkeypatch.setattr(pipeline, "transcribe_segment", lambda *_a, **_k: "拆小帧问题")
     monkeypatch.setattr(
         pipeline,
         "_append_transcription_fragment",
@@ -874,7 +908,7 @@ def test_worker_drains_remaining_raw_audio_after_stop_before_tail_flush(monkeypa
         {
             "position": "",
             "language": "zh",
-            "stt_provider": "whisper",
+            "stt_provider": "doubao",
             "silence_threshold": 0.01,
             "silence_duration": 0.0,
             "assist_vad_min_speech_sec": 0.1,
@@ -899,7 +933,7 @@ def test_worker_drains_remaining_raw_audio_after_stop_before_tail_flush(monkeypa
         return []
 
     audio.drain_audio_chunks = _drain_audio_chunks
-    monkeypatch.setattr(pipeline, "transcribe_with_fallback", lambda *_a, **_k: "停止前最后一句")
+    monkeypatch.setattr(pipeline, "transcribe_segment", lambda *_a, **_k: "停止前最后一句")
     monkeypatch.setattr(
         pipeline,
         "_append_transcription_fragment",
@@ -913,14 +947,13 @@ def test_worker_drains_remaining_raw_audio_after_stop_before_tail_flush(monkeypa
 
 
 def _wire_candidate_fakes(monkeypatch, audio_capture, session):
-    """打桩 _candidate_worker 的外部依赖 (whisper provider, 远程关, streaming 关)."""
+    """Supply a fake capture for the cloud segment worker."""
     monkeypatch.setattr(pipeline, "_candidate_audio_capture", audio_capture)
     pipeline._stop_event.clear()
     pipeline._pause_event.clear()
     pipeline._candidate_flush_event.clear()
     monkeypatch.setattr(pipeline, "get_session", lambda: session)
     monkeypatch.setattr(pipeline, "broadcast", lambda *a, **kw: None)
-    monkeypatch.setattr(pipeline, "_preload_candidate_whisper_async", lambda *a, **kw: None)
     monkeypatch.setattr(pipeline, "stop_interview_loop", lambda: None)
 
 
@@ -954,12 +987,7 @@ def test_candidate_worker_does_not_crash_on_flushed_segment_in_drain_batch(monke
         (),
         {
             "candidate_asr_enabled": True,
-            "candidate_stt_provider": "whisper",
-            "candidate_remote_stt_enabled": False,
-            "candidate_whisper_model": "base",
-            "candidate_whisper_language": "zh",
-            "candidate_streaming_asr_enabled": False,
-            "candidate_streaming_asr_interval_ms": 1500,
+            "candidate_stt_provider": "doubao",
             "silence_threshold": 0.01,
             "silence_duration": 1.2,
             "position": "",
@@ -973,7 +1001,7 @@ def test_candidate_worker_does_not_crash_on_flushed_segment_in_drain_batch(monke
 
     monkeypatch.setattr(
         pipeline,
-        "transcribe_with_fallback",
+        "transcribe_segment",
         lambda *_a, **_k: "候选人完整回答",
     )
     monkeypatch.setattr(
@@ -1036,3 +1064,288 @@ def test_interview_worker_detects_capture_stopped_and_exits(monkeypatch):
     )
     # audio.stop 在 finally 里仍应被调用
     assert "assist" in audio.stop_calls
+
+
+def test_unexpected_capture_stop_clears_recording_stops_candidate_and_finalizes_review(monkeypatch):
+    audio = _RecordingAudioCapture()
+    candidate_audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    _wire_common_fakes(monkeypatch, audio, session)
+    monkeypatch.setattr(pipeline, "_candidate_audio_capture", candidate_audio)
+    monkeypatch.setattr(pipeline, "_wait_for_answer_work_idle", lambda _timeout: True)
+    monkeypatch.setattr(pipeline, "cancel_answer_work", lambda **_kwargs: None)
+
+    broadcast_log: list[dict] = []
+    review_stopped: list[object] = []
+    candidate_exited = threading.Event()
+    monkeypatch.setattr(pipeline, "broadcast", broadcast_log.append)
+    monkeypatch.setattr(pipeline.review_integration, "on_assist_stop", review_stopped.append)
+
+    def _fake_candidate_worker():
+        while not pipeline._stop_event.is_set():
+            time.sleep(0.01)
+        candidate_exited.set()
+
+    cand_thread = threading.Thread(target=_fake_candidate_worker, daemon=True)
+    cand_thread.start()
+    pipeline._candidate_thread = cand_thread
+
+    iter_count = {"n": 0}
+
+    def _chunk_provider():
+        iter_count["n"] += 1
+        if iter_count["n"] > 1:
+            audio._is_running = False
+        return None
+
+    audio._chunk_provider = _chunk_provider
+
+    worker = threading.Thread(target=pipeline._interview_worker, daemon=True)
+    worker.start()
+    worker.join(timeout=3.0)
+
+    assert not worker.is_alive()
+    assert candidate_exited.wait(timeout=2.0)
+    assert session.is_recording is False
+    assert session.is_paused is False
+    assert review_stopped == [session]
+    assert "assist-candidate" in candidate_audio.stop_calls
+    assert any(msg.get("type") == "recording" and msg.get("value") is False for msg in broadcast_log)
+    assert any(msg.get("type") == "error" and "音频采集异常中断" in msg.get("message", "") for msg in broadcast_log)
+
+
+def test_stop_interview_loop_stops_runtime_flush_thread_and_uses_single_drain_deadline(monkeypatch):
+    audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    _wire_common_fakes(monkeypatch, audio, session)
+    monkeypatch.setattr(pipeline, "_wait_for_answer_work_idle", lambda _timeout: True)
+    monkeypatch.setattr(pipeline, "cancel_answer_work", lambda **_kwargs: None)
+    monkeypatch.setattr(pipeline.review_integration, "on_assist_stop", lambda _s: None)
+    monkeypatch.setattr(pipeline.gc, "collect", lambda: 0)
+    drain_calls: list[float] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_drain_interviewer_segments",
+        lambda timeout, **_kwargs: drain_calls.append(timeout),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "get_config",
+        lambda: AppConfig(
+            stt_provider="doubao",
+            doubao_stt_api_key="test-asr",
+            assist_stop_answer_wait_sec=0,
+            assist_interviewer_asr_drain_timeout_sec=0.6,
+        ),
+    )
+
+    runtime = pipeline._new_interviewer_runtime()
+    runtime.transcript_epoch = session.transcript_epoch
+    runtime.segment_queue.put(
+        pipeline.InterviewerSegment(np.zeros(1600, dtype=np.float32), 16000, 0.0, 0.1, 0.1, "silence", False)
+    )
+    release_stuck_asr = threading.Event()
+
+    def _stuck_asr():
+        # Block longer than 1x drain_timeout_sec (0.5s) to prove stop_interview_loop does not wait 2x!
+        release_stuck_asr.wait(timeout=3.0)
+
+    flush_thread = threading.Thread(target=pipeline._flush_worker, args=(runtime,), daemon=True)
+    asr_thread = threading.Thread(target=_stuck_asr, daemon=True)
+    runtime.flush_thread = flush_thread
+    runtime.asr_thread = asr_thread
+    flush_thread.start()
+    asr_thread.start()
+    pipeline._set_interviewer_runtime(runtime)
+
+    try:
+        started = time.monotonic()
+        pipeline.stop_interview_loop()
+        elapsed = time.monotonic() - started
+
+        # Flush thread must have been explicitly stopped by stop_interview_loop even with no _interview_thread.
+        assert runtime.flush_stop_event.is_set() is True
+        assert not flush_thread.is_alive()
+        # Live asr_thread must be joined directly rather than adding a second _drain_interviewer_segments wait.
+        assert drain_calls == []
+        # Unified single deadline (0.6s): must NOT double-wait (~1.2s+).
+        assert elapsed < 1.05, f"Expected single drain deadline (~0.6s), took {elapsed:.2f}s"
+    finally:
+        release_stuck_asr.set()
+        asr_thread.join(timeout=1.0)
+
+
+def test_old_worker_finally_only_joins_its_own_runtime_threads_not_new_session(monkeypatch):
+    audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    _wire_common_fakes(monkeypatch, audio, session)
+
+    new_runtime = pipeline._new_interviewer_runtime()
+    new_runtime_flush_alive = threading.Event()
+    new_runtime_flush = threading.Thread(target=pipeline._flush_worker, args=(new_runtime,), daemon=True)
+    new_runtime.flush_thread = new_runtime_flush
+    new_runtime_flush.start()
+    new_runtime_flush_alive.set()
+
+    def _swap_to_new_session():
+        # Simulate a new session taking over globals while old worker is still unwinding.
+        pipeline._set_interviewer_runtime(new_runtime)
+        pipeline._flush_thread = new_runtime_flush
+        pipeline._stop_event.set()
+        return None
+
+    audio._chunk_provider = _swap_to_new_session
+
+    try:
+        pipeline._interview_worker()
+        # New session's flush_stop_event and flush_thread must remain completely untouched!
+        assert not new_runtime.flush_stop_event.is_set()
+        assert new_runtime_flush.is_alive()
+    finally:
+        new_runtime.flush_stop_event.set()
+        new_runtime_flush.join(timeout=1.0)
+
+
+def test_interview_worker_pause_race_does_not_trigger_unexpected_stop(monkeypatch):
+    audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    _wire_common_fakes(monkeypatch, audio, session)
+    broadcast_log: list[dict] = []
+    monkeypatch.setattr(pipeline, "broadcast", broadcast_log.append)
+    review_stopped: list[object] = []
+    monkeypatch.setattr(pipeline.review_integration, "on_assist_stop", review_stopped.append)
+
+    class _PauseRaceEvent:
+        def __init__(self):
+            self.checks = 0
+            self.paused = False
+
+        def is_set(self):
+            self.checks += 1
+            if self.checks == 1:
+                # Simulate pause_interview() running right after the top-of-loop pause check
+                # and stopping audio_capture before `if not audio_capture.is_running:`.
+                self.paused = True
+                audio._is_running = False
+                return False
+            if self.checks >= 4:
+                pipeline._stop_event.set()
+            return self.paused
+
+        def clear(self):
+            self.paused = False
+
+        def set(self):
+            self.paused = True
+
+    monkeypatch.setattr(pipeline, "_pause_event", _PauseRaceEvent())
+    pipeline._interview_worker()
+
+    assert session.is_recording is True
+    assert review_stopped == []
+    assert not any(
+        msg.get("type") == "error" and "音频采集异常中断" in msg.get("message", "")
+        for msg in broadcast_log
+    )
+    assert not any(msg.get("type") == "recording" and msg.get("value") is False for msg in broadcast_log)
+
+
+def test_single_mic_worker_crash_stops_audio_capture_and_retains_thread_until_teardown_done(monkeypatch):
+    from api.assist.single_mic import SingleMicSession
+
+    audio = _RecordingAudioCapture()
+    candidate_audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    single_mic = SingleMicSession("sm-crash", device_id=3)
+    session.single_mic = single_mic
+    _wire_common_fakes(monkeypatch, audio, session)
+    monkeypatch.setattr(pipeline, "_candidate_audio_capture", candidate_audio)
+    monkeypatch.setattr(pipeline, "broadcast", lambda _msg: None)
+    monkeypatch.setattr(pipeline.review_integration, "on_assist_stop", lambda _s: None)
+    monkeypatch.setattr(
+        pipeline,
+        "get_config",
+        lambda: AppConfig(stt_provider="doubao", doubao_stt_api_key="test-asr", assist_stop_answer_wait_sec=1.0),
+    )
+
+    thread_ref_during_wait: list[object] = []
+
+    def observe_wait(_timeout: float) -> bool:
+        thread_ref_during_wait.append(pipeline._interview_thread)
+        return True
+
+    monkeypatch.setattr(pipeline, "_wait_for_answer_work_idle", observe_wait)
+    monkeypatch.setattr(
+        single_mic.interviewer_input,
+        "drain_audio_chunks",
+        lambda **_kw: (_ for _ in ()).throw(RuntimeError("decoder fault")),
+    )
+
+    worker = threading.Thread(
+        target=pipeline._interview_worker,
+        kwargs={"single_mic": single_mic},
+        daemon=True,
+    )
+    pipeline._interview_thread = worker
+    worker.start()
+    worker.join(timeout=3.0)
+
+    assert not worker.is_alive()
+    assert "assist" in audio.stop_calls
+    assert session.is_recording is False
+    assert session.single_mic is None
+    # _interview_thread must remain set through teardown so concurrent stop_interview_loop joins it.
+    assert thread_ref_during_wait == [worker]
+    assert pipeline._interview_thread is None
+
+
+def test_stop_interview_loop_releases_already_queued_late_constraint_grace(monkeypatch):
+    from core.config import ModelConfig
+
+    audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    _wire_common_fakes(monkeypatch, audio, session)
+    monkeypatch.setattr(pipeline.review_integration, "on_assist_stop", lambda _s: None)
+    cfg = AppConfig(
+        stt_provider="doubao",
+        doubao_stt_api_key="test-asr",
+        assist_stop_answer_wait_sec=0,
+        models=[ModelConfig(id="m1", name="M1", api_key="sk-test", enabled=True)],
+        assist_model_ids=["m1"],
+    )
+    monkeypatch.setattr(pipeline, "get_config", lambda: cfg)
+    monkeypatch.setattr(pipeline, "get_model_health", lambda _idx: "ok")
+    dispatched: list[float] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_try_dispatch",
+        lambda: dispatched.extend(
+            float(task[4].get("dispatch_after_mono", -1.0))
+            for task, _seq, _tv in pipeline._pending
+        ),
+    )
+
+    pipeline.cancel_answer_work(reset_session_data=False)
+    future_grace = time.monotonic() + 1.2
+    with pipeline._dispatch_lock:
+        pipeline._pending.append(
+            (
+                (
+                    "已入队问题？",
+                    None,
+                    False,
+                    "conversation_loopback",
+                    {
+                        "origin": "asr",
+                        "asr_turn_id": 1,
+                        "dispatch_after_mono": future_grace,
+                        "asr_tail_grace_until_mono": future_grace,
+                    },
+                ),
+                0,
+                pipeline._task_session_version,
+            )
+        )
+
+    pipeline.stop_interview_loop()
+    assert dispatched == [0.0]

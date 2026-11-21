@@ -9,8 +9,9 @@ import {
   MapPin,
   Trash2,
 } from 'lucide-react'
-import type { Application, ApplicationReviewSummary, Offer, Stage, TodoItem } from './types'
+import type { Application, ApplicationReviewSummary, Offer, TodoItem } from './types'
 import { filterApplicationsBySearch } from './search'
+import { todosFromText, withMaterializedTodoIds } from './todoDraft'
 import {
   getStageOrderIndex,
   isRejectedStage,
@@ -43,7 +44,7 @@ type Props = {
   applications: Application[]
   offerByAppId: Map<number, Offer>
   onPatch: (id: number, patch: Partial<Application>) => void | Promise<boolean>
-  onDelete: (id: number) => void
+  onDelete: (id: number) => void | Promise<boolean | void>
   onOpenOffer: (app: Application) => void
   onOpenReviews: (app: Application) => void
   search: string
@@ -61,6 +62,26 @@ type Props = {
 
 const CORE_PATCH_KEYS = ['company', 'position', 'city', 'stage', 'applied_at', 'next_followup_at'] as const
 const EXTRA_PATCH_KEYS = ['notes', 'todos'] as const
+const PATCH_KEY_TO_DRAFT_KEY: Partial<Record<keyof Application, keyof EditorDraft>> = {
+  company: 'company',
+  position: 'position',
+  city: 'city',
+  stage: 'stage',
+  applied_at: 'appliedAtInput',
+  next_followup_at: 'nextFollowupInput',
+  notes: 'notes',
+  todos: 'todoText',
+}
+const DRAFT_KEYS: readonly (keyof EditorDraft)[] = [
+  'company',
+  'position',
+  'city',
+  'stage',
+  'appliedAtInput',
+  'nextFollowupInput',
+  'notes',
+  'todoText',
+]
 
 function toDateInput(unix: number | null): string {
   return unix != null ? dayjs.unix(Math.floor(unix)).format('YYYY-MM-DD') : ''
@@ -81,24 +102,6 @@ function createDraft(app: Application): EditorDraft {
     notes: app.notes,
     todoText: app.todos.map((todo) => todo.title).join('\n'),
   }
-}
-
-function todosFromText(text: string, currentTodos: TodoItem[]): TodoItem[] {
-  const lines = text
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-  const existingByTitle = new Map(currentTodos.map((todo) => [todo.title, todo]))
-  return lines.map((title, index) => {
-    const indexed = currentTodos[index]
-    const matched = indexed?.title === title ? indexed : existingByTitle.get(title)
-    return {
-      id: matched?.id ?? crypto.randomUUID(),
-      title,
-      done: matched?.done ?? false,
-      due: matched?.due,
-    }
-  })
 }
 
 function serializeTodos(todos: TodoItem[]): string {
@@ -284,7 +287,6 @@ export default function ApplicationsTable({
   onConsumeDetailIntent,
   hiddenApplicationsCount = 0,
   hiddenApplicationsPreview = [],
-  focusFilterLabel = '当前筛选',
   onShowAll,
 }: Props) {
   const colorScheme = useUiPrefsStore((s) => s.colorScheme)
@@ -304,21 +306,82 @@ export default function ApplicationsTable({
   const [saveNotice, setSaveNotice] = useState<SaveNotice | null>(null)
   const [editCoreOpen, setEditCoreOpen] = useState(false)
   const [extrasOpen, setExtrasOpen] = useState(false)
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const [deletingId, setDeletingId] = useState<number | null>(null)
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false)
   const [pendingDetailFocusId, setPendingDetailFocusId] = useState<number | null>(null)
   const detailRef = useRef<HTMLElement | null>(null)
   const savingRef = useRef(false)
+  const deletingRef = useRef(false)
+  const prevAppRef = useRef<Application | null>(null)
+  const draftRef = useRef<EditorDraft | null>(null)
+  draftRef.current = draft
+  const submittedFieldsRef = useRef<{
+    appId: number
+    fields: Partial<Record<keyof EditorDraft, { value: string; committed: boolean }>>
+  } | null>(null)
   const patch = useMemo(
     () => (current && draft ? buildPatch(current, draft) : {}),
     [current, draft],
   )
 
   useEffect(() => {
-    setDraft(current ? createDraft(current) : null)
-    setSaveNotice(null)
-    setEditCoreOpen(false)
-    setExtrasOpen(false)
-  }, [current?.id, current?.updated_at])
+    const prevApp = prevAppRef.current
+    prevAppRef.current = current
+    if (!current) {
+      submittedFieldsRef.current = null
+      setDraft(null)
+      setSaveNotice(null)
+      setEditCoreOpen(false)
+      setExtrasOpen(false)
+      setConfirmDeleteId(null)
+      return
+    }
+    if (!prevApp || prevApp.id !== current.id) {
+      submittedFieldsRef.current = null
+      setDraft(createDraft(current))
+      setSaveNotice(null)
+      setEditCoreOpen(false)
+      setExtrasOpen(false)
+      setConfirmDeleteId(null)
+      return
+    }
+    const prevBase = createDraft(prevApp)
+    const nextBase = createDraft(current)
+    const tracked =
+      submittedFieldsRef.current?.appId === current.id
+        ? { ...submittedFieldsRef.current.fields }
+        : null
+    if (tracked && submittedFieldsRef.current?.appId === current.id) {
+      const latestDraft = draftRef.current
+      for (const key of DRAFT_KEYS) {
+        const entry = tracked[key]
+        if (!entry) continue
+        const serverChangedField = nextBase[key] !== prevBase[key]
+        const matchesSubmitted = latestDraft != null && latestDraft[key] === entry.value
+        if ((matchesSubmitted && (serverChangedField || entry.committed)) || (!matchesSubmitted && entry.committed)) {
+          delete submittedFieldsRef.current.fields[key]
+        }
+      }
+    }
+    setDraft((prevDraft) => {
+      if (!prevDraft) return nextBase
+      const merged: EditorDraft = { ...prevDraft }
+      for (const key of DRAFT_KEYS) {
+        const wasUntouched = prevDraft[key] === prevBase[key]
+        const entry = tracked?.[key]
+        const serverChangedField = nextBase[key] !== prevBase[key]
+        const wasSubmittedAndLanded =
+          entry != null &&
+          prevDraft[key] === entry.value &&
+          (serverChangedField || entry.committed)
+        if (wasUntouched || wasSubmittedAndLanded) {
+          merged[key] = nextBase[key]
+        }
+      }
+      return merged
+    })
+  }, [current])
 
   useEffect(() => {
     if (!compactDetailLayout) {
@@ -393,26 +456,81 @@ export default function ApplicationsTable({
       })
       return
     }
+    const saveAppId = current.id
+    const submittedEntries: Partial<Record<keyof EditorDraft, { value: string; committed: boolean }>> = {}
+    for (const key of Object.keys(scopedPatch) as Array<keyof Application>) {
+      const draftKey = PATCH_KEY_TO_DRAFT_KEY[key]
+      if (draftKey) {
+        submittedEntries[draftKey] = { value: draft[draftKey], committed: false }
+      }
+    }
+    const existingFields =
+      submittedFieldsRef.current?.appId === saveAppId
+        ? submittedFieldsRef.current.fields
+        : {}
+    submittedFieldsRef.current = {
+      appId: saveAppId,
+      fields: { ...existingFields, ...submittedEntries },
+    }
+    const clearFailedEntries = () => {
+      if (submittedFieldsRef.current?.appId !== saveAppId) return
+      for (const [k, entry] of Object.entries(submittedEntries) as Array<
+        [keyof EditorDraft, { value: string; committed: boolean }]
+      >) {
+        if (submittedFieldsRef.current.fields[k] === entry) {
+          delete submittedFieldsRef.current.fields[k]
+        }
+      }
+    }
     savingRef.current = true
     setSaving(true)
     try {
-      const result = await Promise.resolve(onPatch(current.id, scopedPatch))
+      const result = await Promise.resolve(onPatch(saveAppId, withMaterializedTodoIds(scopedPatch)))
       if (result !== false) {
+        if (submittedFieldsRef.current?.appId === saveAppId) {
+          for (const [k, entry] of Object.entries(submittedEntries) as Array<
+            [keyof EditorDraft, { value: string; committed: boolean }]
+          >) {
+            if (submittedFieldsRef.current.fields[k] === entry) {
+              submittedFieldsRef.current.fields[k] = { ...entry, committed: true }
+            }
+          }
+        }
         setSaveNotice({
           message: scope === 'core' ? '已保存核心信息' : scope === 'extras' ? '已保存补充信息' : '已保存',
           tone: 'info',
         })
         if (scope === 'core' || scope === 'all') setEditCoreOpen(false)
       } else {
+        clearFailedEntries()
         setSaveNotice({ message: '保存失败，请重试', tone: 'error' })
       }
     } catch (error) {
+      clearFailedEntries()
       setSaveNotice({ message: getSaveErrorMessage(error), tone: 'error' })
     } finally {
       savingRef.current = false
       setSaving(false)
     }
   }, [current, draft, onPatch, patch])
+
+  const handleConfirmDelete = useCallback(async () => {
+    if (!current || deletingRef.current) return
+    const targetId = current.id
+    deletingRef.current = true
+    setDeletingId(targetId)
+    try {
+      const result = await Promise.resolve(onDelete(targetId))
+      if (result !== false) {
+        setConfirmDeleteId(null)
+      }
+    } catch (error) {
+      setSaveNotice({ message: getSaveErrorMessage(error), tone: 'error' })
+    } finally {
+      deletingRef.current = false
+      setDeletingId(null)
+    }
+  }, [current, onDelete])
 
   const handleSelect = useCallback((id: number, focusDetail = false) => {
     if (focusDetail && compactDetailLayout) {
@@ -629,7 +747,10 @@ export default function ApplicationsTable({
   const quickProgressDirty = current != null && draft != null
     ? draft.stage !== current.stage || draft.nextFollowupInput !== toDateInput(current.next_followup_at)
     : false
-  const quickProgressTitle = currentIsTerminal ? '改结果' : '更新进度'
+  const draftIsTerminal = draft ? isTerminalStage(draft.stage) : currentIsTerminal
+  const quickProgressTitle = draftIsTerminal ? '改结果' : '更新进度'
+  const isDeletingCurrent = current != null && deletingId === current.id
+  const isConfirmingDelete = current != null && confirmDeleteId === current.id
   const headerQuickProgressShellClass = isLight
     ? 'border-bg-hover bg-bg-secondary/25'
     : 'border-white/[0.08] bg-black/12'
@@ -971,7 +1092,7 @@ export default function ApplicationsTable({
                     </button>
                   </div>
                 </div>
-                <div className={`mt-2.5 grid gap-2.5 ${currentIsTerminal ? 'md:grid-cols-1' : 'md:grid-cols-2'}`}>
+                <div className={`mt-2.5 grid gap-2.5 ${draftIsTerminal ? 'md:grid-cols-1' : 'md:grid-cols-2'}`}>
                   <label className="flex flex-col gap-1.5 text-xs text-text-secondary">
                     当前阶段
                     <select
@@ -995,7 +1116,7 @@ export default function ApplicationsTable({
                       </optgroup>
                     </select>
                   </label>
-                  {!currentIsTerminal ? (
+                  {!draftIsTerminal ? (
                     <label className="flex flex-col gap-1.5 text-xs text-text-secondary">
                       下次跟进
                       <input
@@ -1199,7 +1320,12 @@ export default function ApplicationsTable({
                 <section className="border-t border-bg-hover/80 pt-1">
                   <button
                     type="button"
-                    onClick={() => setExtrasOpen((prev) => !prev)}
+                    onClick={() =>
+                      setExtrasOpen((prev) => {
+                        if (prev) setConfirmDeleteId(null)
+                        return !prev
+                      })
+                    }
                     className="flex w-full items-center justify-between gap-3 py-2 text-left"
                   >
                     <div className="min-w-0">
@@ -1319,16 +1445,40 @@ export default function ApplicationsTable({
                             <p className="text-[11px] leading-relaxed text-text-secondary">
                               会删除关联数据。
                             </p>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (confirm(`删除「${current.company}」这条记录？`)) onDelete(current.id)
-                              }}
-                              className="inline-flex items-center justify-center gap-1.5 rounded-md border border-red-500/20 px-3 py-2 text-xs font-medium text-red-400 transition-colors hover:bg-red-500/10"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                              删除这条记录
-                            </button>
+                            {isConfirmingDelete ? (
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="text-[11px] font-medium text-red-400">
+                                  确认删除「{current.company || '未命名公司'}」？
+                                </span>
+                                <button
+                                  type="button"
+                                  disabled={isDeletingCurrent}
+                                  onClick={() => setConfirmDeleteId(null)}
+                                  className="rounded-md border border-bg-hover bg-bg-secondary px-2.5 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:text-text-primary disabled:opacity-50"
+                                >
+                                  取消
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isDeletingCurrent}
+                                  onClick={() => void handleConfirmDelete()}
+                                  className="inline-flex items-center justify-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/15 px-3 py-1.5 text-xs font-semibold text-red-400 transition-colors hover:bg-red-500/25 disabled:opacity-50"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                  {isDeletingCurrent ? '删除中...' : '确认删除'}
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                disabled={isDeletingCurrent}
+                                onClick={() => setConfirmDeleteId(current.id)}
+                                className="inline-flex items-center justify-center gap-1.5 rounded-md border border-red-500/20 px-3 py-2 text-xs font-medium text-red-400 transition-colors hover:bg-red-500/10 disabled:opacity-50"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                                删除这条记录
+                              </button>
+                            )}
                           </div>
                         </div>
                       </details>
@@ -1371,45 +1521,6 @@ function DesktopSignalChip({
       {actionLabel ? (
         <span className="font-medium text-accent-blue">{actionLabel}</span>
       ) : null}
-    </div>
-  )
-}
-
-function DesktopSignalLine({
-  label,
-  value,
-  hint,
-  tone,
-  className,
-  actionLabel,
-}: {
-  label: string
-  value: string
-  hint: string
-  tone: string
-  className: string
-  actionLabel?: string | null
-}) {
-  return (
-    <div className={`rounded-md border px-3 py-2.5 ${className}`}>
-      <div className="flex items-start gap-3">
-        <div className="w-11 shrink-0 pt-0.5 text-[11px] font-medium text-text-muted">
-          {label}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-start justify-between gap-3">
-            <div className={`min-w-0 text-[14px] font-semibold ${tone}`}>
-              {value}
-            </div>
-            {actionLabel ? (
-              <div className="shrink-0 text-[11px] font-medium text-accent-blue">{actionLabel}</div>
-            ) : null}
-          </div>
-          <div className="mt-0.5 line-clamp-1 text-[11px] leading-relaxed text-text-muted">
-            {hint}
-          </div>
-        </div>
-      </div>
     </div>
   )
 }

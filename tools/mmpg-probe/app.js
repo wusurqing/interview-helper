@@ -62,6 +62,13 @@ function publicError(error) {
   return `启动失败${code ? `（${code}）` : ''}。请检查 RTC Token、房间与用户是否匹配，以及浏览器网络。`;
 }
 
+function normalizeSilenceMs(rawValue) {
+  const text = String(rawValue ?? '').trim();
+  const parsed = text === '' ? 800 : Number(text);
+  const clamped = Math.min(2999, Math.max(500, Number.isFinite(parsed) ? parsed : 800));
+  return Math.round(clamped);
+}
+
 function fail(message) {
   return Object.assign(new Error(message), { probeMessage: message });
 }
@@ -259,9 +266,11 @@ async function startRun() {
     await engine.publishStream(MediaType.AUDIO);
     ensureActive(run);
     timeline('RTC 音频已发布', '开始创建 MMPG 会话');
+    const silenceMs = normalizeSilenceMs(el['silence-ms'].value);
+    el['silence-ms'].value = el['silence-range'].value = String(silenceMs);
     send(run, { type: 'start', options: {
       aivad: el.aivad.checked,
-      silence_ms: Number(el['silence-ms'].value),
+      silence_ms: silenceMs,
       twopass: el.twopass.checked,
     } });
     status('RTC 已发布 · 等待 MMPG', 'busy');

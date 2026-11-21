@@ -1,32 +1,19 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 import sys
 
 import numpy as np
+import pytest
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from services.stt.engines import GenericHTTPSTT
+from core.config import AppConfig
+from services.stt.engines import GenericHTTPSTT, STTError
 from services.stt import factory as stt_factory
-
-
-def _patch_broadcast(monkeypatch, calls: list[dict]):
-    import sys as _sys
-    import types as _types
-
-    real_mod = _sys.modules.get("api.realtime.ws")
-    if real_mod is not None and hasattr(real_mod, "broadcast"):
-        # 真模块已加载：只替换 broadcast 属性，teardown 由 monkeypatch 还原
-        monkeypatch.setattr(real_mod, "broadcast", lambda data: calls.append(data))
-        return
-    # 没有真模块：造桩并经 monkeypatch.setitem 管理，测试结束自动从
-    # sys.modules 移除——否则桩残留会弄坏后续 chat_stream 的延迟导入。
-    stub = _types.ModuleType("api.realtime.ws")
-    stub.broadcast = lambda data: calls.append(data)  # type: ignore[attr-defined]
-    monkeypatch.setitem(_sys.modules, "api.realtime.ws", stub)
 
 
 def test_generic_http_stt_posts_openai_compatible_multipart(monkeypatch):
@@ -85,648 +72,150 @@ def test_generic_http_stt_extracts_nested_result_text(monkeypatch):
     assert engine.transcribe(np.zeros(100, dtype=np.float32), sample_rate=16000) == "你好。"
 
 
-def test_transcribe_with_fallback_treats_empty_remote_text_as_failure(monkeypatch):
-    import core.config as core_config
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"stt_provider": "generic", "whisper_model": "base", "whisper_language": "auto"})(),
+def configured_generic():
+    return AppConfig(
+        stt_provider="generic", generic_stt_api_base_url="https://asr.example/v1",
+        generic_stt_api_key="test-key", generic_stt_model="test-model",
     )
 
-    class _RemoteEngine:
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            return ""
-
-    calls = {"broadcast": [], "fallback": 0, "circuit_failure": 0}
-
-    monkeypatch.setattr(stt_factory, "get_stt_engine", lambda model_size=None, language=None: _RemoteEngine())
-    monkeypatch.setattr(stt_factory, "_is_circuit_open", lambda: False)
-    monkeypatch.setattr(stt_factory, "_circuit_record_failure", lambda is_timeout=False, is_auth=False: calls.__setitem__("circuit_failure", calls["circuit_failure"] + 1))
-    monkeypatch.setattr(stt_factory, "_circuit_reset", lambda: None)
-    monkeypatch.setattr(stt_factory, "_whisper_transcribe", lambda audio, sample_rate, position, language: calls.__setitem__("fallback", calls["fallback"] + 1) or "fallback text")
-    monkeypatch.setattr(stt_factory, "_is_whisper_preloaded", lambda: True)
-    monkeypatch.setattr(stt_factory, "_is_whisper_engine_loaded", lambda *_args, **_kwargs: True)
-
-    _patch_broadcast(monkeypatch, calls["broadcast"])
-
-    text = stt_factory.transcribe_with_fallback(np.zeros(16000 * 8, dtype=np.float32), 16000)
-
-    assert text == "fallback text"
-    assert calls["fallback"] == 1
-    # 空文本（多为静音/语气词段）不算服务故障，不再计入熔断
-    assert calls["circuit_failure"] == 0
-    assert any(e.get("type") == "stt_fallback" for e in calls["broadcast"])
-
-
-def test_candidate_remote_fallback_uses_candidate_event_scope(monkeypatch):
-    import core.config as core_config
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"stt_provider": "generic", "whisper_model": "base", "whisper_language": "auto"})(),
-    )
-
-    class _RemoteEngine:
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            return ""
-
-    calls = {"broadcast": [], "fallback": 0}
-
-    monkeypatch.setattr(stt_factory, "get_stt_engine", lambda model_size=None, language=None: _RemoteEngine())
-    monkeypatch.setattr(stt_factory, "_is_circuit_open", lambda: False)
-    monkeypatch.setattr(stt_factory, "_circuit_record_failure", lambda is_timeout=False, is_auth=False: None)
-    monkeypatch.setattr(stt_factory, "_circuit_reset", lambda: None)
-    monkeypatch.setattr(stt_factory, "_whisper_transcribe", lambda audio, sample_rate, position, language: calls.__setitem__("fallback", calls["fallback"] + 1) or "fallback text")
-    monkeypatch.setattr(stt_factory, "_is_whisper_preloaded", lambda: True)
-    monkeypatch.setattr(stt_factory, "_is_whisper_engine_loaded", lambda *_args, **_kwargs: True)
-
-    _patch_broadcast(monkeypatch, calls["broadcast"])
-
-    text = stt_factory.transcribe_with_fallback(
-        np.zeros(16000 * 8, dtype=np.float32),
-        16000,
-        provider="generic",
-        status_event_type="candidate_asr_status",
-        scope="candidate",
-    )
-
-    assert text == "fallback text"
-    assert any(e.get("type") == "candidate_stt_fallback" and e.get("scope") == "candidate" for e in calls["broadcast"])
-    assert not any(e.get("type") == "stt_fallback" for e in calls["broadcast"])
-
-
-def test_transcribe_with_fallback_reports_remote_provider_after_success(monkeypatch):
-    import core.config as core_config
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"stt_provider": "generic", "whisper_model": "base", "whisper_language": "auto"})(),
-    )
-
-    class _RemoteEngine:
-        @property
-        def is_loaded(self):
-            return True
-
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            return "remote text"
-
-    broadcasts: list[dict] = []
-    monkeypatch.setattr(stt_factory, "get_stt_engine", lambda model_size=None, language=None: _RemoteEngine())
-    monkeypatch.setattr(stt_factory, "_is_circuit_open", lambda: False)
-    monkeypatch.setattr(stt_factory, "_circuit_reset", lambda: None)
-    _patch_broadcast(monkeypatch, broadcasts)
-
-    text = stt_factory.transcribe_with_fallback(np.zeros(16000 * 8, dtype=np.float32), 16000)
-
-    assert text == "remote text"
-    assert any(e.get("type") == "stt_status" and e.get("provider") == "generic" and e.get("loaded") is True for e in broadcasts)
-
-
-def test_transcribe_with_fallback_suppresses_short_empty_remote_audio(monkeypatch):
-    import core.config as core_config
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"stt_provider": "generic", "whisper_model": "base", "whisper_language": "auto"})(),
-    )
-
-    class _RemoteEngine:
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            return ""
-
-    calls = {"fallback": 0, "circuit_failure": 0}
-    monkeypatch.setattr(stt_factory, "get_stt_engine", lambda model_size=None, language=None: _RemoteEngine())
-    monkeypatch.setattr(stt_factory, "_is_circuit_open", lambda: False)
-    monkeypatch.setattr(stt_factory, "_circuit_record_failure", lambda is_timeout=False, is_auth=False: calls.__setitem__("circuit_failure", calls["circuit_failure"] + 1))
-    monkeypatch.setattr(stt_factory, "_circuit_reset", lambda: None)
-    monkeypatch.setattr(stt_factory, "_whisper_transcribe", lambda audio, sample_rate, position, language: calls.__setitem__("fallback", calls["fallback"] + 1) or "fallback text")
-    monkeypatch.setattr(stt_factory, "_is_whisper_preloaded", lambda: True)
-    _patch_broadcast(monkeypatch, [])
-
-    text = stt_factory.transcribe_with_fallback(np.zeros(16000 * 2, dtype=np.float32), 16000)
-
-    assert text == ""
-    assert calls["fallback"] == 0
-    assert calls["circuit_failure"] == 0
-
-
-def test_transcribe_with_fallback_can_force_fallback_on_short_empty_remote_audio(monkeypatch):
-    import core.config as core_config
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"stt_provider": "generic", "whisper_model": "base", "whisper_language": "auto"})(),
-    )
-
-    class _RemoteEngine:
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            return ""
-
-    calls = {"fallback": 0, "circuit_failure": 0}
-    monkeypatch.setattr(stt_factory, "get_stt_engine", lambda model_size=None, language=None, provider=None: _RemoteEngine())
-    monkeypatch.setattr(stt_factory, "_is_circuit_open", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(
-        stt_factory,
-        "_call_circuit_record_failure",
-        lambda *_args, **_kwargs: calls.__setitem__("circuit_failure", calls["circuit_failure"] + 1),
-    )
-    monkeypatch.setattr(stt_factory, "_circuit_reset", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        stt_factory,
-        "_call_whisper_transcribe",
-        lambda *args, **kwargs: calls.__setitem__("fallback", calls["fallback"] + 1) or "fallback text",
-    )
-    monkeypatch.setattr(stt_factory, "_is_whisper_engine_loaded", lambda *_args, **_kwargs: True)
-    _patch_broadcast(monkeypatch, [])
-
-    text = stt_factory.transcribe_with_fallback(
-        np.zeros(16000 * 2, dtype=np.float32),
-        16000,
-        provider="generic",
-        scope="interviewer",
-        fallback_on_empty_remote=True,
-    )
-
-    assert text == "fallback text"
-    assert calls["fallback"] == 1
-    # 空文本（多为静音/语气词段）不算服务故障，不再计入熔断
-    assert calls["circuit_failure"] == 0
-
-
-def test_transcribe_with_fallback_retries_empty_interviewer_remote_with_tail_pad(monkeypatch):
-    import core.config as core_config
-
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"stt_provider": "generic", "whisper_model": "base", "whisper_language": "auto"})(),
-    )
-
-    calls = {"audio_lengths": [], "fallback": 0}
-
-    class _RemoteEngine:
-        @property
-        def is_loaded(self):
-            return True
-
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            calls["audio_lengths"].append(len(audio))
-            return "" if len(calls["audio_lengths"]) == 1 else "retry text"
-
-    monkeypatch.setattr(stt_factory, "get_stt_engine", lambda provider=None, model_size=None, language=None: _RemoteEngine())
-    monkeypatch.setattr(stt_factory, "_call_circuit_open", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(stt_factory, "_call_circuit_reset", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(stt_factory, "_call_circuit_record_failure", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        stt_factory,
-        "_call_whisper_transcribe",
-        lambda *args, **kwargs: calls.__setitem__("fallback", calls["fallback"] + 1) or "fallback text",
-    )
-    monkeypatch.setattr(stt_factory, "_is_whisper_engine_loaded", lambda *_args, **_kwargs: True)
-    _patch_broadcast(monkeypatch, [])
-
-    text = stt_factory.transcribe_with_fallback(
-        np.zeros(16000 * 2, dtype=np.float32),
-        16000,
-        provider="generic",
-        scope="interviewer",
-        fallback_on_empty_remote=True,
-    )
-
-    assert text == "retry text"
-    assert calls["fallback"] == 0
-    assert calls["audio_lengths"] == [32000, 32000 + int(16000 * (stt_factory.REMOTE_EMPTY_RETRY_PAD_MS / 1000.0))]
-
-
-def test_transcribe_with_fallback_does_not_tail_pad_retry_candidate_empty_remote(monkeypatch):
-    import core.config as core_config
-
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"stt_provider": "generic", "whisper_model": "base", "whisper_language": "auto"})(),
-    )
-
-    calls = {"audio_lengths": [], "fallback": 0, "circuit_failure": 0}
-
-    class _RemoteEngine:
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            calls["audio_lengths"].append(len(audio))
-            return ""
-
-    monkeypatch.setattr(stt_factory, "get_stt_engine", lambda provider=None, model_size=None, language=None: _RemoteEngine())
-    monkeypatch.setattr(stt_factory, "_call_circuit_open", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(stt_factory, "_call_circuit_reset", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        stt_factory,
-        "_call_circuit_record_failure",
-        lambda *_args, **_kwargs: calls.__setitem__("circuit_failure", calls["circuit_failure"] + 1),
-    )
-    monkeypatch.setattr(
-        stt_factory,
-        "_call_whisper_transcribe",
-        lambda *args, **kwargs: calls.__setitem__("fallback", calls["fallback"] + 1) or "fallback text",
-    )
-    monkeypatch.setattr(stt_factory, "_is_whisper_engine_loaded", lambda *_args, **_kwargs: True)
-    _patch_broadcast(monkeypatch, [])
-
-    text = stt_factory.transcribe_with_fallback(
-        np.zeros(16000 * 2, dtype=np.float32),
-        16000,
-        provider="generic",
-        scope="candidate",
-        fallback_on_empty_remote=True,
-    )
-
-    assert text == "fallback text"
-    assert calls["audio_lengths"] == [32000]
-    assert calls["fallback"] == 1
-    # 空文本不计熔断
-    assert calls["circuit_failure"] == 0
-
-
-def test_transcribe_with_fallback_retries_remote_once_before_fallback(monkeypatch):
-    import core.config as core_config
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"stt_provider": "doubao", "whisper_model": "base", "whisper_language": "auto"})(),
-    )
-
-    calls = {"remote": 0, "fallback": 0, "sleep": []}
-
-    class _RemoteEngine:
-        @property
-        def is_loaded(self):
-            return True
-
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            calls["remote"] += 1
-            raise ConnectionError("connection reset")
-
-    monkeypatch.setattr(stt_factory, "get_stt_engine", lambda provider=None, model_size=None, language=None: _RemoteEngine())
-    monkeypatch.setattr(stt_factory, "_is_circuit_open", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(stt_factory, "_circuit_reset", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(stt_factory, "_call_circuit_record_failure", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        stt_factory,
-        "_call_whisper_transcribe",
-        lambda *args, **kwargs: calls.__setitem__("fallback", calls["fallback"] + 1) or "fallback text",
-    )
-    monkeypatch.setattr(stt_factory, "_is_whisper_engine_loaded", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(stt_factory.time, "sleep", lambda seconds: calls["sleep"].append(seconds))
-    _patch_broadcast(monkeypatch, [])
-
-    text = stt_factory.transcribe_with_fallback(np.zeros(16000 * 8, dtype=np.float32), 16000, provider="doubao")
-
-    assert text == "fallback text"
-    assert calls["remote"] == 2
-    assert calls["fallback"] == 1
-    assert calls["sleep"] == [0.3]
-
-
-def test_transcribe_with_fallback_loads_unready_whisper_before_returning(monkeypatch):
-    import core.config as core_config
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"stt_provider": "generic", "whisper_model": "base", "whisper_language": "auto"})(),
-    )
-
-    class _RemoteEngine:
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            raise RuntimeError("remote failed")
-
-    calls = {"load": 0, "transcribe": 0, "circuit_failure": 0}
-
-    class _FakeWhisper:
-        def __init__(self, model_size="base", language="auto"):
-            self.model_size = model_size
-            self.language = language
-            self._loaded = False
-
-        @property
-        def is_loaded(self):
-            return self._loaded
-
-        @property
-        def is_loading(self):
-            return False
-
-        def load_model(self):
-            calls["load"] += 1
-            self._loaded = True
-
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            calls["transcribe"] += 1
-            return "whisper text"
-
-    broadcasts: list[dict] = []
-    monkeypatch.setattr(stt_factory, "get_stt_engine", lambda model_size=None, language=None: _RemoteEngine())
-    monkeypatch.setattr(stt_factory, "_is_circuit_open", lambda: False)
-    monkeypatch.setattr(stt_factory, "_circuit_record_failure", lambda is_timeout=False, is_auth=False: calls.__setitem__("circuit_failure", calls["circuit_failure"] + 1))
-    monkeypatch.setattr(stt_factory, "STTEngine", _FakeWhisper)
-    monkeypatch.setattr(stt_factory, "_engine", None)
-    monkeypatch.setattr(stt_factory, "_whisper_preload_done", False)
-    _patch_broadcast(monkeypatch, broadcasts)
-
-    text = stt_factory.transcribe_with_fallback(np.zeros(16000 * 8, dtype=np.float32), 16000)
-
-    assert text == "whisper text"
-    assert calls["load"] == 1
-    assert calls["transcribe"] == 1
-    assert calls["circuit_failure"] == 1
-    assert any(e.get("type") == "stt_status" and e.get("provider") == "whisper" and e.get("loading") is False for e in broadcasts)
-
-
-def test_whisper_fallback_load_does_not_hold_global_engine_lock(monkeypatch):
-    import core.config as core_config
-
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"whisper_model": "base", "whisper_language": "auto"})(),
-    )
-
-    calls = {"load_saw_lock_free": False}
-
-    class _FakeWhisper:
-        def __init__(self, model_size="base", language="auto"):
-            self.model_size = model_size
-            self.language = language
-            self._loaded = False
-
-        @property
-        def is_loaded(self):
-            return self._loaded
-
-        @property
-        def is_loading(self):
-            return False
-
-        def load_model(self):
-            acquired = stt_factory._engine_lock.acquire(blocking=False)
-            if acquired:
-                stt_factory._engine_lock.release()
-                calls["load_saw_lock_free"] = True
-            self._loaded = True
-
-    monkeypatch.setattr(stt_factory, "STTEngine", _FakeWhisper)
-    monkeypatch.setattr(stt_factory, "_engine", None)
-    monkeypatch.setattr(stt_factory, "_whisper_preload_done", False)
-
-    engine = stt_factory._get_whisper_fallback()
-
-    assert engine.is_loaded is True
-    assert calls["load_saw_lock_free"] is True
-
-
-def test_candidate_partial_whisper_skips_when_inference_lock_busy(monkeypatch):
-    import core.config as core_config
-
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"stt_provider": "whisper", "whisper_model": "base", "whisper_language": "auto"})(),
-    )
-
-    calls = {"transcribe": 0}
-
-    class _FakeWhisper:
-        model_size = "base"
-        language = "auto"
-
-        @property
-        def is_loaded(self):
-            return True
-
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            calls["transcribe"] += 1
-            return "should not run"
-
-    monkeypatch.setattr(stt_factory, "_engine", _FakeWhisper())
-    monkeypatch.setattr(stt_factory, "_whisper_engines", {("base", "auto"): stt_factory._engine})
-    _patch_broadcast(monkeypatch, [])
-
-    assert stt_factory._whisper_infer_lock.acquire(blocking=False) is True
-    try:
-        text = stt_factory.transcribe_with_fallback(
-            np.zeros(16000, dtype=np.float32),
-            16000,
-            provider="whisper",
-            scope="candidate",
-            whisper_lock_timeout_sec=0.0,
-            whisper_require_loaded=True,
+
+def test_segment_retries_with_the_same_provider_and_session_configuration(monkeypatch):
+    cfg = configured_generic()
+    events = []
+
+    def transcribe(_audio, _rate, **_context):
+        events.append("attempt")
+        if len(events) == 1:
+            raise TimeoutError("request timed out")
+        return "完整转写。"
+
+    def engine(provider, *, config_snapshot):
+        assert provider == "generic"
+        assert config_snapshot is cfg
+        return SimpleNamespace(transcribe=transcribe)
+
+    monkeypatch.setattr(stt_factory, "get_stt_engine", engine)
+    monkeypatch.setattr(stt_factory, "get_config", lambda: pytest.fail("Must use session snapshot"))
+    assert stt_factory.transcribe_segment(np.zeros(16000), 16000, config_snapshot=cfg) == "完整转写。"
+    assert events == ["attempt", "attempt"]
+
+
+def test_auth_failure_does_not_retry_or_expose_provider_response(monkeypatch):
+    cfg = configured_generic()
+    attempts = []
+
+    def post(*_args, **_kwargs):
+        attempts.append("request")
+        return SimpleNamespace(status_code=401, text="a private diagnostic")
+
+    monkeypatch.setattr("services.stt.engines.requests.post", post)
+    with pytest.raises(STTError, match="HTTP 401") as exc:
+        stt_factory.transcribe_segment(np.zeros(16000), 16000, config_snapshot=cfg)
+    assert "private" not in str(exc.value)
+    assert attempts == ["request"]
+
+
+def test_failed_session_does_not_retry_after_losing_capture_ownership(monkeypatch):
+    cfg = configured_generic()
+    active = True
+    attempts = []
+
+    def transcribe(*_args, **_kwargs):
+        nonlocal active
+        attempts.append("request")
+        active = False
+        raise ConnectionError("interrupted")
+
+    monkeypatch.setattr(stt_factory, "get_stt_engine", lambda *_args, **_options: SimpleNamespace(transcribe=transcribe))
+    assert stt_factory.transcribe_segment(
+        np.zeros(16000), 16000, config_snapshot=cfg, is_current=lambda: active,
+    ) == ""
+    assert attempts == ["request"]
+
+
+@pytest.mark.parametrize(("scope", "expected"), [
+    ("interviewer", [16000, 19840]),
+    ("candidate", [16000]),
+])
+def test_only_short_interviewer_empty_segment_is_retried_with_silence(monkeypatch, scope, expected):
+    cfg = configured_generic()
+    lengths = []
+
+    def transcribe(audio, *_args, **_kwargs):
+        lengths.append(len(audio))
+        return ""
+
+    monkeypatch.setattr(stt_factory, "get_stt_engine", lambda *_args, **_options: SimpleNamespace(transcribe=transcribe))
+    assert stt_factory.transcribe_segment(np.zeros(16000), 16000, config_snapshot=cfg, scope=scope) == ""
+    assert lengths == expected
+
+
+def test_generic_http_stt_strips_content_type_from_custom_headers_and_reuses_session(monkeypatch):
+    from services.stt import engines
+
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        def json(self):
+            return {"text": "自定义头测试"}
+
+    session = engines._get_generic_stt_session()
+    assert engines._get_generic_stt_session() is session
+
+    def fake_session_post(url, headers=None, files=None, data=None, timeout=None):
+        captured["headers"] = headers
+        return _Resp()
+
+    monkeypatch.setattr(session, "post", fake_session_post)
+
+    for raw_custom in (
+        '{"Content-Type": "application/json", "X-Custom": "val1"}',
+        "content-type: multipart/form-data\nX-Custom: val2",
+    ):
+        engine = GenericHTTPSTT(
+            api_base_url="https://asr.example.com/v1",
+            api_key="sk-test",
+            model="whisper-1",
+            custom_headers=raw_custom,
         )
-    finally:
-        stt_factory._whisper_infer_lock.release()
-
-    assert text == ""
-    assert calls["transcribe"] == 0
-
-
-def test_candidate_remote_fallback_skips_whisper_when_inference_lock_busy(monkeypatch):
-    import core.config as core_config
-
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {"stt_provider": "generic", "whisper_model": "base", "whisper_language": "auto"})(),
-    )
-
-    calls = {"whisper": 0}
-
-    class _RemoteEngine:
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            return ""
-
-    class _FakeWhisper:
-        model_size = "base"
-        language = "auto"
-
-        @property
-        def is_loaded(self):
-            return True
-
-        def transcribe(self, audio, sample_rate=16000, position="", language=""):
-            calls["whisper"] += 1
-            return "should not run"
-
-    def fake_get_stt_engine(provider=None, model_size=None, language=None):
-        if provider == "whisper":
-            return _FakeWhisper()
-        return _RemoteEngine()
-
-    monkeypatch.setattr(stt_factory, "get_stt_engine", fake_get_stt_engine)
-    monkeypatch.setattr(stt_factory, "_is_circuit_open", lambda: False)
-    monkeypatch.setattr(stt_factory, "_circuit_record_failure", lambda is_timeout=False, is_auth=False: None)
-    monkeypatch.setattr(stt_factory, "_circuit_reset", lambda: None)
-    monkeypatch.setattr(stt_factory, "_is_whisper_engine_loaded", lambda *_args, **_kwargs: True)
-    _patch_broadcast(monkeypatch, [])
-
-    assert stt_factory._whisper_infer_lock.acquire(blocking=False) is True
-    try:
-        text = stt_factory.transcribe_with_fallback(
-            np.zeros(16000 * 8, dtype=np.float32),
-            16000,
-            provider="generic",
-            scope="candidate",
-            whisper_lock_timeout_sec=0.0,
-        )
-    finally:
-        stt_factory._whisper_infer_lock.release()
-
-    assert text == ""
-    assert calls["whisper"] == 0
+        assert engine.transcribe(np.zeros(320, dtype=np.float32)) == "自定义头测试"
+        lowered_keys = {k.lower() for k in captured["headers"]}
+        assert "content-type" not in lowered_keys
+        assert "x-custom" in lowered_keys
 
 
-def test_whisper_language_cache_does_not_keep_stale_alias(monkeypatch):
-    import core.config as core_config
+def test_generic_http_stt_session_blocks_cookies_and_closes_on_shutdown():
+    import gc
+    import threading
+    from services.stt import engines
 
-    cfg = type(
-        "Cfg",
-        (),
-        {"stt_provider": "whisper", "whisper_model": "base", "whisper_language": "auto"},
-    )()
-    monkeypatch.setattr(core_config, "get_config", lambda: cfg)
+    engines.close_generic_stt_sessions()
+    session = engines._get_generic_stt_session()
+    session.cookies.set("sid", "secret", domain="asr.example.com")
+    assert dict(session.cookies) == {}
 
-    class _FakeWhisper:
-        def __init__(self, model_size="base", language="auto"):
-            self.model_size = model_size
-            self.language = language
+    def worker():
+        s = engines._get_generic_stt_session()
+        s.cookies.set("worker_sid", "secret", domain="asr.example.com")
+        assert dict(s.cookies) == {}
 
-        @property
-        def is_loaded(self):
-            return False
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    gc.collect()
 
-    monkeypatch.setattr(stt_factory, "STTEngine", _FakeWhisper)
-    monkeypatch.setattr(stt_factory, "_engine", None)
-    monkeypatch.setattr(stt_factory, "_whisper_engines", {})
+    closed = {"called": False}
+    orig_close = session.close
 
-    old_auto = stt_factory.get_stt_engine(provider="whisper", model_size="base", language="auto")
-    cfg.whisper_language = "zh"
-    stt_factory.set_whisper_language("zh")
+    def tracked_close():
+        closed["called"] = True
+        orig_close()
 
-    explicit_auto = stt_factory.get_stt_engine(provider="whisper", model_size="base", language="auto")
-    explicit_zh = stt_factory.get_stt_engine(provider="whisper", model_size="base", language="zh")
-
-    assert explicit_zh is old_auto
-    assert explicit_zh.language == "zh"
-    assert explicit_auto is not old_auto
-    assert explicit_auto.language == "auto"
-
-
-def test_whisper_engine_cache_reuses_same_asr_and_splits_different_asr(monkeypatch):
-    import core.config as core_config
-
-    cfg = type(
-        "Cfg",
-        (),
-        {"stt_provider": "whisper", "whisper_model": "base", "whisper_language": "auto"},
-    )()
-    monkeypatch.setattr(core_config, "get_config", lambda: cfg)
-
-    class _FakeWhisper:
-        def __init__(self, model_size="base", language="auto"):
-            self.model_size = model_size
-            self.language = language
-
-        @property
-        def is_loaded(self):
-            return False
-
-    monkeypatch.setattr(stt_factory, "STTEngine", _FakeWhisper)
-    monkeypatch.setattr(stt_factory, "_engine", None)
-    monkeypatch.setattr(stt_factory, "_whisper_engines", {})
-
-    interviewer = stt_factory.get_stt_engine(provider="whisper", model_size="base", language="auto")
-    candidate_same = stt_factory.get_stt_engine(provider="whisper", model_size="base", language="auto")
-    candidate_different = stt_factory.get_stt_engine(provider="whisper", model_size="tiny", language="en")
-
-    assert candidate_same is interviewer
-    assert candidate_different is not interviewer
-    assert candidate_different.model_size == "tiny"
-    assert candidate_different.language == "en"
-
-
-# ---------------------------------------------------------------------------
-# 可配置降级引擎（stt_fallback_provider）
-# ---------------------------------------------------------------------------
-
-def test_remote_failure_falls_back_to_configured_funasr(monkeypatch):
-    import core.config as core_config
-    import services.stt.engines as stt_engines
-
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {
-            "stt_provider": "generic",
-            "stt_fallback_provider": "funasr",
-            "whisper_model": "base",
-            "whisper_language": "auto",
-            "generic_stt_api_base_url": "https://x",
-            "generic_stt_api_key": "k",
-            "generic_stt_model": "m",
-        })(),
-    )
-    calls = {"funasr": 0}
-
-    class _DeadRemote:
-        def transcribe(self, *a, **k):
-            raise RuntimeError("remote failed")
-
-    class _FakeFunasr:
-        is_loaded = True
-
-        def transcribe(self, *a, **k):
-            calls["funasr"] += 1
-            return "funasr 兜底文本"
-
-    import services.stt.factory as f
-    monkeypatch.setattr(f, "get_stt_engine", lambda provider=None, model_size=None, language=None: _DeadRemote() if provider == "generic" else _FakeFunasr())
-    monkeypatch.setattr(f, "_call_circuit_open", lambda *_a, **_k: False)
-    monkeypatch.setattr(f, "_call_circuit_record_failure", lambda *_a, **_k: None)
-    monkeypatch.setattr(f, "_call_circuit_reset", lambda *_a, **_k: None)
-    monkeypatch.setattr(f, "_local_infer_lock", lambda provider: f._whisper_infer_lock)
-
-    _patch_broadcast(monkeypatch, [])
-
-    text = f.transcribe_with_fallback(__import__("numpy").zeros(16000, dtype=__import__("numpy").float32), 16000, provider="generic")
-    assert text == "funasr 兜底文本"
-    assert calls["funasr"] == 1
-
-
-def test_remote_failure_with_none_fallback_returns_empty(monkeypatch):
-    import core.config as core_config
-    import numpy as np
-
-    monkeypatch.setattr(
-        core_config,
-        "get_config",
-        lambda: type("Cfg", (), {
-            "stt_provider": "generic",
-            "stt_fallback_provider": "none",
-            "whisper_model": "base",
-            "whisper_language": "auto",
-            "generic_stt_api_base_url": "https://x",
-            "generic_stt_api_key": "k",
-            "generic_stt_model": "m",
-        })(),
-    )
-
-    class _DeadRemote:
-        def transcribe(self, *a, **k):
-            raise RuntimeError("remote failed")
-
-    import services.stt.factory as f
-    monkeypatch.setattr(f, "get_stt_engine", lambda provider=None, model_size=None, language=None: _DeadRemote())
-    monkeypatch.setattr(f, "_call_circuit_open", lambda *_a, **_k: False)
-    monkeypatch.setattr(f, "_call_circuit_record_failure", lambda *_a, **_k: None)
-    monkeypatch.setattr(f, "_call_circuit_reset", lambda *_a, **_k: None)
-
-    _patch_broadcast(monkeypatch, [])
-
-    text = f.transcribe_with_fallback(np.zeros(16000, dtype=np.float32), 16000, provider="generic")
-    assert text == ""
+    session.close = tracked_close
+    engines.close_generic_stt_sessions()
+    assert closed["called"] is True
+    assert engines._get_generic_stt_session() is not session
+    engines.close_generic_stt_sessions()

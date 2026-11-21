@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 from unittest.mock import MagicMock, patch
 
+import httpx
 import pytest
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
@@ -334,3 +335,338 @@ def test_post_chat_stream_retries_bearer_variant_on_401():
     assert "x-api-key" in seen_headers[0] and "Authorization" not in seen_headers[0]
     assert "Authorization" in seen_headers[1] and "x-api-key" not in seen_headers[1]
     assert any(c.choices and c.choices[0].delta.content == "ok" for c in chunks)
+
+
+def test_get_client_for_model_sets_no_retry_timeout_and_bounds_lru_cache(monkeypatch):
+    from services.llm import streaming
+
+    created = []
+    closed = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            created.append(self)
+
+        def close(self):
+            closed.append(self)
+
+    monkeypatch.setattr(streaming, "OpenAI", FakeClient)
+    monkeypatch.setattr(streaming, "_CLIENT_CACHE_MAX_SIZE", 2)
+    streaming.close_cached_clients()
+
+    try:
+        c1 = streaming.get_client_for_model(_Model(base="https://api1.example.com"))
+        c2 = streaming.get_client_for_model(_Model(base="https://api2.example.com"))
+        assert c1.kwargs["max_retries"] == 0
+        assert c1.kwargs["timeout"] is not None
+        # Touch c1 so c2 becomes LRU
+        assert streaming.get_client_for_model(_Model(base="https://api1.example.com")) is c1
+        c3 = streaming.get_client_for_model(_Model(base="https://api3.example.com"))
+        assert len(streaming._client_cache) == 2
+        assert closed == [c2]
+
+        streaming.close_cached_clients()
+        assert len(streaming._client_cache) == 0
+        assert closed == [c2, c1, c3]
+    finally:
+        streaming.close_cached_clients()
+
+
+def test_chat_stream_passes_sdk_timeout_and_closes_response_on_early_abort(monkeypatch):
+    from types import SimpleNamespace
+    from services.llm import streaming
+
+    captured_kwargs = {}
+    closed = {"called": False}
+
+    class FakeResponse:
+        def __iter__(self):
+            yield SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="first", reasoning_content=None, reasoning=None))],
+                usage=None,
+            )
+            yield SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="second", reasoning_content=None, reasoning=None))],
+                usage=None,
+            )
+
+        def close(self):
+            closed["called"] = True
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured_kwargs.update(kwargs)
+            return FakeResponse()
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    active = SimpleNamespace(
+        name="m1",
+        api_base_url="https://api.example.com/v1",
+        api_key="sk-test",
+        model="gpt-4o-mini",
+        api_type="openai",
+        enabled=True,
+        supports_vision=False,
+        supports_think=False,
+    )
+    cfg = SimpleNamespace(
+        active_model=0,
+        models=[active],
+        get_active_model=lambda: active,
+        temperature=0.3,
+        max_tokens=256,
+        think_mode=False,
+        think_effort="off",
+    )
+    monkeypatch.setattr(streaming, "get_config", lambda: cfg)
+    monkeypatch.setattr(streaming, "get_client_for_model", lambda _m: fake_client)
+
+    aborted = False
+    out = []
+    stream = streaming.chat_stream([{"role": "user", "content": "hi"}], abort_check=lambda: aborted)
+    for item in stream:
+        out.append(item)
+        aborted = True
+
+    assert out == [("text", "first")]
+    assert isinstance(captured_kwargs["timeout"], httpx.Timeout)
+    assert captured_kwargs["timeout"].connect == 10.0
+    assert captured_kwargs["timeout"].read == 90.0
+    assert closed["called"] is True
+
+
+def test_mmpg_stream_aclose_tolerates_closed_loop_runtime_error(monkeypatch):
+    from types import SimpleNamespace
+    from services.llm import streaming
+
+    class FakeLoop:
+        def time(self):
+            return 1.0
+
+        def is_running(self):
+            return True
+
+    request = SimpleNamespace(
+        loop=FakeLoop(),
+        lock=streaming.threading.Lock(),
+        started_at=None,
+        cancelled=False,
+        traces=("t1",),
+        group_id="g1",
+        revision=1,
+        seq=1,
+        final_at=0.5,
+        on_started=None,
+        stream_read=None,
+    )
+    model = SimpleNamespace(
+        name="m1",
+        api_base_url="https://api.example.com/v1",
+        api_key="sk-test",
+        model="gpt-4o-mini",
+        api_type="openai",
+        supports_think=False,
+    )
+    cfg = SimpleNamespace(temperature=0.3, max_tokens=128, think_mode=False, think_effort="off")
+
+    async def fake_stream(*_args, **_kwargs):
+        yield SimpleNamespace(choices=[], usage=None)
+
+    calls = {"count": 0}
+
+    class FakeFuture:
+        def result(self, timeout=None):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return None
+            raise RuntimeError("Event loop is closed")
+
+    def fake_run_coro(coro, _loop):
+        coro.close()
+        return FakeFuture()
+
+    monkeypatch.setattr(streaming, "post_cancellable_chat_stream", fake_stream)
+    monkeypatch.setattr(streaming.asyncio, "run_coroutine_threadsafe", fake_run_coro)
+
+    assert list(streaming._mmpg_stream(model, [{"role": "user", "content": "hi"}], cfg, request, lambda: False)) == []
+    assert calls["count"] == 2
+
+
+def test_stateless_http_client_isolates_threads_and_rejects_cookies():
+    import threading
+
+    client = protocols._StatelessHttpClient()
+    sessions = []
+
+    def grab():
+        s = client._get_session()
+        s.cookies.set("sid", "secret", domain="example.com")
+        sessions.append((s, dict(s.cookies)))
+
+    t1 = threading.Thread(target=grab)
+    t2 = threading.Thread(target=grab)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert len(sessions) == 2
+    assert sessions[0][0] is not sessions[1][0]
+    assert sessions[0][1] == {}
+    assert sessions[1][1] == {}
+    client.close()
+
+
+def test_stateless_http_client_releases_exited_thread_sessions():
+    import gc
+    import threading
+
+    client = protocols._StatelessHttpClient()
+
+    def worker():
+        s = client._get_session()
+        assert s is not None
+
+    for _ in range(5):
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+    gc.collect()
+    assert len(client._sessions) == 0
+
+
+def test_chat_stream_single_model_closes_aborted_stream(monkeypatch):
+    from types import SimpleNamespace
+    from services.llm import streaming
+
+    closed = {"count": 0}
+
+    class FakeStream:
+        def __init__(self):
+            self._items = [
+                SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content="part1", reasoning_content=None, reasoning=None))],
+                    usage=None,
+                ),
+                SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content="part2", reasoning_content=None, reasoning=None))],
+                    usage=None,
+                ),
+            ]
+            self._idx = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._idx >= len(self._items):
+                raise StopIteration
+            item = self._items[self._idx]
+            self._idx += 1
+            return item
+
+        def close(self):
+            closed["count"] += 1
+
+    model = SimpleNamespace(
+        name="m1",
+        api_base_url="https://api.example.com/v1",
+        api_key="sk-test",
+        model="gpt-4o-mini",
+        api_type="openai",
+        supports_vision=False,
+        supports_think=False,
+    )
+    cfg = SimpleNamespace(temperature=0.3, max_tokens=128, think_mode=False, think_effort="off")
+
+    monkeypatch.setattr(streaming, "_try_stream_with_model", lambda *_a, **_kw: FakeStream())
+
+    aborted = False
+    out = []
+    stream = streaming.chat_stream_single_model(
+        model,
+        [{"role": "user", "content": "hi"}],
+        abort_check=lambda: aborted,
+        config_snapshot=cfg,
+    )
+    for item in stream:
+        out.append(item)
+        aborted = True
+
+    assert out == [("text", "part1")]
+    assert closed["count"] == 1
+
+
+def test_try_stream_with_model_forwards_custom_timeout_for_non_openai(monkeypatch):
+    from types import SimpleNamespace
+    from services.llm import streaming
+
+    captured = {}
+
+    def fake_post_chat_stream(base_url, api_type, api_key, payload, *, timeout=(10, 90)):
+        captured["timeout"] = timeout
+        return iter([])
+
+    model = SimpleNamespace(
+        name="claude",
+        api_base_url="https://api.anthropic.com",
+        api_key="sk-ant",
+        model="claude-3-7-sonnet",
+        api_type="anthropic",
+        supports_vision=False,
+        supports_think=False,
+    )
+    cfg = SimpleNamespace(temperature=0.3, max_tokens=128, think_mode=False, think_effort="off")
+    monkeypatch.setattr(streaming, "post_chat_stream", fake_post_chat_stream)
+
+    streaming._try_stream_with_model(model, [{"role": "user", "content": "hi"}], cfg, timeout=(5, 25))
+    assert captured["timeout"] == (5, 25)
+
+
+@pytest.mark.asyncio
+async def test_async_client_reused_per_loop_with_redirects_disabled():
+    await protocols.aclose_async_client()
+    try:
+        c1 = protocols._get_async_client()
+        c2 = protocols._get_async_client()
+        assert c1 is c2
+        assert c1.follow_redirects is False
+        # Set-Cookie headers from one provider must never persist on the shared async client
+        fake_resp = httpx.Response(
+            200,
+            headers={"Set-Cookie": "sid=secret; Path=/"},
+            request=httpx.Request("POST", "https://provider-a.example.com/v1/chat/completions"),
+        )
+        c1.cookies.extract_cookies(fake_resp)
+        assert dict(c1.cookies) == {}
+    finally:
+        await protocols.aclose_async_client()
+
+
+def test_chat_completion_create_preserves_connect_and_read_sdk_timeout(monkeypatch):
+    from types import SimpleNamespace
+    from services.llm import streaming
+
+    captured: dict[str, object] = {}
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+
+    fake_client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    model = SimpleNamespace(
+        name="m1",
+        api_base_url="https://api.example.com/v1",
+        api_key="sk-test",
+        model="gpt-4o-mini",
+        api_type="openai",
+    )
+    monkeypatch.setattr(streaming, "get_client_for_model", lambda _m: fake_client)
+
+    streaming.chat_completion_create(model, [{"role": "user", "content": "hi"}], timeout=(7, 45))
+    assert isinstance(captured["timeout"], httpx.Timeout)
+    assert captured["timeout"].connect == 7.0
+    assert captured["timeout"].read == 45.0

@@ -13,7 +13,8 @@ def backend_root() -> str:
 
 
 def data_dir() -> str:
-    d = os.path.abspath(os.environ.get("IA_DATA_DIR") or os.path.join(_BACKEND_ROOT, "data"))
+    override = os.environ.get("IA_DATA_DIR", "").strip()
+    d = os.path.abspath(override) if override else os.path.join(_BACKEND_ROOT, "data")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -21,22 +22,23 @@ def data_dir() -> str:
 def sqlite_path(filename: str) -> str:
     """
     SQLite 文件路径（仅文件名，如 knowledge.db）。
-    若 data/ 下不存在而 backend 根目录存在同名旧库，则整体迁移 .db 及 -wal/-shm。
+    若未覆盖 IA_DATA_DIR 且 data/ 下不存在而 backend 根目录存在同名旧库，则整体迁移 .db 及 -wal/-shm。
     """
     d = data_dir()
     new_p = os.path.join(d, filename)
-    old_p = os.path.join(_BACKEND_ROOT, filename)
-    if not os.environ.get("IA_DATA_DIR") and not os.path.isfile(new_p) and os.path.isfile(old_p):
-        try:
-            os.replace(old_p, new_p)
-            for ext in ("-wal", "-shm"):
-                o2 = old_p + ext
-                n2 = new_p + ext
-                if os.path.isfile(o2):
-                    try:
-                        os.replace(o2, n2)
-                    except OSError:
-                        pass
-        except OSError:
-            pass
+    if not os.environ.get("IA_DATA_DIR", "").strip():
+        old_p = os.path.join(_BACKEND_ROOT, filename)
+        if not os.path.isfile(new_p) and os.path.isfile(old_p):
+            try:
+                os.replace(old_p, new_p)
+                for ext in ("-wal", "-shm"):
+                    o2 = old_p + ext
+                    n2 = new_p + ext
+                    if os.path.isfile(o2):
+                        try:
+                            os.replace(o2, n2)
+                        except OSError:
+                            pass
+            except OSError:
+                pass
     return new_p

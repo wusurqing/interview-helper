@@ -1,5 +1,5 @@
-import { useState, useEffect, useRef } from 'react'
-import type { ComponentType, ReactNode } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import type { ReactNode } from 'react'
 import {
   ArrowLeft,
   ChevronDown,
@@ -17,6 +17,7 @@ import {
 } from 'lucide-react'
 import dayjs from 'dayjs'
 import ReactMarkdown from 'react-markdown'
+import { SAFE_MARKDOWN_COMPONENTS } from '@/components/MarkdownLink'
 import { api, getErrorMessage } from '../../lib/api'
 import type { ReviewSessionDetail, ReviewTurn } from './types'
 import { ARCHIVE_SPEAKERS, archiveAudioIssue, parseReviewSessionDetail } from './types'
@@ -26,6 +27,7 @@ import { parseApplication } from '../job-tracker/types'
 import { STAGE_LABELS, isTerminalStage } from '../job-tracker/stageConfig'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { ArchiveTurnContent } from './ArchiveTurnContent'
+import { isLightColorScheme } from '@/lib/colorScheme'
 
 interface Props {
   sessionId: number
@@ -85,6 +87,16 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
   const bindApplicationRef = useRef(false)
   const setAppMode = useUiPrefsStore((s) => s.setAppMode)
   const setJobTrackerDeepLink = useUiPrefsStore((s) => s.setJobTrackerDeepLink)
+  const colorScheme = useUiPrefsStore((s) => s.colorScheme)
+  const isLight = isLightColorScheme(colorScheme)
+  const mountedRef = useRef(true)
+  const applicationsLoadSeqRef = useRef(0)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
   const isActiveSession = (targetSessionId: number) => activeSessionIdRef.current === targetSessionId
 
   useEffect(() => {
@@ -127,50 +139,95 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
     }
   }, [sessionId])
 
+  const refreshApplications = useCallback(async (clearOnError = false) => {
+    const reqSeq = applicationsLoadSeqRef.current + 1
+    applicationsLoadSeqRef.current = reqSeq
+    try {
+      const res = await api.jobTrackerApplications()
+      if (mountedRef.current && applicationsLoadSeqRef.current === reqSeq) {
+        setApplications((res.items as Record<string, unknown>[]).map(parseApplication))
+      }
+    } catch {
+      if (clearOnError && mountedRef.current && applicationsLoadSeqRef.current === reqSeq) {
+        setApplications([])
+      }
+    }
+  }, [])
+
   useEffect(() => {
     if (detail?.status !== 'analyzing' && detail?.archive_status !== 'recording' && detail?.archive_status !== 'draining') return undefined
 
     let cancelled = false
+    let inFlight = false
+    let timer: number | null = null
     const targetSessionId = sessionId
+
+    const clearTimer = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer)
+        timer = null
+      }
+    }
+
+    const scheduleNext = () => {
+      if (cancelled || document.hidden) return
+      clearTimer()
+      timer = window.setTimeout(() => {
+        timer = null
+        void pollDetail()
+      }, REVIEW_ANALYSIS_POLL_MS)
+    }
+
     const pollDetail = async () => {
+      if (cancelled || inFlight || document.hidden) return
+      clearTimer()
+      inFlight = true
+      let stillAnalyzing = true
       try {
         const data = parseReviewSessionDetail(await api.reviewSessionDetail(targetSessionId) as Record<string, unknown>)
         if (cancelled || !isActiveSession(targetSessionId)) return
         setDetail(data)
+        stillAnalyzing = data.status === 'analyzing' || data.archive_status === 'recording' || data.archive_status === 'draining'
         if (data.status === 'completed') {
+          if (data.application_id != null) {
+            void refreshApplications(false)
+          }
           setInlineNotice({ tone: 'success', message: '复盘分析已完成' })
         } else if (data.status === 'analysis_failed') {
           setInlineNotice({ tone: 'error', message: '复盘分析失败，可重试生成' })
         }
       } catch {
         // Keep the existing detail visible; the manual refresh/trigger actions remain available.
+      } finally {
+        inFlight = false
+        if (!cancelled && stillAnalyzing && isActiveSession(targetSessionId)) {
+          scheduleNext()
+        }
       }
     }
 
-    const timer = window.setInterval(pollDetail, REVIEW_ANALYSIS_POLL_MS)
+    const onVisibilityChange = () => {
+      if (cancelled) return
+      if (document.hidden) {
+        clearTimer()
+      } else if (!inFlight) {
+        void pollDetail()
+      }
+    }
+
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    scheduleNext()
+
     return () => {
       cancelled = true
-      window.clearInterval(timer)
+      clearTimer()
+      document.removeEventListener('visibilitychange', onVisibilityChange)
     }
-  }, [detail?.status, detail?.archive_status, sessionId])
+  }, [detail?.status, detail?.archive_status, refreshApplications, sessionId])
 
   useEffect(() => {
-    let cancelled = false
-    async function loadApplications() {
-      try {
-        const res = await api.jobTrackerApplications()
-        if (!cancelled) {
-          setApplications((res.items as Record<string, unknown>[]).map(parseApplication))
-        }
-      } catch {
-        if (!cancelled) setApplications([])
-      }
-    }
-    loadApplications()
-    return () => {
-      cancelled = true
-    }
-  }, [])
+    void refreshApplications(true)
+  }, [refreshApplications])
 
   useEffect(() => {
     if (!inlineNotice) return undefined
@@ -246,8 +303,8 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
     }
   }
 
-  const handleBindApplication = async (applicationId: number | null) => {
-    if (bindApplicationRef.current) return
+  const handleBindApplication = async (applicationId: number | null): Promise<boolean> => {
+    if (bindApplicationRef.current) return false
     const targetSessionId = sessionId
     bindApplicationRef.current = true
     setBinding(true)
@@ -256,8 +313,9 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
         auto_sync_eligible?: boolean
       }
       const data = parseReviewSessionDetail(await api.reviewSessionDetail(targetSessionId) as Record<string, unknown>)
-      if (!isActiveSession(targetSessionId)) return
+      if (!isActiveSession(targetSessionId)) return false
       setDetail(data)
+      void refreshApplications(false)
       if (applicationId == null) {
         setInlineNotice({ tone: 'info', message: '已解除求职记录关联' })
       } else if (result?.auto_sync_eligible === false) {
@@ -265,9 +323,11 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
       } else {
         setInlineNotice({ tone: 'success', message: '已关联求职记录，并同步复盘待办' })
       }
+      return true
     } catch (err) {
-      if (!isActiveSession(targetSessionId)) return
+      if (!isActiveSession(targetSessionId)) return false
       setInlineNotice({ tone: 'error', message: getErrorMessage(err, '关联求职记录失败') })
+      return false
     } finally {
       if (isActiveSession(targetSessionId)) {
         bindApplicationRef.current = false
@@ -533,8 +593,8 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
               title={summaryMissing ? '当前状态' : '整体评价'}
             >
               {detail.summary_markdown ? (
-                <div className="prose prose-sm prose-invert max-w-none text-text-primary leading-relaxed">
-                  <ReactMarkdown>{detail.summary_markdown}</ReactMarkdown>
+                <div className={`prose prose-sm ${isLight ? '' : 'prose-invert'} max-w-none text-text-primary leading-relaxed`}>
+                  <ReactMarkdown components={SAFE_MARKDOWN_COMPONENTS}>{detail.summary_markdown}</ReactMarkdown>
                 </div>
               ) : (
                 <PendingSummaryWorkspace
@@ -566,6 +626,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
                 title={`${detail.archive_version ? '面试记录' : '逐题分析'} · ${detail.turns.length} 题`}
                 subtitle={!detail.archive_version && autoExpandTurns ? '短记录，已展开。' : undefined}
                 defaultOpen={autoExpandTurns}
+                resetKey={detail.id}
               >
                 <div className="space-y-3">
                   {detail.turns.map((turn) => (
@@ -622,7 +683,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
             ) : null}
 
             {scoreDimensions.length > 0 ? (
-              <CollapsibleSection title="能力维度">
+              <CollapsibleSection title="能力维度" resetKey={detail.id}>
                 <div className="space-y-3">
                   {scoreDimensions.map((item) => (
                     <div key={item.name}>
@@ -646,6 +707,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
             {followUpDrills.length > 0 ? (
               <CollapsibleSection
                 title={`追问训练 · ${followUpDrills.length}`}
+                resetKey={detail.id}
               >
                 <ol className="divide-y divide-bg-hover/70">
                   {followUpDrills.map((item) => (
@@ -695,13 +757,19 @@ function CollapsibleSection({
   subtitle,
   children,
   defaultOpen = false,
+  resetKey,
 }: {
   title: string
   subtitle?: string
   children: ReactNode
   defaultOpen?: boolean
+  resetKey?: string | number
 }) {
   const [open, setOpen] = useState(defaultOpen)
+
+  useEffect(() => {
+    setOpen(defaultOpen)
+  }, [defaultOpen, resetKey])
 
   return (
     <section className="border-t border-bg-hover/80 py-1">
@@ -1117,17 +1185,21 @@ function ApplicationLinkPanel({
   search: string
   binding: boolean
   onSearch: (value: string) => void
-  onBind: (applicationId: number | null) => void
+  onBind: (applicationId: number | null) => Promise<boolean> | void
   onGoJobTracker: (applicationId: number) => void
   onOpenReviewTimeline: (applicationId: number) => void
 }) {
   const linked = detail.application
   const [changing, setChanging] = useState(false)
+  useEffect(() => {
+    setChanging(false)
+  }, [detail.id])
   const selecting = !linked || changing
   const isClosedStage = linked ? isTerminalStage(linked.stage) : false
   const linkedReviewSummary = linkedApplicationSummary?.review_summary
-  const linkedReviewCount = linkedReviewSummary?.review_count ?? 0
-  const isLatestLinkedReview = linkedReviewSummary?.latest_review_id != null && linkedReviewSummary.latest_review_id === detail.id
+  const linkedReviewCount = Number(linkedReviewSummary?.linked_review_count ?? linkedReviewSummary?.review_count ?? 0)
+  const latestLinkedReviewId = linkedReviewSummary?.latest_linked_review_id ?? linkedReviewSummary?.latest_review_id ?? null
+  const isLatestLinkedReview = latestLinkedReviewId != null && latestLinkedReviewId === detail.id
   const linkedStageLabel = linked ? STAGE_LABELS[linked.stage] ?? linked.stage : ''
   const reviewRelationshipLabel = linkedReviewCount <= 1
     ? '唯一一场'
@@ -1181,7 +1253,7 @@ function ApplicationLinkPanel({
           </div>
 
           <div className="flex flex-wrap gap-x-3 gap-y-2 text-[11px]">
-            {linkedReviewSummary && linkedReviewSummary.review_count > 0 ? (
+            {linkedReviewCount > 0 ? (
               <button
                 type="button"
                 disabled={binding}
@@ -1236,9 +1308,11 @@ function ApplicationLinkPanel({
                 key={app.id}
                 type="button"
                 disabled={binding}
-                onClick={() => {
-                  setChanging(false)
-                  onBind(app.id)
+                onClick={async () => {
+                  const ok = await Promise.resolve(onBind(app.id))
+                  if (ok !== false) {
+                    setChanging(false)
+                  }
                 }}
                 className="rounded-lg border border-bg-hover bg-bg-tertiary/30 px-3 py-2 text-left hover:border-accent-blue/35 hover:bg-accent-blue/5 disabled:opacity-60"
               >

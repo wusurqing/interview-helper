@@ -1,5 +1,7 @@
 const { contextBridge, ipcRenderer } = require('electron');
 
+const overlayStateWrappers = new Map();
+
 contextBridge.exposeInMainWorld('electronAPI', {
   hideWindow: () => ipcRenderer.invoke('hide-window'),
   minimizeWindow: () => ipcRenderer.invoke('minimize-window'),
@@ -42,9 +44,20 @@ contextBridge.exposeInMainWorld('electronAPI', {
   overlayDragEnd: () => ipcRenderer.send('overlay-drag-end'),
   getOverlayState: () => ipcRenderer.invoke('get-overlay-state'),
   onOverlayState: (listener) => {
+    if (typeof listener !== 'function') return () => {};
     const wrapped = (_event, payload) => listener(payload);
+    let wrappers = overlayStateWrappers.get(listener);
+    if (!wrappers) {
+      wrappers = new Set();
+      overlayStateWrappers.set(listener, wrappers);
+    }
+    wrappers.add(wrapped);
     ipcRenderer.on('overlay-state', wrapped);
-    return () => ipcRenderer.removeListener('overlay-state', wrapped);
+    return () => {
+      ipcRenderer.removeListener('overlay-state', wrapped);
+      wrappers.delete(wrapped);
+      if (wrappers.size === 0) overlayStateWrappers.delete(listener);
+    };
   },
   onShortcuts: (listener) => {
     const wrapped = (_event, payload) => listener(payload);
@@ -72,6 +85,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('config-updated', wrapped);
   },
   removeOverlayStateListener: (listener) => {
-    if (listener) ipcRenderer.removeListener('overlay-state', listener);
+    if (!listener) return;
+    const wrappers = overlayStateWrappers.get(listener);
+    if (wrappers) {
+      for (const wrapped of wrappers) {
+        ipcRenderer.removeListener('overlay-state', wrapped);
+      }
+      overlayStateWrappers.delete(listener);
+      return;
+    }
+    ipcRenderer.removeListener('overlay-state', listener);
   },
 });

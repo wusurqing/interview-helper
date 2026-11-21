@@ -25,12 +25,17 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CONFIG_FILE", str(tmp_path / "config.json"))
     monkeypatch.setattr(config, "_config", config.AppConfig(models=[
         config.ModelConfig(name="Assist", model="assist-model", api_key="test-assist"),
-        config.ModelConfig(name="Analysis", model="analysis-model", api_key="test-analysis", supports_think=True),
+        config.ModelConfig(name="Analysis", model="analysis-model", api_key="test-analysis", supports_think=True, supports_vision=True),
     ]))
     app = FastAPI()
     app.include_router(knowledge_router, prefix="/api")
     app.include_router(common_router, prefix="/api")
     return TestClient(app)
+
+
+def test_model_options_include_vision_capability(client):
+    models = client.get("/api/knowledge/settings").json()["models"]
+    assert [model["supports_vision"] for model in models] == [False, True]
 
 
 def _configure(client, **overrides):
@@ -189,9 +194,46 @@ def test_settings_survive_reorder_and_clear_if_selected_model_is_deleted(client)
     assert client.get("/api/knowledge/settings").json()["settings"]["model_index"] == 0
     assert client.post("/api/config", json={"models": [
         {"name": "Assist", "model": "assist-model", "api_key": "test-assist", "model_original_index": 1},
-    ]}).status_code == 200
+    ]}).status_code == 409
+    layout = client.get("/api/model-providers").json()
+    analysis, assist = layout["models"]
+    layout["models"] = [assist]
+    layout["confirmed_remove_ids"] = [analysis["id"]]
+    assert client.put("/api/model-providers", json=layout).status_code == 200
     assert client.get("/api/knowledge/settings").json()["settings"]["model_index"] is None
     assert config._load_config().knowledge_analysis.model_index is None
+
+
+def test_unchecking_model_lets_inflight_analysis_finish_and_skips_queued_records(client, monkeypatch):
+    entered, release = Event(), Event()
+    calls = []
+
+    def completion(model, *_args, **_kwargs):
+        calls.append(model.id)
+        if len(calls) == 1:
+            entered.set()
+            assert release.wait(5)
+        return _completion('["Redis", "限流", "令牌桶"]')
+
+    monkeypatch.setattr(streaming, "chat_completion_create", completion)
+    knowledge.save_record("assist", "当前记录", "")
+    knowledge.save_record("assist", "排队记录", "")
+    _configure(client)
+    assert client.post("/api/knowledge/analysis").status_code == 202
+    try:
+        assert entered.wait(5)
+        layout = client.get("/api/model-providers").json()
+        selected = next(model for model in layout["models"] if model["id"] == calls[0])
+        selected["enabled"] = False
+        layout["confirmed_remove_ids"] = [selected["id"]]
+        assert client.put("/api/model-providers", json=layout).status_code == 200
+    finally:
+        release.set()
+    result = _finish(client)
+    assert len(calls) == 1
+    assert result["job"]["succeeded"] == 1
+    assert result["job"]["skipped"] == 1
+    assert result["pending_count"] == 1
 
 
 def test_model_list_save_does_not_rebind_analysis_to_a_stale_origin(client):

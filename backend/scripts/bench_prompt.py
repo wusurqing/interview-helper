@@ -213,31 +213,72 @@ def _prompt_for_new(case: dict[str, Any]) -> str:
     )
 
 
+def _resolve_followup_chain(
+    case: dict[str, Any],
+    cases_by_id: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return prior cases in chronological order by walking context.prev_idx."""
+    chain: list[dict[str, Any]] = []
+    seen_ids: set[str] = {str(case.get("id") or "")}
+    cur = case
+    while isinstance(cur.get("context"), dict) and cur["context"].get("prev_idx"):
+        prev_id = str(cur["context"]["prev_idx"])
+        if prev_id in seen_ids:
+            break
+        seen_ids.add(prev_id)
+        prev_case = cases_by_id.get(prev_id)
+        if prev_case is None:
+            break
+        chain.append(prev_case)
+        cur = prev_case
+    chain.reverse()
+    return chain
+
+
 def _run_one_case(
     model_cfg,
     case: dict[str, Any],
     variant: str,
     prompts_by_variant: dict[str, Callable[[dict[str, Any]], str]],
+    *,
+    prior_results: dict[str, RunResult] | None = None,
+    cases_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> RunResult:
     from core.config import get_config
     from services.llm import chat_stream_single_model
     from services.llm.prompts import build_assist_user_context
 
     system_prompt = prompts_by_variant[variant](case)
+    lookup = cases_by_id if cases_by_id is not None else {c["id"]: c for c in BENCH_CASES}
+    prior_chain = _resolve_followup_chain(case, lookup)
+
+    messages: list[dict[str, str]] = []
+    unresolved_prior_questions: list[str] = []
+    for prev_case in prior_chain:
+        prev_q = str(prev_case.get("input") or "").strip()
+        prev_res = (prior_results or {}).get(str(prev_case.get("id") or ""))
+        prev_a = prev_res.text.strip() if (prev_res is not None and not prev_res.error and prev_res.text) else ""
+        if prev_q and prev_a:
+            messages.append({"role": "user", "content": prev_q})
+            messages.append({"role": "assistant", "content": prev_a})
+        elif prev_q:
+            unresolved_prior_questions.append(prev_q)
+
     user_text = case["input"]
-    if case.get("context") and case["context"].get("prev_idx"):
-        prev_idx = case["context"]["prev_idx"]
-        user_text = f"[追问上下文] 上一轮用户问: (case {prev_idx})\n\n{user_text}"
+    if unresolved_prior_questions:
+        prior_lines = "\n".join(f"- {q}" for q in unresolved_prior_questions)
+        user_text = f"[追问上下文] 前序面试官问题:\n{prior_lines}\n\n{user_text}"
     user_context = build_assist_user_context(get_config(), mode=case["mode"])
     if user_context:
         user_text = f"[本轮任务资料]\n{user_context}\n\n[当前输入]\n{user_text}"
+    messages.append({"role": "user", "content": user_text})
 
     t0 = time.monotonic()
     chunks: list[str] = []
     try:
         for kind, txt in chat_stream_single_model(
             model_cfg,
-            messages=[{"role": "user", "content": user_text}],
+            messages=messages,
             system_prompt=system_prompt,
         ):
             if kind == "text" and txt:
@@ -444,7 +485,11 @@ def main():
         "NEW": _prompt_for_new,
     }
 
+    from core.config import get_config
+
+    prev_resume = get_config().resume_text
     _set_resume(RESUME_FIXTURE)
+    cases_by_id = {c["id"]: c for c in BENCH_CASES}
     results: list[RunResult] = []
     interrupted = False
     try:
@@ -452,13 +497,22 @@ def main():
         done = 0
         for m in models:
             for variant in variants_ran:
+                variant_results: dict[str, RunResult] = {}
                 for c in cases:
                     done += 1
                     print(
                         f"[{done}/{total}] {m.name} | {variant} | {c['id']} ...",
                         flush=True,
                     )
-                    r = _run_one_case(m, c, variant, prompts_by_variant)
+                    r = _run_one_case(
+                        m,
+                        c,
+                        variant,
+                        prompts_by_variant,
+                        prior_results=variant_results,
+                        cases_by_id=cases_by_id,
+                    )
+                    variant_results[c["id"]] = r
                     results.append(r)
                     if r.error:
                         print(f"    ERROR: {r.error}", file=sys.stderr)
@@ -466,7 +520,7 @@ def main():
         interrupted = True
         print("\n[interrupted] writing partial report...", file=sys.stderr)
     finally:
-        _set_resume(None)
+        _set_resume(prev_resume)
 
     out_path = Path(args.out)
     _format_report(results, cases, models, out_path, variants_ran)

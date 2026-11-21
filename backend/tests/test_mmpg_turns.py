@@ -53,6 +53,20 @@ def test_cplusplus_followup_at_63_ms_submits_one_complete_prompt():
     assert submit.call_count == 1
 
 
+def test_disabling_auto_answer_keeps_already_submitted_answer_and_the_current_utterance():
+    turns, _, submit, cancel = setup(delay_ms=0)
+    records = Mock()
+    turns._record_final = records
+    turns.final("first", "第一问")
+    turns._allow_answer = lambda: False
+    turns.disable_automatic_answers()
+    turns.started("second")
+    turns.final("second", "第二问")
+    cancel.assert_not_called()
+    assert submit.call_count == 1
+    records.assert_called_with("第二问", "second", None)
+
+
 def test_three_revisions_restart_wait_and_request_window():
     turns, clock, submit, cancel = setup()
     turns.final("1", "第一段")

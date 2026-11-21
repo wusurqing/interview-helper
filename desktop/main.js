@@ -1,5 +1,5 @@
-const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, ipcMain, screen } = require('electron');
-const { spawn } = require('child_process');
+const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, ipcMain, screen, shell } = require('electron');
+const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
@@ -48,6 +48,8 @@ const {
   PROMPT_OVERLAY_MAX_WIDTH,
   consumePendingOverlayShow,
   createOverlayChromeOptions,
+  createSafeWebPreferences,
+  installNavigationGuards,
   relayChildOutput,
 } = require('./windowOptions');
 const {
@@ -93,6 +95,7 @@ let mainWindowOpacity = 1;
 let mainWindowOpacitySaveTimer = null;
 let overlayWindow = null;
 let tray = null;
+let trayMenu = null;
 let pythonProcess = null;
 let isQuitting = false;
 let readyToQuit = false;
@@ -109,6 +112,7 @@ let overlayToggleBlockedUntil = 0;
 let queuedOverlayToggle = false;
 const PROMPT_WHEEL_MESSAGE = 0x8000 + 0x179;
 let promptWheelHelper = null;
+const exitingPromptWheelHelpers = new Set();
 let promptWheelGeneration = 0;
 let promptWheelScrollable = false;
 let promptWheelStatus = 'inactive';
@@ -160,6 +164,56 @@ function updatePromptWheelState(active = Boolean(promptWheelActive())) {
   }
 }
 
+function resolvePythonExecutable() {
+  const envPython = typeof process.env.IA_DESKTOP_PYTHON === 'string'
+    ? process.env.IA_DESKTOP_PYTHON.trim()
+    : '';
+  if (envPython) return envPython;
+  const venvPython = process.platform === 'win32'
+    ? path.join(ROOT, '.venv', 'Scripts', 'python.exe')
+    : path.join(ROOT, '.venv', 'bin', 'python');
+  if (fs.existsSync(venvPython)) return venvPython;
+  return process.platform === 'win32' ? 'python' : 'python3';
+}
+
+function terminateChildProcess(proc, { sync = false } = {}) {
+  if (!proc) return;
+  if (proc.exitCode !== null && proc.exitCode !== undefined) return;
+  if (proc.signalCode !== null && proc.signalCode !== undefined) return;
+  if (process.platform === 'win32' && proc.pid) {
+    try {
+      if (sync && typeof spawnSync === 'function') {
+        const res = spawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+          timeout: 3000,
+        });
+        if (!res?.error && (res?.status === 0 || res?.status == null)) {
+          return;
+        }
+      } else {
+        const killer = spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        });
+        const fallbackKill = () => {
+          if (proc.exitCode == null && proc.signalCode == null) {
+            try { proc.kill(); } catch { /* ignore */ }
+          }
+        };
+        killer?.on?.('error', fallbackKill);
+        killer?.on?.('close', (code) => {
+          if (code && code !== 0) fallbackKill();
+        });
+        return;
+      }
+    } catch {
+      /* fallback to proc.kill */
+    }
+  }
+  try { proc.kill('SIGKILL'); } catch { /* ignore */ }
+}
+
 function stopPromptWheelHelper(status = 'inactive') {
   const helper = promptWheelHelper;
   if (helper) {
@@ -168,15 +222,29 @@ function stopPromptWheelHelper(status = 'inactive') {
     promptWheelHelper = null;
     promptWheelGeneration += 1;
     clearTimeout(helper.startupTimer);
+    clearTimeout(helper.killTimer);
     try { helper.stdin.end(); } catch { /* process may have exited */ }
+    if (helper.exitCode == null && helper.signalCode == null) {
+      exitingPromptWheelHelpers.add(helper);
+      helper.killTimer = setTimeout(() => {
+        helper.killTimer = null;
+        exitingPromptWheelHelpers.delete(helper);
+        terminateChildProcess(helper);
+      }, 1500);
+      helper.killTimer?.unref?.();
+      helper.once?.('exit', () => {
+        clearTimeout(helper.killTimer);
+        helper.killTimer = null;
+        exitingPromptWheelHelpers.delete(helper);
+      });
+    }
   }
   sendPromptWheelStatus(status);
 }
 
 function startPromptWheelHelper() {
   if (!promptWheelActive() || promptWheelHelper) return;
-  const python = process.env.IA_DESKTOP_PYTHON || (fs.existsSync(path.join(ROOT, '.venv', 'Scripts', 'python.exe'))
-    ? path.join(ROOT, '.venv', 'Scripts', 'python.exe') : 'python');
+  const python = resolvePythonExecutable();
   let helper;
   try {
     helper = spawn(python, ['-u', path.join(__dirname, 'prompt_mouse_hook.py'), '--parent-pid', String(process.pid)], {
@@ -392,24 +460,59 @@ function createTrayIcon() {
 function waitForServer(timeout = 40000) {
   const start = Date.now();
   return new Promise((resolve, reject) => {
-    const check = () => {
-      const req = http.get(`${SERVER_URL}/api/options`, { timeout: 1000 }, (res) => {
-        if (res.statusCode === 200) return resolve();
-        retry();
-      });
-      req.on('error', retry);
-      req.on('timeout', () => { req.destroy(); retry(); });
+    let done = false;
+    let retryTimer = null;
+    const finish = (err) => {
+      if (done) return;
+      done = true;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      if (err) reject(err);
+      else resolve();
     };
-    const retry = () => {
-      if (Date.now() - start > timeout) return reject(new Error('Server start timeout'));
-      setTimeout(check, 300);
+    const scheduleRetry = () => {
+      if (done || retryTimer) return;
+      if (Date.now() - start > timeout) {
+        finish(new Error('Server start timeout'));
+        return;
+      }
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        check();
+      }, 300);
+    };
+    const check = () => {
+      if (done) return;
+      let attemptSettled = false;
+      const onAttemptFailed = () => {
+        if (attemptSettled || done) return;
+        attemptSettled = true;
+        scheduleRetry();
+      };
+      const req = http.get(`${SERVER_URL}/api/options`, { timeout: 1000 }, (res) => {
+        res.resume?.();
+        if (attemptSettled || done) return;
+        attemptSettled = true;
+        if (res.statusCode === 200) {
+          finish();
+          return;
+        }
+        scheduleRetry();
+      });
+      req.on('error', onAttemptFailed);
+      req.on('timeout', () => {
+        try { req.destroy(); } catch { /* ignore */ }
+        onAttemptFailed();
+      });
     };
     check();
   });
 }
 
 function startPythonBackend() {
-  const python = process.platform === 'win32' ? 'python' : 'python3';
+  const python = resolvePythonExecutable();
   pythonProcess = spawn(python, [
     path.join(ROOT, 'start.py'),
     '--mode', 'network',
@@ -454,21 +557,25 @@ function createWindow() {
     ...(opacitySupported ? { opacity: mainWindowOpacity } : {}),
     // Windows 下不在任务栏显示，只在托盘
     skipTaskbar: isWindows,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      // 主窗口隐藏到悬浮窗或托盘时，仍需持续向 RTC 提供会议音频。
-      backgroundThrottling: false,
-    },
+    webPreferences: createSafeWebPreferences(path.join(__dirname, 'preload.js')),
   });
 
+  installNavigationGuards(mainWindow.webContents, {
+    allowedOrigin: FRONTEND_URL,
+    allowOpenExternal: true,
+    openExternal: (url) => shell?.openExternal?.(url),
+  });
+
+  mainWindow._contentProtection = true;
   mainWindow.setContentProtection(true);
 
-  // 每次启动清除缓存，确保加载到最新的前端构建（避免设置里识别引擎等不更新）
-  mainWindow.webContents.session.clearCache().then(() => {
-    mainWindow.loadURL(FRONTEND_URL);
-  });
+  // 静态资源已由 Vite 生成内容 hash，直接加载主页面，避免每次启动暴力清空缓存。
+  const win = mainWindow;
+  if (win && !win.isDestroyed()) {
+    Promise.resolve(win.loadURL(FRONTEND_URL)).catch((err) => {
+      console.warn('loadURL failed:', err?.message || err);
+    });
+  }
 
   mainWindow.webContents.on('did-finish-load', () => {
     const t = JSON.stringify(APP_DISPLAY_NAME);
@@ -528,12 +635,12 @@ function createOverlayWindow() {
     autoHideMenuBar: true,
     roundedCorners: true,
     title: `${APP_DISPLAY_NAME} Overlay`,
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      backgroundThrottling: false,
-    },
+    webPreferences: createSafeWebPreferences(path.join(__dirname, 'preload.js')),
+  });
+
+  installNavigationGuards(overlayWindow.webContents, {
+    allowedOrigin: FRONTEND_URL,
+    allowOpenExternal: false,
   });
 
   // Content protection 必须尽早调用 —— 等到 ready-to-show 时,
@@ -727,12 +834,22 @@ function notifyConfigUpdated(config) {
   }
 }
 
-function postBackend(pathname, body = '{}') {
+const BACKEND_GET_TIMEOUT_MS = 15000;
+const BACKEND_POST_TIMEOUT_MS = 30000;
+
+function postBackend(pathname, body = '{}', timeoutMs = BACKEND_POST_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
     const req = http.request(
       `${SERVER_URL}${pathname}`,
       {
         method: 'POST',
+        timeout: timeoutMs,
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
@@ -742,38 +859,66 @@ function postBackend(pathname, body = '{}') {
         let raw = '';
         res.setEncoding('utf8');
         res.on('data', (chunk) => { raw += chunk; });
+        res.on('error', (err) => settle(reject, err));
+        res.on('close', () => {
+          if (!settled && res.complete === false) {
+            settle(reject, new Error(`连接已中断 (${pathname})`));
+          }
+        });
         res.on('end', () => {
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            if (!raw) { resolve({ ok: true }); return; }
-            try { resolve(JSON.parse(raw)); } catch { resolve({ ok: true }); }
+            if (!raw) { settle(resolve, { ok: true }); return; }
+            try { settle(resolve, JSON.parse(raw)); } catch { settle(resolve, { ok: true }); }
             return;
           }
-          reject(new Error(raw || res.statusMessage || `HTTP ${res.statusCode}`));
+          let detail;
+          try { detail = JSON.parse(raw).detail; } catch { /* Some errors are plain text. */ }
+          settle(reject, new Error((typeof detail === 'string' && detail) || raw || res.statusMessage || `HTTP ${res.statusCode}`));
         });
       }
     );
-    req.on('error', reject);
+    req.on('timeout', () => {
+      settle(reject, new Error(`请求超时 (${pathname})`));
+      try { req.destroy(); } catch { /* ignore */ }
+    });
+    req.on('error', (err) => settle(reject, err));
     req.write(body);
     req.end();
   });
 }
 
-function getBackend(pathname) {
+function getBackend(pathname, timeoutMs = BACKEND_GET_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    const req = http.request(`${SERVER_URL}${pathname}`, { method: 'GET' }, (res) => {
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
+    const req = http.request(`${SERVER_URL}${pathname}`, { method: 'GET', timeout: timeoutMs }, (res) => {
       let raw = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { raw += chunk; });
+      res.on('error', (err) => settle(reject, err));
+      res.on('close', () => {
+        if (!settled && res.complete === false) {
+          settle(reject, new Error(`连接已中断 (${pathname})`));
+        }
+      });
       res.on('end', () => {
         if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-          if (!raw) { resolve({}); return; }
-          try { resolve(JSON.parse(raw)); } catch { resolve({}); }
+          if (!raw) { settle(resolve, {}); return; }
+          try { settle(resolve, JSON.parse(raw)); } catch { settle(resolve, {}); }
           return;
         }
-        reject(new Error(raw || res.statusMessage || `HTTP ${res.statusCode}`));
+        settle(reject, new Error(raw || res.statusMessage || `HTTP ${res.statusCode}`));
       });
     });
-    req.on('error', reject);
+    req.on('timeout', () => {
+      settle(reject, new Error(`请求超时 (${pathname})`));
+      try { req.destroy(); } catch { /* ignore */ }
+    });
+    req.on('error', (err) => settle(reject, err));
     req.end();
   });
 }
@@ -789,11 +934,12 @@ async function getMultiScreenIdleMs() {
 }
 
 const multiServerScreenBatch = createMultiScreenBatch({
-  submitImages: (images) => (
-    postBackend('/api/ask-from-server-screens', JSON.stringify({ images }))
+  submitImages: (images, writtenExamMode) => (
+    postBackend('/api/ask-from-server-screens', JSON.stringify({ images, expected_written_exam_mode: writtenExamMode }))
   ),
   onError: (error) => {
     console.error('flushMultiServerScreenBatch failed:', error);
+    notifyDesktopToast(error.message || '连续截图提交失败', 'error');
   },
 });
 
@@ -801,10 +947,12 @@ async function addMultiServerScreenShot() {
   try {
     const res = await postBackend('/api/capture-server-screen');
     if (!res?.image) throw new Error('capture response missing image');
+    if (typeof res.written_exam_mode !== 'boolean') throw new Error('无法确认截图所属答题模式，请检查后端版本后重新截图。');
     const idleMs = await getMultiScreenIdleMs();
-    multiServerScreenBatch.add(res.image, idleMs);
+    multiServerScreenBatch.add(res.image, idleMs, res.written_exam_mode);
   } catch (error) {
     console.error('addMultiServerScreenShot failed:', error);
+    notifyDesktopToast(error.message || '连续截图失败', 'error');
   }
 }
 
@@ -833,17 +981,22 @@ function createTray() {
       },
     },
     {
+      id: 'content-protection',
       label: '屏幕共享隐身',
       type: 'checkbox',
-      checked: true,
+      checked: mainWindow?._contentProtection !== false,
       click: (menuItem) => {
-        mainWindow?.setContentProtection(menuItem.checked);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow._contentProtection = Boolean(menuItem.checked);
+          mainWindow.setContentProtection(mainWindow._contentProtection);
+        }
       },
     },
     { type: 'separator' },
     { label: '退出', click: () => { isQuitting = true; app.quit(); } },
   ]);
 
+  trayMenu = contextMenu;
   tray.setContextMenu(contextMenu);
   tray.on('click', () => { mainWindow?.show(); mainWindow?.focus(); });
   // Windows 双击托盘图标也能显示
@@ -984,6 +1137,7 @@ const shortcutCallbacks = {
       await postBackend('/api/ask-from-server-screen');
     } catch (error) {
       console.error('askFromServerScreen failed:', error);
+      notifyDesktopToast(error.message || '截图答题失败', 'error');
     }
   },
   askScreenForceThink: async () => {
@@ -1111,12 +1265,14 @@ ipcMain.handle('toggle-always-on-top', () => {
   return next;
 });
 ipcMain.handle('toggle-content-protection', () => {
-  if (!mainWindow) return true;
-  const webContents = mainWindow.webContents;
+  if (!mainWindow || mainWindow.isDestroyed()) return true;
   const isProtected = mainWindow._contentProtection !== false;
-  mainWindow._contentProtection = !isProtected;
-  mainWindow.setContentProtection(!isProtected);
-  return !isProtected;
+  const next = !isProtected;
+  mainWindow._contentProtection = next;
+  mainWindow.setContentProtection(next);
+  const stealthItem = trayMenu?.getMenuItemById?.('content-protection');
+  if (stealthItem) stealthItem.checked = next;
+  return next;
 });
 ipcMain.handle('get-window-state', () => ({
   alwaysOnTop: mainWindow?.isAlwaysOnTop() ?? false,
@@ -1144,7 +1300,10 @@ ipcMain.handle('set-window-opacity', (_event, requestedOpacity) => {
   }, 250);
   return mainWindow.getOpacity();
 });
-ipcMain.handle('sync-overlay-window', (_event, payload = {}) => {
+ipcMain.handle('sync-overlay-window', (_event, rawPayload) => {
+  const payload = rawPayload && typeof rawPayload === 'object' && !Array.isArray(rawPayload)
+    ? rawPayload
+    : {};
   const style = {};
   if ('opacity' in payload) {
     const opacity = Number(payload.opacity);
@@ -1300,10 +1459,16 @@ ipcMain.handle('destroy-overlay', () => {
   }
   return { ok: true };
 });
-ipcMain.handle('move-overlay-window', (_event, dx, dy) => {
-  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+ipcMain.handle('move-overlay-window', (event, dx, dy) => {
+  if (!overlayWindow || overlayWindow.isDestroyed() || event?.sender !== overlayWindow.webContents) {
+    return { ok: false };
+  }
+  if (typeof dx !== 'number' || typeof dy !== 'number' || !Number.isFinite(dx) || !Number.isFinite(dy)) {
+    return { ok: false };
+  }
   const [x, y] = overlayWindow.getPosition();
   overlayWindow.setPosition(x + Math.round(dx), y + Math.round(dy));
+  return { ok: true };
 });
 ipcMain.on('overlay-drag-start', (event) => {
   _overlayDragging = true;
@@ -1343,20 +1508,36 @@ function createAppMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-function requestAssistStop() {
+function requestAssistStop(timeoutMs) {
   return new Promise((resolve) => {
-    const req = http.request(`${SERVER_URL}/api/stop`, { method: 'POST' }, (res) => {
-      res.once('end', () => resolve(res.statusCode >= 200 && res.statusCode < 300));
-      res.once('close', () => resolve(false));
-      res.once('error', () => resolve(false));
+    let settled = false;
+    const done = (acknowledged) => {
+      if (settled) return;
+      settled = true;
+      resolve(acknowledged);
+    };
+    const options = timeoutMs === undefined ? { method: 'POST' } : { method: 'POST', timeout: timeoutMs };
+    const req = http.request(`${SERVER_URL}/api/stop`, options, (res) => {
+      res.once('end', () => done(res.statusCode >= 200 && res.statusCode < 300));
+      res.once('close', () => done(false));
+      res.once('error', () => done(false));
       res.resume();
     });
-    req.once('error', () => resolve(false));
+    if (timeoutMs !== undefined && typeof req.on === 'function') {
+      req.once('timeout', () => {
+        try { req.destroy?.(); } catch { /* ignore */ }
+        done(false);
+      });
+    }
+    req.once('error', () => done(false));
     req.end();
   });
 }
 
-function stopPythonProcess(proc) {
+function stopPythonProcess(proc, timeoutMs = 5000) {
+  if (!proc || proc.exitCode != null || proc.signalCode != null) {
+    return Promise.resolve();
+  }
   return new Promise((resolve) => {
     let settled = false;
     let forceTimer;
@@ -1367,20 +1548,40 @@ function stopPythonProcess(proc) {
       resolve();
     };
     proc.once('exit', finish);
-    try { proc.kill('SIGTERM'); } catch (err) { console.warn('[py] SIGTERM failed:', err.message); }
+    if (process.platform === 'win32' && proc.pid) {
+      terminateChildProcess(proc);
+    } else {
+      try { proc.kill('SIGTERM'); } catch (err) { console.warn('[py] SIGTERM failed:', err.message); }
+    }
     if (settled) return;
     forceTimer = setTimeout(() => {
       try {
-        if (proc.exitCode === null && proc.signalCode === null) {
+        if (proc.exitCode == null && proc.signalCode == null) {
           console.warn('[py] graceful timeout, escalating to SIGKILL');
-          proc.kill('SIGKILL');
+          if (process.platform === 'win32' && proc.pid) {
+            terminateChildProcess(proc);
+          } else {
+            proc.kill('SIGKILL');
+          }
         }
       } catch (err) {
         console.warn('[py] SIGKILL failed:', err.message);
       }
       finish();
-    }, 5000);
+    }, timeoutMs);
   });
+}
+
+// 先等 /api/stop 释放 MMPG 音频和云端会话，并完成复盘归档，再停止后端进程。
+let pythonStopPromise = null;
+function gracefulStopPython(timeoutMs = 20000) {
+  if (pythonStopPromise) return pythonStopPromise;
+  const proc = pythonProcess;
+  if (!proc || proc.exitCode != null || proc.signalCode != null) return Promise.resolve();
+  const stopTimeoutMs = Math.max(1000, timeoutMs - 5000);
+  const killTimeoutMs = Math.max(1000, timeoutMs - stopTimeoutMs);
+  pythonStopPromise = requestAssistStop(stopTimeoutMs).then(() => stopPythonProcess(proc, killTimeoutMs));
+  return pythonStopPromise;
 }
 
 app.on('before-quit', (event) => {
@@ -1467,8 +1668,21 @@ app.on('will-quit', () => {
   }
   // 兜底:before-quit 通常已经 graceful 停过 pythonProcess,
   // 这里 fallback 防止异常路径泄漏子进程。
+  if (promptWheelHelper) {
+    const activeHelper = promptWheelHelper;
+    promptWheelHelper = null;
+    clearTimeout(activeHelper.startupTimer);
+    clearTimeout(activeHelper.killTimer);
+    terminateChildProcess(activeHelper, { sync: true });
+  }
+  for (const helper of [...exitingPromptWheelHelpers]) {
+    clearTimeout(helper.killTimer);
+    helper.killTimer = null;
+    exitingPromptWheelHelpers.delete(helper);
+    terminateChildProcess(helper, { sync: true });
+  }
   if (pythonProcess) {
-    try { pythonProcess.kill('SIGKILL'); } catch (_) { /* ignore */ }
+    terminateChildProcess(pythonProcess, { sync: true });
     pythonProcess = null;
   }
 });

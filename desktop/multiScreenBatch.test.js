@@ -115,3 +115,20 @@ test('a later screenshot keeps its full idle deadline when the active request fi
   assert.deepEqual(submissions, [['screen-1'], ['screen-2']]);
   assert.equal(timers.size(), 0);
 });
+
+test('separates pending captures from a different workspace before submission', async () => {
+  const timers = createFakeTimers();
+  const submissions = [];
+  const errors = [];
+  const batch = createMultiScreenBatch({
+    submitImages: async (images, exam) => submissions.push([images, exam]),
+    onError: (err) => errors.push(err.message),
+    setTimeoutFn: timers.setTimeoutFn, clearTimeoutFn: timers.clearTimeoutFn,
+  });
+  batch.add('interview', 1000, false);
+  batch.add('exam A', 1000, true);
+  batch.add('exam B', 1000, true);
+  await batch.flush();
+  assert.deepEqual(submissions, [[['exam A', 'exam B'], true]]);
+  assert.match(errors[0], /重新截图/);
+});

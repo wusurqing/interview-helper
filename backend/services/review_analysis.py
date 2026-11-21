@@ -31,6 +31,8 @@ def get_review_model_cfg():
     cfg = get_config()
     review_model = cfg.get_review_model()
 
+    if review_model is None or not getattr(review_model, "enabled", True):
+        raise ValueError("请先选择复盘分析模型")
     if not review_model.api_key or review_model.api_key in ("", "sk-your-api-key-here"):
         raise ValueError("Review 模型未配置有效的 API Key")
 
@@ -44,16 +46,14 @@ def get_active_llm_client() -> tuple[OpenAI, str]:
     return client, review_model.model
 
 
-def _review_think_params(max_tokens: int) -> dict[str, Any]:
+def _review_think_params(model_cfg, max_tokens: int) -> dict[str, Any]:
     """Review 路径固定关闭思考；返回统一 call 需要的 think 参数。"""
-    cfg = get_config()
-    review_model = cfg.get_review_model()
     request_cfg = SimpleNamespace(
         think_mode=False,
         think_effort="off",
         max_tokens=max_tokens,
     )
-    return _build_think_params(review_model, request_cfg)
+    return _build_think_params(model_cfg, request_cfg)
 
 
 def _review_chat(model_cfg, messages: list, *, temperature: float, max_tokens: int, trace_context=None):
@@ -65,7 +65,7 @@ def _review_chat(model_cfg, messages: list, *, temperature: float, max_tokens: i
         messages,
         temperature=temperature,
         max_tokens=max_tokens,
-        think_params=_review_think_params(max_tokens),
+        think_params=_review_think_params(model_cfg, max_tokens),
         trace_context=trace_context,
     )
 
@@ -112,8 +112,8 @@ def run_asr_correction_check(
     original = (candidate_answer or "").strip() or DEFAULT_ASR_CORRECTION_SAMPLE
     result: dict[str, Any] = {
         "ok": False,
-        "model_name": review_model.name,
-        "model": review_model.model,
+        "model_name": review_model.name if review_model else "",
+        "model": review_model.model if review_model else "",
         "original": original,
         "corrected": original,
         "changed": False,
@@ -145,7 +145,9 @@ def run_asr_correction_check(
             trace_context={"scene": "asr_correction"},
         )
 
-        content = response.choices[0].message.content
+        choices = getattr(response, "choices", None) or []
+        first_message = getattr(choices[0], "message", None) if choices else None
+        content = getattr(first_message, "content", None) if first_message is not None else None
         if not content or not content.strip():
             result["detail"] = "模型返回为空"
             return result
@@ -237,11 +239,41 @@ _REVIEW_PROMPT_SPECS = {
     "exam_review_turn": (_EXAM_TURN_PROMPT, _TURN_OUTPUT_CONTRACT, 1000),
     "exam_review_summary": (_EXAM_SUMMARY_PROMPT, _SUMMARY_OUTPUT_CONTRACT, 1500),
 }
-_JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE)
+_JSON_FENCE = re.compile(r"```(?:json)?\s*([\s\S]*)\s*```", re.DOTALL | re.IGNORECASE)
+_EMBEDDED_JSON_FENCE = re.compile(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", re.DOTALL | re.IGNORECASE)
 
 
 def review_prompt_specs() -> dict[str, tuple[str, str, int]]:
     return _REVIEW_PROMPT_SPECS.copy()
+
+
+def _parse_review_json(content: str) -> Any:
+    stripped = content.strip()
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        # 兼容外层 Markdown 围栏（含贪婪包裹内部代码块的 JSON）或前后说明文字包裹的围栏
+        candidates: list[str] = []
+        outer = _JSON_FENCE.fullmatch(stripped)
+        if outer:
+            candidates.append(outer.group(1).strip())
+        for embedded in _EMBEDDED_JSON_FENCE.finditer(stripped):
+            candidates.append(embedded.group(1).strip())
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+        decoder = json.JSONDecoder()
+        for idx, ch in enumerate(stripped):
+            if ch != "{":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(stripped, idx)
+                return obj
+            except json.JSONDecodeError:
+                continue
+        raise ValueError("复盘模型未返回有效 JSON") from exc
 
 
 def _request_review_json(scene: str, user_text: str, overrides: Mapping[str, str] | None) -> dict[str, Any]:
@@ -261,21 +293,13 @@ def _request_review_json(scene: str, user_text: str, overrides: Mapping[str, str
         trace_context={"scene": scene},
     )
 
-    content = response.choices[0].message.content if response.choices else ""
+    choices = getattr(response, "choices", None) or []
+    first_message = getattr(choices[0], "message", None) if choices else None
+    content = getattr(first_message, "content", None) if first_message is not None else ""
     if not content:
         raise ValueError("复盘模型返回为空")
 
-    try:
-        result = json.loads(content)
-    except json.JSONDecodeError as exc:
-        # 兼容外层 Markdown 围栏，同时保留 JSON 字符串内部的代码块。
-        match = _JSON_FENCE.fullmatch(content.strip())
-        if not match:
-            raise ValueError("复盘模型未返回有效 JSON") from exc
-        try:
-            result = json.loads(match.group(1))
-        except json.JSONDecodeError as fenced_exc:
-            raise ValueError("复盘模型未返回有效 JSON") from fenced_exc
+    result = _parse_review_json(content)
     if not isinstance(result, dict):
         raise ValueError("复盘模型未返回 JSON 对象")
     return result

@@ -11,6 +11,7 @@ function createMultiScreenBatch({
 
   const state = {
     images: [],
+    writtenExamMode: null,
     timer: null,
     submitting: false,
   };
@@ -46,9 +47,11 @@ function createMultiScreenBatch({
     const images = state.images.splice(0);
     if (images.length === 0) return false;
 
+    const mode = state.writtenExamMode;
+    state.writtenExamMode = null;
     state.submitting = true;
     try {
-      await submitImages(images);
+      await submitImages(images, mode);
       return true;
     } catch (error) {
       onError(error);
@@ -64,7 +67,12 @@ function createMultiScreenBatch({
     }
   }
 
-  function add(image, idleMs) {
+  function add(image, idleMs, writtenExamMode) {
+    if (state.images.length && state.writtenExamMode !== writtenExamMode) {
+      state.images.length = 0;
+      onError(new Error('答题模式已切换，上一批连续截图已丢弃。若要提交上一批，请回到原模式重新截图。'));
+    }
+    state.writtenExamMode = writtenExamMode;
     state.images.push(image);
     scheduleFlush(idleMs);
   }

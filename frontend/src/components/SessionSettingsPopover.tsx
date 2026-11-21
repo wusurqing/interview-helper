@@ -65,10 +65,10 @@ export default function SessionSettingsPopover({
 
   if (!open) return null
 
-  const thinkOn = !!config?.think_mode
+  const thinkOn = config?.assist_think_mode ?? config?.think_mode ?? false
   const handleThinkToggle = async () => {
     const next = !thinkOn
-    await updateConfigAndRefresh({ think_mode: next, think_effort: next ? 'xhigh' : 'off' })
+    await updateConfigAndRefresh({ assist_think_mode: next, assist_think_effort: next ? 'xhigh' : 'off' })
   }
   const handlePos = async (val: string) => {
     const v = val.trim()

@@ -5,23 +5,21 @@ import path from 'node:path'
 const realSmokeEnabled = process.env.REAL_CHAIN_SMOKE === '1'
 const repoRoot = path.resolve(process.cwd(), '..')
 const preflightAudioPath = path.join(repoRoot, 'backend', 'assets', 'preflight_phrase.wav')
+const segmentedProviders = ['doubao', 'generic']
 const candidateConfigKeys = [
   'candidate_asr_enabled',
   'candidate_stt_provider',
-  'candidate_whisper_model',
-  'candidate_whisper_language',
-  'candidate_remote_stt_enabled',
   'candidate_context_enabled',
   'candidate_context_wait_ms',
   'candidate_context_max_chars',
   'candidate_context_min_chars',
-  'candidate_streaming_asr_enabled',
-  'candidate_streaming_asr_interval_ms',
 ]
 
 test.describe('real interview chain smoke', () => {
   test.skip(!realSmokeEnabled, 'Set REAL_CHAIN_SMOKE=1 to run live audio/STT/LLM smoke tests.')
   test.setTimeout(130_000)
+  test.describe.configure({ mode: 'serial' })
+  const ownedPages = new WeakSet()
 
   async function api(page, path, options = {}) {
     return await page.evaluate(async ({ path, options }) => {
@@ -55,6 +53,20 @@ test.describe('real interview chain smoke', () => {
 
   function pickCandidateConfig(config) {
     return Object.fromEntries(candidateConfigKeys.map((key) => [key, config[key]]))
+  }
+
+  async function requireSegmentedInterviewer(page) {
+    await page.goto('/')
+    const result = await api(page, '/api/config')
+    expect(result.ok).toBe(true)
+    const config = result.body
+    test.skip(!segmentedProviders.includes(config.stt_provider) || !config.stt_configured?.[config.stt_provider],
+      'Select a configured Volcengine Doubao or OpenAI-compatible ASR for the interviewer.')
+    const session = await api(page, '/api/session')
+    expect(session.ok).toBe(true)
+    test.skip(session.body.is_recording, 'The live smoke test needs an idle interview session.')
+    ownedPages.add(page)
+    return config
   }
 
   async function pickMainLoopbackDevice(page) {
@@ -98,13 +110,13 @@ test.describe('real interview chain smoke', () => {
   }
 
   test.afterEach(async ({ page }) => {
-    if (page.isClosed()) return
+    if (page.isClosed() || !ownedPages.has(page)) return
     await api(page, '/api/stop', { method: 'POST', body: '{}' }).catch(() => null)
     await api(page, '/api/clear', { method: 'POST', body: '{}' }).catch(() => null)
   })
 
   test('real preflight sends playback/capture/STT/LLM events over WebSocket', async ({ page }) => {
-    await page.goto('/')
+    await requireSegmentedInterviewer(page)
     await expect(page.getByRole('button', { name: /开始面试/ })).toBeVisible({ timeout: 20_000 })
     const main = await pickMainLoopbackDevice(page)
 
@@ -161,7 +173,7 @@ test.describe('real interview chain smoke', () => {
   })
 
   test('bad candidate microphone does not block real main interview answer generation', async ({ page }) => {
-    await page.goto('/')
+    await requireSegmentedInterviewer(page)
     await expect(page.getByRole('button', { name: /开始面试/ })).toBeVisible({ timeout: 20_000 })
     const main = await pickMainLoopbackDevice(page)
 
@@ -195,11 +207,10 @@ test.describe('real interview chain smoke', () => {
   })
 
   test('candidate ASR config matrix preserves start, pause, resume, and stop', async ({ page }) => {
-    await page.goto('/')
+    const original = await requireSegmentedInterviewer(page)
     await expect(page.getByRole('button', { name: /开始面试/ })).toBeVisible({ timeout: 20_000 })
     const main = await pickMainLoopbackDevice(page)
     const mic = await pickCandidateMicDevice(page, main.id)
-    const original = (await api(page, '/api/config')).body
     const restorePatch = pickCandidateConfig(original)
     const startRequests = []
     page.on('request', (request) => {
@@ -212,19 +223,18 @@ test.describe('real interview chain smoke', () => {
       await patchConfig(page, { candidate_asr_enabled: false })
       await page.reload({ waitUntil: 'domcontentloaded' })
       await expect(page.getByRole('button', { name: /开始面试/ })).toBeVisible({ timeout: 20_000 })
-      await expect(page.getByText(/我的麦克风未开启/)).toBeVisible({ timeout: 10_000 })
+      await expect(page.getByRole('status', { name: '我的回答记录状态' })).toContainText('我的回答记录已关闭')
       await page.getByRole('button', { name: /开始面试/ }).click()
       await waitForRecording(page, true)
       expect(startRequests.at(-1)).not.toContain('candidate_mic_device_id')
       await postJson(page, '/api/stop')
       await waitForRecording(page, false)
 
+      const otherProvider = segmentedProviders.find((provider) => provider !== original.stt_provider && original.stt_configured[provider])
       await patchConfig(page, {
         candidate_asr_enabled: true,
-        candidate_stt_provider: 'whisper',
-        candidate_remote_stt_enabled: false,
+        candidate_stt_provider: otherProvider ?? original.stt_provider,
         candidate_context_enabled: true,
-        candidate_streaming_asr_enabled: true,
       })
       await page.reload({ waitUntil: 'domcontentloaded' })
       await expect(page.getByText(/我的麦克风 · 记录我的回答/)).toBeVisible({ timeout: 20_000 })
@@ -238,11 +248,9 @@ test.describe('real interview chain smoke', () => {
       await postJson(page, '/api/stop')
       await waitForRecording(page, false)
 
-      const sameProvider = original.stt_provider || 'whisper'
       await patchConfig(page, {
         candidate_asr_enabled: true,
-        candidate_stt_provider: sameProvider,
-        candidate_remote_stt_enabled: sameProvider !== 'whisper',
+        candidate_stt_provider: original.stt_provider,
         candidate_context_enabled: true,
       })
       await page.reload({ waitUntil: 'domcontentloaded' })

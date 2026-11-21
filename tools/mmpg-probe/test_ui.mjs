@@ -57,6 +57,9 @@ try {
   await page.reload();
   await page.locator('#status').filter({ hasText: '准备就绪' }).waitFor();
   await page.locator('#aivad').uncheck();
+  await page.locator('#silence-ms').evaluate((input) => {
+    input.value = '850.7';
+  });
   await page.locator('#start').click();
   await page.locator('#status').filter({ hasText: '可以讲话' }).waitFor();
   await page.locator('#mark-end').click();
@@ -67,6 +70,7 @@ try {
   const test = await page.evaluate(() => window.probeTest);
   assert.equal(test.commands[0].type, 'start');
   assert.equal(test.commands[0].options.aivad, false);
+  assert.equal(test.commands[0].options.silence_ms, 851);
   assert.ok(test.commands.some(command => command.type === 'stop'));
   assert.ok(test.stoppedTracks > 0);
   assert.equal(test.left, 1);

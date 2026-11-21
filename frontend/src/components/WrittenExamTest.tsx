@@ -14,7 +14,8 @@ import {
   XCircle,
 } from 'lucide-react'
 import { api } from '@/lib/api'
-import { buildWsUrl } from '@/lib/backendUrl'
+import { getWrittenExamModel, missingWrittenExamModel } from '@/lib/assistModels'
+import { subscribeExamPreflight, type PreflightWsMessage } from '@/lib/preflightWsBus'
 import { useInterviewStore } from '@/stores/configStore'
 
 type StepStatus = 'idle' | 'running' | 'pass' | 'fail' | 'warn' | 'skip' | 'done'
@@ -268,99 +269,52 @@ export default function WrittenExamTest() {
     }
   }, [markTerminal, setCurrentPreflightId])
 
-  const handleMessage = useCallback((event: MessageEvent) => {
-    try {
-      const msg = JSON.parse(event.data)
-      if (msg.exam_preflight_id) {
-        const eventPreflightId = String(msg.exam_preflight_id)
-        if (!shouldAcceptPreflightEvent(eventPreflightId)) return
-        if (msg.type === 'answer_start') {
-          if (isTerminalFor(eventPreflightId)) return
-          setRunning(true)
-          setSteps((prev) => ({
-            ...prev,
-            submit: mergeStepState(prev.submit, {
-              status: 'pass',
-              detail: '真实答题 worker 已开始流式回答',
-              question: FIXED_QUESTION,
-              model_name: msg.model_name,
-            }),
-            llm: mergeStepState(prev.llm, {
-              status: 'running',
-              detail: '正在通过真实答题流生成代码答案…',
-              question: FIXED_QUESTION,
-              model_name: msg.model_name,
-            }),
-            ws: mergeStepState(prev.ws, {
-              status: 'running',
-              detail: '已收到答题启动事件，等待模型流式片段…',
-            }),
-          }))
-          return
-        }
-        if (msg.type === 'answer_think_chunk' || msg.type === 'answer_chunk') {
-          if (isTerminalFor(eventPreflightId)) return
-          setSteps((prev) => ({
-            ...prev,
-            ws: mergeStepState(prev.ws, {
-              status: 'running',
-              detail: '已收到真实答题 WebSocket 流式片段，等待模型生成完成…',
-            }),
-          }))
-          return
-        }
-        if (msg.type === 'answer_done') {
-          const answer = typeof msg.answer === 'string' ? msg.answer : ''
-          if (!answer.trim()) {
-            if (terminalOutcomeRef.current === 'success') return
-            markTerminal(eventPreflightId, 'failure')
-            const message = '模型未返回有效答案，请重试或更换模型。'
-            runRequestRef.current = false
-            setRunning(false)
-            setDone(true)
-            setErrorMsg(message)
-            setSteps((prev) => ({
-              ...applyFailureSteps(prev, message),
-              ws: mergeStepState(prev.ws, {
-                status: 'pass',
-                detail: '已收到真实答题结果事件',
-              }),
-            }))
-            return
-          }
-          if (terminalOutcomeRef.current === 'failure') return
-          markTerminal(eventPreflightId, 'success')
-          runRequestRef.current = false
-          setRunning(false)
-          setDone(true)
-          setErrorMsg(null)
-          setSteps((prev) => ({
-            ...prev,
-            llm: mergeStepState(prev.llm, {
-              status: 'pass',
-              detail: `首 token ${msg.first_token_ms ?? 0}ms · 完整 ${msg.total_ms ?? 0}ms`,
-              answer: msg.answer,
-              question: FIXED_QUESTION,
-              first_token_ms: msg.first_token_ms,
-              total_ms: msg.total_ms,
-              model_name: msg.model_name,
-            }),
-            ws: mergeStepState(prev.ws, {
-              status: 'pass',
-              detail: '真实答题 WebSocket 完整推送正常',
-            }),
-            ui: mergeStepState(prev.ui, {
-              status: 'pass',
-              detail: '真实答题结果已在检测面板渲染',
-            }),
-          }))
-          void hydrateStatus()
-          return
-        }
-        if (msg.type === 'answer_error' || msg.type === 'answer_cancelled') {
+  const handleMessage = useCallback((rawMsg: PreflightWsMessage) => {
+    const msg = rawMsg as Record<string, any>
+    if (msg.exam_preflight_id) {
+      const eventPreflightId = String(msg.exam_preflight_id)
+      if (!shouldAcceptPreflightEvent(eventPreflightId)) return
+      if (msg.type === 'answer_start') {
+        if (isTerminalFor(eventPreflightId)) return
+        setRunning(true)
+        setSteps((prev) => ({
+          ...prev,
+          submit: mergeStepState(prev.submit, {
+            status: 'pass',
+            detail: '真实答题 worker 已开始流式回答',
+            question: FIXED_QUESTION,
+            model_name: msg.model_name,
+          }),
+          llm: mergeStepState(prev.llm, {
+            status: 'running',
+            detail: '正在通过真实答题流生成代码答案…',
+            question: FIXED_QUESTION,
+            model_name: msg.model_name,
+          }),
+          ws: mergeStepState(prev.ws, {
+            status: 'running',
+            detail: '已收到答题启动事件，等待模型流式片段…',
+          }),
+        }))
+        return
+      }
+      if (msg.type === 'answer_think_chunk' || msg.type === 'answer_chunk') {
+        if (isTerminalFor(eventPreflightId)) return
+        setSteps((prev) => ({
+          ...prev,
+          ws: mergeStepState(prev.ws, {
+            status: 'running',
+            detail: '已收到真实答题 WebSocket 流式片段，等待模型生成完成…',
+          }),
+        }))
+        return
+      }
+      if (msg.type === 'answer_done') {
+        const answer = typeof msg.answer === 'string' ? msg.answer : ''
+        if (!answer.trim()) {
           if (terminalOutcomeRef.current === 'success') return
-          const message = msg.message || '笔试链路检测被取消或失败'
           markTerminal(eventPreflightId, 'failure')
+          const message = '模型未返回有效答案，请重试或更换模型。'
           runRequestRef.current = false
           setRunning(false)
           setDone(true)
@@ -369,72 +323,100 @@ export default function WrittenExamTest() {
             ...applyFailureSteps(prev, message),
             ws: mergeStepState(prev.ws, {
               status: 'pass',
-              detail: '已收到真实答题错误事件',
+              detail: '已收到真实答题结果事件',
             }),
           }))
           return
         }
-        return
-      }
-      if (msg.type !== 'exam_preflight_step') return
-      const { step, status, detail, answer, question, first_token_ms, total_ms, model_name } = msg
-      const eventPreflightId = msg.preflight_id ? String(msg.preflight_id) : null
-      if (msg.preflight_id) {
-        if (!shouldAcceptPreflightEvent(eventPreflightId)) return
-      }
-      if (step === 'done') {
         if (terminalOutcomeRef.current === 'failure') return
-        if (eventPreflightId) markTerminal(eventPreflightId, 'success')
+        markTerminal(eventPreflightId, 'success')
         runRequestRef.current = false
-        setDone(true)
         setRunning(false)
+        setDone(true)
+        setErrorMsg(null)
+        setSteps((prev) => ({
+          ...prev,
+          llm: mergeStepState(prev.llm, {
+            status: 'pass',
+            detail: `首 token ${msg.first_token_ms ?? 0}ms · 完整 ${msg.total_ms ?? 0}ms`,
+            answer: msg.answer,
+            question: FIXED_QUESTION,
+            first_token_ms: msg.first_token_ms,
+            total_ms: msg.total_ms,
+            model_name: msg.model_name,
+          }),
+          ws: mergeStepState(prev.ws, {
+            status: 'pass',
+            detail: '真实答题 WebSocket 完整推送正常',
+          }),
+          ui: mergeStepState(prev.ui, {
+            status: 'pass',
+            detail: '真实答题结果已在检测面板渲染',
+          }),
+        }))
         void hydrateStatus()
         return
       }
-      if (step === 'error') {
+      if (msg.type === 'answer_error' || msg.type === 'answer_cancelled') {
         if (terminalOutcomeRef.current === 'success') return
-        const message = detail || '笔试链路检测失败，请检查模型配置'
-        if (eventPreflightId) markTerminal(eventPreflightId, 'failure')
+        const message = msg.message || '笔试链路检测被取消或失败'
+        markTerminal(eventPreflightId, 'failure')
         runRequestRef.current = false
         setRunning(false)
         setDone(true)
         setErrorMsg(message)
-        setSteps((prev) => applyFailureSteps(prev, message))
+        setSteps((prev) => ({
+          ...applyFailureSteps(prev, message),
+          ws: mergeStepState(prev.ws, {
+            status: 'pass',
+            detail: '已收到真实答题错误事件',
+          }),
+        }))
         return
       }
-      setSteps((prev) => ({
-        ...prev,
-        [step]: mergeStepState(prev[step], {
-          status,
-          detail,
-          answer,
-          question,
-          first_token_ms,
-          total_ms,
-          model_name,
-        }),
-      }))
-    } catch {
-      /* ignore malformed WS frames */
+      return
     }
+    if (msg.type !== 'exam_preflight_step') return
+    const { step, status, detail, answer, question, first_token_ms, total_ms, model_name } = msg
+    const eventPreflightId = msg.preflight_id ? String(msg.preflight_id) : null
+    if (msg.preflight_id) {
+      if (!shouldAcceptPreflightEvent(eventPreflightId)) return
+    }
+    if (step === 'done') {
+      if (terminalOutcomeRef.current === 'failure') return
+      if (eventPreflightId) markTerminal(eventPreflightId, 'success')
+      runRequestRef.current = false
+      setDone(true)
+      setRunning(false)
+      void hydrateStatus()
+      return
+    }
+    if (step === 'error') {
+      if (terminalOutcomeRef.current === 'success') return
+      const message = detail || '笔试链路检测失败，请检查模型供应商配置'
+      if (eventPreflightId) markTerminal(eventPreflightId, 'failure')
+      runRequestRef.current = false
+      setRunning(false)
+      setDone(true)
+      setErrorMsg(message)
+      setSteps((prev) => applyFailureSteps(prev, message))
+      return
+    }
+    setSteps((prev) => ({
+      ...prev,
+      [step]: mergeStepState(prev[step], {
+        status,
+        detail,
+        answer,
+        question,
+        first_token_ms,
+        total_ms,
+        model_name,
+      }),
+    }))
   }, [hydrateStatus, isTerminalFor, markTerminal, shouldAcceptPreflightEvent])
 
-  useEffect(() => {
-    const ws = new WebSocket(buildWsUrl('/ws'))
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data)
-        if (msg?.type === 'ping') {
-          ws.send(JSON.stringify({ type: 'pong' }))
-          return
-        }
-      } catch {
-        /* malformed frames are handled by the component message parser */
-      }
-      handleMessage(event)
-    }
-    return () => { ws.close() }
-  }, [handleMessage])
+  useEffect(() => subscribeExamPreflight(handleMessage), [handleMessage])
 
   useEffect(() => {
     void hydrateStatus()
@@ -452,8 +434,9 @@ export default function WrittenExamTest() {
     preflightGenerationRef.current += 1
   }, [])
 
+  const screenshotModel = getWrittenExamModel(config)
   const handleRun = async () => {
-    if (runRequestRef.current || running) return
+    if (runRequestRef.current || running || !screenshotModel) return
     const generation = preflightGenerationRef.current + 1
     preflightGenerationRef.current = generation
     runRequestRef.current = true
@@ -495,8 +478,7 @@ export default function WrittenExamTest() {
   const llmQuestion = llmStep?.question ?? steps.submit?.question ?? FIXED_QUESTION
   const firstToken = formatLatency(llmStep?.first_token_ms)
   const total = formatLatency(llmStep?.total_ms)
-  const modelName = llmStep?.model_name ?? steps.submit?.model_name ?? config?.model_name
-  const hasVisionModel = Boolean(config?.models?.some((model) => model.enabled !== false && model.supports_vision))
+  const modelName = llmStep?.model_name ?? steps.submit?.model_name ?? screenshotModel?.name
 
   return (
     <div className="preflight-panel animate-fade-up">
@@ -525,7 +507,7 @@ export default function WrittenExamTest() {
           <button
             type="button"
             onClick={handleRun}
-            disabled={running}
+            disabled={running || !screenshotModel}
             className="flex items-center gap-1.5 px-4 py-2 btn-primary text-xs font-semibold rounded-xl disabled:opacity-50 flex-shrink-0 whitespace-nowrap"
           >
             {running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Code2 className="w-3.5 h-3.5" />}
@@ -535,7 +517,7 @@ export default function WrittenExamTest() {
           <button
             type="button"
             onClick={handleRun}
-            disabled={running}
+            disabled={running || !screenshotModel}
             className="flex items-center gap-1.5 px-3 py-2 btn-ghost text-xs font-medium rounded-xl disabled:opacity-50 flex-shrink-0"
           >
             {running ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RotateCcw className="w-3.5 h-3.5" />}
@@ -551,10 +533,10 @@ export default function WrittenExamTest() {
         </div>
       )}
 
-      {!hasVisionModel && !hasAnyResult && (
+      {!screenshotModel && !running && (
         <div className="flex items-center gap-2 text-xs text-accent-amber bg-accent-amber/10 px-3 py-2 rounded-lg mb-2">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-          <span>固定截图代码题需要支持视觉的模型。</span>
+          <span>{missingWrittenExamModel}</span>
         </div>
       )}
 
@@ -644,7 +626,7 @@ export default function WrittenExamTest() {
 
       {!hasAnyResult && config && (
         <div className="mt-3 space-y-1 text-[10px] text-text-muted/70 px-1">
-          <div>当前模型：{config.models?.[config.active_model]?.name ?? config.model_name ?? 'N/A'}</div>
+          <div>当前模型：{screenshotModel?.name ?? '未配置'}</div>
           <div>检测会走固定截图代码题，不写入正式答题记录</div>
         </div>
       )}

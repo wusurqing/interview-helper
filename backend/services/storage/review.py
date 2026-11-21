@@ -5,9 +5,15 @@ import json
 import sqlite3
 import threading
 import time
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
 
 from services.storage.paths import sqlite_path
+from services.storage.sqlite_utils import (
+    enable_wal_mode,
+    open_sqlite_connection,
+    sqlite_connection,
+)
 
 DB_PATH = sqlite_path("review.db")
 _db_lock = threading.Lock()
@@ -17,6 +23,13 @@ _DEFAULT_REVIEW_TITLES = {"", "手动复盘", "面试详情", "复盘"}
 _DEFAULT_COMPANY_VALUES = {"", "新公司", "未命名公司"}
 _DEFAULT_ROLE_VALUES = {"", "岗位", "岗位未填写"}
 MAX_REVIEW_PAGE_SIZE = 100
+ANALYZABLE_SESSION_STATUSES = (
+    "recorded",
+    "recording",
+    "completed",
+    "partial_capture",
+    "analysis_failed",
+)
 _TERMINAL_APPLICATION_STAGES = {
     "written_rejected",
     "interview1_rejected",
@@ -76,104 +89,116 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
 
 
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return open_sqlite_connection(DB_PATH, foreign_keys=True)
+
+
+@contextmanager
+def _connect(*, transactional: bool = False) -> Iterator[sqlite3.Connection]:
+    with sqlite_connection(
+        DB_PATH,
+        foreign_keys=True,
+        transactional=transactional,
+    ) as conn:
+        yield conn
 
 
 def init_db() -> None:
-    with _db_lock:
-        conn = _conn()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS review_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                status TEXT NOT NULL DEFAULT 'recording',
-                started_at REAL NOT NULL,
-                ended_at REAL,
-                source TEXT NOT NULL DEFAULT 'assist',
-                title TEXT,
-                company TEXT,
-                role TEXT,
-                application_id INTEGER,
-                jd_snapshot TEXT,
-                resume_snapshot TEXT,
-                interviewer_capture_enabled INTEGER NOT NULL DEFAULT 0,
-                candidate_capture_enabled INTEGER NOT NULL DEFAULT 0,
-                turn_count INTEGER NOT NULL DEFAULT 0,
-                avg_score REAL,
-                summary_markdown TEXT,
-                strong_points_json TEXT,
-                weak_points_json TEXT,
-                behavior_traits_json TEXT,
-                domain_summary_json TEXT,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS review_turns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id INTEGER NOT NULL,
-                qa_id TEXT NOT NULL,
-                seq INTEGER NOT NULL,
-                question_text TEXT NOT NULL,
-                candidate_answer_text TEXT,
-                original_candidate_answer_text TEXT,
-                reference_answer_text TEXT,
-                code_text TEXT,
-                duration_ms INTEGER NOT NULL DEFAULT 0,
-                is_partial INTEGER NOT NULL DEFAULT 0,
-                analysis_status TEXT NOT NULL DEFAULT 'pending',
-                strengths_json TEXT,
-                risks_json TEXT,
-                evidence_json TEXT,
-                behavior_signals_json TEXT,
-                tags_json TEXT,
-                scorecard_json TEXT,
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                FOREIGN KEY (session_id) REFERENCES review_sessions(id)
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS review_profile_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                generated_at REAL NOT NULL,
-                session_count INTEGER NOT NULL DEFAULT 0,
-                summary_json TEXT,
-                strengths_json TEXT,
-                weaknesses_json TEXT,
-                behavior_traits_json TEXT,
-                domain_mastery_json TEXT,
-                trend_json TEXT
-            )
-        """)
-        try:
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_review_turns_session_id ON review_turns(session_id)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_review_turns_qa_id ON review_turns(qa_id)")
-            _ensure_column(conn, "review_turns", "original_candidate_answer_text", "TEXT")
-            _ensure_column(conn, "review_sessions", "application_id", "INTEGER")
-            _ensure_column(conn, "review_sessions", "archive_status", "TEXT")
-            _ensure_column(conn, "review_sessions", "archive_warning", "TEXT")
-            _ensure_column(conn, "review_sessions", "archive_version", "INTEGER NOT NULL DEFAULT 0")
-            for name, definition in {
-                "round_id": "TEXT", "archive_version": "INTEGER NOT NULL DEFAULT 0",
-                "candidate_status": "TEXT", "ai_status": "TEXT", "started_at": "REAL", "ended_at": "REAL",
-                "media_json": "TEXT", "model_summary_json": "TEXT", "audio_status_json": "TEXT",
-            }.items():
-                _ensure_column(conn, "review_turns", name, definition)
-            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_review_round ON review_turns(session_id, round_id)")
-            conn.execute("""CREATE TABLE IF NOT EXISTS review_archive_payloads (
-                turn_id INTEGER PRIMARY KEY, details_json TEXT NOT NULL)""")
-            conn.execute("""CREATE TABLE IF NOT EXISTS review_audio_assets (
-                session_id INTEGER NOT NULL, turn_id INTEGER NOT NULL, asset_id TEXT NOT NULL,
-                relative_path TEXT NOT NULL, PRIMARY KEY(turn_id, asset_id))""")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_review_sessions_application_id ON review_sessions(application_id)")
-        except Exception:
-            pass
-        conn.commit()
-        conn.close()
+    with _db_lock, _connect() as conn:
+        enable_wal_mode(conn)
+        with conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS review_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    status TEXT NOT NULL DEFAULT 'recording',
+                    started_at REAL NOT NULL,
+                    ended_at REAL,
+                    source TEXT NOT NULL DEFAULT 'assist',
+                    title TEXT,
+                    company TEXT,
+                    role TEXT,
+                    application_id INTEGER,
+                    jd_snapshot TEXT,
+                    resume_snapshot TEXT,
+                    interviewer_capture_enabled INTEGER NOT NULL DEFAULT 0,
+                    candidate_capture_enabled INTEGER NOT NULL DEFAULT 0,
+                    turn_count INTEGER NOT NULL DEFAULT 0,
+                    avg_score REAL,
+                    summary_markdown TEXT,
+                    strong_points_json TEXT,
+                    weak_points_json TEXT,
+                    behavior_traits_json TEXT,
+                    domain_summary_json TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS review_turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    qa_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    question_text TEXT NOT NULL,
+                    candidate_answer_text TEXT,
+                    original_candidate_answer_text TEXT,
+                    reference_answer_text TEXT,
+                    code_text TEXT,
+                    duration_ms INTEGER NOT NULL DEFAULT 0,
+                    is_partial INTEGER NOT NULL DEFAULT 0,
+                    analysis_status TEXT NOT NULL DEFAULT 'pending',
+                    strengths_json TEXT,
+                    risks_json TEXT,
+                    evidence_json TEXT,
+                    behavior_signals_json TEXT,
+                    tags_json TEXT,
+                    scorecard_json TEXT,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES review_sessions(id)
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS review_profile_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    generated_at REAL NOT NULL,
+                    session_count INTEGER NOT NULL DEFAULT 0,
+                    summary_json TEXT,
+                    strengths_json TEXT,
+                    weaknesses_json TEXT,
+                    behavior_traits_json TEXT,
+                    domain_mastery_json TEXT,
+                    trend_json TEXT
+                )
+            """)
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_review_turns_session_id ON review_turns(session_id)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_review_turns_qa_id ON review_turns(qa_id)")
+                _ensure_column(conn, "review_turns", "original_candidate_answer_text", "TEXT")
+                _ensure_column(conn, "review_sessions", "application_id", "INTEGER")
+                _ensure_column(conn, "review_sessions", "archive_status", "TEXT")
+                _ensure_column(conn, "review_sessions", "archive_warning", "TEXT")
+                _ensure_column(conn, "review_sessions", "archive_version", "INTEGER NOT NULL DEFAULT 0")
+                for name, definition in {
+                    "round_id": "TEXT",
+                    "archive_version": "INTEGER NOT NULL DEFAULT 0",
+                    "candidate_status": "TEXT",
+                    "ai_status": "TEXT",
+                    "started_at": "REAL",
+                    "ended_at": "REAL",
+                    "media_json": "TEXT",
+                    "model_summary_json": "TEXT",
+                    "audio_status_json": "TEXT",
+                }.items():
+                    _ensure_column(conn, "review_turns", name, definition)
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_review_round ON review_turns(session_id, round_id)")
+                conn.execute("""CREATE TABLE IF NOT EXISTS review_archive_payloads (
+                    turn_id INTEGER PRIMARY KEY, details_json TEXT NOT NULL)""")
+                conn.execute("""CREATE TABLE IF NOT EXISTS review_audio_assets (
+                    session_id INTEGER NOT NULL, turn_id INTEGER NOT NULL, asset_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL, PRIMARY KEY(turn_id, asset_id))""")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_review_sessions_application_id ON review_sessions(application_id)")
+            except Exception:
+                pass
 
 
 init_db()
@@ -193,9 +218,8 @@ def create_session(
 ) -> int:
     """创建新 session，返回 session_id"""
     now = time.time()
-    with _db_lock:
-        conn = _conn()
-        conn.execute(
+    with _db_lock, _connect(transactional=True) as conn:
+        cur = conn.execute(
             """
             INSERT INTO review_sessions (
                 status, started_at, source,
@@ -221,20 +245,16 @@ def create_session(
                 now,
             ),
         )
-        conn.commit()
-        session_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.close()
+        session_id = cur.lastrowid
     return int(session_id)
 
 
 def get_current_session() -> Optional[dict[str, Any]]:
     """获取当前进行中的 session（status=recording）"""
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect() as conn:
         row = conn.execute(
             "SELECT * FROM review_sessions WHERE status = 'recording' ORDER BY started_at DESC LIMIT 1"
         ).fetchone()
-        conn.close()
     if not row:
         return None
     return dict(row)
@@ -254,8 +274,7 @@ def end_session(
     if ended_at is None:
         ended_at = now
 
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect(transactional=True) as conn:
         conn.execute(
             """
             UPDATE review_sessions
@@ -277,8 +296,6 @@ def end_session(
                 session_id,
             ),
         )
-        conn.commit()
-        conn.close()
 
 
 def add_turn(
@@ -299,9 +316,8 @@ def add_turn(
 ) -> int:
     """添加一轮 turn，返回 turn_id，并更新 session 的 turn_count"""
     now = time.time()
-    with _db_lock:
-        conn = _conn()
-        conn.execute(
+    with _db_lock, _connect(transactional=True) as conn:
+        cur = conn.execute(
             """
             INSERT INTO review_turns (
                 session_id, qa_id, seq,
@@ -330,7 +346,7 @@ def add_turn(
                 now,
             ),
         )
-        turn_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        turn_id = cur.lastrowid
 
         # 更新 session 的 turn_count
         conn.execute(
@@ -342,9 +358,6 @@ def add_turn(
             """,
             (session_id, now, session_id),
         )
-
-        conn.commit()
-        conn.close()
     return int(turn_id)
 
 
@@ -353,8 +366,7 @@ def list_sessions(page: int = 1, page_size: int = 20) -> dict[str, Any]:
     page = _bounded_int(page, fallback=1, minimum=1, maximum=1_000_000)
     page_size = _bounded_int(page_size, fallback=20, minimum=1, maximum=MAX_REVIEW_PAGE_SIZE)
     offset = (page - 1) * page_size
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect() as conn:
         total = conn.execute("SELECT COUNT(*) as c FROM review_sessions").fetchone()["c"]
         rows = conn.execute(
             """
@@ -364,30 +376,28 @@ def list_sessions(page: int = 1, page_size: int = 20) -> dict[str, Any]:
             """,
             (page_size, offset),
         ).fetchall()
-        conn.close()
     items = [dict(row) for row in rows]
+    app_ids = [item["application_id"] for item in items if item.get("application_id")]
+    briefs = _application_briefs_by_ids(app_ids) if app_ids else {}
     for item in items:
         item["auto_sync_eligible"] = is_auto_sync_eligible_session(item)
         application_id = item.get("application_id")
-        item["application"] = _application_brief(application_id) if application_id else None
+        item["application"] = briefs.get(int(application_id)) if application_id else None
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
 def get_session_detail(session_id: int) -> Optional[dict[str, Any]]:
     """详情页：session + turns，并解析 JSON 字段"""
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect() as conn:
         session_row = conn.execute(
             "SELECT * FROM review_sessions WHERE id = ?", (session_id,)
         ).fetchone()
         if not session_row:
-            conn.close()
             return None
         turn_rows = conn.execute(
             "SELECT * FROM review_turns WHERE session_id = ? ORDER BY seq ASC",
             (session_id,),
         ).fetchall()
-        conn.close()
 
     session = dict(session_row)
     session["auto_sync_eligible"] = is_auto_sync_eligible_session(session)
@@ -431,16 +441,96 @@ def get_session_detail(session_id: int) -> Optional[dict[str, Any]]:
 
 def update_session_status(session_id: int, status: str):
     """更新 session 状态"""
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect(transactional=True) as conn:
         now = time.time()
         conn.execute(
             "UPDATE review_sessions SET status = ?, updated_at = ? WHERE id = ?",
             (status, now, session_id),
         )
-        conn.commit()
-        conn.close()
     sync_application_todos_for_session(session_id)
+
+
+def claim_session_for_analysis(session_id: int) -> bool:
+    """原子条件占位：仅当会话处于可分析状态（且非已完成有效复盘）时切换为 analyzing。"""
+    now = time.time()
+    with _db_lock, _connect(transactional=True) as conn:
+        cur = conn.execute(
+            """
+            UPDATE review_sessions
+            SET status = 'analyzing', updated_at = ?
+            WHERE id = ?
+              AND COALESCE(archive_status, '') NOT IN ('recording', 'draining')
+              AND (
+                status IN ('recorded', 'recording', 'partial_capture', 'analysis_failed')
+                OR (
+                    status = 'completed'
+                    AND COALESCE(summary_markdown, '') = ''
+                    AND avg_score IS NULL
+                    AND NOT EXISTS (
+                        SELECT 1 FROM review_turns t
+                        WHERE t.session_id = review_sessions.id
+                          AND t.analysis_status = 'completed'
+                          AND (
+                              COALESCE(t.strengths_json, '') NOT IN ('', '[]')
+                              OR COALESCE(t.risks_json, '') NOT IN ('', '[]')
+                              OR COALESCE(t.scorecard_json, '') NOT IN ('', '{}')
+                          )
+                    )
+                )
+              )
+            """,
+            (now, int(session_id)),
+        )
+        claimed = cur.rowcount == 1
+    if claimed:
+        sync_application_todos_for_session(session_id)
+    return claimed
+
+
+def ensure_session_analyzing(session_id: int) -> bool:
+    """幂等置为 analyzing（仅当当前并非 analyzing 时写入）。"""
+    now = time.time()
+    with _db_lock, _connect(transactional=True) as conn:
+        cur = conn.execute(
+            """
+            UPDATE review_sessions
+            SET status = 'analyzing', updated_at = ?
+            WHERE id = ? AND status != 'analyzing'
+            """,
+            (now, int(session_id)),
+        )
+        changed = cur.rowcount == 1
+    if changed:
+        sync_application_todos_for_session(session_id)
+    return changed
+
+
+def recover_stale_sessions_on_startup() -> dict[str, int]:
+    """服务启动时将遗留的 analyzing 复位为 analysis_failed，recording 复位为 partial_capture。"""
+    now = time.time()
+    with _db_lock, _connect(transactional=True) as conn:
+        cur_analyzing = conn.execute(
+            """
+            UPDATE review_sessions
+            SET status = 'analysis_failed', updated_at = ?
+            WHERE status = 'analyzing'
+            """,
+            (now,),
+        )
+        cur_recording = conn.execute(
+            """
+            UPDATE review_sessions
+            SET status = 'partial_capture',
+                ended_at = COALESCE(ended_at, ?),
+                updated_at = ?
+            WHERE status = 'recording'
+            """,
+            (now, now),
+        )
+        return {
+            "analyzing_recovered": cur_analyzing.rowcount,
+            "recording_recovered": cur_recording.rowcount,
+        }
 
 
 def update_turn_analysis(
@@ -454,8 +544,7 @@ def update_turn_analysis(
 ):
     """更新 turn 的分析结果（含 ASR 纠错后的回答）"""
     session_id: Optional[int] = None
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect(transactional=True) as conn:
         now = time.time()
         row = conn.execute(
             "SELECT session_id, evidence_json FROM review_turns WHERE id = ?",
@@ -502,8 +591,6 @@ def update_turn_analysis(
 
         sql = f"UPDATE review_turns SET {', '.join(fields)} WHERE id = ?"
         conn.execute(sql, params)
-        conn.commit()
-        conn.close()
     if session_id is not None:
         sync_application_todos_for_session(session_id)
 
@@ -516,8 +603,7 @@ def update_session_summary(
     avg_score: Optional[float] = None,
 ):
     """更新 session 的整体总结"""
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect(transactional=True) as conn:
         now = time.time()
         conn.execute(
             """
@@ -538,8 +624,6 @@ def update_session_summary(
                 session_id,
             ),
         )
-        conn.commit()
-        conn.close()
     sync_application_todos_for_session(session_id)
 
 
@@ -581,8 +665,7 @@ def _patch_review_session_fields(
 ) -> Optional[int]:
     now = time.time()
     old_application_id: Optional[int] = None
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect(transactional=True) as conn:
         if application_id is not _UNSET:
             row = conn.execute(
                 "SELECT application_id FROM review_sessions WHERE id = ?",
@@ -608,7 +691,6 @@ def _patch_review_session_fields(
             params.append(int(application_id) if application_id is not None else None)
 
         if not updates:
-            conn.close()
             return old_application_id
 
         updates.append("updated_at = ?")
@@ -619,18 +701,21 @@ def _patch_review_session_fields(
             f"UPDATE review_sessions SET {', '.join(updates)} WHERE id = ?",
             params,
         )
-        conn.commit()
-        conn.close()
     return old_application_id
 
 
-def _application_brief(application_id: Any) -> Optional[dict[str, Any]]:
-    try:
-        from services.storage import job_tracker
+def unlink_application(application_id: int) -> int:
+    """解除已删除投递与复盘记录的关联，避免残留悬空 application_id。"""
+    now = time.time()
+    with _db_lock, _connect(transactional=True) as conn:
+        cur = conn.execute(
+            "UPDATE review_sessions SET application_id = NULL, updated_at = ? WHERE application_id = ?",
+            (now, int(application_id)),
+        )
+        return cur.rowcount
 
-        app = job_tracker.get_application(int(application_id))
-    except Exception:
-        return None
+
+def _format_application_brief(app: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     if not app:
         return None
     return {
@@ -645,13 +730,47 @@ def _application_brief(application_id: Any) -> Optional[dict[str, Any]]:
     }
 
 
+def _application_brief(application_id: Any) -> Optional[dict[str, Any]]:
+    try:
+        from services.storage import job_tracker
+
+        app = job_tracker.get_application(int(application_id))
+    except Exception:
+        return None
+    return _format_application_brief(app)
+
+
+def _application_briefs_by_ids(application_ids: list[Any]) -> dict[int, dict[str, Any]]:
+    ids: list[int] = []
+    for raw in application_ids:
+        try:
+            val = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if val > 0:
+            ids.append(val)
+    if not ids:
+        return {}
+    try:
+        from services.storage import job_tracker
+
+        apps = job_tracker.get_applications_by_ids(ids)
+    except Exception:
+        return {}
+    out: dict[int, dict[str, Any]] = {}
+    for app_id, app in apps.items():
+        brief = _format_application_brief(app)
+        if brief is not None:
+            out[int(app_id)] = brief
+    return out
+
+
 def get_application_review_summaries(application_ids: list[int]) -> dict[int, dict[str, Any]]:
     ids = sorted({int(i) for i in application_ids if int(i) > 0})
     if not ids:
         return {}
     placeholders = ",".join("?" * len(ids))
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect() as conn:
         rows = conn.execute(
             f"""
             SELECT id, application_id, status, started_at, ended_at, turn_count, avg_score
@@ -661,7 +780,6 @@ def get_application_review_summaries(application_ids: list[int]) -> dict[int, di
             """,
             ids,
         ).fetchall()
-        conn.close()
 
     summaries: dict[int, dict[str, Any]] = {
         app_id: {
@@ -699,8 +817,7 @@ def get_application_review_summaries(application_ids: list[int]) -> dict[int, di
 
 
 def list_reviews_for_application(application_id: int) -> list[dict[str, Any]]:
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect() as conn:
         rows = conn.execute(
             """
             SELECT id, status, started_at, ended_at, title, company, role,
@@ -711,7 +828,6 @@ def list_reviews_for_application(application_id: int) -> list[dict[str, Any]]:
             """,
             (int(application_id),),
         ).fetchall()
-        conn.close()
     out: list[dict[str, Any]] = []
     for row in rows:
         item = dict(row)
@@ -872,13 +988,11 @@ def sync_review_metadata_from_application(application_id: int) -> int:
     if not app:
         return 0
 
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect() as conn:
         rows = conn.execute(
             "SELECT id, title, company, role FROM review_sessions WHERE application_id = ?",
             (int(application_id),),
         ).fetchall()
-        conn.close()
 
     updated = 0
     for row in rows:

@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from services.storage import review
 from core.logger import get_logger
+from scripts.recover_review_from_logs import _extract_repr
 
 logger = get_logger(__name__)
 
@@ -35,10 +36,13 @@ def parse_log_file(log_path: str) -> List[Dict[str, Any]]:
         for line in f:
             # 检测会话开始：INTERVIEW_START
             if 'INTERVIEW_START' in line:
-                # 如果有正在记录的 session，先保存
-                if current_session and current_turns and has_conversation:
-                    current_session['turns'] = current_turns
-                    sessions.append(current_session)
+                # 如果有正在记录的 session（例如前一场异常中断未打印 INTERVIEW_STOP），先完整落盘最后一个 QA
+                if current_session:
+                    if current_qa.get('question'):
+                        current_turns.append(current_qa)
+                    if current_turns and has_conversation:
+                        current_session['turns'] = current_turns
+                        sessions.append(current_session)
 
                 # 提取时间戳
                 ts_match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
@@ -68,6 +72,12 @@ def parse_log_file(log_path: str) -> List[Dict[str, Any]]:
                 if ts_match:
                     dt = datetime.strptime(ts_match.group(1), '%Y-%m-%d %H:%M:%S')
                     current_session['ended_at'] = dt.timestamp()
+                if current_turns and has_conversation:
+                    current_session['turns'] = current_turns
+                    sessions.append(current_session)
+                current_session = None
+                current_turns = []
+                has_conversation = False
 
             # 检测真实对话：source=conversation_loopback
             elif current_session and 'source=conversation_loopback' in line:
@@ -79,24 +89,23 @@ def parse_log_file(log_path: str) -> List[Dict[str, Any]]:
                 if current_qa.get('question'):
                     current_turns.append(current_qa)
 
-                # 提取问题文本
-                text_match = re.search(r"text='([^']*)'", line)
-                if text_match:
-                    question_text = text_match.group(1)
+                # 提取问题文本（使用 _extract_repr 兼容单引号、双引号与转义字符）
+                question_text = _extract_repr(line, 'text')
+                if question_text:
                     # 去掉连续追问的前缀
                     if '以下内容来自同一轮实时面试' in question_text:
                         # 提取最关键的部分
                         parts = question_text.split('连续追问：')
                         if len(parts) > 1:
                             # 取连续追问的最后一条
-                            追问s = parts[1].strip().split('\n')
+                            追问s = [item.strip() for item in parts[1].strip().splitlines() if item.strip()]
                             if 追问s:
                                 question_text = 追问s[-1].split('. ', 1)[-1] if '. ' in 追问s[-1] else 追问s[-1]
                         else:
                             # 取主问题
                             main_q = question_text.split('主问题：')
                             if len(main_q) > 1:
-                                question_text = main_q[1].split('\n')[0]
+                                question_text = main_q[1].splitlines()[0].strip()
 
                     current_qa = {
                         'question': question_text[:500],
@@ -120,24 +129,49 @@ def parse_log_file(log_path: str) -> List[Dict[str, Any]]:
     return sessions
 
 
+def _collect_existing_started_ats() -> list[float]:
+    started_ats: list[float] = []
+    fetched = 0
+    page = 1
+    page_size = review.MAX_REVIEW_PAGE_SIZE
+    while True:
+        batch = review.list_sessions(page=page, page_size=page_size)
+        items = batch.get('items') or []
+        fetched += len(items)
+        for item in items:
+            started = item.get('started_at')
+            if started is not None:
+                started_ats.append(float(started))
+        if fetched >= int(batch.get('total') or 0) or not items:
+            break
+        page += 1
+    return started_ats
+
+
 def import_sessions_to_db(sessions: List[Dict[str, Any]]) -> int:
     """
-    导入会话到数据库
+    导入会话到数据库（按 started_at 去重，状态置为 recorded）
     返回成功导入的会话数
     """
     imported_count = 0
+    seen_started_ats = _collect_existing_started_ats()
 
     for sess in sessions:
         turns = sess.get('turns', [])
         if not turns:
             continue
+        started_at = float(sess['started_at'])
+        if any(abs(existing - started_at) < 1.0 for existing in seen_started_ats):
+            logger.info("Skipped duplicate session started_at=%s", started_at)
+            continue
 
         try:
             # 创建 session
             session_id = review.create_session(
-                started_at=sess['started_at'],
+                started_at=started_at,
                 interviewer_enabled=True,
                 candidate_enabled=True,
+                source=str(sess.get('source') or 'log_import'),
             )
 
             # 添加 turns
@@ -150,14 +184,15 @@ def import_sessions_to_db(sessions: List[Dict[str, Any]]) -> int:
                     candidate_answer_text=turn.get('candidate_answer', ''),
                     reference_answer_text=turn.get('answer', ''),
                     duration_ms=0,
-                    is_partial=False,
+                    is_partial=not bool((turn.get('candidate_answer') or '').strip()),
                     analysis_status='pending',
                 )
 
-            # 结束 session
-            ended_at = sess.get('ended_at') or (sess['started_at'] + len(turns) * 300)
-            review.end_session(session_id=session_id, ended_at=ended_at)
+            # 结束 session：未运行分析前保持 recorded 状态
+            ended_at = sess.get('ended_at') or (started_at + len(turns) * 300)
+            review.end_session(session_id=session_id, status='recorded', ended_at=ended_at)
 
+            seen_started_ats.append(started_at)
             imported_count += 1
             logger.info(f"Imported session {session_id} with {len(turns)} turns")
 
@@ -212,8 +247,7 @@ def main():
 
     # 显示统计
     try:
-        from services.storage import review
-        total = len(review.get_sessions())
+        total = review.list_sessions(page=1, page_size=1)['total']
         print(f"\n数据库中现有 {total} 场面试记录")
     except Exception:
         print("\n导入完成")

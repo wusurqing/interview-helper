@@ -31,17 +31,7 @@ def test_mmpg_can_be_saved_for_both_audio_sources(client):
     assert config._load_config().candidate_stt_provider == "doubao_mmpg"
 
 
-def test_candidate_mmpg_never_preloads_whisper(monkeypatch):
-    from api.assist import pipeline
-
-    settings = config.AppConfig(candidate_stt_provider="doubao_mmpg", candidate_asr_enabled=True)
-    monkeypatch.setattr(pipeline, "get_config", lambda: settings)
-    monkeypatch.setattr(pipeline, "_preload_candidate_whisper_async", lambda *_: pytest.fail("Whisper was preloaded"))
-
-    pipeline.preload_candidate_asr_if_enabled()
-
-
-def test_disabling_candidate_asr_ends_its_mmpg_session(client, monkeypatch):
+def test_role_edits_do_not_end_the_active_mmpg_session(client, monkeypatch):
     from api.assist import candidate_mmpg
 
     stop = AsyncMock()
@@ -51,7 +41,7 @@ def test_disabling_candidate_asr_ends_its_mmpg_session(client, monkeypatch):
     stop.assert_not_awaited()
 
     assert client.post("/api/config", json={"candidate_asr_enabled": False}).status_code == 200
-    stop.assert_awaited_once_with("settings_changed")
+    stop.assert_not_awaited()
 
 
 def test_previous_config_uses_probe_tuning_defaults(client):
@@ -153,7 +143,7 @@ def test_probe_import_preserves_token_mode_app_key_and_provider(client, monkeypa
         "volc_access_key": "probe-test-key", "rtc_app_id": "probe-app-id",
         "rtc_app_key": "ignored-test-app-key", "doubao_api_key": None,
         "rtc_token": "probe-test-token", "token_mode": "manual", "silence_ms": 950,
-        "stt_provider": "doubao_mmpg",
+        "stt_provider": "doubao_mmpg", "answer_delay_ms": 999, "followup_window_ms": 50,
     }), encoding="utf-8-sig")
     monkeypatch.setattr(common_router, "_MMPG_PROBE_CONFIG_PATH", probe_path, raising=False)
     response = client.post("/api/stt/mmpg/import-probe")
@@ -168,6 +158,7 @@ def test_probe_import_preserves_token_mode_app_key_and_provider(client, monkeypa
     assert saved.mmpg.rtc_token == "probe-test-token"
     assert saved.mmpg.rtc_app_id == "probe-app-id"
     assert saved.mmpg.silence_ms == 950
+    assert saved.mmpg.answer_delay_ms == saved.mmpg.followup_window_ms == 1500
 
 
 def test_probe_import_rejects_invalid_values_without_modifying_saved_config(client, monkeypatch, tmp_path):
@@ -217,6 +208,6 @@ def test_mmpg_status_reports_missing_credentials_without_loading_legacy_engine(c
 
 def test_mmpg_status_keeps_active_provider_after_saving_future_provider(client, monkeypatch):
     integration = import_module("api.assist.mmpg_integration")
-    monkeypatch.setattr(integration.pipeline, "is_streaming_interview", lambda: True)
+    monkeypatch.setattr(integration.pipeline, "_interviewer_config", config.AppConfig(stt_provider="doubao_mmpg"))
     assert client.post("/api/config", json={"stt_provider": "doubao"}).status_code == 200
     assert client.get("/api/stt/status").json()["provider"] == "doubao_mmpg"

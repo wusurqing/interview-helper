@@ -195,17 +195,6 @@ def _extract_port(extra_args: list[str]) -> int:
     return DEFAULT_PORT
 
 
-def _current_primary_stt_provider() -> str:
-    try:
-        import json
-
-        with open(os.path.join(BACKEND_DIR, "config.json"), "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return str(data.get("stt_provider") or "whisper").strip().lower()
-    except Exception:
-        return "whisper"
-
-
 def _app_reachable(url: str, timeout: float = 1.5) -> bool:
     """端口上有 HTTP 响应即认为服务已起（401/404 也算，鉴权无关）。"""
     try:
@@ -215,18 +204,6 @@ def _app_reachable(url: str, timeout: float = 1.5) -> bool:
         return True
     except (OSError, ValueError):
         return False
-
-
-def _get_json(url: str, timeout: float = 2.0) -> dict | None:
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
-            if resp.status != 200:
-                return None
-            import json
-
-            return json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
-    except (OSError, urllib.error.URLError, ValueError):
-        return None
 
 
 STARTUP_LOG = os.path.join(ROOT, "log", "startup-console.log")
@@ -252,19 +229,8 @@ def _wait_for_app_ready(port: int, timeout_sec: int = DEFAULT_READY_TIMEOUT_SEC)
     print(f"[...] 等待桌面应用加载完成 (端口 {port})...")
     while time.monotonic() < deadline:
         if _app_reachable(f"{base}/api/options"):
-            break
-        time.sleep(0.5)
-    else:
-        return False
-
-    if _current_primary_stt_provider() != "whisper":
-        return True
-
-    while time.monotonic() < deadline:
-        status = _get_json(f"{base}/api/stt/status", timeout=1.5)
-        if status and status.get("loaded") and not status.get("loading"):
             return True
-        time.sleep(0.8)
+        time.sleep(0.5)
     return False
 
 

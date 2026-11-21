@@ -16,6 +16,8 @@ import {
 import { api, getErrorMessage } from '../../lib/api'
 import { useInterviewStore } from '../../stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
+import ModelPicker from '@/components/ModelPicker'
+import { isConfiguredModel, modelOptionLabel } from '@/lib/assistModels'
 import { StageBadge } from '@/components/job-tracker/stageConfig'
 import { isLightColorScheme } from '@/lib/colorScheme'
 import type { ReviewSession, ReviewSessionsResponse } from './types'
@@ -86,9 +88,10 @@ interface Props {
 
 export default function ReviewSessionList({ onViewDetail }: Props) {
   const latestLoadIdRef = useRef(0)
-  const reviewConfigSaveSeqRef = useRef(0)
   const reviewToggleSaveSeqRef = useRef(0)
   const reviewModelSaveSeqRef = useRef(0)
+  const reviewToggleCommittedSeqRef = useRef(0)
+  const reviewModelCommittedSeqRef = useRef(0)
   const triggeringIdsRef = useRef<Set<number>>(new Set())
   const [loading, setLoading] = useState(true)
   const [data, setData] = useState<ReviewSessionsResponse | null>(null)
@@ -98,7 +101,7 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
   const [triggeringIds, setTriggeringIds] = useState<Set<number>>(new Set())
   const [focusFilter, setFocusFilter] = useState<ReviewListFocus>('all')
   const [pendingReviewEnabled, setPendingReviewEnabled] = useState<boolean | null>(null)
-  const [pendingReviewModelIndex, setPendingReviewModelIndex] = useState<number | null>(null)
+  const [pendingReviewModelIndex, setPendingReviewModelIndex] = useState<number | null>()
   const pageSize = 20
 
   const config = useInterviewStore((s) => s.config)
@@ -110,10 +113,10 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
   const isLight = isLightColorScheme(colorScheme)
 
   const reviewEnabled = config?.review_enabled ?? false
-  const reviewModelIndex = config?.review_model_index ?? 0
+  const reviewModelIndex = config?.review_model_index === undefined ? 0 : config.review_model_index
   const models = config?.models ?? []
   const displayedReviewEnabled = pendingReviewEnabled ?? reviewEnabled
-  const displayedReviewModelIndex = pendingReviewModelIndex ?? reviewModelIndex
+  const displayedReviewModelIndex = pendingReviewModelIndex === undefined ? reviewModelIndex : pendingReviewModelIndex
 
   const loadSessions = useCallback(async (p: number, options?: { silent?: boolean }) => {
     const loadId = latestLoadIdRef.current + 1
@@ -163,18 +166,29 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
   }, [])
 
   const handleToggleReview = async (enabled: boolean) => {
-    const saveSeq = reviewConfigSaveSeqRef.current + 1
-    reviewConfigSaveSeqRef.current = saveSeq
     const toggleSaveSeq = reviewToggleSaveSeqRef.current + 1
     reviewToggleSaveSeqRef.current = toggleSaveSeq
+    const committedModelSeqAtStart = reviewModelCommittedSeqRef.current
     setPendingReviewEnabled(enabled)
     try {
       const updated = await api.updateConfig({ review_enabled: enabled })
-      if (saveSeq !== reviewConfigSaveSeqRef.current) return
-      setConfig(updated)
+      if (toggleSaveSeq !== reviewToggleSaveSeqRef.current) return
+      const latestConfig = useInterviewStore.getState().config
+      const nextConfig =
+        latestConfig && reviewModelCommittedSeqRef.current > committedModelSeqAtStart
+          ? {
+              ...updated,
+              review_model_index: latestConfig.review_model_index,
+              ...(latestConfig.review_model_id !== undefined
+                ? { review_model_id: latestConfig.review_model_id }
+                : {}),
+            }
+          : updated
+      reviewToggleCommittedSeqRef.current += 1
+      setConfig(nextConfig)
       setToastMessage(enabled ? '已开启自动生成复盘' : '已关闭自动生成复盘')
     } catch (err) {
-      if (saveSeq === reviewConfigSaveSeqRef.current) {
+      if (toggleSaveSeq === reviewToggleSaveSeqRef.current) {
         setToastMessage(getErrorMessage(err, '开关切换失败'))
       }
     } finally {
@@ -184,25 +198,36 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
     }
   }
 
-  const handleChangeModel = async (modelIndex: number) => {
-    const saveSeq = reviewConfigSaveSeqRef.current + 1
-    reviewConfigSaveSeqRef.current = saveSeq
+  const handleChangeModel = async (modelIndex: number | null) => {
     const modelSaveSeq = reviewModelSaveSeqRef.current + 1
     reviewModelSaveSeqRef.current = modelSaveSeq
+    const committedToggleSeqAtStart = reviewToggleCommittedSeqRef.current
     setPendingReviewModelIndex(modelIndex)
     try {
-      const updated = await api.updateConfig({ review_model_index: modelIndex })
-      if (saveSeq !== reviewConfigSaveSeqRef.current) return
-      setConfig(updated)
-      const modelName = updated.models?.[modelIndex]?.name ?? models[modelIndex]?.name ?? '当前模型'
-      setToastMessage(`已切换复盘模型为 ${modelName}`)
+      const model = modelIndex === null ? undefined : models[modelIndex]
+      const selection = modelIndex === null || model?.id
+        ? { review_model_id: model?.id ?? null }
+        : { review_model_index: modelIndex }
+      const updated = await api.updateConfig(selection)
+      if (modelSaveSeq !== reviewModelSaveSeqRef.current) return
+      const latestConfig = useInterviewStore.getState().config
+      const nextConfig =
+        latestConfig && reviewToggleCommittedSeqRef.current > committedToggleSeqAtStart
+          ? {
+              ...updated,
+              review_enabled: latestConfig.review_enabled,
+            }
+          : updated
+      reviewModelCommittedSeqRef.current += 1
+      setConfig(nextConfig)
+      setToastMessage(model ? `已切换复盘模型为 ${model.name}` : '已清除复盘模型')
     } catch (err) {
-      if (saveSeq === reviewConfigSaveSeqRef.current) {
+      if (modelSaveSeq === reviewModelSaveSeqRef.current) {
         setToastMessage(getErrorMessage(err, '模型切换失败'))
       }
     } finally {
       if (modelSaveSeq === reviewModelSaveSeqRef.current) {
-        setPendingReviewModelIndex(null)
+        setPendingReviewModelIndex(undefined)
       }
     }
   }
@@ -306,8 +331,6 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
         <ManualImportPanel
           onCreated={(sessionId) => {
             setShowManualImport(false)
-            void loadSessions(1)
-            setPage(1)
             onViewDetail(sessionId)
           }}
           onToast={setToastMessage}
@@ -406,7 +429,7 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
                     <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1">
                       <h3 className="text-sm font-semibold text-text-primary">复盘队列</h3>
                       <span className="text-[11px] text-text-muted">
-                        {currentFocusOption.label} · {total} 场
+                        {currentFocusOption.label} · {focusFilter === 'all' ? total : currentFocusOption.count} 场
                       </span>
                     </div>
                   </div>
@@ -435,8 +458,9 @@ export default function ReviewSessionList({ onViewDetail }: Props) {
               {configPanels}
 
               <SessionTable
-                sessions={sessions}
+                groups={groups}
                 focusFilter={focusFilter}
+                isLight={isLight}
                 linkedReviewCounts={linkedReviewCounts}
                 linkedTimelineLabels={linkedTimelineLabels}
                 triggeringIds={triggeringIds}
@@ -639,11 +663,11 @@ function ReviewSettingsPanel({
   onChangeModel,
 }: {
   reviewEnabled: boolean
-  reviewModelIndex: number
+  reviewModelIndex: number | null
   reviewToggleSaving: boolean
-  models: { name: string; enabled?: boolean }[]
+  models: { name: string; enabled?: boolean; has_api_key?: boolean; provider_name?: string; supports_vision?: boolean }[]
   onToggle: (enabled: boolean) => void
-  onChangeModel: (modelIndex: number) => void
+  onChangeModel: (modelIndex: number | null) => void
 }) {
   const [testing, setTesting] = useState(false)
   const [testResult, setTestResult] = useState<AsrSelfTestResult | null>(null)
@@ -657,7 +681,7 @@ function ReviewSettingsPanel({
     } catch (err) {
       setTestResult({
         ok: false,
-        model_name: models[reviewModelIndex]?.name ?? '复盘模型',
+        model_name: (reviewModelIndex === null ? undefined : models[reviewModelIndex]?.name) ?? '复盘模型',
         model: '',
         original: '',
         corrected: '',
@@ -697,21 +721,15 @@ function ReviewSettingsPanel({
           </span>
         </button>
       </div>
-      <label className="mb-2 block text-xs font-medium text-text-secondary">
-        复盘分析模型
-      </label>
-      <select
-        value={reviewModelIndex}
-        onChange={(event) => onChangeModel(Number(event.target.value))}
-        disabled={!reviewEnabled}
-        className={FIELD_CLASS}
-      >
-        {models.map((model, idx) => (
-          <option key={idx} value={idx} disabled={!model.enabled}>
-            {model.name} {!model.enabled ? '(未启用)' : ''}
-          </option>
-        ))}
-      </select>
+      <ModelPicker
+        label="复盘分析模型"
+        value={reviewModelIndex === null ? '' : String(reviewModelIndex)}
+        emptyLabel="未选择模型"
+        onChange={(value) => onChangeModel(value ? Number(value) : null)}
+        options={models.flatMap((model, index) => isConfiguredModel(model) ? [{
+          value: String(index), label: modelOptionLabel(model), supportsVision: model.supports_vision,
+        }] : [])}
+      />
       <div className="mt-3 border-t border-bg-hover/80 pt-3">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
@@ -769,8 +787,9 @@ function ReviewSettingsPanel({
 }
 
 function SessionTable({
-  sessions,
+  groups,
   focusFilter,
+  isLight,
   linkedReviewCounts,
   linkedTimelineLabels,
   triggeringIds,
@@ -779,8 +798,9 @@ function SessionTable({
   onTriggerAnalysis,
   hasGeneratedAnalysis,
 }: {
-  sessions: ReviewSession[]
+  groups: SessionGroup[]
   focusFilter: ReviewListFocus
+  isLight: boolean
   linkedReviewCounts: Map<number, number>
   linkedTimelineLabels: Map<number, string>
   triggeringIds: Set<number>
@@ -789,7 +809,6 @@ function SessionTable({
   onTriggerAnalysis: (sessionId: number) => void
   hasGeneratedAnalysis: (session: ReviewSession) => boolean
 }) {
-  const groups = buildSessionGroups(sessions, hasGeneratedAnalysis)
   const visibleGroups = groups.filter((group) => focusFilter === 'all' || group.key === focusFilter)
 
   if (visibleGroups.length === 0) {
@@ -815,6 +834,7 @@ function SessionTable({
               <ReviewTimelineCluster
                 key={cluster.key}
                 cluster={cluster}
+                isLight={isLight}
                 linkedReviewCounts={linkedReviewCounts}
                 linkedTimelineLabels={linkedTimelineLabels}
                 triggeringIds={triggeringIds}
@@ -833,6 +853,7 @@ function SessionTable({
 
 function ReviewTimelineCluster({
   cluster,
+  isLight,
   linkedReviewCounts,
   linkedTimelineLabels,
   triggeringIds,
@@ -842,6 +863,7 @@ function ReviewTimelineCluster({
   onTriggerAnalysis,
 }: {
   cluster: SessionCluster
+  isLight: boolean
   linkedReviewCounts: Map<number, number>
   linkedTimelineLabels: Map<number, string>
   triggeringIds: Set<number>
@@ -863,7 +885,7 @@ function ReviewTimelineCluster({
                 <h4 className="text-sm font-semibold text-text-primary">
                   {cluster.application?.company || '未命名公司'} · {cluster.application?.position || '岗位未填写'}
                 </h4>
-                <StageBadge stage={cluster.application?.stage || 'applied'} />
+                <StageBadge stage={cluster.application?.stage || 'applied'} isLight={isLight} />
                 <span className="text-[11px] text-text-muted">
                   同岗位 {timelineCount} 场复盘
                 </span>
@@ -880,6 +902,7 @@ function ReviewTimelineCluster({
             <ReviewQueueRow
               key={session.id}
               session={session}
+              isLight={isLight}
               linkedReviewCount={session.application?.id != null ? linkedReviewCounts.get(session.application.id) ?? 1 : null}
               statusColor={statusColor}
               StatusIcon={StatusIcon}
@@ -900,6 +923,7 @@ function ReviewTimelineCluster({
 
 function ReviewQueueRow({
   session,
+  isLight,
   linkedReviewCount,
   statusColor,
   StatusIcon,
@@ -912,6 +936,7 @@ function ReviewQueueRow({
   onTriggerAnalysis,
 }: {
   session: ReviewSession
+  isLight: boolean
   linkedReviewCount: number | null
   statusColor: string
   StatusIcon: ComponentType<{ className?: string }>
@@ -982,7 +1007,7 @@ function ReviewQueueRow({
                 <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-text-secondary">
                   <span className="font-medium text-accent-blue">{compactLinkedApplication ? '同岗位' : '岗位'}</span>
                   <span className="font-medium text-text-primary">{linkedApplicationName}</span>
-                  <StageBadge stage={session.application?.stage || 'applied'} />
+                  <StageBadge stage={session.application?.stage || 'applied'} isLight={isLight} />
                   {linkedReviewCount != null && linkedReviewCount > 1 ? (
                     <span className="font-medium text-text-muted">
                       {linkedReviewCount} 场
@@ -1106,7 +1131,7 @@ function sessionRailTone(status: ReviewSession['status']) {
   }
 }
 
-function sessionRowTone(status: ReviewSession['status']) {
+function sessionRowTone(_status: ReviewSession['status']) {
   return ''
 }
 
@@ -1180,13 +1205,6 @@ function describeTimelinePosition(index: number, total: number) {
   if (index === 0) return '最近一场'
   if (index === total - 1) return '更早一场'
   return '中间场'
-}
-
-function formatRelativeDate(ts: number) {
-  const diffDays = Math.floor((Date.now() / 1000 - ts) / 86400)
-  if (diffDays <= 0) return '今天'
-  if (diffDays === 1) return '昨天'
-  return `${diffDays} 天前`
 }
 
 function buildSessionGroups(

@@ -24,6 +24,7 @@ class QAPair:
     answer_format: str | None = None
     first_token_ms: int | None = None
     total_ms: int | None = None
+    written_exam: bool = False
 
 
 @dataclass
@@ -58,6 +59,7 @@ class Session:
     capture_is_loopback: bool = True
     single_mic: "SingleMicSession | None" = field(default=None, repr=False, compare=False)
     created_at: float = field(default_factory=time.time)
+    session_version: int = 0
     system_summary: str = ""
     _compaction_running: bool = False
     _live_transcript: LiveTranscript = field(default_factory=LiveTranscript, repr=False, compare=False)
@@ -242,6 +244,7 @@ class Session:
         answer_format: str | None = None,
         first_token_ms: int | None = None,
         total_ms: int | None = None,
+        written_exam: bool = False,
     ) -> QAPair:
         qa = QAPair(
             id=qa_id or f"qa-{len(self.qa_pairs)}-{int(time.time())}",
@@ -253,6 +256,7 @@ class Session:
             answer_format=answer_format,
             first_token_ms=first_token_ms,
             total_ms=total_ms,
+            written_exam=written_exam,
         )
         self.qa_pairs.append(qa)
         if len(self.qa_pairs) > self.MAX_QA_PAIRS:
@@ -398,33 +402,35 @@ class Session:
         try:
             schedule_compaction(self)
         except Exception:
-            self._compaction_running = False
+            return
 
     def clear(self):
-        if self.archive:
-            self.archive.settle_transcriptions()
-        self._live_transcript.reset()
-        self.transcription_history.clear()
-        self.candidate_transcription_history.clear()
-        self.candidate_answer_segments.clear()
-        self.conversation_history.clear()
-        self.qa_pairs.clear()
-        self.current_transcription = ""
-        self.current_candidate_transcription = ""
-        self.current_candidate_qa_id = ""
-        self.candidate_asr_busy = False
-        self.candidate_asr_active_qa_id = ""
-        self.candidate_asr_activity_at = 0.0
-        self.is_recording = False
-        self.is_paused = False
-        self.last_device_id = -1
-        self.last_candidate_mic_device_id = -1
-        self.capture_is_loopback = True
-        self.single_mic = None
-        self.created_at = time.time()
-        self.system_summary = ""
-        self._compaction_running = False
-        self.last_llm_history_stats = {}
+        with conversation_lock:
+            if self.archive:
+                self.archive.settle_transcriptions()
+            self._live_transcript.reset()
+            self.transcription_history.clear()
+            self.candidate_transcription_history.clear()
+            self.candidate_answer_segments.clear()
+            self.conversation_history.clear()
+            self.qa_pairs.clear()
+            self.current_transcription = ""
+            self.current_candidate_transcription = ""
+            self.current_candidate_qa_id = ""
+            self.candidate_asr_busy = False
+            self.candidate_asr_active_qa_id = ""
+            self.candidate_asr_activity_at = 0.0
+            self.is_recording = False
+            self.is_paused = False
+            self.last_device_id = -1
+            self.last_candidate_mic_device_id = -1
+            self.capture_is_loopback = True
+            self.single_mic = None
+            self.created_at = time.time()
+            self.session_version += 1
+            self.system_summary = ""
+            self._compaction_running = False
+            self.last_llm_history_stats = {}
 
     def snapshot(self) -> dict:
         return {
@@ -444,6 +450,7 @@ class Session:
 
     def _serialize_qa_pair(self, qa: QAPair) -> dict:
         payload = asdict(qa)
+        payload.pop("written_exam")
         verdict = str(payload.pop("vision_verify_verdict", "") or "")
         reason = str(payload.pop("vision_verify_reason", "") or "")
         if not payload.get("updates_qa_id"):

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useInterviewStore } from '@/stores/configStore'
 import { useShallow } from 'zustand/react/shallow'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
@@ -6,6 +6,7 @@ import { isLightColorScheme } from '@/lib/colorScheme'
 import { api } from '@/lib/api'
 import { Clipboard, FileSearch, Sparkles, X } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
+import { SAFE_MARKDOWN_COMPONENTS } from './MarkdownLink'
 import { ResumeMountPanel } from '@/components/resume/ResumeMount'
 
 const JD_STORAGE_KEY = 'ia-resume-opt-jd-draft'
@@ -268,7 +269,7 @@ export default function ResumeOptimizer() {
               prose-td:text-text-secondary prose-td:px-2 prose-td:py-1 prose-td:border-bg-hover
             `}
             >
-              <ReactMarkdown>{displayText}</ReactMarkdown>
+              <ReactMarkdown components={SAFE_MARKDOWN_COMPONENTS}>{displayText}</ReactMarkdown>
               {isAnalyzing && (
                 <span className="inline-block w-1.5 h-3 bg-accent-blue animate-pulse rounded-sm ml-0.5" />
               )}

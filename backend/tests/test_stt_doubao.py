@@ -33,8 +33,8 @@ def _server_text_frame(text: str, *, with_sequence: bool = False, is_last: bool 
     return header + prefix + struct.pack(">I", len(payload)) + payload
 
 
-def test_doubao_stt_does_not_retry_timeout_before_factory_fallback(monkeypatch):
-    calls = {"connect": 0, "sleep": []}
+def test_doubao_stt_leaves_timeout_retry_to_the_segment_worker(monkeypatch):
+    calls = {"connect": 0}
 
     def fake_create_connection(*_args, **_kwargs):
         calls["connect"] += 1
@@ -45,7 +45,6 @@ def test_doubao_stt_does_not_retry_timeout_before_factory_fallback(monkeypatch):
         "websocket",
         SimpleNamespace(create_connection=fake_create_connection),
     )
-    monkeypatch.setattr(engines.time, "sleep", lambda seconds: calls["sleep"].append(seconds))
 
     engine = DoubaoSTT(api_key="sk-test")
 
@@ -53,11 +52,10 @@ def test_doubao_stt_does_not_retry_timeout_before_factory_fallback(monkeypatch):
         engine.transcribe(np.zeros(1600, dtype=np.float32), sample_rate=16000)
 
     assert calls["connect"] == 1
-    assert calls["sleep"] == []
 
 
-def test_doubao_stt_leaves_transient_retry_to_factory_fallback(monkeypatch):
-    calls = {"connect": 0, "sleep": []}
+def test_doubao_stt_leaves_connection_retry_to_the_segment_worker(monkeypatch):
+    calls = {"connect": 0}
 
     class FakeWebSocket:
         def __init__(self):
@@ -89,7 +87,6 @@ def test_doubao_stt_leaves_transient_retry_to_factory_fallback(monkeypatch):
         "websocket",
         SimpleNamespace(create_connection=fake_create_connection),
     )
-    monkeypatch.setattr(engines.time, "sleep", lambda seconds: calls["sleep"].append(seconds))
 
     engine = DoubaoSTT(api_key="sk-test")
 
@@ -97,7 +94,6 @@ def test_doubao_stt_leaves_transient_retry_to_factory_fallback(monkeypatch):
         engine.transcribe(np.zeros(1600, dtype=np.float32), sample_rate=16000)
 
     assert calls["connect"] == 1
-    assert calls["sleep"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -176,3 +172,123 @@ def test_transcribe_returns_immediately_on_server_last_frame(monkeypatch):
     for i, frame in enumerate(audio_frames[:-1]):
         assert frame[1] == 0x21
         assert struct.unpack(">i", frame[4:8])[0] == 2 + i
+
+
+def test_disconnect_before_final_packet_is_not_a_successful_transcription(monkeypatch):
+    calls = {"received": 0, "closed": False}
+
+    class InterruptedSocket:
+        def send_binary(self, _frame):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self):
+            calls["received"] += 1
+            if calls["received"] == 1:
+                return _server_text_frame("未完成的转写")
+            raise TimeoutError("final packet timed out")
+
+        def close(self):
+            calls["closed"] = True
+
+    monkeypatch.setattr(
+        engines, "websocket",
+        SimpleNamespace(create_connection=lambda *_args, **_options: InterruptedSocket()),
+    )
+    with pytest.raises(TimeoutError):
+        DoubaoSTT(api_key="test-key").transcribe(np.zeros(16000, dtype=np.float32))
+    assert calls["closed"]
+
+
+def test_doubao_stt_never_puts_secrets_in_user_uid_and_fixes_default_resource_id(monkeypatch):
+    sent_frames: list[bytes] = []
+
+    class FakeWebSocket:
+        def send_binary(self, frame):
+            sent_frames.append(frame)
+
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self):
+            return _server_text_frame("测试通过", with_sequence=True, is_last=True)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        engines,
+        "websocket",
+        SimpleNamespace(create_connection=lambda *_a, **_k: FakeWebSocket()),
+    )
+
+    engine = DoubaoSTT(api_key="sk-secret-api-key", access_token="tok-secret", resource_id="")
+    assert engine.resource_id == "volc.seedasr.sauc.duration"
+    assert engine.transcribe(np.zeros(1600, dtype=np.float32), sample_rate=16000) == "测试通过"
+
+    first_frame = sent_frames[0]
+    payload_size = struct.unpack(">I", first_frame[8:12])[0]
+    req_json = json.loads(gzip.decompress(first_frame[12 : 12 + payload_size]).decode("utf-8"))
+    assert req_json["user"]["uid"] == "interview-helper"
+    assert "sk-secret-api-key" not in json.dumps(req_json)
+    assert "tok-secret" not in json.dumps(req_json)
+
+
+def test_doubao_stt_non_16khz_resampling_handles_empty_and_non_empty_arrays(monkeypatch):
+    sent_frames: list[bytes] = []
+
+    class FakeWebSocket:
+        def send_binary(self, frame):
+            sent_frames.append(frame)
+
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self):
+            return _server_text_frame("重采样正常", with_sequence=True, is_last=True)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        engines,
+        "websocket",
+        SimpleNamespace(create_connection=lambda *_a, **_k: FakeWebSocket()),
+    )
+
+    engine = DoubaoSTT(api_key="sk-test")
+    # Empty array at 48kHz must not raise IndexError
+    assert engine.transcribe(np.empty(0, dtype=np.float32), sample_rate=48000) == "重采样正常"
+    assert len(sent_frames) == 2  # full request + 1 padded audio frame
+
+    # 1 second at 48kHz -> resampled to 16000 samples with anti-aliasing filter
+    t = np.linspace(0, 1.0, 48000, endpoint=False, dtype=np.float32)
+    low_freq = 0.5 * np.sin(2 * np.pi * 440.0 * t)
+    high_freq = 0.5 * np.sin(2 * np.pi * 14000.0 * t)  # above 8kHz Nyquist of 16kHz
+    low_resampled = engines._resample_pcm_int16(engines._audio_to_pcm_int16(low_freq), 48000, 16000)
+    high_resampled = engines._resample_pcm_int16(engines._audio_to_pcm_int16(high_freq), 48000, 16000)
+    assert len(low_resampled) == 16000
+    assert low_resampled.dtype == np.int16
+    # Passband 440Hz should retain strong RMS energy; stopband 14kHz should be heavily attenuated
+    low_rms = float(np.sqrt(np.mean(low_resampled[200:-200].astype(np.float64) ** 2)))
+    high_rms = float(np.sqrt(np.mean(high_resampled[200:-200].astype(np.float64) ** 2)))
+    assert low_rms > 8000.0
+    assert high_rms < low_rms * 0.05
+
+    # Multi-channel (stereo) 2D PCM downmixes to 1D mono cleanly without raising ValueError
+    stereo = np.column_stack([
+        np.full(4800, 1000, dtype=np.int16),
+        np.full(4800, 3000, dtype=np.int16),
+    ])
+    stereo_resampled = engines._resample_pcm_int16(stereo, 48000, 16000)
+    assert stereo_resampled.ndim == 1
+    assert len(stereo_resampled) == 1600
+    assert abs(int(stereo_resampled[800]) - 2000) <= 5
+
+    # Short buffer preserves exact rate step (sample index 0 and 3, not endpoint-stretched 0 and 5)
+    short = np.array([100, 200, 300, 400, 500, 600], dtype=np.int16)
+    short_resampled = engines._resample_pcm_int16(short, 48000, 16000)
+    assert len(short_resampled) == 2
+    assert short_resampled[1] < 500

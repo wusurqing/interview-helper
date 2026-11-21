@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
+from core.config import Mmpg
 from core.logger import get_logger
 
 
@@ -140,6 +141,21 @@ def _manual_expiry(config):
         return supplied or expires or None
     except (ValueError, binascii.Error, struct.error):
         raise MmpgError("rtc_token_invalid", ["rtc_token"]) from None
+
+
+def refresh_manual_rtc_token(snapshot: Mmpg, current: Mmpg) -> Mmpg:
+    """Keep the session's RTC identity and recognition options when renewing its Token."""
+    if (
+        snapshot.token_mode == current.token_mode == "manual"
+        and snapshot.rtc_app_id == current.rtc_app_id
+        and snapshot.rtc_room_id == current.rtc_room_id
+        and snapshot.rtc_user_id == current.rtc_user_id
+    ):
+        return snapshot.model_copy(update={
+            "rtc_token": current.rtc_token,
+            "rtc_token_expires_at": current.rtc_token_expires_at,
+        })
+    return snapshot
 
 
 def validate_config(config):
@@ -267,7 +283,13 @@ async def connect_mmpg(config):
                              close_timeout=3, ping_interval=20, ping_timeout=20, max_size=1024 * 1024,
                              logger=_WIRE_LOGGER)
     except Exception as exc:
-        if getattr(getattr(exc, "response", None), "status_code", None) in (400, 401, 403):
+        status_code = getattr(getattr(exc, "response", None), "status_code", None)
+        _log.warning(
+            "connect_mmpg failed kind=%s status=%s",
+            type(exc).__name__,
+            status_code,
+        )
+        if status_code in (400, 401, 403):
             raise MmpgError("cloud_auth_failed") from None
         raise MmpgError("cloud_connection_failed") from None
 
@@ -282,6 +304,7 @@ class _Run:
     stop_reason: str | None = None
     started: bool = False
     deadline: asyncio.TimerHandle | None = None
+    timeout_task: asyncio.Task | None = None
 
     def capture_options(self) -> dict[str, str]:
         return {"single_mic_id": self.single_mic_id} if self.single_mic_id is not None else {}
@@ -312,7 +335,7 @@ class _Generation:
     conversation_numbers: dict[str, int] = field(default_factory=dict)
     pause_received_at: dict[str, float] = field(default_factory=dict)
     recent_underruns: deque = field(default_factory=lambda: deque(maxlen=BROWSER_UNDERRUN_LIMIT))
-    token_issued_at: int | None = None
+    token_issued_at: float | None = None
 
 
 class MmpgManager:
@@ -406,8 +429,33 @@ class MmpgManager:
         self._task = self._loop.create_task(self._run_session(run, preflight))
         if mode == "test":
             run.deadline = self._loop.call_later(
-                self._test_timeout, lambda: self._loop.create_task(self._timeout_test(run)),
+                self._test_timeout, self._schedule_timeout_test, run,
             )
+
+    def _schedule_timeout_test(self, run):
+        if (
+            run is self._run
+            and run.stop_reason is None
+            and run.timeout_task is None
+            and self._loop is not None
+            and not self._loop.is_closed()
+        ):
+            task = self._loop.create_task(self._timeout_test(run))
+            run.timeout_task = task
+
+            def _cleanup(done_task):
+                if run.timeout_task is done_task:
+                    run.timeout_task = None
+                if not done_task.cancelled():
+                    exc = done_task.exception()
+                    if exc is not None:
+                        _log.warning(
+                            "session=%s event=timeout_test_failed kind=%s",
+                            run.trace_id,
+                            type(exc).__name__,
+                        )
+
+            task.add_done_callback(_cleanup)
 
     async def _timeout_test(self, run):
         if run is self._run:
@@ -417,6 +465,8 @@ class MmpgManager:
         run, task = self._run, self._task
         if run is None:
             return
+        if run.deadline is not None:
+            run.deadline.cancel()
         if run.stop_reason is None:
             run.stop_reason = reason
             if self._current is not None:
@@ -429,6 +479,12 @@ class MmpgManager:
                 task.cancel()
         with suppress(asyncio.CancelledError):
             await asyncio.shield(task)
+        timeout_task = run.timeout_task
+        if timeout_task is not None and timeout_task is not asyncio.current_task():
+            if not timeout_task.done():
+                timeout_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await timeout_task
 
     async def close(self):
         self._closed = True
@@ -495,8 +551,14 @@ class MmpgManager:
                 self._queued_bytes += size
                 self._last_audio = time.monotonic()
             if not self._wake_pending:
+                if self._loop is None:
+                    return False
                 self._wake_pending = True
-                self._loop.call_soon_threadsafe(self._wake_audio)
+                try:
+                    self._loop.call_soon_threadsafe(self._wake_audio)
+                except RuntimeError:
+                    self._wake_pending = False
+                    return False
             return not self._audio_failed
 
     def _wake_audio(self):
@@ -641,7 +703,7 @@ class MmpgManager:
             generation.expires_at = config["rtc_token_expires_at"]
             return config["rtc_token"]
         issued = int(time.time())
-        generation.token_issued_at = issued
+        generation.token_issued_at = time.monotonic()
         generation.expires_at = issued + TOKEN_TTL_SECONDS
         generation.expiry_changed.set()
         return sign_rtc_token(
@@ -687,7 +749,7 @@ class MmpgManager:
                     self._set_audio_gate(generation.number)
                 await self._publish("muted" if generation.muted else "listening")
         elif kind == "renew" and generation.config["token_mode"] == "auto" and generation.rtc_ready.is_set():
-            if int(time.time()) - generation.token_issued_at >= 1:
+            if generation.token_issued_at is None or time.monotonic() - generation.token_issued_at >= 1.0:
                 token = self._issue_token(generation)
                 _log.info("session=%s generation=%s event=token_issued", self._run.trace_id, generation.number)
                 await self._emit({
@@ -1009,6 +1071,9 @@ class MmpgManager:
         finally:
             if run.deadline is not None:
                 run.deadline.cancel()
+            timeout_task = run.timeout_task
+            if timeout_task is not None and not timeout_task.done() and run.stop_reason != "test_timeout":
+                timeout_task.cancel()
             try:
                 if run.stop_reason:
                     await self._publish("idle", reason=run.stop_reason)

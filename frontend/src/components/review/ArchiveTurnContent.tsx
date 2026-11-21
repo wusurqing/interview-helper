@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Info } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
+import { SAFE_MARKDOWN_COMPONENTS } from '@/components/MarkdownLink'
 import { api, getErrorMessage } from '@/lib/api'
 import ArchiveAudioPlayer from './ArchiveAudioPlayer'
 import { ARCHIVE_SPEAKERS, archiveAudioIssue, type ArchiveDetails, type ArchiveSpeaker, type ReviewTurn } from './types'
@@ -76,7 +77,7 @@ export function ArchiveTurnContent({ turn }: { turn: ReviewTurn }) {
           <button type="button" title={timing} aria-label="查看对话和 AI 调用详情" aria-expanded={open}
             className="rounded p-1 text-text-muted hover:bg-bg-hover" onClick={() => setOpen(!open)}><Info className="h-4 w-4" /></button>
         </div>
-        {turn.reference_answer_text ? <div className="markdown-body"><ReactMarkdown>{turn.reference_answer_text}</ReactMarkdown></div>
+        {turn.reference_answer_text ? <div className="markdown-body"><ReactMarkdown components={SAFE_MARKDOWN_COMPONENTS}>{turn.reference_answer_text}</ReactMarkdown></div>
           : <p>{answerStatus[turn.ai_status ?? ''] || '无参考答案'}</p>}
       </section>
       {open && <section className="space-y-3 rounded border border-bg-hover p-3 text-xs">

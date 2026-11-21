@@ -46,23 +46,37 @@ _VERIFY_PROMPT = """你是严谨的代码评审员。下面是一道编程题(�
 
 
 _JSON_FENCE = re.compile(r"^```(?:json)?|```$", re.IGNORECASE | re.MULTILINE)
-_JSON_OBJECT = re.compile(r"\{[\s\S]*?\}")
+
+
+def _extract_json_dict(text: str) -> Optional[dict]:
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        # Valid top-level JSON that is not an object (e.g. array/scalar) must not
+        # have inner objects scraped out of it.
+        return data if isinstance(data, dict) else None
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
 
 
 def _parse_verdict(raw: str) -> dict:
     if not raw:
         return {"verdict": "UNKNOWN", "reason": "模型无返回"}
     cleaned = _JSON_FENCE.sub("", raw.strip())
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        match = _JSON_OBJECT.search(cleaned)
-        if not match:
-            return {"verdict": "UNKNOWN", "reason": cleaned[:120]}
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return {"verdict": "UNKNOWN", "reason": cleaned[:120]}
+    data = _extract_json_dict(cleaned)
+    if not isinstance(data, dict):
+        return {"verdict": "UNKNOWN", "reason": cleaned[:120] or "模型返回格式异常"}
     verdict = str(data.get("verdict", "UNKNOWN")).upper()
     if verdict not in ("PASS", "FAIL", "UNKNOWN"):
         verdict = "UNKNOWN"
@@ -119,26 +133,32 @@ def _build_verify_prompt(answer: str, image_count: int) -> str:
     return _VERIFY_PROMPT.format(answer=answer, image_note=image_note)
 
 
-def _verify_blocking(answer: str, image_data_url: str | Sequence[str]) -> dict:
+def _verify_blocking(answer: str, image_data_url: str | Sequence[str], *, model_cfg=None) -> dict:
     """同步执行一次 self-verify。失败时返回 verdict=UNKNOWN。"""
-    model_cfg = _pick_vision_model_cfg()
+    model_cfg = model_cfg if model_cfg is not None else _pick_vision_model_cfg()
     if model_cfg is None:
         return {"verdict": "UNKNOWN", "reason": "未配置可用的视觉模型"}
 
+    from types import SimpleNamespace
     from services.llm import _add_tokens
-    from services.llm.streaming import chat_completion_create
+    from services.llm.streaming import _build_think_params, chat_completion_create
     images = _normalize_image_data_urls(image_data_url)
     user_content = [
         {"type": "text", "text": _build_verify_prompt(answer, len(images))},
     ]
     for image_url in images:
         user_content.append({"type": "image_url", "image_url": {"url": image_url}})
+    think_params = _build_think_params(
+        model_cfg,
+        SimpleNamespace(think_mode=False, think_effort="off", max_tokens=300),
+    )
     try:
         response = chat_completion_create(
             model_cfg,
             [{"role": "user", "content": user_content}],
             temperature=0.1,
             max_tokens=300,
+            think_params=think_params,
             trace_context={"scene": "vision_verify"},
         )
     except Exception as e:  # noqa: BLE001
@@ -160,6 +180,7 @@ def schedule_self_verify(
     answer: str,
     image_data_url: Optional[str | Sequence[str]],
     broadcast_callable,
+    model_cfg=None,
 ) -> None:
     """异步触发一次 self-verify,完成后通过 broadcast_callable 推送结果。
 
@@ -169,7 +190,8 @@ def schedule_self_verify(
     images = _normalize_image_data_urls(image_data_url)
     if not qa_id or not answer or not images:
         return
-    if _pick_vision_model_cfg() is None:
+    selected_model = model_cfg if model_cfg is not None else _pick_vision_model_cfg()
+    if selected_model is None:
         return
     if not _VERIFY_SEMAPHORE.acquire(blocking=False):
         _log.debug("vision_verify skipped (semaphore full) id=%s", qa_id)
@@ -179,7 +201,7 @@ def schedule_self_verify(
         try:
             from services.llm import trace
             with trace.scope("vision_verify", qa_id=qa_id):
-                result = _verify_blocking(answer, images)
+                result = _verify_blocking(answer, images, model_cfg=selected_model)
         except Exception as e:  # noqa: BLE001
             _log.warning("vision self-verify worker crashed: %s", e)
             result = {"verdict": "UNKNOWN", "reason": f"自检异常: {e}"}

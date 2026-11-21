@@ -37,6 +37,11 @@ export function useAssistSplit() {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseup', onUp)
       window.removeEventListener('blur', onUp)
+      if (assistSplitDragging.current) {
+        assistSplitDragging.current = false
+        document.body.style.removeProperty('cursor')
+        document.body.style.removeProperty('user-select')
+      }
     }
   }, [persistAssistSplitPct, setAssistSplitPct])
 

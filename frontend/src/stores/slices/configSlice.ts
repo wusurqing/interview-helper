@@ -20,8 +20,7 @@ export type ConfigSlice = ConfigSliceState & ConfigSliceActions
 function modelHealthIdentity(config: AppConfig | null): string[] {
   if (!config) return []
   return config.models.map((model) => (
-    model.health_fingerprint
-    || `${model.name}\u001f${model.enabled !== false ? '1' : '0'}`
+    `${model.health_fingerprint || model.name}\u001f${model.enabled !== false ? '1' : '0'}`
   ))
 }
 
@@ -45,6 +44,7 @@ export const createConfigSlice: StateCreator<RootState, [], [], ConfigSlice> = (
       modelHealth: {},
       modelHealthDetail: {},
       modelHealthLatency: {},
+      modelCatalog: {},
     }
   }),
   setDevices: (devices, platformInfo) => set({ devices, platformInfo }),

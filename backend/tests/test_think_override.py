@@ -237,5 +237,6 @@ def test_model_idx_out_of_range_reports_error_and_advances_commit_queue(monkeypa
             "id": broadcasts[0]["id"],
             "stage": "generation",
             "message": "答题模型配置已变更，请重新提交问题。",
+            "attempt": 1,
         }
     ]

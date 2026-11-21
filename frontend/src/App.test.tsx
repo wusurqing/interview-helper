@@ -65,6 +65,7 @@ describe('App bootstrap', () => {
       currentStreamingId: null,
       transcriptions: [],
       isPaused: false,
+      isRecording: false,
       wsConnected: true,
     } as any)
     useUiPrefsStore.setState({ appMode: 'assist' })
@@ -111,18 +112,54 @@ describe('App bootstrap', () => {
     render(<App />)
 
     await waitFor(() => {
-      expect(screen.getByRole('tab', { name: '实时辅助' })).toBeInTheDocument()
+      expect(screen.getByRole('tab', { name: '面试辅助' })).toBeInTheDocument()
     })
 
     expect(screen.queryByText('连接后端失败')).not.toBeInTheDocument()
   })
 
+  it('switches between dedicated interview and exam tabs while keeping manual and screenshot tools', async () => {
+    const current = await apiMock.getConfig()
+    apiMock.getConfig.mockImplementation(async () => ({ ...current }))
+    apiMock.updateConfig.mockImplementation(async (patch) => {
+      Object.assign(current, patch)
+      return { ok: true }
+    })
+    render(<App />)
+    await screen.findByRole('tab', { name: '面试辅助', selected: true })
+    expect(screen.getAllByRole('tab').slice(0, 3).map((item) => item.textContent)).toEqual([
+      '面试辅助', '笔试辅助', '面试复盘',
+    ])
+    fireEvent.click(screen.getByRole('tab', { name: '笔试辅助' }))
+    await screen.findByRole('tab', { name: '笔试辅助', selected: true })
+    expect(apiMock.updateConfig).toHaveBeenCalledWith({ written_exam_mode: true })
+    expect(screen.queryByText('transcript')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^截图答题$/ })).toBeInTheDocument()
+    expect(screen.getByText('controls')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: '面试辅助' }))
+    await screen.findByRole('tab', { name: '面试辅助', selected: true })
+    expect(apiMock.updateConfig).toHaveBeenCalledWith({ written_exam_mode: false })
+    expect(screen.getAllByText('transcript').length).toBeGreaterThan(0)
+  })
+
+  it('keeps the current workflow if an interview is still recording', async () => {
+    useInterviewStore.setState({ isRecording: true })
+    render(<App />)
+    await screen.findByRole('tab', { name: '面试辅助', selected: true })
+    fireEvent.click(screen.getByRole('tab', { name: '笔试辅助' }))
+    expect(await screen.findByText('请先结束当前面试，再切换到笔试辅助。')).toBeInTheDocument()
+    expect(apiMock.updateConfig).not.toHaveBeenCalled()
+    expect(screen.getByRole('tab', { name: '面试辅助', selected: true })).toBeInTheDocument()
+  })
+
   it('does not allow disabled models to be picked as the priority answer model', async () => {
     apiMock.getConfig.mockResolvedValue({
       models: [
-        { name: 'Enabled Model', supports_vision: false, enabled: true },
-        { name: 'Disabled Model', supports_vision: true, enabled: false },
+        { id: 'enabled', name: 'Enabled Model', supports_vision: false, enabled: true },
+        { id: 'disabled', name: 'Disabled Model', supports_vision: true, enabled: false },
+        { id: 'other', name: 'Unselected Model', supports_vision: true, enabled: true },
       ],
+      assist_model_ids: ['enabled', 'disabled'],
       active_model: 0,
       api_key_set: true,
       think_mode: false,
@@ -135,30 +172,39 @@ describe('App bootstrap', () => {
     const trigger = await screen.findByRole('button', { name: /优先答题模型 Enabled Model/ })
     fireEvent.click(trigger)
 
-    const disabledOption = screen.getByRole('button', { name: /Disabled Model/ })
-    expect(disabledOption).toBeDisabled()
-    fireEvent.click(disabledOption)
+    expect(screen.queryByRole('button', { name: /Disabled Model/ })).not.toBeInTheDocument()
+    expect(trigger).not.toHaveTextContent('识图')
+    expect(screen.queryByRole('button', { name: 'Unselected Model' })).not.toBeInTheDocument()
 
     expect(apiMock.updateConfig).not.toHaveBeenCalled()
   })
 
   it('serializes priority model changes so the latest selection wins', async () => {
     const firstSave = deferred<{ ok: boolean }>()
-    apiMock.getConfig.mockResolvedValue({
+    const config = {
       models: [
-        { name: 'First Model', supports_vision: false, enabled: true },
-        { name: 'Second Model', supports_vision: false, enabled: true },
-        { name: 'Third Model', supports_vision: true, enabled: true },
+        { id: 'first', name: 'First Model', supports_vision: false, enabled: true },
+        { id: 'second', name: 'Second Model', supports_vision: false, enabled: true },
+        { id: 'third', name: 'Third Model', supports_vision: true, enabled: true },
       ],
+      assist_model_ids: ['first', 'second', 'third'],
       active_model: 0,
       api_key_set: true,
       think_mode: false,
       think_effort: 'off',
       stt_provider: 'whisper',
-    })
+    }
+    apiMock.getConfig.mockImplementation(async () => ({ ...config }))
     apiMock.updateConfig
-      .mockReturnValueOnce(firstSave.promise)
-      .mockResolvedValue({ ok: true })
+      .mockImplementationOnce(async (patch) => {
+        await firstSave.promise
+        Object.assign(config, patch)
+        return { ok: true }
+      })
+      .mockImplementation(async (patch) => {
+        Object.assign(config, patch)
+        return { ok: true }
+      })
 
     render(<App />)
 
@@ -166,7 +212,7 @@ describe('App bootstrap', () => {
     fireEvent.click(screen.getByRole('button', { name: /Second Model/ }))
 
     await waitFor(() => {
-      expect(apiMock.updateConfig).toHaveBeenCalledWith({ active_model: 1 })
+      expect(apiMock.updateConfig).toHaveBeenCalledWith({ assist_model_ids: ['second', 'first', 'third'] })
     })
     expect(apiMock.updateConfig).toHaveBeenCalledTimes(1)
 
@@ -183,7 +229,7 @@ describe('App bootstrap', () => {
     await waitFor(() => {
       expect(apiMock.updateConfig).toHaveBeenCalledTimes(2)
     })
-    expect(apiMock.updateConfig).toHaveBeenNthCalledWith(2, { active_model: 2 })
+    expect(apiMock.updateConfig).toHaveBeenNthCalledWith(2, { assist_model_ids: ['third', 'second', 'first'] })
     await waitFor(() => {
       expect(useInterviewStore.getState().toastMessage).toBe('已设为优先答题模型：Third Model')
     })
@@ -198,11 +244,18 @@ describe('App bootstrap', () => {
 
     render(<App />)
 
-    const trigger = await screen.findByRole('button', { name: /连接失败：401 unauthorized/ })
+    const trigger = await screen.findByRole('button', { name: /生成验证失败：401 unauthorized/ })
     expect(trigger).toHaveAttribute('title', expect.stringContaining('401 unauthorized'))
   })
 
   it('prevents duplicate mobile server screen asks while one is in flight', async () => {
+    apiMock.getConfig.mockResolvedValue({
+      models: [{ id: 'screen', name: 'Screenshot model', supports_vision: true, enabled: true }],
+      active_model: 0,
+      assist_model_ids: [],
+      assist_screenshot_model_id: 'screen',
+      api_key_set: true,
+    })
     let resolveAsk: ((value: unknown) => void) | null = null
     const pendingAsk = new Promise((resolve) => {
       resolveAsk = resolve
@@ -233,11 +286,18 @@ describe('App bootstrap', () => {
     })
   })
 
-  it('switches mobile written-exam view to the answer tab when a question starts', async () => {
+  it('shows a single answer panel and submits screenshots in the mobile written-exam workspace', async () => {
     const originalInnerWidth = window.innerWidth
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 })
     apiMock.getConfig.mockResolvedValue({
-      models: [{ name: 'demo', supports_vision: true, enabled: true }],
+      models: [
+        { id: 'other', name: 'Second Vision', supports_vision: true, has_api_key: true, enabled: true },
+        { id: 'off', name: 'Disabled Vision', supports_vision: true, has_api_key: true, enabled: false },
+        { id: 'exam', name: 'Exam Vision', supports_vision: true, has_api_key: true, enabled: true },
+      ],
+      assist_screenshot_model_id: null,
+      assist_model_ids: [],
+      written_exam_model_ids: ['off', 'exam', 'other'],
       active_model: 0,
       api_key_set: true,
       written_exam_mode: true,
@@ -249,26 +309,92 @@ describe('App bootstrap', () => {
     try {
       render(<App />)
 
-      await waitFor(() => {
-        expect(screen.getByRole('button', { name: '答题记录' })).toBeInTheDocument()
-        expect(screen.getByRole('button', { name: 'AI 答案' })).toBeInTheDocument()
-      })
-      expect(screen.getByRole('button', { name: '答题记录' })).toHaveClass('border-accent-blue')
-      expect(screen.getByRole('button', { name: 'AI 答案' })).not.toHaveClass('border-accent-blue')
-
-      act(() => {
-        useInterviewStore.getState().startAnswer('qa-exam-1', '截图题', {
-          source: 'server_screen_single',
-          modelName: 'demo',
-        })
-      })
-
-      await waitFor(() => {
-        expect(screen.getByRole('button', { name: 'AI 答案' })).toHaveClass('border-accent-blue')
-        expect(screen.getByRole('button', { name: '答题记录' })).not.toHaveClass('border-accent-blue')
-      })
+      const screenshotButton = await screen.findByRole('button', { name: '截图答题' })
+      expect(screen.getByRole('button', { name: '笔试模型 Exam Vision' })).toHaveTextContent('识图')
+      expect(screen.queryByText('transcript')).not.toBeInTheDocument()
+      expect(screen.getByText('answer')).toBeInTheDocument()
+      fireEvent.click(screenshotButton)
+      await waitFor(() => expect(apiMock.askFromServerScreen).toHaveBeenCalledTimes(1))
     } finally {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth })
+    }
+  })
+
+  it('mounts a single TranscriptionPanel/AnswerPanel tree per matchMedia viewport and switches on resize', async () => {
+    const originalMatchMedia = window.matchMedia
+    let matches = true
+    const listeners = new Set<(e: MediaQueryListEvent) => void>()
+    const matchMediaMock = vi.fn().mockImplementation((query: string) => ({
+      get matches() {
+        return matches
+      },
+      media: query,
+      onchange: null,
+      addEventListener: (_type: string, cb: (e: MediaQueryListEvent) => void) => {
+        listeners.add(cb)
+      },
+      removeEventListener: (_type: string, cb: (e: MediaQueryListEvent) => void) => {
+        listeners.delete(cb)
+      },
+      addListener: (cb: (e: MediaQueryListEvent) => void) => {
+        listeners.add(cb)
+      },
+      removeListener: (cb: (e: MediaQueryListEvent) => void) => {
+        listeners.delete(cb)
+      },
+      dispatchEvent: () => true,
+    }))
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: matchMediaMock })
+
+    try {
+      render(<App />)
+      await screen.findByRole('tab', { name: '面试辅助', selected: true })
+
+      expect(screen.getAllByText('transcript')).toHaveLength(1)
+      expect(screen.getAllByText('answer')).toHaveLength(1)
+
+      act(() => {
+        matches = false
+        for (const cb of listeners) {
+          cb({ matches: false, media: '(min-width: 768px)' } as MediaQueryListEvent)
+        }
+      })
+
+      expect(screen.getAllByText('transcript')).toHaveLength(1)
+      expect(screen.queryByText('answer')).not.toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: 'AI 答案' }))
+      expect(screen.queryByText('transcript')).not.toBeInTheDocument()
+      expect(screen.getAllByText('answer')).toHaveLength(1)
+
+      act(() => {
+        matches = true
+        for (const cb of listeners) {
+          cb({ matches: true, media: '(min-width: 768px)' } as MediaQueryListEvent)
+        }
+      })
+
+      expect(screen.getAllByText('transcript')).toHaveLength(1)
+      expect(screen.getAllByText('answer')).toHaveLength(1)
+    } finally {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia })
+    }
+  })
+
+  it('tolerates minimal matchMedia objects without addEventListener or addListener', async () => {
+    const originalMatchMedia = window.matchMedia
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn().mockReturnValue({ matches: true, media: '(min-width: 768px)' }),
+    })
+
+    try {
+      render(<App />)
+      await screen.findByRole('tab', { name: '面试辅助', selected: true })
+      expect(screen.getAllByText('transcript')).toHaveLength(1)
+      expect(screen.getAllByText('answer')).toHaveLength(1)
+    } finally {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia })
     }
   })
 })
@@ -338,7 +464,7 @@ describe('Window control buttons', () => {
     render(<App />)
 
     await waitFor(() => {
-      expect(screen.getByRole('tab', { name: '实时辅助' })).toBeInTheDocument()
+      expect(screen.getByRole('tab', { name: '面试辅助' })).toBeInTheDocument()
     })
 
     expect(screen.queryByRole('button', { name: '最小化窗口' })).not.toBeInTheDocument()

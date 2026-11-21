@@ -10,7 +10,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from api.common.model_health import get_model_health
+from api.assist.scheduler import EXAM_MODEL_UNAVAILABLE, exam_primary_index
 from api.realtime.ws import broadcast
 from core.config import get_config
 from core.logger import get_logger
@@ -23,6 +23,7 @@ EXAM_PREFLIGHT_TIMEOUT_SEC = 180.0
 
 _running = False
 _lock = threading.Lock()
+_timeout_timer: Optional[threading.Timer] = None
 _log = get_logger("assist.exam_preflight")
 _status: dict = {
     "running": False,
@@ -72,6 +73,8 @@ def _set_step_unless_status(
     with _lock:
         extra = dict(extra or {})
         preflight_id = _status.get("preflight_id")
+        if not _status.get("running") or extra.get("preflight_id", preflight_id) != preflight_id:
+            return False
         if preflight_id and "preflight_id" not in extra:
             extra["preflight_id"] = preflight_id
         if extra:
@@ -172,43 +175,11 @@ def build_fixed_code_question_image_data_url() -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _model_key_ok(model_cfg) -> bool:
-    api_key = getattr(model_cfg, "api_key", "")
-    return bool(api_key and api_key not in ("", "sk-your-api-key-here"))
-
-
 def select_exam_preflight_model(cfg):
-    """Pick the same kind of model a real screenshot code question requires."""
-    models = list(getattr(cfg, "models", []) or [])
-    if not models:
-        raise RuntimeError("没有可用的答题模型，请先配置模型")
-
-    try:
-        active_idx = max(0, min(int(getattr(cfg, "active_model", 0) or 0), len(models) - 1))
-    except Exception:
-        active_idx = 0
-    order = [active_idx] + [i for i in range(len(models)) if i != active_idx]
-
-    def eligible(i: int, model_cfg, *, ignore_health: bool = False) -> bool:
-        if not getattr(model_cfg, "enabled", True):
-            return False
-        if not _model_key_ok(model_cfg):
-            return False
-        if not getattr(model_cfg, "supports_vision", False):
-            return False
-        if not ignore_health and get_model_health(i) == "error":
-            return False
-        return True
-
-    for idx in order:
-        model_cfg = models[idx]
-        if eligible(idx, model_cfg):
-            return idx, model_cfg
-    for idx in order:
-        model_cfg = models[idx]
-        if eligible(idx, model_cfg, ignore_health=True):
-            return idx, model_cfg
-    raise RuntimeError("没有可用的识图模型，请在设置中启用一个支持视觉且已填写 API Key 的模型")
+    model_index = exam_primary_index(_exam_preflight_task("image", ""), cfg)
+    if model_index is None:
+        raise RuntimeError(EXAM_MODEL_UNAVAILABLE)
+    return model_index, cfg.models[model_index]
 
 
 def _exam_preflight_task(image_data_url: str, preflight_id: str):
@@ -226,9 +197,18 @@ def _exam_preflight_task(image_data_url: str, preflight_id: str):
     )
 
 
+def _cancel_timeout_timer_locked() -> None:
+    global _timeout_timer
+    timer = _timeout_timer
+    _timeout_timer = None
+    if timer is not None:
+        timer.cancel()
+
+
 def _finish_preflight() -> None:
     global _running
     with _lock:
+        _cancel_timeout_timer_locked()
         _status["running"] = False
         _status["finished_at"] = time.time()
         _running = False
@@ -273,9 +253,15 @@ def record_exam_preflight_answer_event(event: dict) -> None:
             {"preflight_id": preflight_id},
         )
         return
+    if event_type == "answer_retry":
+        if model_name := event.get("model_name"):
+            _set_status(model_name=model_name)
+        return
     if event_type == "answer_done":
         answer = str(event.get("answer") or "").strip()
         if answer:
+            if model_name := event.get("model_name"):
+                _set_status(model_name=model_name)
             _set_step(
                 "llm",
                 "pass",
@@ -328,6 +314,7 @@ def _expire_exam_preflight(preflight_id: str, timeout_sec: float = EXAM_PREFLIGH
             or _status.get("preflight_id") != preflight_id
         ):
             return False
+        _cancel_timeout_timer_locked()
         _status["running"] = False
         _status["finished_at"] = time.time()
         _status["error"] = message
@@ -339,6 +326,12 @@ def _expire_exam_preflight(preflight_id: str, timeout_sec: float = EXAM_PREFLIGH
         }
         _status["steps"] = steps
         _running = False
+    try:
+        from .pipeline import cancel_exam_preflight_task
+
+        cancel_exam_preflight_task(preflight_id)
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("EXAM_PREFLIGHT_TIMEOUT_CANCEL_FAIL id=%s err=%s", preflight_id, exc)
     broadcast(
         {
             "type": EXAM_PREFLIGHT_EVENT_TYPE,
@@ -353,6 +346,7 @@ def _expire_exam_preflight(preflight_id: str, timeout_sec: float = EXAM_PREFLIGH
 
 
 def _schedule_exam_preflight_timeout(preflight_id: str) -> None:
+    global _timeout_timer
     timer = threading.Timer(
         EXAM_PREFLIGHT_TIMEOUT_SEC,
         _expire_exam_preflight,
@@ -360,6 +354,11 @@ def _schedule_exam_preflight_timeout(preflight_id: str) -> None:
     )
     timer.daemon = True
     timer.name = "exam-preflight-timeout"
+    with _lock:
+        if not _status.get("running") or _status.get("preflight_id") != preflight_id:
+            return
+        _cancel_timeout_timer_locked()
+        _timeout_timer = timer
     timer.start()
 
 
@@ -368,18 +367,22 @@ def _new_preflight_id() -> str:
 
 
 def _run_exam_preflight(preflight_id: Optional[str] = None) -> None:
+    global _running
     preflight_id = preflight_id or _new_preflight_id()
-    _set_status(
-        running=True,
-        question=EXAM_PREFLIGHT_QUESTION,
-        model_name=None,
-        preflight_id=preflight_id,
-        qa_id=None,
-        steps={},
-        error=None,
-        started_at=time.time(),
-        finished_at=None,
-    )
+    with _lock:
+        if not _status.get("running") or _status.get("preflight_id") != preflight_id:
+            _running = True
+            _status.update(
+                running=True,
+                question=EXAM_PREFLIGHT_QUESTION,
+                model_name=None,
+                preflight_id=preflight_id,
+                qa_id=None,
+                steps={},
+                error=None,
+                started_at=time.time(),
+                finished_at=None,
+            )
     try:
         _log.info("EXAM_PREFLIGHT_START question=%r", EXAM_PREFLIGHT_QUESTION)
         _set_step("screenshot", "running", "正在生成固定截图代码题…", {"question": EXAM_PREFLIGHT_QUESTION})
@@ -391,13 +394,14 @@ def _run_exam_preflight(preflight_id: Optional[str] = None) -> None:
         _model_idx, model_cfg = select_exam_preflight_model(cfg)
         _set_status(model_name=getattr(model_cfg, "name", None))
         task = _exam_preflight_task(image_data_url, preflight_id)
-        from .pipeline import pick_model_index, submit_answer_task
+        from .pipeline import submit_answer_task
 
-        if pick_model_index(task, set()) is None:
-            raise RuntimeError("没有可用的识图模型，请检查启用状态与 API Key")
-        queued = submit_answer_task(task)
+        queued = submit_answer_task(task, config_snapshot=cfg)
         if not queued:
-            raise RuntimeError("没有可用的识图模型，请检查启用状态与 API Key")
+            raise RuntimeError(EXAM_MODEL_UNAVAILABLE)
+        with _lock:
+            if not _status.get("running") or _status.get("preflight_id") != preflight_id:
+                return
         _schedule_exam_preflight_timeout(preflight_id)
         _set_step_unless_status(
             "submit",
@@ -432,12 +436,28 @@ def start_exam_preflight() -> Optional[str]:
         # compete with an active (including paused) interview/exam session.
         if _running or get_session().is_recording:
             return None
+        _cancel_timeout_timer_locked()
         _running = True
-    thread = threading.Thread(
-        target=_run_exam_preflight,
-        args=(preflight_id,),
-        daemon=True,
-        name="exam-preflight",
-    )
-    thread.start()
+        _status.update(
+            running=True,
+            question=EXAM_PREFLIGHT_QUESTION,
+            model_name=None,
+            preflight_id=preflight_id,
+            qa_id=None,
+            steps={},
+            error=None,
+            started_at=time.time(),
+            finished_at=None,
+        )
+    try:
+        thread = threading.Thread(
+            target=_run_exam_preflight,
+            args=(preflight_id,),
+            daemon=True,
+            name="exam-preflight",
+        )
+        thread.start()
+    except Exception:
+        _finish_preflight()
+        raise
     return preflight_id

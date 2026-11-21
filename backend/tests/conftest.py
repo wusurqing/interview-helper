@@ -1,21 +1,113 @@
 """pytest 全局夹具。
 
-必须在任何测试 import main/core 之前执行：把日志目录指到系统临时目录，
-避免测试进程（import main 会触发 setup_logging）把转录/答案/错误日志
-写进项目根目录 log/ 污染生产日志。
+必须在任何测试 import main/core/services 之前执行：
+1. 将默认 IA_CONFIG_PATH 指向进程级隔离临时文件，绝不读取或改写开发者本机 backend/config.json；
+2. 将 IA_DATA_DIR 与日志目录指向隔离临时目录，绝不读写真实 backend/data/ SQLite 或项目 log/；
+3. 每个用例前后复位内存配置缓存与临时配置文件，避免跨用例状态污染。
 """
 
+from __future__ import annotations
+
+import atexit
+import logging
 import os
+import shutil
+import sys
 import tempfile
 
-# Storage modules initialize databases on import. Isolate BEFORE test collection,
-# including legacy fixtures which delete rows through an imported DB_PATH.
-_TEST_DATA = tempfile.TemporaryDirectory(prefix="ia-test-data-", ignore_cleanup_errors=True)
-os.environ["IA_DATA_DIR"] = _TEST_DATA.name
-os.environ["IA_CONFIG_PATH"] = os.path.join(_TEST_DATA.name, "config.json")
+import pytest
 
-_TEST_LOG_DIR = os.path.join(tempfile.gettempdir(), "ia-test-logs")
+_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
+# 手动压测脚本（依赖可选 aiohttp 且连接真实本地服务），不纳入 pytest 自动收集。
+collect_ignore = ["test_realistic_interview.py"]
+
+_TEST_ENV_ROOT = tempfile.mkdtemp(prefix="ia-pytest-env-")
+_TEST_LOG_DIR = os.path.join(_TEST_ENV_ROOT, "logs")
+_TEST_DATA_DIR = os.path.join(_TEST_ENV_ROOT, "data")
+_TEST_CONFIG_PATH = os.path.join(_TEST_ENV_ROOT, "config.json")
+
+os.makedirs(_TEST_LOG_DIR, exist_ok=True)
+os.makedirs(_TEST_DATA_DIR, exist_ok=True)
+
+# 强制覆盖进程默认路径，确保单测绝不触碰开发者真实配置与数据库。
+os.environ["IA_CONFIG_PATH"] = _TEST_CONFIG_PATH
+os.environ["IA_DATA_DIR"] = _TEST_DATA_DIR
+
+
+def _cleanup_test_env() -> None:
+    try:
+        logging.shutdown()
+    except Exception:
+        pass
+    shutil.rmtree(_TEST_ENV_ROOT, ignore_errors=True)
+
+
+atexit.register(_cleanup_test_env)
 
 import core.logger as _logger  # noqa: E402
 
 _logger.LOG_DIR = _TEST_LOG_DIR
+
+import core.config as _config  # noqa: E402
+
+_config.CONFIG_FILE = _TEST_CONFIG_PATH
+
+
+def _reset_default_config_state() -> None:
+    os.environ["IA_CONFIG_PATH"] = _TEST_CONFIG_PATH
+    os.environ["IA_DATA_DIR"] = _TEST_DATA_DIR
+    _logger.LOG_DIR = _TEST_LOG_DIR
+    _config.CONFIG_FILE = _TEST_CONFIG_PATH
+    _config._config = None
+    _config._config_corrupt_state = None
+    try:
+        if os.path.exists(_TEST_CONFIG_PATH):
+            os.remove(_TEST_CONFIG_PATH)
+    except OSError:
+        pass
+
+
+def _stop_active_archives() -> None:
+    session_mod = sys.modules.get("core.session")
+    if session_mod is not None:
+        get_session_fn = getattr(session_mod, "get_session", None)
+        if callable(get_session_fn):
+            session = get_session_fn()
+            archive = getattr(session, "archive", None)
+            if archive is not None:
+                session.archive = None
+                try:
+                    archive.stop(timeout=2)
+                except Exception:
+                    pass
+
+    review_int_mod = sys.modules.get("services.review_integration")
+    if review_int_mod is not None:
+        archive_lock = getattr(review_int_mod, "_archive_lock", None)
+        draining = getattr(review_int_mod, "_draining_archives", None)
+        if archive_lock is not None and draining is not None:
+            with archive_lock:
+                pending = list(draining)
+                draining.clear()
+                review_int_mod._archive_status = None
+            for archive in pending:
+                try:
+                    archive.stop(timeout=2)
+                except Exception:
+                    pass
+        else:
+            review_int_mod._archive_status = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_default_config(monkeypatch):
+    # Each test starts with the application defaults in the isolated log directory.
+    monkeypatch.delenv("IA_LLM_TRACE", raising=False)
+    monkeypatch.delenv("IA_LLM_TRACE_MAX_ASSETS_MB", raising=False)
+    _reset_default_config_state()
+    yield
+    _stop_active_archives()
+    _reset_default_config_state()

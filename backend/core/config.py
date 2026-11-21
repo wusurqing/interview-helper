@@ -1,20 +1,24 @@
-from pydantic import BaseModel, Field, StrictBool, StrictStr, StringConstraints, ValidationError, field_validator, model_validator
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Annotated, Literal, Optional, Any
+from typing import Annotated, Callable, Iterator, Literal, Optional, Any, get_args
+from urllib.parse import urlsplit
+from uuid import NAMESPACE_URL, uuid4, uuid5
+import copy
 import hashlib
 import hmac
 import json
 import math
 import os
 import secrets
+import shutil
+import threading
+
+from pydantic import BaseModel, Field, StrictBool, StrictStr, StringConstraints, ValidationError, field_validator, model_validator
 
 from core.logger import get_logger
 from core.prompt_settings import patch_system_prompts
-
-logger = get_logger(__name__)
-import shutil
-import threading
 
 logger = get_logger(__name__)
 
@@ -52,12 +56,15 @@ def normalize_llm_max_tokens(value: Any) -> int:
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_FILE = os.environ.get("IA_CONFIG_PATH") or os.path.join(_BACKEND_DIR, "config.json")
 CONFIG_EXAMPLE = os.path.join(_BACKEND_DIR, "config.example.json")
+_ASR_CONFIG_VERSION = 1
 
 
 class ModelConfig(BaseModel):
+    id: str = ""
+    provider_id: str = ""
     name: str = "Default"
     api_base_url: str = "https://api.openai.com/v1"
-    api_key: str = ""
+    api_key: str = Field(default="", repr=False)
     model: str = "gpt-4o-mini"
     context_window_tokens: int = Field(default=DEFAULT_CONTEXT_WINDOW_TOKENS, strict=True, ge=1, le=2**53 - 1)
     # 接口协议：openai=Chat Completions，anthropic=Messages，responses=Responses
@@ -65,6 +72,7 @@ class ModelConfig(BaseModel):
     supports_think: bool = False
     supports_vision: bool = False
     enabled: bool = True
+    verified: bool = False
     think_enabled_params: dict[str, Any] = Field(default_factory=dict)
     think_disabled_params: dict[str, Any] = Field(default_factory=dict)
 
@@ -75,6 +83,22 @@ class ModelConfig(BaseModel):
         if normalized not in API_TYPE_OPTIONS:
             return API_TYPE_OPENAI
         return normalized
+
+
+class ModelProvider(BaseModel):
+    id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    api_type: Literal["openai", "anthropic", "responses"]
+    api_base_url: str
+    api_key: str = Field(default="", repr=False)
+
+
+def provider_url(url: str) -> str:
+    return url.strip().rstrip("/")
+
+
+def provider_connection(provider: ModelProvider | ModelConfig) -> tuple[str, str, str]:
+    return (provider_url(provider.api_base_url), provider.api_type, provider.api_key)
 
 
 def model_health_fingerprint(model: Any) -> str:
@@ -110,8 +134,17 @@ def _default_model_config() -> ModelConfig:
 
 
 MMPG_STT_PROVIDER = "doubao_mmpg"
+SEGMENT_STT_PROVIDERS = ("doubao", "generic")
+STT_PROVIDER_OPTIONS = [*SEGMENT_STT_PROVIDERS, MMPG_STT_PROVIDER]
+CANDIDATE_STT_PROVIDER_OPTIONS = STT_PROVIDER_OPTIONS.copy()
 MMPG_SECRET_FIELDS = frozenset({
     "volc_access_key", "volc_secret_key", "rtc_app_key", "rtc_token", "doubao_api_key",
+})
+STT_SECRET_FIELDS = frozenset({
+    "doubao_stt_access_token",
+    "doubao_stt_api_key",
+    "generic_stt_api_key",
+    "generic_stt_custom_headers",
 })
 _MmpgText = Annotated[str, StringConstraints(strip_whitespace=True, strict=True)]
 _PositiveInt = Annotated[int, Field(strict=True, gt=0)]
@@ -143,16 +176,37 @@ class Mmpg(BaseModel):
 
 class KnowledgeAnalysisSettings(BaseModel):
     model_index: Annotated[int, Field(strict=True, ge=0)] | None = None
+    model_id: StrictStr | None = None
     system_prompt: StrictStr | None = None
     temperature: float = Field(default=0.3, ge=0, le=2, allow_inf_nan=False)
     max_tokens: int = Field(default=1024, strict=True, ge=256, le=32768)
     think_effort: Literal["off", "low", "medium", "high", "xhigh"] = "off"
 
 
+AssistScene = Literal["assist_realtime", "assist_manual", "assist_screen", "assist_exam"]
+ASSIST_SCENES = get_args(AssistScene)
+ThinkEffort = Literal["off", "low", "medium", "high", "xhigh"]
+
+
+class AssistGeneration(BaseModel):
+    temperature: float = Field(ge=0, le=2, allow_inf_nan=False)
+    max_output_tokens: int = Field(strict=True, ge=128, le=32768)
+
+
 class AppConfig(BaseModel):
     system_prompts: dict[str, StrictStr] = Field(default_factory=dict)
     models: list[ModelConfig] = Field(default_factory=lambda: [_default_model_config()])
-    active_model: int = 0
+    model_providers: list[ModelProvider] | None = None
+    active_model: int | None = 0
+    active_model_id: StrictStr | None = None
+    assist_model_ids: list[StrictStr] | None = None
+    assist_screenshot_model_id: StrictStr | None = None
+    written_exam_model_id: StrictStr | None = None
+    written_exam_model_ids: list[StrictStr] = Field(default_factory=list)
+    assist_generation: dict[AssistScene, AssistGeneration] = Field(default_factory=dict)
+    assist_think_mode: StrictBool | None = None
+    assist_think_effort: ThinkEffort | None = None
+    knowledge_practice_system_prompt: StrictStr | None = None
 
     temperature: float = 0.5
     max_tokens: int = 4096
@@ -160,57 +214,32 @@ class AppConfig(BaseModel):
     # 推理强度: off=关闭, low/medium/high/xhigh 分别对应低/中/高/超高强度推理
     think_effort: Literal["off", "low", "medium", "high", "xhigh"] = "off"
 
-    # 语音识别：whisper=本地 faster-whisper，funasr=本地 FunASR（paraformer/SenseVoice），
-    # doubao=豆包语音识别 API，doubao_mmpg=豆包会话式 ASR，generic=OpenAI-compatible HTTP ASR
-    stt_provider: str = "whisper"
+    # 两路各自选择云端引擎。空值表示用户尚未选择。
+    stt_provider: str = ""
     mmpg: Mmpg = Field(default_factory=Mmpg)
-    whisper_model: str = "base"
-    # 可选的本地模型缓存，以及旧 Windows 显卡驱动的 CUDA 11 隔离运行库。
-    stt_model_cache_root: str = ""
-    whisper_cuda11_compat: bool = False
-    # "auto" is more robust for Chinese interview speech mixed with English terms.
-    whisper_language: str = "auto"
-    # 启动时预加载 whisper 降级模型（远程 ASR 为主引擎时，~300MB 内存换更快降级）
-    whisper_preload: bool = False
-    # FunASR 本地模型（stt_provider=funasr 时使用）：首次使用需显式下载（设置页有下载按钮）
-    funasr_model: str = "paraformer-zh"
-    # 本地 ASR 自定义热词（岗位 -> 空格分隔词串；"通用" 键对所有岗位生效）。
-    # 与内置 TECH_VOCAB 合并后传给 FunASR(paraformer)/Whisper 做偏置。
-    stt_hotwords: dict[str, str] = Field(default_factory=dict)
-    # 远程 ASR（豆包/通用）失败时的降级引擎：whisper（默认）/funasr/none（不降级）。
-    # 主链路本身是本地引擎时此配置不生效（本地引擎失败无需再降级）。
-    stt_fallback_provider: str = "whisper"
-    # 本地 ASR 推理线程数：0=自动（min(8, 核数-2)）；调小降温降噪，调大更快。
-    # 改动重启后端生效。
-    stt_infer_threads: int = 0
     # 豆包语音识别 API（当 stt_provider=doubao 时使用），使用小时版 + WebSocket 双流式
     doubao_stt_app_id: str = ""
-    doubao_stt_access_token: str = ""
+    doubao_stt_access_token: str = Field(default="", repr=False)
     # 新版控制台 API Key（优先于 app_id + access_token）
-    doubao_stt_api_key: str = ""
+    doubao_stt_api_key: str = Field(default="", repr=False)
     # 资源 ID：豆包流式语音识别模型2.0 小时版
     doubao_stt_resource_id: str = "volc.seedasr.sauc.duration"
     # 热词表 ID：在自学习平台上传热词文件后获得；有则传入请求，没有则不传
     doubao_stt_boosting_table_id: str = ""
     # 通用 ASR（OpenAI-compatible multipart: POST /audio/transcriptions）
     generic_stt_api_base_url: str = ""
-    generic_stt_api_key: str = ""
+    generic_stt_api_key: str = Field(default="", repr=False)
     generic_stt_model: str = ""
     # 自定义 HTTP header，JSON 格式如 {"X-Custom":"value"} 或每行 Key: Value
-    generic_stt_custom_headers: str = ""
-    # 实时辅助候选人麦克风 ASR：默认关闭；开启后默认本地 Whisper，避免额外远程识别成本。
+    generic_stt_custom_headers: str = Field(default="", repr=False)
+    # 我的回答需要用户显式选择引擎并启用。
     candidate_asr_enabled: bool = False
-    candidate_stt_provider: str = "whisper"
-    candidate_whisper_model: str = ""
-    candidate_whisper_language: str = ""
-    candidate_remote_stt_enabled: bool = False
+    candidate_stt_provider: str = ""
     # 候选人真实回答上下文：下一轮问题可携带，追问时强优先，非追问时作为可忽略背景。
     candidate_context_enabled: bool = True
     candidate_context_wait_ms: int = 200
     candidate_context_max_chars: int = 900
     candidate_context_min_chars: int = 6
-    candidate_streaming_asr_enabled: bool = True
-    candidate_streaming_asr_interval_ms: int = 1500
     # 只用于“我的麦克风”：始终共享读取；开启后冲突时会尝试更保守的采样与默认输入设备。
     candidate_mic_compatibility_mode: bool = True
 
@@ -294,7 +323,8 @@ class AppConfig(BaseModel):
 
     # --- Review (面试复盘) ---
     review_enabled: bool = False
-    review_model_index: int = 0
+    review_model_index: int | None = 0
+    review_model_id: StrictStr | None = None
     knowledge_analysis: KnowledgeAnalysisSettings = Field(default_factory=KnowledgeAnalysisSettings)
 
     @field_validator("temperature", mode="before")
@@ -307,25 +337,22 @@ class AppConfig(BaseModel):
     def _normalize_max_tokens_field(cls, value: Any) -> int:
         return normalize_llm_max_tokens(value)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _retire_legacy_candidate_route(cls, data):
+        # Old builds used a separate permission flag before routing a segment to the cloud.
+        if (isinstance(data, dict) and data.get("candidate_remote_stt_enabled") is False
+                and data.get("candidate_stt_provider") in SEGMENT_STT_PROVIDERS):
+            return {**data, "candidate_asr_enabled": False, "candidate_stt_provider": ""}
+        return data
+
     @model_validator(mode="after")
     def _ensure_valid_models(self):
-        if self.stt_provider == "iflytek":
-            logger.warning(
-                "检测到已废弃的 stt_provider=iflytek；请在设置中改为 generic 或 whisper"
-            )
-        if self.candidate_stt_provider == "iflytek":
-            logger.warning(
-                "检测到已废弃的 candidate_stt_provider=iflytek；已重置为 whisper"
-            )
-            self.candidate_stt_provider = "whisper"
+        if self.stt_provider not in STT_PROVIDER_OPTIONS:
+            self.stt_provider = ""
         if self.candidate_stt_provider not in CANDIDATE_STT_PROVIDER_OPTIONS:
-            logger.warning(
-                "candidate_stt_provider=%r 不支持，已重置为 whisper",
-                self.candidate_stt_provider,
-            )
-            self.candidate_stt_provider = "whisper"
-        if self.candidate_stt_provider in ("doubao", "generic") and not self.candidate_remote_stt_enabled:
-            self.candidate_stt_provider = "whisper"
+            self.candidate_stt_provider = ""
+            self.candidate_asr_enabled = False
         self.temperature = normalize_llm_temperature(self.temperature)
         self.max_tokens = normalize_llm_max_tokens(self.max_tokens)
         self.candidate_context_wait_ms = max(0, min(2000, int(self.candidate_context_wait_ms or 0)))
@@ -336,43 +363,16 @@ class AppConfig(BaseModel):
             128,
             min(self.assist_realtime_max_tokens, int(self.assist_realtime_high_churn_max_tokens or 320)),
         )
-        self.candidate_streaming_asr_interval_ms = max(800, min(5000, int(self.candidate_streaming_asr_interval_ms or 1500)))
         self.candidate_mic_compatibility_mode = bool(self.candidate_mic_compatibility_mode)
-        wl = (self.whisper_language or "").strip()
-        if wl and wl != "auto":
-            import re as _re
-            if not _re.match(r"^[a-z]{2}(-[A-Z]{2})?$", wl):
-                logger.warning(
-                    "whisper_language=%r 格式不正确，已重置为 auto (应为 ISO 639-1 码如 en/zh)", wl
-                )
-                self.whisper_language = "auto"
-        cwl = (self.candidate_whisper_language or "").strip()
-        if cwl and cwl != "auto":
-            import re as _re
-            if not _re.match(r"^[a-z]{2}(-[A-Z]{2})?$", cwl):
-                logger.warning(
-                    "candidate_whisper_language=%r 格式不正确，已重置为空（沿用 whisper_language）",
-                    cwl,
-                )
-                self.candidate_whisper_language = ""
-        self.stt_infer_threads = max(0, min(64, int(self.stt_infer_threads or 0)))
-        fbp = (self.stt_fallback_provider or "").strip().lower()
-        if fbp not in STT_FALLBACK_PROVIDER_OPTIONS:
-            logger.warning("stt_fallback_provider=%r 不支持，已重置为 whisper", fbp)
-            self.stt_fallback_provider = "whisper"
-        fm = (self.funasr_model or "").strip()
-        if fm not in FUNASR_MODEL_OPTIONS:
-            logger.warning("funasr_model=%r 不支持，已重置为 paraformer-zh", fm)
-            self.funasr_model = "paraformer-zh"
-        if not isinstance(self.stt_hotwords, dict):
-            self.stt_hotwords = {}
-        self.stt_hotwords = {
-            str(k).strip(): str(v).strip()
-            for k, v in self.stt_hotwords.items()
-            if str(k).strip() and str(v).strip()
-        }
-        if not self.models:
+        if self.model_providers is None and not self.models:
             self.models = [_default_model_config()]
+        if self.model_providers is not None:
+            if "models" not in self.model_fields_set:
+                self.models = []
+            providers = {provider.id: provider for provider in self.model_providers}
+            if len(providers) != len(self.model_providers):
+                raise ValueError("供应商 ID 重复")
+            self.models = [_hydrate_model(model, providers) for model in self.models]
         self.screen_capture_max_long_edge = max(0, min(4000, int(self.screen_capture_max_long_edge or 0)))
         self.assist_vad_max_speech_sec = max(6.0, min(60.0, float(self.assist_vad_max_speech_sec or 18.0)))
         self.assist_vad_min_speech_sec = max(0.1, min(2.0, float(self.assist_vad_min_speech_sec or 0.3)))
@@ -381,26 +381,146 @@ class AppConfig(BaseModel):
             0.5,
             min(30.0, float(self.assist_interviewer_asr_drain_timeout_sec or 6.0)),
         )
-        self.active_model = max(0, min(int(self.active_model), len(self.models) - 1))
-        if not getattr(self.models[self.active_model], "enabled", True):
-            for i, model in enumerate(self.models):
-                if getattr(model, "enabled", True):
-                    self.active_model = i
-                    break
-        self.review_model_index = max(0, min(int(self.review_model_index), len(self.models) - 1))
+        if self.model_providers is None:
+            if self.active_model is not None:
+                self.active_model = max(0, min(self.active_model, len(self.models) - 1))
+                if not self.models[self.active_model].enabled:
+                    self.active_model = next(
+                        (i for i, model in enumerate(self.models) if model.enabled), self.active_model,
+                    )
+            if self.review_model_index is not None:
+                self.review_model_index = max(0, min(self.review_model_index, len(self.models) - 1))
+        self._migrate_assist_settings()
         return self
 
-    def get_active_model(self) -> ModelConfig:
-        idx = max(0, min(self.active_model, len(self.models) - 1))
-        return self.models[idx]
+    def _migrate_assist_settings(self) -> None:
+        used_ids: set[str] = set()
+        reserved_ids = {model.id for model in self.models if model.id}
+        for index, model in enumerate(self.models):
+            if not model.id or model.id in used_ids:
+                # An old config can be read across restarts before its first save.
+                seed = f"interview-helper:legacy-model:{index}"
+                candidate = uuid5(NAMESPACE_URL, seed).hex
+                while candidate in used_ids or candidate in reserved_ids:
+                    candidate = uuid5(NAMESPACE_URL, candidate).hex
+                model = model.model_copy(update={"id": candidate})
+                self.models[index] = model
+            used_ids.add(model.id)
 
-    def get_review_model(self) -> ModelConfig:
-        idx = max(0, min(self.review_model_index, len(self.models) - 1))
-        return self.models[idx]
+        self._sync_model_references()
+        legacy_order = list(self.models)
+        if self.active_model is not None:
+            legacy_order.insert(0, legacy_order.pop(self.active_model))
+        if self.assist_model_ids is None:
+            self.assist_model_ids = [model.id for model in legacy_order if model.enabled]
+        else:
+            self.assist_model_ids = list(dict.fromkeys(
+                model_id for model_id in self.assist_model_ids if model_id in used_ids
+            ))
+        vision_ids = {model.id for model in self.models if model.supports_vision}
+        if "assist_screenshot_model_id" not in self.model_fields_set:
+            self.assist_screenshot_model_id = next(
+                (model.id for model in legacy_order if model.id in vision_ids and knowledge_model_available(model)),
+                None,
+            )
+        elif self.assist_screenshot_model_id not in vision_ids:
+            self.assist_screenshot_model_id = None
+        if "written_exam_model_ids" not in self.model_fields_set:
+            ready_vision_ids = {model.id for model in self.models if written_exam_model_available(model)}
+            primary_id = self.written_exam_model_id
+            if "written_exam_model_id" not in self.model_fields_set:
+                primary_id = self.assist_screenshot_model_id if self.assist_screenshot_model_id in ready_vision_ids else None
+            exam_ids = [primary_id] if primary_id in used_ids else []
+            if primary_id in ready_vision_ids:
+                exam_ids.extend(model_id for model_id in self.assist_model_ids if model_id in ready_vision_ids)
+        else:
+            exam_ids = [model_id for model_id in self.written_exam_model_ids if model_id in used_ids]
+        self.written_exam_model_ids = list(dict.fromkeys(exam_ids))
+        self.written_exam_model_id = self.written_exam_model_ids[0] if self.written_exam_model_ids else None
+        for scene in ASSIST_SCENES:
+            if scene not in self.assist_generation:
+                limit = min(self.max_tokens, self.assist_realtime_max_tokens) if scene == "assist_realtime" else self.max_tokens
+                self.assist_generation[scene] = AssistGeneration(temperature=self.temperature, max_output_tokens=limit)
+        if self.assist_think_mode is None:
+            self.assist_think_mode = self.think_mode
+        if self.assist_think_effort is None:
+            self.assist_think_effort = self.think_effort
+        if "knowledge_practice_system_prompt" not in self.model_fields_set:
+            self.knowledge_practice_system_prompt = self.system_prompts.get("assist_manual")
+
+    def _sync_model_references(self) -> None:
+        if self.model_providers is None:
+            if "active_model_id" not in self.model_fields_set:
+                self.active_model_id = self._model_id_at(self.active_model)
+            if "review_model_id" not in self.model_fields_set:
+                self.review_model_id = self._model_id_at(self.review_model_index)
+            if "model_id" not in self.knowledge_analysis.model_fields_set:
+                self.knowledge_analysis.model_id = self._model_id_at(self.knowledge_analysis.model_index)
+            return
+
+        enabled_indices = {model.id: i for i, model in enumerate(self.models) if model.enabled}
+        self.active_model = enabled_indices.get(self.active_model_id)
+        self.review_model_index = enabled_indices.get(self.review_model_id)
+        self.knowledge_analysis.model_index = enabled_indices.get(self.knowledge_analysis.model_id)
+        if self.active_model is None:
+            self.active_model_id = None
+        if self.review_model_index is None:
+            self.review_model_id = None
+        if self.knowledge_analysis.model_index is None:
+            self.knowledge_analysis.model_id = None
+
+    def _model_id_at(self, index: int | None) -> str | None:
+        return self.models[index].id if index is not None and 0 <= index < len(self.models) else None
+
+    def get_active_model(self) -> ModelConfig | None:
+        index = self.active_model
+        return self.models[index] if index is not None else None
+
+    def get_review_model(self) -> ModelConfig | None:
+        index = self.review_model_index
+        return self.models[index] if index is not None else None
 
 
 _config: Optional[AppConfig] = None
+_config_corrupt_state: Optional[dict[str, Any]] = None
 _config_lock = threading.RLock()
+
+
+class ConfigCorruptError(RuntimeError):
+    """配置文件损坏处于只读保护态时，拒绝未确认的覆写保存。"""
+
+
+def _current_config_file_key() -> str:
+    return str(Path(CONFIG_FILE).resolve())
+
+
+def get_config_corrupt_state() -> Optional[dict[str, Any]]:
+    with _config_lock:
+        if _config_corrupt_state is None:
+            return None
+        if _config_corrupt_state.get("config_file") != _current_config_file_key():
+            return None
+        return {
+            "corrupt": True,
+            "error": _config_corrupt_state["error"],
+            "backup_path": _config_corrupt_state.get("backup_path"),
+            "backup_filename": _config_corrupt_state.get("backup_filename"),
+        }
+
+
+def _assert_config_writable(*, allow_overwrite_corrupt: bool = False) -> None:
+    corrupt = get_config_corrupt_state()
+    if corrupt is None or allow_overwrite_corrupt:
+        return
+    backup_hint = (
+        f"（原文件已备份为 {corrupt['backup_filename']}）"
+        if corrupt.get("backup_filename")
+        else ""
+    )
+    raise ConfigCorruptError(
+        f"配置文件加载失败，当前处于只读保护模式{backup_hint}。"
+        "请先修复或恢复 config.json，或在页面明确确认覆盖后再保存。"
+    )
 
 
 def get_config() -> AppConfig:
@@ -411,8 +531,269 @@ def get_config() -> AppConfig:
         return _config
 
 
+@contextmanager
+def temporary_config_override(updates: dict[str, Any]) -> Iterator[AppConfig]:
+    """Temporarily override in-memory config fields without writing config.json."""
+    global _config
+    if not updates:
+        yield get_config()
+        return
+    with _config_lock:
+        previous = get_config()
+        if isinstance(previous, AppConfig):
+            data = previous.model_dump()
+            data.update(updates)
+            if "active_model" in updates and "active_model_id" not in updates:
+                idx = updates["active_model"]
+                if previous.model_providers is not None:
+                    data["active_model_id"] = (
+                        previous.models[idx].id
+                        if isinstance(idx, int) and 0 <= idx < len(previous.models)
+                        else None
+                    )
+                else:
+                    data.pop("active_model_id", None)
+            overridden = AppConfig(**data)
+        else:
+            overridden = copy.copy(previous)
+            for key, value in updates.items():
+                setattr(overridden, key, value)
+        _config = overridden
+    try:
+        yield overridden
+    finally:
+        with _config_lock:
+            _config = previous
+
+
 class ModelListChanged(ValueError):
     pass
+
+
+class InvalidAssistModelSelection(ValueError):
+    pass
+
+
+def _hydrate_model(model: ModelConfig, providers: dict[str, ModelProvider]) -> ModelConfig:
+    provider = providers.get(model.provider_id)
+    if provider is None:
+        raise ValueError("模型引用的供应商不存在")
+    return model.model_copy(update={
+        "api_base_url": provider.api_base_url, "api_key": provider.api_key, "api_type": provider.api_type,
+    })
+
+
+def _provider_name(model: ModelConfig) -> str:
+    try:
+        host = urlsplit(model.api_base_url).hostname
+    except ValueError:
+        return model.name
+    return {
+        "api.openai.com": "OpenAI",
+        "api.deepseek.com": "DeepSeek",
+        "api.anthropic.com": "Anthropic",
+    }.get(host, "火山方舟" if host and host.startswith("ark.") and host.endswith(".volces.com") else host or model.name)
+
+
+def get_provider_layout(cfg: AppConfig) -> tuple[list[ModelProvider], list[ModelConfig]]:
+    if cfg.model_providers is not None:
+        return list(cfg.model_providers), list(cfg.models)
+    groups: dict[tuple[str, str, str], ModelProvider] = {}
+    models = []
+    for model in cfg.models:
+        if not model.api_key and model.name == "请在 config.json 中配置":
+            continue
+        connection = provider_connection(model)
+        provider = groups.get(connection)
+        if provider is None:
+            provider = ModelProvider(
+                id=uuid5(NAMESPACE_URL, f"interview-helper:legacy-provider:{model.id}").hex,
+                name=_provider_name(model),
+                api_base_url=connection[0],
+                api_type=connection[1],
+                api_key=connection[2],
+            )
+            groups[connection] = provider
+        models.append(model.model_copy(update={"provider_id": provider.id, "verified": False}))
+    return list(groups.values()), models
+
+
+def get_model_providers(cfg: AppConfig) -> list[ModelProvider]:
+    return get_provider_layout(cfg)[0]
+
+
+def get_model_usages(cfg: AppConfig) -> dict[str, list[str]]:
+    usages: dict[str, list[str]] = {}
+    for name, model_ids in (
+        ("实时辅助", cfg.assist_model_ids or []),
+        ("截图答题", [cfg.assist_screenshot_model_id]),
+        ("笔试", cfg.written_exam_model_ids),
+        ("复盘", [cfg.review_model_id]),
+        ("知识分析", [cfg.knowledge_analysis.model_id]),
+        ("通用默认模型", [cfg.active_model_id]),
+    ):
+        for model_id in model_ids:
+            if model_id is not None:
+                usages.setdefault(model_id, []).append(name)
+    return usages
+
+
+def provider_layout_revision(cfg: AppConfig) -> str:
+    providers, models = get_provider_layout(cfg)
+    data = [
+        [provider.model_dump() for provider in providers],
+        [model.model_dump() for model in models],
+        get_model_usages(cfg),
+        cfg.assist_model_ids,
+        cfg.written_exam_model_ids,
+    ]
+    payload = json.dumps(data, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hmac.new(_MODEL_HEALTH_FINGERPRINT_KEY, payload, hashlib.sha256).hexdigest()
+
+
+def save_provider_layout(
+    revision: str,
+    providers: list[ModelProvider],
+    models: list[ModelConfig],
+    confirmed_remove_ids: set[str],
+    active_model_id: str | None,
+    was_verified: Callable[[ModelProvider, str], bool],
+) -> AppConfig:
+    global _config
+    with _config_lock:
+        cfg = get_config()
+        _assert_config_writable()
+        if revision != provider_layout_revision(cfg):
+            raise ModelListChanged("供应商或模型用途已变更，请刷新并重新确认")
+        previous_providers, previous_models = get_provider_layout(cfg)
+        previous_provider_by_id = {provider.id: provider for provider in previous_providers}
+        providers_by_id = {provider.id: provider for provider in providers}
+        if len(providers_by_id) != len(providers):
+            raise ValueError("供应商 ID 重复")
+        if any(not provider.name.strip() for provider in providers):
+            raise ValueError("请输入供应商名称")
+        for provider in providers:
+            previous = previous_provider_by_id.get(provider.id)
+            if previous is None or provider_url(previous.api_base_url) != provider_url(provider.api_base_url):
+                _validate_provider_url(provider.api_base_url)
+        models_by_id = {model.id: model for model in models}
+        if len(models_by_id) != len(models) or any(not model.id.strip() or not model.model.strip() for model in models):
+            raise ValueError("模型 ID 不能为空或重复")
+        previous_by_id = {model.id: model for model in previous_models}
+        removed = {
+            model.id for model in previous_models
+            if model.id not in models_by_id or (model.enabled and not models_by_id[model.id].enabled)
+        }
+        if (removed & get_model_usages(cfg).keys()) - confirmed_remove_ids:
+            raise ModelListChanged("模型正在被使用，请确认移除后重试")
+        verified_models = []
+        for model in models:
+            provider = providers_by_id.get(model.provider_id)
+            if provider is None:
+                raise ValueError("模型引用的供应商不存在")
+            previous = previous_by_id.get(model.id)
+            connection_changed = (
+                previous is None or previous.model != model.model
+                or previous.provider_id != model.provider_id
+                or provider_connection(previous_provider_by_id[previous.provider_id]) != provider_connection(provider)
+            )
+            has_proof = was_verified(provider, model.model)
+            if model.enabled and (connection_changed or not previous.enabled) and not has_proof:
+                raise ValueError("请在当前供应商连接下验证模型后再勾选")
+            verified_models.append(model.model_copy(update={
+                "verified": has_proof or (not connection_changed and previous.verified),
+            }))
+        if active_model_id in removed:
+            active_model_id = None
+        if active_model_id is not None:
+            active = models_by_id.get(active_model_id)
+            if active is None or not active.enabled:
+                raise ValueError("请选择已勾选的通用默认模型")
+        data = cfg.model_dump()
+        data.update({
+            "model_providers": providers,
+            "models": verified_models,
+            "active_model_id": active_model_id,
+            "assist_model_ids": [mid for mid in cfg.assist_model_ids or [] if mid not in removed],
+            "written_exam_model_ids": [mid for mid in cfg.written_exam_model_ids if mid not in removed],
+        })
+        if cfg.assist_screenshot_model_id in removed:
+            data["assist_screenshot_model_id"] = None
+        if cfg.review_model_id in removed:
+            data["review_model_id"] = None
+        if cfg.knowledge_analysis.model_id in removed:
+            data["knowledge_analysis"]["model_id"] = None
+        updated = AppConfig.model_validate(data)
+        _save_config(updated)
+        _config = updated
+        return updated
+
+
+def _validate_provider_url(url: str) -> None:
+    try:
+        parsed = urlsplit(url)
+        # urllib.parse validates the range only when the port is read.
+        _ = parsed.port
+        valid = (
+            bool(parsed.hostname)
+            and parsed.scheme in ("http", "https")
+            and parsed.username is None
+            and parsed.password is None
+            and "?" not in url
+            and "#" not in url
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("API Base URL 必须是有效的 HTTP 或 HTTPS 地址")
+
+
+def _map_single_model_reference(
+    data: dict, updates: dict, model_rows: list[dict], id_field: str, index_field: str,
+) -> None:
+    if id_field not in updates and index_field in updates:
+        index = updates[index_field]
+        if index is not None and not (type(index) is int and 0 <= index < len(model_rows)):
+            raise InvalidAssistModelSelection("模型已变更，请重新选择")
+        data[id_field] = model_rows[index]["id"] if index is not None else None
+    if id_field not in updates and index_field not in updates:
+        return
+    model_id = data[id_field]
+    model = next((model for model in model_rows if model["id"] == model_id), None)
+    if model_id is not None and (model is None or not model["enabled"]):
+        raise InvalidAssistModelSelection("请选择已勾选的模型")
+    if id_field in updates:
+        data[index_field] = model_rows.index(model) if model is not None else None
+
+
+def _validate_legacy_model_changes(cfg: AppConfig, rows: list[dict]) -> None:
+    previous_by_id = {model.id: model for model in cfg.models}
+    candidates = [ModelConfig.model_validate(row) for row in rows]
+    by_id = {model.id: model for model in candidates}
+    if len(by_id) != len(candidates):
+        raise InvalidAssistModelSelection("模型 ID 不能重复")
+    for model_id in get_model_usages(cfg):
+        previous = previous_by_id.get(model_id)
+        if previous is None:
+            continue
+        candidate = by_id.get(model_id)
+        if candidate is None or (previous.enabled and not candidate.enabled):
+            raise ModelListChanged("模型正在被使用，请在模型供应商配置中确认移除")
+    for candidate in candidates:
+        previous = previous_by_id.get(candidate.id)
+        changed = previous is None or (
+            previous.model != candidate.model or provider_connection(previous) != provider_connection(candidate)
+        )
+        reused_key_at_new_address = previous is not None and bool(previous.api_key.strip()) and (
+            previous.api_key == candidate.api_key
+            and provider_connection(previous)[:2] != provider_connection(candidate)[:2]
+        )
+        needs_proof = candidate.enabled and (changed or not previous.enabled)
+        if needs_proof or reused_key_at_new_address:
+            from api.common.provider_catalog import was_verified
+
+            if not was_verified(candidate, candidate.model):
+                raise InvalidAssistModelSelection("请在模型供应商配置中使用当前连接验证模型")
 
 
 def update_config(
@@ -420,10 +801,12 @@ def update_config(
     *,
     model_origins: list[int | None] | None = None,
     model_snapshot: list[ModelConfig] | None = None,
+    allow_overwrite_corrupt: bool = False,
 ) -> AppConfig:
     global _config
     with _config_lock:
         cfg = get_config()
+        _assert_config_writable(allow_overwrite_corrupt=allow_overwrite_corrupt)
         if model_snapshot is not None and model_snapshot != cfg.models:
             raise ModelListChanged("模型列表已更新，请刷新后重试")
         data = cfg.model_dump()
@@ -444,13 +827,95 @@ def update_config(
                     current[field] = setting
                 if current["rtc_token"] != previous_token and "rtc_token_expires_at" not in value:
                     current["rtc_token_expires_at"] = None
+            elif key in STT_SECRET_FIELDS:
+                if isinstance(value, str):
+                    stripped = value.strip()
+                    if not stripped:
+                        continue
+                    data[key] = stripped
+                elif value is None:
+                    data[key] = ""
+                else:
+                    data[key] = value
             elif key == "system_prompts":
                 data[key] = patch_system_prompts(data[key], value)
+            elif key == "assist_generation":
+                data[key].update(value)
             elif hasattr(cfg, key):
                 data[key] = value
+        legacy_exam_update = "written_exam_model_id" in updates and "written_exam_model_ids" not in updates
+        if legacy_exam_update:
+            primary_id = updates["written_exam_model_id"]
+            data["written_exam_model_ids"] = [] if primary_id is None else [primary_id, *cfg.written_exam_model_ids]
+        if "models" in updates:
+            model_rows = [
+                model.model_dump() if isinstance(model, ModelConfig) else dict(model)
+                for model in data["models"]
+            ]
+            for index, model in enumerate(model_rows):
+                if not model.get("id"):
+                    origin = model_origins[index] if model_origins is not None and index < len(model_origins) else None
+                    model["id"] = cfg.models[origin].id if origin is not None else uuid4().hex
+            if cfg.model_providers is not None:
+                previous_by_id = {model.id: model for model in cfg.models}
+                if len(model_rows) != len(previous_by_id) or {row["id"] for row in model_rows} != previous_by_id.keys():
+                    raise ModelListChanged("请在模型供应商配置中添加或移除模型")
+                for row in model_rows:
+                    previous = previous_by_id[row["id"]]
+                    candidate = ModelConfig.model_validate(row)
+                    if (candidate.enabled != previous.enabled or candidate.model != previous.model
+                            or provider_connection(candidate) != provider_connection(previous)):
+                        raise ModelListChanged("请在模型供应商配置中变更供应商连接或勾选模型")
+                    row["provider_id"] = previous.provider_id
+                    row["verified"] = previous.verified
+            else:
+                _validate_legacy_model_changes(cfg, model_rows)
+            data["models"] = model_rows
+            by_id = {model["id"]: index for index, model in enumerate(model_rows)}
+            for field in ("active_model", "review_model_index"):
+                if field not in updates and (previous_index := getattr(cfg, field)) is not None:
+                    old_id = cfg.models[previous_index].id
+                    data[field] = by_id.get(old_id, data[field])
+        model_rows = data["models"]
+        for id_field, index_field in (("active_model_id", "active_model"), ("review_model_id", "review_model_index")):
+            _map_single_model_reference(data, updates, model_rows, id_field, index_field)
+        if cfg.model_providers is None:
+            if "active_model_id" not in updates:
+                data.pop("active_model_id", None)
+            if "review_model_id" not in updates:
+                data.pop("review_model_id", None)
+        if "assist_model_ids" in updates or "assist_screenshot_model_id" in updates:
+            catalog = {
+                model.id if isinstance(model, ModelConfig) else model["id"]: model
+                for model in data["models"]
+            }
+            if "assist_model_ids" in updates and any(model_id not in catalog for model_id in updates["assist_model_ids"]):
+                raise ModelListChanged("答题模型目录已更新，请刷新后重试")
+            if cfg.model_providers is not None and "assist_model_ids" in updates and any(
+                not catalog[model_id]["enabled"] and model_id not in (cfg.assist_model_ids or [])
+                for model_id in updates["assist_model_ids"]
+            ):
+                raise InvalidAssistModelSelection("实时辅助请选择已勾选的模型")
+            selected_vision = updates.get("assist_screenshot_model_id")
+            if selected_vision is not None:
+                model = catalog.get(selected_vision)
+                vision = model.supports_vision if isinstance(model, ModelConfig) else (model or {}).get("supports_vision")
+                if not vision:
+                    raise InvalidAssistModelSelection("截图答题请选择支持识图的模型")
+                if cfg.model_providers is not None and selected_vision != cfg.assist_screenshot_model_id:
+                    if not written_exam_model_available(ModelConfig.model_validate(model)):
+                        raise InvalidAssistModelSelection("截图答题请选择已勾选、已配置 API Key 且支持识图的模型")
         updated = AppConfig(**data)
+        if legacy_exam_update or "written_exam_model_ids" in updates:
+            exam_catalog = {model.id: model for model in updated.models}
+            requested_ids = data["written_exam_model_ids"][:1] if legacy_exam_update else updates["written_exam_model_ids"]
+            for model_id in requested_ids:
+                model = exam_catalog.get(model_id)
+                retained = not legacy_exam_update and model_id in cfg.written_exam_model_ids
+                if model is None or (not retained and not written_exam_model_available(model)):
+                    raise InvalidAssistModelSelection("笔试答题请选择已启用、已配置 API Key 且支持图片输入的模型")
         index = cfg.knowledge_analysis.model_index
-        if "models" in updates and index is not None:
+        if cfg.model_providers is None and "models" in updates and index is not None:
             if model_origins is not None:
                 matches = [new for new, old in enumerate(model_origins) if old == index]
             elif index < len(cfg.models):
@@ -463,7 +928,8 @@ def update_config(
             else:
                 matches = []
             updated.knowledge_analysis.model_index = matches[0] if len(matches) == 1 else None
-        _save_config(updated)
+            updated.knowledge_analysis.model_id = updated._model_id_at(updated.knowledge_analysis.model_index)
+        _save_config(updated, allow_overwrite_corrupt=allow_overwrite_corrupt)
         _config = updated
         return updated
 
@@ -472,12 +938,21 @@ def knowledge_model_available(model: ModelConfig) -> bool:
     return bool(model.enabled and model.api_key.strip() not in ("", "sk-your-api-key-here"))
 
 
+def written_exam_model_available(model: ModelConfig) -> bool:
+    return model.supports_vision and knowledge_model_available(model)
+
+
 def update_knowledge_analysis_settings(
     settings: KnowledgeAnalysisSettings, fingerprint: str | None,
 ) -> AppConfig:
     with _config_lock:
-        models = get_config().models
+        cfg = get_config()
+        models = cfg.models
         index = settings.model_index
+        if settings.model_id is not None:
+            index = next((i for i, model in enumerate(models) if model.id == settings.model_id), None)
+            if index is None:
+                raise ModelListChanged("模型列表已更新，请重新选择分析模型")
         if index is not None:
             if index >= len(models) or fingerprint != model_health_fingerprint(models[index]):
                 raise ModelListChanged("模型列表已更新，请重新选择分析模型")
@@ -485,10 +960,46 @@ def update_knowledge_analysis_settings(
                 raise ValueError("请选择已启用且配置了 API Key 的分析模型")
             if settings.think_effort != "off" and not models[index].supports_think:
                 raise ValueError("该模型未启用推理能力，请将推理强度设为关闭")
-        return update_config({"knowledge_analysis": settings.model_dump()})
+        data = settings.model_dump()
+        data["model_index"] = index
+        data["model_id"] = models[index].id if index is not None else None
+        return update_config({"knowledge_analysis": data})
+
+
+def _backup_corrupt_config(target: Path) -> Optional[Path]:
+    if not target.exists():
+        return None
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = target.with_name(f"{target.name}.corrupt.{stamp}")
+    suffix = 1
+    while backup.exists():
+        backup = target.with_name(f"{target.name}.corrupt.{stamp}.{suffix}")
+        suffix += 1
+    temp_path = None
+    try:
+        raw = target.read_bytes()
+        with NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+            temp_path = Path(stream.name)
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, backup)
+        temp_path = None
+        return backup
+    except OSError as exc:
+        logger.error("备份损坏的配置文件失败: %s", exc)
+        return None
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _load_config() -> AppConfig:
+    global _config_corrupt_state
+    _config_corrupt_state = None
     _custom_path = os.environ.get("IA_CONFIG_PATH")
     if not os.path.exists(CONFIG_FILE):
         if _custom_path:
@@ -496,22 +1007,71 @@ def _load_config() -> AppConfig:
             return AppConfig()
         if os.path.exists(CONFIG_EXAMPLE):
             shutil.copy2(CONFIG_EXAMPLE, CONFIG_FILE)
-            print("[Config] 已从 config.example.json 创建 config.json，请填入你的 API Key")
+            logger.info("已从 config.example.json 创建 config.json，请在设置中添加模型供应商")
     if os.path.exists(CONFIG_FILE):
+        target = Path(CONFIG_FILE)
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return AppConfig(**json.load(f))
+            with open(target, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("配置文件根节点必须是 JSON 对象")
+            if data.pop("asr_config_version", None) == _ASR_CONFIG_VERSION:
+                data.pop("candidate_remote_stt_enabled", None)
+            else:
+                # In older releases, omitting this flag meant the candidate still used local ASR.
+                data["candidate_remote_stt_enabled"] = data.get("candidate_remote_stt_enabled") is True
+            return AppConfig(**data)
         except ValidationError as e:
-            logger.warning("配置包含 %s 项无效设置，使用默认配置", e.error_count())
+            backup = _backup_corrupt_config(target)
+            fields = sorted({
+                ".".join(str(part) for part in item.get("loc", ()))
+                for item in e.errors(include_input=False, include_context=False, include_url=False)
+                if item.get("loc")
+            })
+            field_suffix = f"：{', '.join(fields[:5])}" if fields else ""
+            summary = f"配置校验失败（{e.error_count()} 项无效{field_suffix}）"
+            logger.error("%s，已备份至 %s 并进入只读保护模式", summary, backup or "备份失败")
+            _config_corrupt_state = {
+                "config_file": _current_config_file_key(),
+                "error": summary,
+                "backup_path": str(backup) if backup else None,
+                "backup_filename": backup.name if backup else None,
+            }
         except Exception as e:
-            print(f"[Config] 配置文件解析失败: {e}，使用默认配置")
+            backup = _backup_corrupt_config(target)
+            summary = f"配置文件解析失败（{type(e).__name__}）"
+            logger.error("%s，已备份至 %s 并进入只读保护模式: %s", summary, backup or "备份失败", e)
+            _config_corrupt_state = {
+                "config_file": _current_config_file_key(),
+                "error": summary,
+                "backup_path": str(backup) if backup else None,
+                "backup_filename": backup.name if backup else None,
+            }
     return AppConfig()
 
 
-def _save_config(cfg: AppConfig) -> None:
+def _save_config(cfg: AppConfig, *, allow_overwrite_corrupt: bool = False) -> None:
+    global _config_corrupt_state
+    _assert_config_writable(allow_overwrite_corrupt=allow_overwrite_corrupt)
     target = Path(CONFIG_FILE)
     data = cfg.model_dump()
+    data["asr_config_version"] = _ASR_CONFIG_VERSION
     data.pop("resume_text", None)
+    if cfg.model_providers is None:
+        for field in ("model_providers", "active_model_id", "review_model_id"):
+            data.pop(field, None)
+        data["knowledge_analysis"].pop("model_id", None)
+        for model in data["models"]:
+            for field in ("provider_id", "verified"):
+                model.pop(field, None)
+    else:
+        _backup_legacy_model_config(target)
+        for key in ("active_model", "review_model_index"):
+            data.pop(key, None)
+        data["knowledge_analysis"].pop("model_index", None)
+        for model in data["models"]:
+            for field in ("api_base_url", "api_type", "api_key"):
+                model.pop(field, None)
     temp_path = None
     try:
         with NamedTemporaryFile(mode="w", encoding="utf-8", dir=target.parent, delete=False) as f:
@@ -521,12 +1081,40 @@ def _save_config(cfg: AppConfig) -> None:
             os.fsync(f.fileno())
         os.replace(temp_path, target)
         temp_path = None
+        if _config_corrupt_state is not None and _config_corrupt_state.get("config_file") == _current_config_file_key():
+            _config_corrupt_state = None
     finally:
         if temp_path is not None:
             try:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 logger.warning("无法清理配置临时文件")
+
+
+def _backup_legacy_model_config(target: Path) -> None:
+    backup = target.with_name(target.name + ".pre-model-providers.bak")
+    if backup.exists() or not target.exists():
+        return
+    original = target.read_bytes()
+    try:
+        prev = json.loads(original.decode("utf-8-sig"))
+    except (ValueError, UnicodeError) as exc:
+        raise OSError("无法读取旧配置以备份") from exc
+    if not isinstance(prev, dict):
+        raise OSError("无法读取旧配置以备份")
+    if isinstance(prev.get("model_providers"), list):
+        return
+    temp_path = None
+    try:
+        with NamedTemporaryFile(dir=target.parent, delete=False) as stream:
+            temp_path = Path(stream.name)
+            stream.write(original)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, backup)
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 POSITION_OPTIONS = [
@@ -537,13 +1125,7 @@ LANGUAGE_OPTIONS = [
     "Python", "Java", "C++", "JavaScript", "TypeScript",
     "Go", "SQL",
 ]
-WHISPER_MODEL_OPTIONS = ["tiny", "base", "small", "medium", "large-v3"]
 # 远程 ASR 失败降级目标：本地引擎或关闭
-STT_FALLBACK_PROVIDER_OPTIONS = ["whisper", "funasr", "none"]
 # FunASR 本地模型（中文面试场景推荐 paraformer-zh：准确率高、CPU 快、支持热词）
-FUNASR_MODEL_OPTIONS = ["paraformer-zh", "sensevoice-small", "paraformer-zh-streaming"]
-# 语音识别引擎：whisper=本地，funasr=本地 FunASR，doubao=豆包 API，generic=OpenAI-compatible HTTP ASR
-STT_PROVIDER_OPTIONS = ["whisper", "funasr", "qwen3_asr", "doubao", "generic", MMPG_STT_PROVIDER]
-CANDIDATE_STT_PROVIDER_OPTIONS = STT_PROVIDER_OPTIONS.copy()
 # 电脑截图区域
 SCREEN_CAPTURE_REGION_OPTIONS = ["full", "left_half", "right_half", "top_half", "bottom_half"]

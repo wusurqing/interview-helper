@@ -28,10 +28,10 @@ from services.llm.interview_budget import stream_interview_answer
 from services.llm.prompts import (
     assist_prompt_scene,
     build_assist_user_context,
+    config_for_assist_generation,
     format_interview_utterance,
-    max_tokens_for_assist_prompt,
 )
-from api.assist.scheduler import TaskPayload
+from api.assist.scheduler import EXAM_MODEL_STALE, TaskPayload, task_is_written_exam
 
 
 @dataclass(frozen=True)
@@ -55,11 +55,28 @@ class AnswerWorkerDeps:
     error_logger: Any
     start_abort_check: Optional[Callable[[], bool]] = None
     model_cfg_snapshot: Any = None
-    # The dispatcher captures the complete immutable configuration that was
-    # active when the task claimed a model.  Runtime/session state is still
-    # read through the callbacks above, but prompt and generation settings
-    # must not drift while a queued worker is waiting to start.
+    # Exam options originate at submission; other options originate at dispatch.
+    # Session state and exam catalog availability are still checked at runtime.
     config_snapshot: Any = None
+    reserve_retry: Callable[[set[int], Callable[[], None]], int | None] | None = None
+    resolve_exam_model: Callable[[int], Any] | None = None
+
+
+@dataclass(frozen=True)
+class GeneratedAnswer:
+    text: str
+    think: str
+    first_token_at: float | None
+    prompt_tokens: int
+    completion_tokens: int
+
+
+class EmptyAnswer(LLMError):
+    user_msg = "模型未返回有效答案，请重试或更换模型。"
+
+
+class ExamModelUnavailable(LLMError):
+    user_msg = EXAM_MODEL_STALE
 
 
 def _screen_region_label(region: str) -> str:
@@ -143,6 +160,7 @@ def _written_exam_followup_context(session_ref, *, source: str, image_count: int
         qa
         for qa in session_ref.qa_pairs[-4:]
         if (qa.question or qa.answer)
+        and qa.written_exam
         and (qa.source or "").startswith("server_screen_")
         and not (qa.source or "").endswith("exam_preflight")
     ][-2:]
@@ -604,11 +622,18 @@ def _history_context_options(prompt_mode: PromptMode) -> dict[str, Any]:
     }
 
 
-def _wait_for_candidate_context_if_pending(session_ref, qa_id: str, wait_ms: int) -> None:
+def _wait_for_candidate_context_if_pending(
+    session_ref,
+    qa_id: str,
+    wait_ms: int,
+    abort_check: Optional[Callable[[], bool]] = None,
+) -> None:
     if wait_ms <= 0 or not qa_id:
         return
     deadline = time.monotonic() + (wait_ms / 1000.0)
     while time.monotonic() < deadline:
+        if abort_check is not None and abort_check():
+            return
         if not getattr(session_ref, "has_candidate_asr_pending_for_qa", lambda *_args, **_kwargs: False)(qa_id):
             return
         time.sleep(0.025)
@@ -648,8 +673,11 @@ def _process_question_parallel(
     mmpg_request = meta.get("mmpg_request")
     exam_preflight_id = str(meta.get("exam_preflight_id") or "") if meta.get("exam_preflight") else ""
     qa_id = f"qa-{seq}-{int(time.time() * 1000)}"
+    attempt_number = 1
 
     def _broadcast(data: dict) -> None:
+        if data["type"].startswith("answer_"):
+            data = {**data, "attempt": attempt_number}
         if exam_preflight_id:
             data = {**data, "exam_preflight_id": exam_preflight_id}
         if mmpg_request:
@@ -658,7 +686,7 @@ def _process_question_parallel(
                     return
                 if data["type"] == "answer_start":
                     mmpg_request.shown_qa_id = qa_id
-                if mmpg_request.updates_qa_id and data["type"] in ("answer_start", "answer_done"):
+                if mmpg_request.updates_qa_id and data["type"] in ("answer_start", "answer_retry", "answer_done"):
                     data = {**data, "updates_qa_id": mmpg_request.updates_qa_id}
                 deps.broadcast(data)
         else:
@@ -699,23 +727,35 @@ def _process_question_parallel(
         return
     if model_cfg is None:
         model_cfg = cfg.models[model_idx]
-    if deps.start_abort_check is not None and deps.start_abort_check():
+    if (deps.start_abort_check is not None and deps.start_abort_check()) or deps.abort_check():
         deps.mark_seq_skipped(seq)
         return
+    if deps.resolve_exam_model is not None:
+        live_model = deps.resolve_exam_model(model_idx)
+        if live_model is None:
+            _broadcast({"type": "answer_error", "id": qa_id, "stage": "generation", "message": EXAM_MODEL_STALE})
+            deps.mark_seq_skipped(seq)
+            return
+        model_cfg = live_model
 
-    written_exam = bool(meta.get("exam_preflight") or getattr(cfg, "written_exam_mode", False))
+    written_exam = task_is_written_exam(task, cfg)
     written_exam_think = bool(getattr(cfg, "written_exam_think", False))
     prompt_mode = prompt_mode_for_task(source, manual_input, written_exam=written_exam)
+    knowledge_practice = meta.get("purpose") == "knowledge_practice"
     plain_text = prompt_mode == PROMPT_MODE_ASR_REALTIME or (
         prompt_mode == PROMPT_MODE_MANUAL_TEXT
         and source == "manual_text"
         and not image
-        and meta.get("purpose") != "knowledge_practice"
+        and not knowledge_practice
     )
     format_payload = {"answer_format": "plain_text"} if plain_text else {}
-    short_answer = bool(getattr(cfg, "assist_high_churn_short_answer", False))
-    scene = assist_prompt_scene(prompt_mode, high_churn_short_answer=short_answer)
-    customized_prompt = scene in getattr(cfg, "system_prompts", {})
+    scene = assist_prompt_scene(prompt_mode)
+    customized_prompt = (
+        cfg.knowledge_practice_system_prompt is not None
+        if knowledge_practice and hasattr(cfg, "knowledge_practice_system_prompt")
+        else scene in getattr(cfg, "system_prompts", {})
+    )
+    generation_cfg = cfg if knowledge_practice else config_for_assist_generation(cfg, prompt_mode)
 
     kb_hits: list = []
     kb_latency_ms = 0
@@ -745,6 +785,10 @@ def _process_question_parallel(
             deps.error_logger.warning("kb retrieve in answer worker failed: %s", exc)
             kb_hits = []
             kb_degraded = True
+
+    if deps.abort_check():
+        deps.mark_seq_skipped(seq)
+        return
 
     images = _normalize_task_images(image)
     realtime_voice = prompt_mode == PROMPT_MODE_ASR_REALTIME and not images
@@ -783,6 +827,7 @@ def _process_question_parallel(
             history_stats = dict(getattr(session_ref, "last_llm_history_stats", {}) or {})
             written_followup_context = ""
         last_qa = session_ref.get_last_qa()
+        prior_candidate_qa_id = getattr(session_ref, "current_candidate_qa_id", "") or ""
         candidate_context_enabled, candidate_wait_ms, candidate_max_chars, candidate_min_chars = _candidate_context_settings(cfg)
         candidate_source_ok = _supports_candidate_context_source(source, meta)
         should_use_candidate_context = bool(
@@ -801,7 +846,18 @@ def _process_question_parallel(
         )
 
     if should_use_candidate_context and last_qa:
-        _wait_for_candidate_context_if_pending(session_ref, last_qa.id, candidate_wait_ms)
+        try:
+            _wait_for_candidate_context_if_pending(
+                session_ref,
+                last_qa.id,
+                candidate_wait_ms,
+                abort_check=deps.abort_check,
+            )
+        except TypeError:
+            _wait_for_candidate_context_if_pending(session_ref, last_qa.id, candidate_wait_ms)
+        if deps.abort_check():
+            deps.mark_seq_skipped(seq)
+            return
         with conversation_lock:
             actual_spoken_answer = session_ref.get_candidate_answer_for_qa(
                 last_qa.id,
@@ -887,15 +943,22 @@ def _process_question_parallel(
         else:
             user_for_llm = f"{written_followup_context}\n\n[当前题面]\n{question_text}"
 
+    aborted_before_start = False
     with conversation_lock:
-        session_ref.close_candidate_answer_window()
+        if deps.abort_check():
+            aborted_before_start = True
+        elif prior_candidate_qa_id and session_ref.current_candidate_qa_id == prior_candidate_qa_id:
+            session_ref.close_candidate_answer_window()
+    if aborted_before_start:
+        deps.mark_seq_skipped(seq)
+        return
 
     system_prompt = build_system_prompt(
         manual_input=manual_input,
         mode=prompt_mode,
-        high_churn_short_answer=short_answer,
         cfg=cfg,
         structured_manual=prompt_mode == PROMPT_MODE_MANUAL_TEXT and not plain_text,
+        knowledge_practice=knowledge_practice,
     )
     user_context = build_assist_user_context(
         cfg,
@@ -956,6 +1019,10 @@ def _process_question_parallel(
             customized_prompt,
         )
 
+    if deps.abort_check():
+        deps.mark_seq_skipped(seq)
+        return
+
     if len(images) > 1:
         display_question = f"{question_text} [📷 多图 x{len(images)}]"
     else:
@@ -992,11 +1059,11 @@ def _process_question_parallel(
             if not deps.abort_check():
                 get_session().open_candidate_answer_window(qa_id)
 
-    if kb_hits or kb_degraded:
+    if (kb_hits or kb_degraded) and not deps.abort_check():
         try:
             from services.kb.ws import build_kb_hits_payload as _kb_payload
 
-            deps.broadcast(
+            _broadcast(
                 _kb_payload(
                     qa_id=qa_id,
                     hits=kb_hits,
@@ -1010,88 +1077,85 @@ def _process_question_parallel(
         except Exception as exc:
             deps.error_logger.warning("broadcast kb_hits failed: %s", exc)
 
-    raw_full_answer = ""
-    stream_sanitizer = create_answer_stream_sanitizer(
-        prompt_mode, preserve_format=customized_prompt, plain_text=plain_text,
-    )
-    visible_chunks: list[str] = []
-    full_think = ""
-    token_prompt_delta = 0
-    token_completion_delta = 0
-
-    def _record_usage(prompt_tokens: int, completion_tokens: int, _model_name: str) -> None:
-        nonlocal token_prompt_delta, token_completion_delta
-        token_prompt_delta += int(prompt_tokens or 0)
-        token_completion_delta += int(completion_tokens or 0)
-
-    exam_think_notified = False
     gen_start = time.monotonic()
     if mmpg_trace and not mmpg_request:
         get_logger("mmpg.diagnostics").info("turn=%s event=llm_start seq=%s", mmpg_trace, seq)
-    # User-facing "首字" latency means the first answer token, not a hidden
-    # reasoning token.  This matters for written-exam mode where Think output
-    # may arrive seconds before any usable code/answer text.
-    first_token_mono: Optional[float] = None
-    chunk_buffer: list[str] = []
-    batch_size = 5
-    try:
-        # Precedence: one-shot meta override > written-exam screen think > model/global.
-        if "override_think_mode" in meta and meta.get("override_think_mode") is not None:
-            think_override = bool(meta.get("override_think_mode"))
-        elif prompt_mode == PROMPT_MODE_WRITTEN_EXAM and (source or "").startswith("server_screen_"):
-            think_override = written_exam_think
-        else:
-            think_override = None
+    # Precedence: per-request override, exam screenshot Think, then the assist setting.
+    if meta.get("override_think_mode") is not None:
+        think_override = bool(meta["override_think_mode"])
+    elif prompt_mode == PROMPT_MODE_WRITTEN_EXAM and (source or "").startswith("server_screen_"):
+        think_override = written_exam_think
+    else:
+        think_override = None
+
+    flush_failed_attempt: Optional[Callable[[], None]] = None
+
+    def _generate_attempt() -> GeneratedAnswer | None:
+        nonlocal flush_failed_attempt
+        flush_failed_attempt = None
+        sanitizer = create_answer_stream_sanitizer(
+            prompt_mode, preserve_format=customized_prompt, plain_text=plain_text,
+        )
+        raw_chunks: list[str] = []
+        visible_chunks: list[str] = []
+        think_chunks: list[str] = []
+        pending_chunks: list[str] = []
+        token_prompt_delta = token_completion_delta = 0
+        first_token_mono: float | None = None
+
+        def record_usage(prompt_tokens: int, completion_tokens: int, _model_name: str) -> None:
+            nonlocal token_prompt_delta, token_completion_delta
+            token_prompt_delta += int(prompt_tokens or 0)
+            token_completion_delta += int(completion_tokens or 0)
+
+        def flush_chunks() -> None:
+            if pending_chunks:
+                _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": "".join(pending_chunks)})
+                pending_chunks.clear()
+
+        def emit_tail() -> None:
+            tail = sanitizer.finish()
+            if tail:
+                visible_chunks.append(tail)
+                _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": tail})
+
         stream_options = dict(
             system_prompt=system_prompt,
             abort_check=deps.abort_check,
             override_think_mode=think_override,
-            usage_callback=_record_usage,
-            override_max_tokens=max_tokens_for_assist_prompt(
-                prompt_mode, cfg, high_churn_short_answer=short_answer,
-            ),
+            usage_callback=record_usage,
+            override_max_tokens=int(getattr(generation_cfg, "max_tokens", 4096)),
             trace_context={
-                "scene": scene, "qa_id": qa_id, "source": source,
+                "scene": scene, "qa_id": qa_id, "source": source, "answer_attempt": attempt_number,
                 "mmpg_group_id": getattr(mmpg_request, "group_id", None),
                 "mmpg_revision": getattr(mmpg_request, "revision", None),
                 "mmpg_seq": getattr(mmpg_request, "seq", None),
             },
+            mmpg_request=mmpg_request,
+            config_snapshot=generation_cfg,
         )
         if realtime_voice:
             stream = stream_interview_answer(
                 model_cfg, voice_rounds, context_prefix=voice_prefix,
-                mmpg_request=mmpg_request, config_snapshot=cfg,
                 stream_fn=chat_stream_single_model, **stream_options,
             )
         else:
-            if mmpg_request:
-                stream_options.update(mmpg_request=mmpg_request, config_snapshot=cfg)
-            stream = chat_stream_single_model(model_cfg, messages_for_llm, **stream_options)
-        for chunk_type, chunk_text in stream:
-            if deps.abort_check():
-                break
-            if chunk_type == "think":
-                full_think += chunk_text
-                if prompt_mode == PROMPT_MODE_WRITTEN_EXAM:
-                    if not exam_think_notified:
-                        exam_think_notified = True
-                        _broadcast(
-                            {
-                                "type": "answer_think_chunk",
-                                "id": qa_id,
-                                "chunk": "思考中...",
-                            }
-                        )
-                else:
-                    _broadcast(
-                        {
-                            "type": "answer_think_chunk",
-                            "id": qa_id,
-                            "chunk": chunk_text,
-                        }
-                    )
-            else:
-                clean_chunk = stream_sanitizer.push(chunk_text)
+            stream = chat_stream_single_model(
+                model_cfg, messages_for_llm, protect_output_limit=True, **stream_options,
+            )
+        try:
+            for chunk_type, chunk_text in stream:
+                if deps.abort_check():
+                    return None
+                if chunk_type == "think":
+                    think_chunks.append(chunk_text)
+                    if prompt_mode != PROMPT_MODE_WRITTEN_EXAM or len(think_chunks) == 1:
+                        _broadcast({
+                            "type": "answer_think_chunk", "id": qa_id,
+                            "chunk": "思考中..." if prompt_mode == PROMPT_MODE_WRITTEN_EXAM else chunk_text,
+                        })
+                    continue
+                clean_chunk = sanitizer.push(chunk_text)
                 if first_token_mono is None and (clean_chunk.strip() if plain_text else chunk_text):
                     first_token_mono = time.monotonic()
                     if mmpg_trace:
@@ -1104,53 +1168,108 @@ def _process_question_parallel(
                             )
                         else:
                             get_logger("mmpg.diagnostics").info(
-                                "turn=%s event=llm_first_token seq=%s elapsed_ms=%.1f",
-                                mmpg_trace, seq, (first_token_mono - gen_start) * 1000,
+                                "turn=%s event=llm_first_token seq=%s", mmpg_trace, seq,
                             )
-                raw_full_answer += chunk_text
-                if clean_chunk:
-                    if plain_text:
-                        visible_chunks.append(clean_chunk)
-                        _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": clean_chunk})
-                    else:
-                        chunk_buffer.append(clean_chunk)
-                        if len(chunk_buffer) >= batch_size:
-                            _broadcast(
-                                {"type": "answer_chunk", "id": qa_id, "chunk": "".join(chunk_buffer)}
-                            )
-                            chunk_buffer.clear()
-        if chunk_buffer:
-            _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": "".join(chunk_buffer)})
-            chunk_buffer.clear()
-    except Exception as exc:
-        if mmpg_request and mmpg_request.cancelled:
-            deps.mark_seq_skipped(seq)
-            return
-        deps.error_logger.error(
-            "LLM stream error id=%s: %s",
-            qa_id,
-            exc,
-            exc_info=not isinstance(exc, LLMError),
+                raw_chunks.append(chunk_text)
+                if not clean_chunk:
+                    continue
+                if plain_text:
+                    visible_chunks.append(clean_chunk)
+                    _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": clean_chunk})
+                else:
+                    pending_chunks.append(clean_chunk)
+                    if len(pending_chunks) >= 5:
+                        flush_chunks()
+        except Exception:
+            if not deps.abort_check():
+                def _flush_residual() -> None:
+                    flush_chunks()
+                    emit_tail()
+
+                flush_failed_attempt = _flush_residual
+            raise
+        finally:
+            close = getattr(stream, "close", None)
+            if close is not None:
+                close()
+
+        if deps.abort_check():
+            return None
+        flush_chunks()
+        emit_tail()
+        answer = (
+            "".join(visible_chunks) if plain_text else
+            postprocess_answer_for_mode("".join(raw_chunks), prompt_mode, preserve_format=customized_prompt)
         )
-        if chunk_buffer:
-            _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": "".join(chunk_buffer)})
-            chunk_buffer.clear()
-        tail = stream_sanitizer.finish()
-        if tail:
-            _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": tail})
-        message = (
-            exc.user_msg
-            if isinstance(exc, LLMError)
-            else "生成答案失败，请稍后重试。"
+        if not answer.strip():
+            raise EmptyAnswer("No visible answer generated")
+        return GeneratedAnswer(
+            answer, "".join(think_chunks), first_token_mono, token_prompt_delta, token_completion_delta,
         )
-        _broadcast({
-            "type": "answer_error",
-            "id": qa_id,
-            "stage": "generation",
-            "message": message,
-        })
-        # The commit queue must advance past a failed generation, but the
-        # failed answer itself must never be written as a successful QA pair.
+
+    generated = None
+    attempted: set[int] = set()
+    while not deps.abort_check():
+        first_attempt = not attempted
+        attempted.add(model_idx)
+        try:
+            if deps.resolve_exam_model is not None:
+                live_model = deps.resolve_exam_model(model_idx)
+                if live_model is None:
+                    raise ExamModelUnavailable(EXAM_MODEL_STALE)
+                model_cfg = live_model
+            generated = _generate_attempt()
+        except Exception as exc:
+            if deps.abort_check():
+                break
+            deps.error_logger.error(
+                "ANSWER_ATTEMPT_FAILED id=%s attempt=%d model=%s kind=%s",
+                qa_id, attempt_number, model_cfg.name, type(exc).__name__,
+                exc_info=not isinstance(exc, LLMError),
+            )
+            retry_attempt = attempt_number + 1
+
+            def announce_retry(model_name: str = "", *, attempt: int = retry_attempt) -> None:
+                nonlocal attempt_number
+                if deps.abort_check():
+                    return
+                attempt_number = attempt
+                _broadcast({
+                    "type": "answer_retry", "id": qa_id, "question": display_question, "source": source,
+                    "model_name": model_name, **format_payload,
+                })
+
+            next_index = None
+            primary_lost = first_attempt and isinstance(exc, ExamModelUnavailable)
+            if isinstance(exc, LLMError) and not primary_lost and not knowledge_practice and deps.reserve_retry is not None:
+                next_index = deps.reserve_retry(attempted, announce_retry)
+            if deps.abort_check():
+                break
+            if next_index is None:
+                if flush_failed_attempt is not None:
+                    flush_failed_attempt()
+                    flush_failed_attempt = None
+                _broadcast({
+                    "type": "answer_error", "id": qa_id, "stage": "generation",
+                    "message": exc.user_msg if isinstance(exc, LLMError) else "生成答案失败，请稍后重试。",
+                })
+                deps.mark_seq_skipped(seq)
+                return
+            flush_failed_attempt = None
+            model_idx = next_index
+            model_cfg = cfg.models[next_index]
+            retry_model_name = model_cfg.name
+            if deps.resolve_exam_model is not None:
+                live_model = deps.resolve_exam_model(next_index)
+                retry_model_name = live_model.name if live_model is not None else ""
+            deps.logger.info("ANSWER_RETRY id=%s attempt=%d model=%s", qa_id, retry_attempt, retry_model_name or model_cfg.name)
+            announce_retry(retry_model_name)
+        else:
+            break
+
+    if generated is None or deps.abort_check():
+        deps.logger.info("ANSWER_CANCEL id=%s after=%.0fms", qa_id, (time.monotonic() - gen_start) * 1000)
+        _broadcast({"type": "answer_cancelled", "id": qa_id})
         deps.mark_seq_skipped(seq)
         return
 
@@ -1158,42 +1277,10 @@ def _process_question_parallel(
         gen_start = mmpg_request.started_at
     gen_elapsed = (time.monotonic() - gen_start) * 1000
     first_token_ms = (
-        (first_token_mono - gen_start) * 1000 if first_token_mono else gen_elapsed
+        (generated.first_token_at - gen_start) * 1000 if generated.first_token_at is not None else gen_elapsed
     )
-
-    if deps.abort_check():
-        deps.logger.info("ANSWER_CANCEL id=%s after=%.0fms", qa_id, gen_elapsed)
-        _broadcast({"type": "answer_cancelled", "id": qa_id})
-        deps.mark_seq_skipped(seq)
-        return
-
-    tail = stream_sanitizer.finish()
-    if tail:
-        _broadcast({"type": "answer_chunk", "id": qa_id, "chunk": tail})
-
-    full_answer = (
-        "".join(visible_chunks) + tail if plain_text else
-        postprocess_answer_for_mode(raw_full_answer, prompt_mode, preserve_format=customized_prompt)
-    )
-    if not full_answer.strip():
-        deps.error_logger.warning(
-            "ANSWER_EMPTY id=%s model=%s source=%s think_len=%d raw_len=%d",
-            qa_id,
-            model_cfg.name,
-            source,
-            len(full_think),
-            len(raw_full_answer),
-        )
-        _broadcast(
-            {
-                "type": "answer_error",
-                "id": qa_id,
-                "stage": "generation",
-                "message": "模型未返回有效答案，请重试或更换模型。",
-            }
-        )
-        deps.mark_seq_skipped(seq)
-        return
+    full_answer, full_think = generated.text, generated.think
+    token_prompt_delta, token_completion_delta = generated.prompt_tokens, generated.completion_tokens
 
     def _cancel_visible_answer():
         _broadcast({"type": "answer_cancelled", "id": qa_id})
@@ -1205,6 +1292,8 @@ def _process_question_parallel(
             return
         session = get_session()
         if exam_preflight_id:
+            if deps.abort_check():
+                return
             stats = get_token_stats()
             deps.logger.info(
                 "EXAM_PREFLIGHT_ANSWER_DONE id=%s model=%s first_token=%.0fms total=%.0fms answer_len=%d",
@@ -1236,28 +1325,60 @@ def _process_question_parallel(
                 }
             )
             return
-        pre_user_len = len(session.conversation_history)
-        pre_qa_len = len(session.qa_pairs)
+        user_msg_content = f"{question_text} [图片已省略 x{len(images)}]" if images else question_text
+        stale_before_commit = False
         try:
             with conversation_lock:
-                if images:
-                    suffix = f" [图片已省略 x{len(images)}]"
-                    session.add_user_message(question_text + suffix)
+                if not deps.is_session_current(sess_v) or (mmpg_request and mmpg_request.cancelled):
+                    stale_before_commit = True
                 else:
-                    session.add_user_message(question_text)
-                session.add_assistant_message(full_answer)
-                session.add_qa(
-                    display_question,
-                    full_answer,
-                    qa_id=qa_id,
-                    source=source,
-                    model_name=model_cfg.name,
-                    **({"answer_format": "plain_text", "first_token_ms": int(first_token_ms),
-                        "total_ms": int(gen_elapsed)} if plain_text else {}),
-                    **({"updates_qa_id": mmpg_request.updates_qa_id} if mmpg_request and mmpg_request.updates_qa_id else {}),
-                )
-                if mmpg_request:
-                    mmpg_request.completed_qa_id = qa_id
+                    prev_history = list(session.conversation_history)
+                    prev_qa_pairs = list(session.qa_pairs)
+                    prev_completed_qa_id = mmpg_request.completed_qa_id if mmpg_request else None
+                    try:
+                        session.add_user_message(user_msg_content)
+                        session.add_assistant_message(full_answer)
+                        session.add_qa(
+                            display_question,
+                            full_answer,
+                            qa_id=qa_id,
+                            source=source,
+                            model_name=model_cfg.name,
+                            written_exam=written_exam,
+                            **({"answer_format": "plain_text", "first_token_ms": int(first_token_ms),
+                                "total_ms": int(gen_elapsed)} if plain_text else {}),
+                            **({"updates_qa_id": mmpg_request.updates_qa_id} if mmpg_request and mmpg_request.updates_qa_id else {}),
+                        )
+                        if mmpg_request:
+                            mmpg_request.completed_qa_id = qa_id
+                    except Exception:
+                        if mmpg_request:
+                            mmpg_request.completed_qa_id = prev_completed_qa_id
+                        session.qa_pairs[:] = [qa for qa in prev_qa_pairs if qa.id != qa_id]
+                        session.conversation_history[:] = prev_history
+                        raise
+        except Exception as exc:
+            deps.error_logger.error(
+                "_commit failed for id=%s seq=%d: %s",
+                qa_id, seq, exc, exc_info=True,
+            )
+            _broadcast({
+                "type": "answer_error",
+                "id": qa_id,
+                "stage": "persistence",
+                "message": "答案保存失败",
+            })
+            return
+
+        if stale_before_commit:
+            if plain_text:
+                _cancel_visible_answer()
+            return
+
+        # Persistence succeeded; post-commit side effects must degrade independently
+        # and never roll back the committed QA or emit a contradictory answer_error.
+        stats = None
+        try:
             stats = get_token_stats()
             deps.logger.info(
                 "ANSWER_DONE id=%s model=%s first_token=%.0fms total=%.0fms "
@@ -1274,6 +1395,10 @@ def _process_question_parallel(
                 stats["prompt"],
                 stats["completion"],
             )
+        except Exception as exc:  # noqa: BLE001
+            deps.error_logger.warning("ANSWER_DONE stats/log failed id=%s: %s", qa_id, exc)
+
+        try:
             _broadcast(
                 {
                     "type": "answer_done",
@@ -1288,15 +1413,24 @@ def _process_question_parallel(
                     **({"source": source} if plain_text else {}),
                 }
             )
-            deps.broadcast(
-                {
-                    "type": "token_update",
-                    "prompt": stats["prompt"],
-                    "completion": stats["completion"],
-                    "total": stats["total"],
-                    "by_model": stats.get("by_model", {}),
-                }
-            )
+        except Exception as exc:  # noqa: BLE001
+            deps.error_logger.warning("broadcast answer_done failed id=%s: %s", qa_id, exc)
+
+        if stats is not None:
+            try:
+                deps.broadcast(
+                    {
+                        "type": "token_update",
+                        "prompt": stats["prompt"],
+                        "completion": stats["completion"],
+                        "total": stats["total"],
+                        "by_model": stats.get("by_model", {}),
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001
+                deps.error_logger.warning("broadcast token_update failed id=%s: %s", qa_id, exc)
+
+        try:
             candidate_answer_for_record = ""
             with conversation_lock:
                 candidate_answer_for_record = session.get_candidate_answer_for_qa(
@@ -1309,40 +1443,26 @@ def _process_question_parallel(
                     qa_id,
                     question_text[:80],
                 )
-            if prompt_mode in (PROMPT_MODE_SERVER_SCREEN, PROMPT_MODE_WRITTEN_EXAM) and images:
-                try:
-                    from services.vision_verify import schedule_self_verify
+        except Exception as exc:  # noqa: BLE001
+            deps.error_logger.warning("KNOWLEDGE_ENQUEUE_FAIL id=%s err=%s", qa_id, exc)
 
-                    schedule_self_verify(
-                        qa_id=qa_id,
-                        answer=full_answer,
-                        image_data_url=images,
-                        broadcast_callable=deps.broadcast,
-                    )
-                except Exception as exc: # noqa: BLE001
-                    deps.error_logger.warning(
-                        "VISION_VERIFY_SCHEDULE_FAIL id=%s err=%s",
-                        qa_id,
-                        exc,
-                    )
-        except Exception as exc:
-            if mmpg_request:
-                mmpg_request.completed_qa_id = None
-            with conversation_lock:
-                if len(session.qa_pairs) > pre_qa_len:
-                    session.qa_pairs.pop()
-                if len(session.conversation_history) > pre_user_len:
-                    del session.conversation_history[pre_user_len:]
-            deps.error_logger.error(
-                "_commit failed for id=%s seq=%d: %s",
-                qa_id, seq, exc, exc_info=True,
-            )
-            _broadcast({
-                "type": "answer_error",
-                "id": qa_id,
-                "stage": "persistence",
-                "message": "答案保存失败",
-            })
+        if prompt_mode in (PROMPT_MODE_SERVER_SCREEN, PROMPT_MODE_WRITTEN_EXAM) and images:
+            try:
+                from services.vision_verify import schedule_self_verify
+
+                schedule_self_verify(
+                    qa_id=qa_id,
+                    answer=full_answer,
+                    image_data_url=images,
+                    broadcast_callable=deps.broadcast,
+                    model_cfg=model_cfg,
+                )
+            except Exception as exc:  # noqa: BLE001
+                deps.error_logger.warning(
+                    "VISION_VERIFY_SCHEDULE_FAIL id=%s err=%s",
+                    qa_id,
+                    exc,
+                )
 
     def _commit_current_request():
         with mmpg_request.lock:

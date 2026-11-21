@@ -21,9 +21,8 @@ export const SAMPLE_CONFIG = {
   temperature: 0.2,
   max_tokens: 2048,
   think_mode: true,
-  stt_provider: 'whisper',
-  whisper_model: 'large-v3-turbo',
-  whisper_language: 'zh',
+  stt_provider: 'doubao',
+  stt_configured: { doubao: true, generic: true, doubao_mmpg: true },
   doubao_stt_app_id: '',
   doubao_stt_access_token: '',
   doubao_stt_resource_id: '',
@@ -32,16 +31,11 @@ export const SAMPLE_CONFIG = {
   generic_stt_api_key: '',
   generic_stt_model: '',
   candidate_asr_enabled: true,
-  candidate_stt_provider: 'whisper',
-  candidate_whisper_model: 'small',
-  candidate_whisper_language: 'zh',
-  candidate_remote_stt_enabled: false,
+  candidate_stt_provider: 'generic',
   candidate_context_enabled: true,
   candidate_context_wait_ms: 1200,
   candidate_context_max_chars: 1600,
   candidate_context_min_chars: 8,
-  candidate_streaming_asr_enabled: true,
-  candidate_streaming_asr_interval_ms: 900,
   candidate_mic_compatibility_mode: true,
   position: '后端开发工程师',
   language: '中文',
@@ -64,6 +58,8 @@ export const SAMPLE_CONFIG = {
 
 export const SAMPLE_WRITTEN_EXAM_CONFIG = {
   ...SAMPLE_CONFIG,
+  models: SAMPLE_CONFIG.models.map((model, index) => ({ ...model, id: 'model-' + index, has_api_key: true })),
+  written_exam_model_ids: ['model-0'],
   written_exam_mode: true,
   written_exam_think: false,
 }
@@ -71,8 +67,8 @@ export const SAMPLE_WRITTEN_EXAM_CONFIG = {
 export const SAMPLE_OPTIONS = {
   positions: ['后端开发工程师', '前端开发工程师', '全栈开发工程师', 'Java 工程师'],
   languages: ['中文', 'English'],
-  stt_providers: ['whisper', 'doubao', 'generic'],
-  whisper_models: ['large-v3-turbo', 'medium', 'small'],
+  stt_providers: ['doubao', 'generic', 'doubao_mmpg'],
+  candidate_stt_providers: ['doubao', 'generic', 'doubao_mmpg'],
   screen_capture_regions: ['full', 'left_half', 'right_half', 'top_half', 'bottom_half'],
 }
 

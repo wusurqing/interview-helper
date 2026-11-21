@@ -6,11 +6,11 @@ import { useInterviewStore, type AppConfig } from '@/stores/configStore'
 
 const apiMock = vi.hoisted(() => ({
   checkModelsHealth: vi.fn(),
-  getModelsHealth: vi.fn(),
 }))
 
 vi.mock('@/lib/api', () => ({
   api: apiMock,
+  getErrorMessage: (error: Error) => error.message,
 }))
 
 function deferred<T>() {
@@ -31,6 +31,7 @@ function renderDropdown() {
     ],
     active_model: 0,
   } as AppConfig
+  useInterviewStore.setState({ config })
 
   return render(
     <ModelPriorityDropdown
@@ -46,25 +47,20 @@ function renderDropdown() {
 describe('ModelPriorityDropdown', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    apiMock.checkModelsHealth.mockResolvedValue({ ok: true })
-    apiMock.getModelsHealth.mockResolvedValue({ health: {}, detail: {}, latency: {} })
+    apiMock.checkModelsHealth.mockResolvedValue({ ok: true, catalog: {}, detail: {}, fingerprint: {} })
     useInterviewStore.setState({
       modelHealth: {},
       modelHealthDetail: {},
       modelHealthLatency: {},
+      modelCatalog: {},
       toastMessage: null,
       toasts: [],
     } as any)
   })
 
-  it('marks enabled models checking, ignores duplicate health checks, and applies the snapshot', async () => {
-    const healthCheck = deferred<{ ok: boolean }>()
+  it('checks the directory once for the enabled queue and preserves generation health', async () => {
+    const healthCheck = deferred<{ ok: boolean; catalog: Record<number, 'visible'> }>()
     apiMock.checkModelsHealth.mockReturnValueOnce(healthCheck.promise)
-    apiMock.getModelsHealth.mockResolvedValueOnce({
-      health: { 0: 'ok' },
-      detail: { 0: '' },
-      latency: { 0: 87 },
-    })
 
     renderDropdown()
 
@@ -73,22 +69,20 @@ describe('ModelPriorityDropdown', () => {
     fireEvent.click(recheck)
     fireEvent.click(recheck)
 
-    expect(apiMock.checkModelsHealth).toHaveBeenCalledTimes(1)
-    expect(useInterviewStore.getState().modelHealth[0]).toBe('checking')
-    expect(useInterviewStore.getState().modelHealth[1]).toBeUndefined()
+    expect(apiMock.checkModelsHealth).toHaveBeenCalledExactlyOnceWith([0])
+    expect(useInterviewStore.getState().modelHealth).toEqual({})
     expect(screen.getByRole('button', { name: '检测中…' })).toBeDisabled()
 
     await act(async () => {
-      healthCheck.resolve({ ok: true })
+      healthCheck.resolve({ ok: true, catalog: { 0: 'visible' } })
       await healthCheck.promise
     })
 
-    await waitFor(() => expect(apiMock.getModelsHealth).toHaveBeenCalledTimes(1))
-    expect(useInterviewStore.getState().modelHealth[0]).toBe('ok')
-    expect(useInterviewStore.getState().modelHealthLatency[0]).toBe(87)
+    expect(await screen.findByRole('button', { name: /优先答题模型 Primary Model.*目录可见/ })).toBeInTheDocument()
+    expect(useInterviewStore.getState().modelHealth).toEqual({})
   })
 
-  it('surfaces health check request failures instead of leaving the selector silent', async () => {
+  it('surfaces a directory error without marking the model as failed for scheduling', async () => {
     apiMock.checkModelsHealth.mockRejectedValueOnce(new Error('queue busy'))
 
     renderDropdown()
@@ -97,11 +91,9 @@ describe('ModelPriorityDropdown', () => {
     fireEvent.click(screen.getByRole('button', { name: '重新检查连接' }))
 
     await waitFor(() => {
-      expect(useInterviewStore.getState().modelHealth[0]).toBe('error')
+      expect(useInterviewStore.getState().toastMessage).toContain('queue busy')
     })
-    expect(useInterviewStore.getState().modelHealthDetail[0]).toBe('queue busy')
-    expect(useInterviewStore.getState().toastMessage).toContain('queue busy')
-    expect(apiMock.getModelsHealth).not.toHaveBeenCalled()
+    expect(useInterviewStore.getState().modelHealth).toEqual({})
     expect(screen.getByRole('button', { name: '重新检查连接' })).toBeEnabled()
   })
 })

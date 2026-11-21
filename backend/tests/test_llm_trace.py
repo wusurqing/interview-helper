@@ -393,3 +393,342 @@ def test_sdk_records_provider_sse_error_as_failure(tmp_path, monkeypatch):
     assert result["attempt_id"] == request["attempt_id"]
     assert result["status"] == "failed"
     assert result["error"] == "fixture provider rejected [REDACTED]"
+
+
+def test_trace_disabled_via_env_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "0")
+    image = "data:image/png;base64,aGVsbG8="
+    attempt = trace.begin("https://example.com/v1", "openai", {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "private resume"}, {"type": "image_url", "image_url": {"url": image}}]}],
+    })
+    assert isinstance(attempt, trace._NullAttempt)
+    attempt.headers(200)
+    attempt.response({"choices": [{"message": {"content": "private reply"}}]})
+    attempt.finish()
+    assert not (tmp_path / "llm.jsonl").exists()
+    assert not (tmp_path / "llm_assets").exists()
+
+
+def test_trace_metadata_mode_omits_prompts_replies_and_assets(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "metadata")
+    image = "data:image/png;base64,aGVsbG8="
+    with trace.scope("resume_review", qa_id="qa-9"):
+        attempt = trace.begin("https://example.com/v1", "openai", {
+            "model": "gpt-4o",
+            "stream": True,
+            "temperature": 0.2,
+            "max_tokens": 512,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "SUPER_PRIVATE_RESUME_TEXT"},
+                {"type": "image_url", "image_url": {"url": image}},
+            ]}],
+        })
+        attempt.headers(200)
+        attempt.stream_event({"choices": [{"delta": {"reasoning_content": "PRIVATE_THINK"}}]})
+        attempt.stream_event({"choices": [{"delta": {"content": "PRIVATE_ANSWER"}, "finish_reason": "stop"}],
+                              "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150}})
+        attempt.finish()
+
+    raw_log = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    assert "SUPER_PRIVATE_RESUME_TEXT" not in raw_log
+    assert "PRIVATE_THINK" not in raw_log
+    assert "PRIVATE_ANSWER" not in raw_log
+    assert "aGVsbG8=" not in raw_log
+    assert not (tmp_path / "llm_assets").exists()
+
+    req, res = [json.loads(line) for line in raw_log.splitlines()]
+    assert req["trace_mode"] == "metadata"
+    assert req["request"]["redacted"] is True
+    assert req["request"]["model"] == "gpt-4o"
+    assert req["request"]["message_count"] == 1
+    assert req["request"]["image_count"] == 1
+    assert res["trace_mode"] == "metadata"
+    assert res["output_text"] is None
+    assert res["reasoning_text"] is None
+    assert res["response"] is None
+    assert res["stream_events"] is None
+    assert res["output_chars"] == len("PRIVATE_ANSWER")
+    assert res["reasoning_chars"] == len("PRIVATE_THINK")
+    assert res["stream_event_count"] == 2
+    assert res["tokens"]["input"] == 120
+    assert res["tokens"]["output"] == 30
+
+
+def test_trace_assets_quota_evicts_oldest_and_respects_zero_cap(tmp_path, monkeypatch):
+    import base64
+    import os
+
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+
+    # Zero cap: image is never written to disk
+    monkeypatch.setenv("IA_LLM_TRACE_MAX_ASSETS_MB", "0")
+    img_zero = "data:image/png;base64," + base64.b64encode(b"0123456789").decode("ascii")
+    a0 = trace.begin("https://example.com/v1", "openai", {"image": img_zero})
+    a0.finish()
+    req0 = json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert req0["request"]["image"]["path"] is None
+    assert req0["request"]["image"]["omitted"] == "asset_quota_exceeded"
+    assert not (tmp_path / "llm_assets").exists()
+
+    # Tight quota: keep at most ~25 bytes total so 3rd 12-byte image evicts the oldest
+    monkeypatch.setenv("IA_LLM_TRACE_MAX_ASSETS_MB", str(25 / (1024 * 1024)))
+    saved_paths = []
+    for idx, payload_bytes in enumerate((b"aaaaaaaaaaaa", b"bbbbbbbbbbbb", b"cccccccccccc")):
+        data_url = "data:image/png;base64," + base64.b64encode(payload_bytes).decode("ascii")
+        attempt = trace.begin("https://example.com/v1", "openai", {"image": data_url})
+        attempt.finish()
+        req = json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[-2])
+        p = tmp_path / req["request"]["image"]["path"]
+        saved_paths.append(p)
+        if p.exists():
+            os.utime(p, (1_700_000_000 + idx * 10, 1_700_000_000 + idx * 10))
+
+    remaining = list((tmp_path / "llm_assets").iterdir())
+    assert sum(f.stat().st_size for f in remaining) <= 25
+    assert not saved_paths[0].exists()
+    assert saved_paths[2].exists()
+
+
+def test_trace_metadata_excludes_provider_free_text_and_file_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "metadata")
+    private = "fictional resume excerpt"
+    with trace.scope("kb_vision_caption", image_path=f"/fixture/{private}/page.png", qa_id="qa-2"):
+        attempt = trace.begin("https://example.com/personal-gateway/v1?team=fixture-team", "openai",
+                              {"messages": [{"content": private}]})
+        attempt.headers(400)
+        attempt.response({"choices": [{"finish_reason": private}], "usage": {
+            "prompt_tokens": 9, "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 3, "note": private},
+            "vendor_note": private,
+        }})
+        attempt.finish("failed", f"provider rejected {private}")
+
+    logged = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    assert private not in logged
+    request, result = map(json.loads, logged.splitlines())
+    assert request["context"] == {"scene": "kb_vision_caption", "qa_id": "qa-2"}
+    assert request["url"] == "https://example.com"
+    assert result["status"] == "failed"
+    assert result["http_status"] == 400
+    assert result["tokens"]["input"] == 9
+    assert result["tokens"]["cached_read"] == 3
+
+
+def test_trace_quota_applies_to_multiple_images_in_one_request(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+    monkeypatch.setenv("IA_LLM_TRACE_MAX_ASSETS_MB", str(5 / (1024 * 1024)))
+    first = "data:image/png;base64,aGVsbG8="
+    second = "data:image/png;base64,d29ybGQ="
+    trace.begin("https://example.com/v1", "openai", {"images": [first, second, first]}).finish()
+
+    logged = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    images = json.loads(logged.splitlines()[0])["request"]["images"]
+    assert sum(path.stat().st_size for path in (tmp_path / "llm_assets").iterdir()) <= 5
+    assert images[0] == images[2]
+    assert (tmp_path / images[0]["path"]).read_bytes() == b"hello"
+    assert images[1]["path"] is None
+    assert images[1]["omitted"] == "asset_quota_exceeded"
+
+
+def test_trace_asset_write_failure_omits_inline_images(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+    (tmp_path / "llm_assets").write_text("fixture prevents creating a directory")
+    trace.begin("https://example.com/v1", "openai", {
+        "image_url": "data:image/png;base64,aGVsbG8=",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+    }).finish()
+
+    logged = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    assert len(logged.splitlines()) == 2
+    assert "aGVsbG8=" not in logged
+
+
+def test_unadmittable_image_preserves_existing_trace_assets(tmp_path, monkeypatch):
+    import base64
+
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+    monkeypatch.setenv("IA_LLM_TRACE_MAX_ASSETS_MB", str(10 / (1024 * 1024)))
+    for image_bytes in ([b"aa"], [b"bbbbbbbb", b"cccc"]):
+        images = ["data:image/png;base64," + base64.b64encode(data).decode("ascii") for data in image_bytes]
+        trace.begin("https://example.com/v1", "openai", {"images": images}).finish()
+
+    records = map(json.loads, (tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines())
+    old, new = (r["request"]["images"] for r in records if r["event"] == "request")
+    assert new[1]["omitted"] == "asset_quota_exceeded"
+    assert (tmp_path / new[0]["path"]).read_bytes() == b"bbbbbbbb"
+    assert (tmp_path / old[0]["path"]).read_bytes() == b"aa"
+
+
+def test_rollover_prunes_assets_asynchronously_without_blocking_emit(tmp_path, monkeypatch):
+    import logging
+    import threading
+    import time
+
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def slow_prune(log_dir=None, *, min_age_seconds=0.0):
+        calls.append((Path(log_dir), min_age_seconds, threading.current_thread().name))
+        started.set()
+        release.wait(timeout=3.0)
+
+    monkeypatch.setattr(trace, "prune_unused_assets", slow_prune)
+
+    handler = trace._TraceFileHandler(str(tmp_path / "llm.jsonl"), when="midnight", backupCount=5, encoding="utf-8")
+    try:
+        handler.rolloverAt = int(time.time()) - 10
+        record = logging.LogRecord("llm.trace", logging.INFO, __file__, 1, '{"event":"ping"}', (), None)
+        t0 = time.monotonic()
+        handler.emit(record)
+        elapsed = time.monotonic() - t0
+        # emit() must return immediately instead of waiting on slow_prune
+        assert elapsed < 1.0
+        assert started.wait(timeout=2.0)
+        assert calls[0][0] == tmp_path
+        assert calls[0][1] > 0
+        assert calls[0][2] == "llm-trace-asset-pruner"
+    finally:
+        release.set()
+        assert trace.wait_for_pending_prune(timeout=3.0)
+        handler.close()
+
+
+def test_prune_during_concurrent_attempt_never_deletes_newly_logged_asset(tmp_path, monkeypatch):
+    import base64
+    import threading
+
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+
+    # Seed llm_assets/ with one unrelated orphan and an initial log file
+    assets_dir = tmp_path / "llm_assets"
+    assets_dir.mkdir(parents=True)
+    orphan = assets_dir / "orphan.png"
+    orphan.write_bytes(b"orphan-bytes")
+    (tmp_path / "llm.jsonl").write_text("", encoding="utf-8")
+
+    scanned = threading.Event()
+    resume_prune = threading.Event()
+    orig_glob = Path.glob
+
+    def paused_glob(self, pattern):
+        items = list(orig_glob(self, pattern))
+        if self == tmp_path and pattern == "llm.jsonl*":
+            scanned.set()
+            resume_prune.wait(timeout=3.0)
+        return iter(items)
+
+    monkeypatch.setattr(Path, "glob", paused_glob)
+
+    prune_thread = threading.Thread(target=trace.prune_unused_assets, kwargs={"log_dir": tmp_path, "min_age_seconds": 0.0})
+    prune_thread.start()
+    assert scanned.wait(timeout=2.0)
+
+    # While pruner has already collected the pre-write log snapshot and is about to unlink,
+    # a concurrent Attempt writes a brand-new asset, logs it, and exits __init__ (clearing _in_flight_assets).
+    live_url = "data:image/png;base64," + base64.b64encode(b"live-concurrent-image").decode("ascii")
+    attempt = trace.begin("https://example.com/v1", "openai", {"image": live_url})
+    attempt.finish()
+    req = json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    live_asset = tmp_path / req["request"]["image"]["path"]
+    assert live_asset.exists()
+
+    resume_prune.set()
+    prune_thread.join(timeout=3.0)
+    assert not prune_thread.is_alive()
+
+    assert live_asset.exists(), "asset logged during active prune scan must never be deleted"
+    assert not orphan.exists(), "unrelated orphan asset should still be pruned"
+
+
+def test_trace_asset_reuse_refreshes_mtime_for_lru_quota_eviction(tmp_path, monkeypatch):
+    import base64
+    import os
+
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+    monkeypatch.setenv("IA_LLM_TRACE_MAX_ASSETS_MB", str(25 / (1024 * 1024)))
+
+    img_a = "data:image/png;base64," + base64.b64encode(b"aaaaaaaaaaaa").decode("ascii")
+    img_b = "data:image/png;base64," + base64.b64encode(b"bbbbbbbbbbbb").decode("ascii")
+    img_c = "data:image/png;base64," + base64.b64encode(b"cccccccccccc").decode("ascii")
+
+    a1 = trace.begin("https://example.com/v1", "openai", {"image": img_a})
+    a1.finish()
+    path_a = tmp_path / json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[-2])["request"]["image"]["path"]
+    os.utime(path_a, (1_700_000_000, 1_700_000_000))
+
+    b1 = trace.begin("https://example.com/v1", "openai", {"image": img_b})
+    b1.finish()
+    path_b = tmp_path / json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[-2])["request"]["image"]["path"]
+    os.utime(path_b, (1_700_000_100, 1_700_000_100))
+
+    # Reuse A -> should refresh A's mtime so B becomes the oldest asset
+    a2 = trace.begin("https://example.com/v1", "openai", {"image": img_a})
+    a2.finish()
+
+    c1 = trace.begin("https://example.com/v1", "openai", {"image": img_c})
+    c1.finish()
+    path_c = tmp_path / json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[-2])["request"]["image"]["path"]
+
+    assert path_a.exists()
+    assert not path_b.exists()
+    assert path_c.exists()
+
+
+def test_trace_metadata_mode_anthropic_responses_and_off_skips_sdk_json_parse(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "metadata")
+
+    anth = trace.begin("https://example.com/v1/messages", "anthropic", {
+        "model": "claude-sonnet",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "TOP_SECRET_ANTHROPIC_PROMPT"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}},
+        ]}],
+    })
+    anth.headers(200)
+    anth.response({
+        "content": [
+            {"type": "thinking", "thinking": "SECRET_CLAUDE_THINK"},
+            {"type": "text", "text": "SECRET_CLAUDE_REPLY"},
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    })
+    anth.finish()
+
+    resp_api = trace.begin("https://example.com/v1/responses", "responses", {
+        "model": "gpt-5",
+        "input": [{"role": "user", "content": "TOP_SECRET_RESPONSES_PROMPT"}],
+    })
+    resp_api.headers(200)
+    resp_api.stream_event({"type": "response.output_text.delta", "delta": "SECRET_RESP_DELTA"})
+    resp_api.stream_event({"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 7, "output_tokens": 3}}})
+    resp_api.finish()
+
+    raw = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    for secret in ("TOP_SECRET_ANTHROPIC_PROMPT", "SECRET_CLAUDE_THINK", "SECRET_CLAUDE_REPLY",
+                   "TOP_SECRET_RESPONSES_PROMPT", "SECRET_RESP_DELTA", "aGVsbG8="):
+        assert secret not in raw
+    assert not (tmp_path / "llm_assets").exists()
+
+    # IA_LLM_TRACE=0 short-circuits TracingHttpxClient._request without calling json.loads
+    monkeypatch.setenv("IA_LLM_TRACE", "0")
+    calls = []
+    monkeypatch.setattr(trace.json, "loads", lambda *a, **k: calls.append(True))
+    req = httpx.Request("POST", "https://example.com/v1/chat/completions", content=b'{"model":"m"}')
+    trace.TracingHttpxClient._request(req)
+    assert isinstance(req.extensions["llm_trace"], trace._NullAttempt)
+    assert calls == []

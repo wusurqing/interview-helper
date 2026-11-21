@@ -460,8 +460,10 @@ def test_review_job_snapshots_prompts_and_retry_preserves_valid_stages(monkeypat
     monkeypatch.setattr(review_async_analysis.review_analysis, "get_config", lambda: config)
     workers = []
     monkeypatch.setattr(
-        review_async_analysis.threading, "Thread",
-        lambda *, target, args, daemon: SimpleNamespace(start=lambda: workers.append(lambda: target(*args))),
+        review_async_analysis, "_submit_analysis_worker",
+        lambda sid, prompts: workers.append(
+            lambda: review_async_analysis._analyze_session_worker(sid, prompts)
+        ),
     )
     valid_turn = {
         "strengths": ["复杂度清晰"], "risks": [],

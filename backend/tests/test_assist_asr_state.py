@@ -177,3 +177,37 @@ def test_late_constraint_tail_is_merged_before_question_flush():
     assert "不要结合项目" in question_text
     assert state.pending_group is not None
     assert state.pending_group.utterances == ["pipeline 里怎么做 retry 和 timeout"]
+
+
+def test_force_and_immediate_flush_skip_late_constraint_grace_delay():
+    submitted: list[tuple] = []
+    state = AssistAsrStateMachine(
+        broadcast=lambda _data: None,
+        submit_answer_task=lambda task: submitted.append(task) or True,
+        begin_asr_turn=lambda: len(submitted) + 1,
+        logger=_Logger(),
+        clock=lambda: 100.0,
+    )
+    session = reset_session()
+    cfg = _cfg(assist_asr_late_constraint_grace_sec=1.5)
+
+    # Normal flush keeps the 1.5s late-constraint grace delay.
+    state.handle_auto_detect_asr_text(cfg, session, "请讲一下 MVCC 的实现原理？", "conversation_loopback", now_mono=99.0)
+    state.try_flush_question_group(cfg, session, now_mono=100.0, force=False)
+    assert len(submitted) == 1
+    assert submitted[0][4]["dispatch_after_mono"] == 101.5
+    assert submitted[0][4]["asr_tail_grace_until_mono"] == 101.5
+
+    # Stop force flush skips the grace delay completely.
+    state.handle_auto_detect_asr_text(cfg, session, "请讲一下事务隔离级别？", "conversation_loopback", now_mono=100.0)
+    state.try_flush_question_group(cfg, session, now_mono=100.0, force=True)
+    assert len(submitted) == 2
+    assert submitted[1][4]["dispatch_after_mono"] == 0.0
+    assert submitted[1][4]["asr_tail_grace_until_mono"] == 0.0
+
+    # Direct immediate flush (single-mic role switch) also skips the grace delay.
+    state.handle_auto_detect_asr_text(cfg, session, "Redis 哨兵怎么选主？", "conversation_mic", now_mono=100.0)
+    state.flush_question_group_now(cfg, session, immediate=True)
+    assert len(submitted) == 3
+    assert submitted[2][4]["dispatch_after_mono"] == 0.0
+    assert submitted[2][4]["asr_tail_grace_until_mono"] == 0.0

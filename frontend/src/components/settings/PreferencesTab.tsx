@@ -1,11 +1,7 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, type ReactNode } from 'react'
 import {
-  AlertTriangle,
   Palette,
-  LayoutGrid,
-  AlignVerticalSpaceAround,
   Monitor,
-  PenLine,
   ChevronDown,
   BookOpen,
 } from 'lucide-react'
@@ -13,8 +9,7 @@ import { useInterviewStore } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { updateConfigAndRefresh } from '@/lib/configSync'
 import { COLOR_SCHEME_OPTIONS } from '@/lib/colorScheme'
-import { prepareExamOverlayPrompt } from '@/lib/examOverlay'
-import { Section, Field, SaveStateBadge, matchSettingsSearch, useAutoSaveSetting, useSettingsSearch } from './shared'
+import { Field, SaveStateBadge, matchSettingsSearch, useAutoSaveSetting, useSettingsSearch } from './shared'
 
 function Collapsible({ title, searchTitle, icon, defaultOpen = false, alwaysOpen = false, keywords, children }: {
   title: React.ReactNode
@@ -68,18 +63,9 @@ function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: 
   )
 }
 
-export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' | 'mode' | 'kb' | 'appearance' } = {}) {
+export default function PreferencesTab({ variant, children }: { variant: 'mode' | 'kb' | 'appearance'; children?: ReactNode }) {
   const config = useInterviewStore((s) => s.config)
   const options = useInterviewStore((s) => s.options)
-  const platformInfo = useInterviewStore((s) => s.platformInfo)
-  const sttLoaded = useInterviewStore((s) => s.sttLoaded)
-  const sttLoading = useInterviewStore((s) => s.sttLoading)
-  const sttActiveProvider = useInterviewStore((s) => s.sttActiveProvider)
-  const sttFallbackLoaded = useInterviewStore((s) => s.sttFallbackLoaded)
-  const isWhisperFallback = sttActiveProvider === 'whisper' && !!config?.stt_provider && config.stt_provider !== 'whisper'
-  const setSettingsDrawerTab = useInterviewStore((s) => s.setSettingsDrawerTab)
-  const answerPanelLayout = useUiPrefsStore((s) => s.answerPanelLayout)
-  const setAnswerPanelLayout = useUiPrefsStore((s) => s.setAnswerPanelLayout)
   const colorScheme = useUiPrefsStore((s) => s.colorScheme)
   const setColorScheme = useUiPrefsStore((s) => s.setColorScheme)
   const [scrollBottomPx, setScrollBottomPx] = useState(40)
@@ -118,20 +104,6 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
     config?.kb_asr_deadline_ms,
   ])
 
-  const sttLabel =
-    config?.stt_provider === 'doubao_mmpg'
-      ? '豆包 MMPG'
-      : config?.stt_provider === 'doubao'
-      ? '豆包'
-      : config?.stt_provider === 'generic'
-        ? '通用 ASR'
-        : config?.stt_provider === 'whisper'
-          ? 'Whisper'
-          : config?.stt_provider === 'qwen3_asr'
-            ? 'Qwen3-ASR GPU'
-            : config?.stt_provider === 'funasr'
-              ? 'FunASR'
-              : `不支持 (${config?.stt_provider ?? 'unknown'})`
   const hasScreenCapture = (options?.screen_capture_regions?.length ?? 0) > 0
   const searchQuery = useSettingsSearch()
   const inSearch = searchQuery.trim().length > 0
@@ -141,163 +113,31 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
       <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-bg-hover/60 bg-bg-primary/35 px-4 py-3">
         <div>
           <p className="text-sm font-semibold text-text-primary">
-            {variant === 'appearance' ? '外观'
-              : variant === 'mode' ? '笔试与截图'
-              : variant === 'kb' ? '本地知识库'
-              : '常用偏好'}
+            {variant === 'appearance' ? '外观' : variant === 'mode' ? '笔试配置' : '本地知识库'}
           </p>
           <p className="mt-0.5 text-[11px] leading-relaxed text-text-muted">
             {variant === 'appearance'
               ? '配色即时生效，流式跟滚阈值自动保存。'
               : variant === 'mode'
-                ? '笔试模式与截图审题设置自动保存。'
-                : variant === 'kb'
-                  ? '开启后回答会引用本地知识库笔记；检索参数可按延迟预算调整。'
-                  : '这里的运行偏好会自动保存；外观和悬浮窗本机偏好即时生效。'}
+                ? '从顶部「笔试辅助」进入答题。'
+                : '开启后回答会引用本地知识库笔记。'}
           </p>
         </div>
         {variant !== 'appearance' && <SaveStateBadge mode="auto" state={autoSave.state} error={autoSave.error} />}
       </div>
 
-      {/* ── 系统状态 ── */}
-      {platformInfo?.needs_virtual_device && (
-        <div className="bg-accent-amber/10 border border-accent-amber/30 rounded-lg p-3 text-xs space-y-2">
-          <div className="flex items-start gap-2">
-            <AlertTriangle className="w-4 h-4 text-accent-amber flex-shrink-0 mt-0.5" />
-            <div className="text-text-secondary whitespace-pre-line">{platformInfo.instructions}</div>
-          </div>
-        </div>
-      )}
-
-      {variant === 'main' && (<>
-      <Section title="运行状态" icon={<AlertTriangle className="w-3.5 h-3.5" />} keywords="status 状态 stt 语音识别 就绪">
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          <div className="rounded-xl border border-bg-hover/60 bg-bg-tertiary/25 px-3 py-2.5">
-            <div className="flex items-center gap-2">
-              <div className={`w-2 h-2 rounded-full ${sttLoaded ? (isWhisperFallback ? 'bg-accent-amber' : 'bg-accent-green') : sttLoading ? 'bg-accent-amber animate-pulse' : 'bg-accent-red'}`} />
-              <span className="text-xs font-medium text-text-primary">语音识别</span>
-            </div>
-            <p className="text-[11px] text-text-muted mt-1">
-              {sttLoaded ? (isWhisperFallback ? 'Whisper 降级就绪' : sttFallbackLoaded ? '就绪，降级已预备' : '就绪') : sttLoading ? '加载中' : '未就绪'} · {sttLabel}
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() => setSettingsDrawerTab('config')}
-            className="rounded-xl border border-accent-blue/30 bg-accent-blue/10 px-3 py-2.5 text-left hover:bg-accent-blue/15 transition-colors"
-          >
-            <span className="text-xs font-medium text-accent-blue">语音配置</span>
-            <p className="text-[11px] text-text-muted mt-1">切换 STT 与断句参数</p>
-          </button>
-        </div>
-      </Section>
-
-      <Section title="回答体验" icon={<LayoutGrid className="w-3.5 h-3.5" />} keywords="布局 卡片 流式 简短 layout card stream">
-        <div className="grid grid-cols-2 gap-2">
-          {([
-            { key: 'cards' as const, icon: LayoutGrid, label: '卡片', hint: '独立框，框内滚动' },
-            { key: 'stream' as const, icon: AlignVerticalSpaceAround, label: '流式', hint: '通读，无高度限制' },
-          ]).map(({ key, icon: Icon, label, hint }) => (
-            <button
-              key={key}
-              type="button"
-              onClick={() => setAnswerPanelLayout(key)}
-              className={`flex flex-col items-start gap-1.5 p-2.5 rounded-xl border text-left transition-all ${
-                answerPanelLayout === key
-                  ? 'border-accent-blue bg-accent-blue/10 ring-1 ring-accent-blue/30'
-                  : 'border-bg-hover bg-bg-tertiary/30 hover:border-bg-hover'
-              }`}
-            >
-              <Icon className={`w-4 h-4 ${answerPanelLayout === key ? 'text-accent-blue' : 'text-text-muted'}`} />
-              <span className="text-xs font-medium text-text-primary">{label}</span>
-              <span className="text-[10px] text-text-muted leading-snug">{hint}</span>
-            </button>
-          ))}
-        </div>
-        <Field label="回答长度">
-          <div className="grid grid-cols-2 gap-2">
-            {([
-              { value: false, label: '详细回答', hint: '每轮语音答题使用标准提示词' },
-              { value: true, label: '简短回答', hint: '每轮语音答题使用简短提示词' },
-            ]).map((item) => {
-              const selected = (config?.assist_high_churn_short_answer ?? false) === item.value
-              return (
-                <button
-                  key={item.label}
-                  type="button"
-                  onClick={async () => {
-                    await autoSave.saveNow({ assist_high_churn_short_answer: item.value })
-                  }}
-                  className={`rounded-xl border px-3 py-2.5 text-left transition-all ${
-                    selected
-                      ? 'border-accent-blue bg-accent-blue/10 ring-1 ring-accent-blue/30'
-                      : 'border-bg-hover bg-bg-tertiary/25 hover:border-bg-hover'
-                  }`}
-                >
-                  <span className={`text-xs font-semibold ${selected ? 'text-accent-blue' : 'text-text-primary'}`}>
-                    {item.label}
-                  </span>
-                  <span className="block text-[10px] text-text-muted mt-1">{item.hint}</span>
-                </button>
-              )
-            })}
-          </div>
-          <p className="text-[10px] text-text-muted mt-0.5 leading-relaxed">
-            当前：{config?.assist_high_churn_short_answer ? '简短回答' : '详细回答'}
-          </p>
-        </Field>
-      </Section>
-      </>)}
-
-      {/* ── 2. 笔试模式与截图 ── */}
       {variant === 'mode' && (<>
+      {children}
       <Collapsible
         alwaysOpen
-        title="工作模式"
-        searchTitle="工作模式"
+        title="截图审题"
         icon={<Monitor className="w-3.5 h-3.5" />}
-        keywords="overlay 截图 笔试 toolbar ocr vision 悬浮窗 浮窗 exam"
+        keywords="截图 笔试 vision exam 连续截图 多图 Think 深度思考"
       >
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-          <button
-            type="button"
-            onClick={() => setSettingsDrawerTab('overlay')}
-            className="rounded-xl border border-bg-hover bg-bg-tertiary/25 px-3 py-2.5 text-left hover:bg-bg-hover/40"
-          >
-            <span className="text-xs font-medium text-text-primary">悬浮窗设置</span>
-            <p className="text-[10px] text-text-muted mt-1">位置、尺寸和外观</p>
-          </button>
-          {config && hasScreenCapture && (
-            <button
-              type="button"
-              onClick={() => {
-                const next = !(config?.written_exam_mode ?? false)
-                autoSave.saveNow({ written_exam_mode: next })
-                  .then((ok) => {
-                    if (ok && next) prepareExamOverlayPrompt()
-                  })
-                  .catch(() => {})
-              }}
-              className={`rounded-xl border px-3 py-2.5 text-left transition-all ${
-                config?.written_exam_mode ? 'border-accent-blue bg-accent-blue/10' : 'border-bg-hover bg-bg-tertiary/25 hover:border-bg-hover'
-              }`}
-            >
-              <span className="text-xs font-medium text-text-primary">笔试模式</span>
-              <p className="text-[10px] text-text-muted mt-1">{config?.written_exam_mode ? '已开启' : '已关闭'}</p>
-            </button>
-          )}
-        </div>
-        <div className="mb-2 p-2.5 rounded-lg bg-accent-amber/10 border border-accent-amber/30 text-[11px] text-text-secondary leading-relaxed">
-          <div className="font-semibold text-accent-amber mb-0.5">反截图检测说明</div>
-          <div>
-            Windows 上通过 <code className="font-mono text-[10px] bg-bg-tertiary/60 px-1 rounded">setContentProtection</code> 可稳定避免被屏幕共享软件截图；
-            macOS 15+ 的 <span className="font-mono text-[10px]">ScreenCaptureKit</span> 会绕过保护位，实际效果请以你自己的环境测试为准。
-          </div>
-        </div>
-        {/* 截图区域 */}
         {config && hasScreenCapture && (
-          <Field label="截图区域" hint="服务端截图审题时，后端截取主显示器的范围">
+          <Field label="截图区域" htmlFor="exam-screen-region" hint="服务端截图审题时，后端截取主显示器的范围">
             <select
+              id="exam-screen-region"
               value={config.screen_capture_region ?? 'left_half'}
               onChange={async (e) => {
                 await autoSave.saveNow({ screen_capture_region: e.target.value })
@@ -316,9 +156,11 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
         {config && hasScreenCapture && (
           <Field
             label={`截图最长边: ${screenMaxLongEdge}px`}
+            htmlFor="exam-screen-max-edge"
             hint="送入识图模型前缩放截图，降低带宽和 token；0 表示不缩放"
           >
             <input
+              id="exam-screen-max-edge"
               type="number"
               min={0}
               max={4000}
@@ -343,9 +185,11 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
         {config && hasScreenCapture && (
           <Field
             label={`多图截图等待: ${multiScreenIdleSec} 秒`}
+            htmlFor="exam-screen-batch-wait"
             hint="多图截图判题快捷键最后一次按下后，等待这段时间无新截图就提交整批图片 (1-60)"
           >
             <input
+              id="exam-screen-batch-wait"
               type="number"
               min={1}
               max={60}
@@ -366,50 +210,14 @@ export default function PreferencesTab({ variant = 'main' }: { variant?: 'main' 
           </Field>
         )}
 
-        {/* 笔试模式 */}
-        {config && hasScreenCapture && (
-          <div className="border-t border-bg-hover/40 pt-3 space-y-3">
-            <div className="flex items-center gap-2">
-              <PenLine className="w-3.5 h-3.5 text-text-muted" />
-              <span className="text-xs font-semibold text-text-muted uppercase tracking-wider">笔试模式</span>
-            </div>
+        {config && (
+          <div className="space-y-1 border-t border-bg-hover/40 pt-3">
             <Toggle
-              checked={config?.written_exam_mode ?? false}
-              onChange={async (v) => {
-                autoSave.saveNow({ written_exam_mode: v }).then((ok) => {
-                  if (ok && v) prepareExamOverlayPrompt()
-                }).catch(() => {})
-              }}
-              label={config?.written_exam_mode ? '已开启' : '已关闭'}
+              checked={config.written_exam_think ?? false}
+              onChange={(enabled) => { void autoSave.saveNow({ written_exam_think: enabled }) }}
+              label="深度思考 (Think)"
             />
-            {config?.written_exam_mode && (
-              <>
-                <Field label="深度思考 (Think)">
-                  <Toggle
-                    checked={config?.written_exam_think ?? false}
-                    onChange={async (v) => {
-                      try {
-                        await autoSave.saveNow({ written_exam_think: v })
-                      } catch {}
-                    }}
-                    label={config?.written_exam_think ? '已开启（更准但更慢）' : '已关闭（更快）'}
-                  />
-                  <p className="text-[10px] text-text-muted mt-0.5 leading-relaxed">
-                    开启后模型会先推理再作答，编程题准确率更高，但响应变慢。需模型支持 think。
-                  </p>
-                </Field>
-                <div className="bg-accent-blue/5 border border-accent-blue/20 rounded-lg p-2.5 space-y-1">
-                  <p className="text-[11px] text-text-secondary leading-relaxed">
-                    <span className="font-medium text-accent-blue">配合截图快捷键使用</span>
-                  </p>
-                  <ul className="text-[10px] text-text-muted leading-relaxed space-y-0.5 pl-3 list-disc">
-                    <li>选择题 → 直接输出答案（如 A.Redis）</li>
-                    <li>编程题 → 直接输出完整可提交代码</li>
-                    <li>填空题 → 直接输出填空内容</li>
-                  </ul>
-                </div>
-              </>
-            )}
+            <p className="text-[11px] text-text-muted">用于笔试截图答题，需模型支持 Think。</p>
           </div>
         )}
       </Collapsible>

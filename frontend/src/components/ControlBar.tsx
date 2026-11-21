@@ -16,6 +16,9 @@ import {
 } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore } from '@/stores/configStore'
+import { speechProvider } from '@/lib/speechProviders'
+import type { AppConfig } from '@/stores/slices/types'
+import { getAssistModelEntries, getWrittenExamModel, isConfiguredModel, missingWrittenExamModel } from '@/lib/assistModels'
 import type { SingleMicRole } from '@/stores/slices/types'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { useArchiveStatusStore } from '@/stores/archiveStatusStore'
@@ -44,8 +47,10 @@ export {
   saveQuickPrompts,
 } from './control-bar/quickPrompts'
 
-function getEnabledVisionModels(config: { models?: Array<{ name?: string; supports_vision?: boolean; enabled?: boolean }> } | null | undefined) {
-  return (config?.models ?? []).filter((model) => model.enabled !== false && model.supports_vision)
+function getEnabledVisionModels(config: AppConfig | null) {
+  return getAssistModelEntries(config).flatMap(({ model }) => (
+    model.supports_vision && isConfiguredModel(model) ? [model] : []
+  ))
 }
 
 function connectInterviewerAudio(
@@ -76,55 +81,56 @@ export default function ControlBar() {
     isRecording,
     singleMic,
     interviewerStreaming,
+    candidateCaptureProvider,
     isPaused,
     devices,
     setDevices,
     config,
     platformInfo,
     clearSession,
-    streamingIds,
-    qaPairs,
-    transcriptions,
-    candidateTranscriptions,
+    streamingCount,
+    qaPairsCount,
+    hasTranscriptions,
+    hasCandidateTranscriptions,
+    lastCandidateTranscription,
     setToastMessage,
     lastWSError,
     setLastWSError,
     wsConnected,
     modelHealth,
-    sttLoaded,
     sttLoading,
-    sttActiveProvider,
     mmpgPhase,
     candidateSttLoaded,
     candidateSttLoading,
-    candidateSttProvider,
   } = useInterviewStore(
     useShallow((s) => ({
       isRecording: s.isRecording,
       singleMic: s.singleMic,
       interviewerStreaming: s.interviewerStreaming,
+      candidateCaptureProvider: s.candidateCaptureProvider,
       isPaused: s.isPaused,
       devices: s.devices,
       setDevices: s.setDevices,
       config: s.config,
       platformInfo: s.platformInfo,
       clearSession: s.clearSession,
-      streamingIds: s.streamingIds,
-      qaPairs: s.qaPairs,
-      transcriptions: s.transcriptions,
-      candidateTranscriptions: s.candidateTranscriptions,
+      streamingCount: s.streamingIds.length,
+      qaPairsCount: s.qaPairs.length,
+      hasTranscriptions: s.transcriptions.length > 0,
+      hasCandidateTranscriptions: s.candidateTranscriptions.length > 0,
+      lastCandidateTranscription:
+        s.candidateTranscriptions.length > 0
+          ? s.candidateTranscriptions[s.candidateTranscriptions.length - 1]
+          : null,
       setToastMessage: s.setToastMessage,
       lastWSError: s.lastWSError,
       setLastWSError: s.setLastWSError,
       wsConnected: s.wsConnected,
       modelHealth: s.modelHealth,
-      sttLoaded: s.sttLoaded ?? true,
       sttLoading: s.sttLoading ?? false,
-      sttActiveProvider: s.sttActiveProvider ?? '',
       mmpgPhase: s.mmpgPhase,
       candidateSttLoaded: s.candidateSttLoaded ?? false,
       candidateSttLoading: s.candidateSttLoading ?? false,
-      candidateSttProvider: s.candidateSttProvider ?? '',
     })),
   )
   const [selectedDevice, setSelectedDevice] = useState<number | null>(null)
@@ -147,29 +153,34 @@ export default function ControlBar() {
   const [error, setError] = useState<string | null>(null)
 
   const enabledModelEntries = useMemo(
-    () => (config?.models ?? []).map((model, index) => ({ model, index })).filter(({ model }) => model.enabled !== false),
-    [config?.models],
+    () => getAssistModelEntries(config).filter(({ model }) => isConfiguredModel(model)),
+    [config?.models, config?.assist_model_ids, config?.active_model],
   )
   const isExamMode = !singleMic && !interviewerStreaming && config?.written_exam_mode === true
   const singleMicMode = !isExamMode && (singleMic !== null || (!isRecording && singleMicSelected))
-  const usesMmpg = !isExamMode && config?.stt_provider === 'doubao_mmpg'
+  const usesMmpg = !isExamMode && (isRecording ? interviewerStreaming : config?.stt_provider === 'doubao_mmpg')
+  const interviewerProvider = speechProvider(config?.stt_provider)
+  const interviewerConfigRequired = config?.stt_provider === '' ||
+    Boolean(config?.stt_configured && (!interviewerProvider || !config.stt_configured[interviewerProvider]))
   const mmpg = useMmpgStatus()
   const ownsMmpgConnection = mmpg.mode && mmpg.mode !== 'test' && ['connecting', 'reconnecting'].includes(mmpg.state)
   const mmpgIsConnecting = interviewerStreaming && (ownsMmpgConnection || ['connecting', 'reconnecting'].includes(mmpgPhase))
-  const noEnabledModels = (config?.models?.length ?? 0) > 0 && enabledModelEntries.length === 0
-  const allModelsUnavailable = enabledModelEntries.length > 0 &&
+  const examModel = getWrittenExamModel(config)
+  const missingModelMessage = isExamMode ? missingWrittenExamModel : '请先在实时辅助中勾选可用的答题模型'
+  const noEnabledModels = isExamMode ? !examModel : (config?.assist_model_ids !== undefined || (config?.models?.length ?? 0) > 0) && enabledModelEntries.length === 0
+  const allModelsUnavailable = !isExamMode && enabledModelEntries.length > 0 &&
     enabledModelEntries.every(({ index }) => modelHealth[index] === 'error')
   const enabledVisionModels = useMemo(() => getEnabledVisionModels(config), [config])
-  const hasEnabledVisionModel = enabledVisionModels.length > 0
+  const hasEnabledVisionModel = isExamMode ? Boolean(examModel) : enabledVisionModels.length > 0
   const answerModelUnavailable = noEnabledModels || allModelsUnavailable
   const showColdStartHint =
     !isExamMode &&
     !singleMicMode &&
     !isRecording &&
-    transcriptions.length === 0 &&
-    qaPairs.length === 0 &&
+    !hasTranscriptions &&
+    qaPairsCount === 0 &&
     (devices.length === 0 || selectedDevice === null)
-  const showExamStartHint = isExamMode && !isRecording && qaPairs.length === 0
+  const showExamStartHint = isExamMode && !isRecording && qaPairsCount === 0
   const inputRef = useRef<HTMLInputElement>(null)
   const isComposingRef = useRef(false)
   const askingRef = useRef(false)
@@ -218,20 +229,24 @@ export default function ControlBar() {
   const selectedCandidateDevice = devices.find((d) => d.id === selectedCandidateMic) ?? null
   selectedCandidateMicRef.current = selectedCandidateMic
   const selectedCandidateIsMic = selectedCandidateDevice?.is_loopback === false
-  const candidateCaptureEnabled = config?.candidate_asr_enabled ?? false
-  const candidateUsesMmpg = candidateCaptureEnabled && config?.candidate_stt_provider === 'doubao_mmpg'
+  const hasCaptureSnapshot = isRecording && candidateCaptureProvider !== null
+  const currentCandidateProvider = hasCaptureSnapshot ? candidateCaptureProvider : config?.candidate_stt_provider
+  const candidateCaptureEnabled = !isExamMode &&
+    (hasCaptureSnapshot ? Boolean(candidateCaptureProvider) : config?.candidate_asr_enabled === true)
+  const candidateUsesMmpg = candidateCaptureEnabled && currentCandidateProvider === 'doubao_mmpg'
   const testMic = singleMic?.device_id
     ?? candidateMicDevices.find((device) => device.id === selectedTestMic)?.id
     ?? candidateMicDevices[0]?.id
     ?? null
+  const dualMmpgManual = usesMmpg && candidateUsesMmpg && config?.mmpg?.token_mode === 'manual'
   const testModeDisabledReason = !candidateCaptureEnabled
-    ? '请先在语音设置开启「我的回答记录」。'
-    : usesMmpg && candidateUsesMmpg && config?.mmpg?.token_mode === 'manual'
+    ? '请先在实时辅助设置开启「我的回答记录」。'
+    : dualMmpgManual
       ? '两路都使用豆包 MMPG 时，请在语音设置选择自动签发 Token。'
       : null
-  const startDisabled = loading || (!isExamMode && (singleMicMode
+  const startDisabled = loading || (!isExamMode && (interviewerConfigRequired || (singleMicMode
     ? testMic === null || testModeDisabledReason !== null || !wsConnected
-    : selectedDevice === null))
+    : selectedDevice === null)))
   const microphoneSwitching = singleMic !== null && (singleMic.switching || roleRequest?.sessionId === singleMic.id)
   const waitingForCandidateMmpg = candidateUsesMmpg && !candidateSttLoaded
   const roleSwitchDisabled = !isRecording || loading || mmpgIsConnecting || microphoneSwitching || waitingForCandidateMmpg || isPaused || !wsConnected
@@ -249,13 +264,13 @@ export default function ControlBar() {
     ? selectedCandidateMic
     : null
   const hasLoopback = devices.some((d) => d.is_loopback)
-  const activeModel = config?.models?.[config.active_model]
+  const activeModel = isExamMode ? examModel : enabledModelEntries[0]?.model
   const activeModelSupportsVision = activeModel?.supports_vision ?? false
   const pastedImageVisionHint = activeModelSupportsVision
     ? null
     : hasEnabledVisionModel
       ? `当前优先模型不支持图片，将自动使用「${enabledVisionModels[0]?.name ?? '识图模型'}」`
-      : '没有已启用的识图模型，请先在设置中开启带 👁 的模型'
+      : '请在实时辅助中勾选支持识图的答题模型'
 
   useEffect(() => {
     const pending = roleRequestRef.current
@@ -334,8 +349,12 @@ export default function ControlBar() {
         const file = items[i].getAsFile()
         if (!file) continue
         const store = useInterviewStore.getState()
-        if ((store.config?.models?.length ?? 0) > 0 && getEnabledVisionModels(store.config).length === 0) {
-          setError('请先在设置中启用至少一个带 👁 的识图模型，再粘贴截图')
+        if (store.config?.written_exam_mode && !getWrittenExamModel(store.config)) {
+          setError(missingWrittenExamModel)
+          return
+        }
+        if (store.config && !store.config.written_exam_mode && getEnabledVisionModels(store.config).length === 0) {
+          setError('请先在实时辅助中勾选支持识图的答题模型，再粘贴图片')
           return
         }
         const reader = new FileReader()
@@ -405,6 +424,7 @@ export default function ControlBar() {
 
   const handleStart = useCallback(async () => {
     if (lifecycleActionRef.current) return
+    if (!isExamMode && interviewerConfigRequired) return
     const device = singleMicMode ? testMic : selectedDevice
     if (!isExamMode && device === null) { setError('请先选择音频设备'); return }
     if (singleMicMode && testModeDisabledReason) { setError(testModeDisabledReason); return }
@@ -414,7 +434,7 @@ export default function ControlBar() {
       const singleMicId = singleMicMode
         ? Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('')
         : undefined
-      const candidate = singleMicMode ? device : effectiveCandidateMic
+      const candidate = isExamMode ? null : singleMicMode ? device : effectiveCandidateMic
       const interviewer = connectInterviewerAudio('start', isExamMode ? null : device, candidate, usesMmpg, platformInfo?.platform, singleMicId)
       connectCandidateMmpg('start', interviewer, candidate, singleMicId)
       await interviewer
@@ -450,7 +470,7 @@ export default function ControlBar() {
       lifecycleActionRef.current = false
       setLoading(false)
     }
-  }, [selectedDevice, effectiveCandidateMic, isExamMode, usesMmpg, platformInfo?.platform, connectCandidateMmpg, singleMicMode, testMic, testModeDisabledReason])
+  }, [selectedDevice, effectiveCandidateMic, isExamMode, usesMmpg, platformInfo?.platform, connectCandidateMmpg, singleMicMode, testMic, testModeDisabledReason, interviewerConfigRequired])
   const handleStop = useCallback(async () => {
     if (lifecycleActionRef.current) return
     const interviewName = singleMic ? '单人测试' : isExamMode ? '笔试' : '面试'
@@ -522,8 +542,9 @@ export default function ControlBar() {
   }, [selectedDevice, effectiveCandidateMic, isExamMode, interviewerStreaming, platformInfo?.platform, connectCandidateMmpg, singleMic])
   const handleClear = useCallback(async () => {
     if (clearingRef.current) return
-    if (qaPairs.length > 0 || transcriptions.length > 0 || candidateTranscriptions.length > 0) {
-      if (!window.confirm('确定要清空当前页的转录与答案吗？清空后不可恢复。')) return
+    if (qaPairsCount > 0 || hasTranscriptions || hasCandidateTranscriptions) {
+      const contents = isExamMode ? '答案' : '转录与答案'
+      if (!window.confirm(`确定要清空当前页的${contents}吗？清空后不可恢复。`)) return
     }
     clearingRef.current = true
     candidateConnectionAttemptRef.current = null
@@ -537,7 +558,7 @@ export default function ControlBar() {
       clearingRef.current = false
       setClearing(false)
     }
-  }, [qaPairs.length, transcriptions.length, candidateTranscriptions.length, clearSession, setToastMessage])
+  }, [qaPairsCount, hasTranscriptions, hasCandidateTranscriptions, clearSession, isExamMode, setToastMessage])
 
   const handleCancelAsk = useCallback(async () => {
     if (cancellingAskRef.current) return
@@ -563,15 +584,15 @@ export default function ControlBar() {
     if (askingRef.current) return
     if (!manualQuestion.trim() && !pastedImage) return
     if (noEnabledModels) {
-      setError('请先在设置中启用至少一个模型')
+      setError(missingModelMessage)
       return
     }
     if (allModelsUnavailable) {
-      setError('所有启用模型不可用，请先检查模型连接')
+      setError('所选答题模型均不可用，请检查模型连接')
       return
     }
     if (pastedImage && !hasEnabledVisionModel) {
-      setError('请先在设置中启用至少一个带 👁 的识图模型')
+      setError('请先在实时辅助中勾选支持识图的答题模型')
       return
     }
     askingRef.current = true
@@ -586,7 +607,7 @@ export default function ControlBar() {
       askingRef.current = false
       setAsking(false)
     }
-  }, [manualQuestion, pastedImage, noEnabledModels, allModelsUnavailable, hasEnabledVisionModel])
+  }, [manualQuestion, pastedImage, noEnabledModels, allModelsUnavailable, hasEnabledVisionModel, missingModelMessage])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (isComposingRef.current) return
@@ -707,6 +728,16 @@ export default function ControlBar() {
           <span>点击「开始笔试」进入答题模式，可通过截图或手动输入提问</span>
         </div>
       )}
+      {!isExamMode && !isRecording && interviewerConfigRequired && (
+        <div className="flex items-center gap-2 rounded-lg bg-accent-amber/10 px-3 py-1.5 text-xs text-accent-amber">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+          <span>请配置面试官语音识别后开始采集。</span>
+          <button type="button" className="ml-auto shrink-0 rounded-md px-2 py-1 text-accent-blue hover:bg-accent-blue/10"
+            onClick={() => useInterviewStore.setState({ settingsOpen: true, settingsDrawerTab: 'realtime' })}>
+            配置面试官 ASR
+          </button>
+        </div>
+      )}
       {!wsConnected && <WsReconnectingBanner />}
       {archive && (archive.warning || archive.pending_round_count > 0 || archive.persisted_turn_count > 0) && (
         <div role="status" className="px-3 pb-1 text-xs text-text-muted">
@@ -718,13 +749,13 @@ export default function ControlBar() {
       {allModelsUnavailable && (
         <div className="flex items-center gap-2 text-xs text-accent-red bg-accent-red/10 px-3 py-1.5 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-          <span>所有启用模型不可用，请检查 API 与网络。</span>
+          <span>所选答题模型均不可用，请检查 API 与网络。</span>
         </div>
       )}
       {noEnabledModels && (
         <div className="flex items-center gap-2 text-xs text-accent-red bg-accent-red/10 px-3 py-1.5 rounded-lg">
           <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-          <span>未启用任何模型，请在设置中开启至少一个模型。</span>
+          <span>{isExamMode ? missingWrittenExamModel : '请先在实时辅助中勾选可用的答题模型。'}</span>
         </div>
       )}
       {!isExamMode && !singleMicMode && !hasLoopback && platformInfo?.needs_virtual_device && (
@@ -768,7 +799,7 @@ export default function ControlBar() {
           <button
             type="button"
             className="ml-auto shrink-0 rounded-md px-2 py-1 text-accent-blue hover:bg-accent-blue/10"
-            onClick={() => useInterviewStore.getState().openConfigDrawer()}
+            onClick={() => useInterviewStore.setState({ settingsOpen: true, settingsDrawerTab: dualMmpgManual ? 'config' : 'realtime' })}
           >
             打开设置
           </button>
@@ -816,10 +847,10 @@ export default function ControlBar() {
           </div>
         </div>
       )}
-      {!isExamMode && candidateTranscriptions.length > 0 && (
+      {!isExamMode && hasCandidateTranscriptions && (
         <div className="flex items-start gap-2 text-xs text-accent-green bg-accent-green/10 px-3 py-1.5 rounded-lg">
           <Mic className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
-          <span className="min-w-0 break-all">我的回答记录：{candidateTranscriptions[candidateTranscriptions.length - 1]}</span>
+          <span className="min-w-0 break-all">我的回答记录：{lastCandidateTranscription}</span>
         </div>
       )}
 
@@ -963,13 +994,7 @@ export default function ControlBar() {
           <button disabled
             className="flex min-h-[38px] items-center gap-1.5 rounded-lg px-4 py-2 bg-bg-tertiary text-text-muted text-xs font-semibold cursor-not-allowed flex-shrink-0">
             <Loader2 className="w-3.5 h-3.5 animate-spin" />
-            <span>{sttActiveProvider === 'whisper' && config?.stt_provider && config.stt_provider !== 'whisper' ? '降级加载 Whisper…' : '语音加载中…'}</span>
-          </button>
-        ) : !isExamMode && !usesMmpg && !sttLoaded ? (
-          <button onClick={handleStart} disabled={startDisabled}
-            className="flex min-h-[38px] items-center gap-1.5 rounded-lg px-4 py-2 text-white text-xs font-semibold flex-shrink-0" style={{ background: 'linear-gradient(135deg, rgb(var(--c-accent-amber)), rgb(var(--c-accent-amber) / 0.85))' }}>
-            <AlertTriangle className="w-3.5 h-3.5" />
-            <span>{singleMicMode ? '语音未就绪，开始单人测试' : '语音未就绪，开始面试'}</span>
+            <span>语音连接中…</span>
           </button>
         ) : (
           <button onClick={handleStart} disabled={startDisabled}
@@ -996,32 +1021,32 @@ export default function ControlBar() {
 
         {!isExamMode && <ResumeMountInline className="bg-bg-primary/45" />}
 
-        {streamingIds.length > 0 && (
+        {streamingCount > 0 && (
           <button onClick={handleCancelAsk} disabled={cancellingAsk}
             className="flex items-center gap-1 min-h-[36px] min-w-[36px] justify-center px-2 py-2 bg-accent-amber/20 hover:bg-accent-amber/30 text-accent-amber text-xs rounded-lg transition-colors flex-shrink-0 disabled:opacity-50"
             aria-label={cancellingAsk ? '正在取消生成' : '取消正在生成的回答'}
             title="取消全部正在生成的回答">
             {cancellingAsk ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}
             <span className="hidden sm:inline">
-              {cancellingAsk ? '取消中' : streamingIds.length > 1 ? `取消生成 (${streamingIds.length})` : '取消生成'}
+              {cancellingAsk ? '取消中' : streamingCount > 1 ? `取消生成 (${streamingCount})` : '取消生成'}
             </span>
           </button>
         )}
         <button
           onClick={handleClear}
           disabled={clearing}
-          title={qaPairs.length > 30 ? `当前会话较长 (${qaPairs.length} 条), 建议清空以保持流畅` : isExamMode ? '清空当前页的 AI 答案 (不影响历史)' : '清空当前页的实时转录与 AI 答案 (不影响历史)'}
-          aria-label={qaPairs.length > 30 ? `清空当前 ${qaPairs.length} 条转录与答案` : '清空当前转录与答案'}
+          title={qaPairsCount > 30 ? `当前会话较长 (${qaPairsCount} 条), 建议清空以保持流畅` : isExamMode ? '清空当前页的 AI 答案 (不影响历史)' : '清空当前页的实时转录与 AI 答案 (不影响历史)'}
+          aria-label={`清空当前${qaPairsCount > 30 ? ` ${qaPairsCount} 条` : ''}${isExamMode ? '答案' : '转录与答案'}`}
           className={`relative flex items-center gap-1 min-h-[36px] min-w-[36px] justify-center px-2 py-2 text-xs rounded-lg transition-colors flex-shrink-0 disabled:opacity-50 ${
-            qaPairs.length > 30
+            qaPairsCount > 30
               ? 'bg-accent-amber/20 hover:bg-accent-amber/30 text-accent-amber'
               : 'bg-bg-tertiary hover:bg-bg-hover hover:text-accent-red text-text-secondary'
           }`}
         >
           {clearing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
           <span className="hidden sm:inline">{clearing ? '清空中' : '清空内容'}</span>
-          {qaPairs.length > 30 && !clearing && (
-            <span className="ml-0.5 text-[10px] tabular-nums hidden md:inline">({qaPairs.length})</span>
+          {qaPairsCount > 30 && !clearing && (
+            <span className="ml-0.5 text-[10px] tabular-nums hidden md:inline">({qaPairsCount})</span>
           )}
         </button>
         </div>
@@ -1058,11 +1083,11 @@ export default function ControlBar() {
             asking
               ? '正在提交问题'
               : noEnabledModels
-              ? '请先在设置中启用至少一个模型'
+              ? missingModelMessage
               : allModelsUnavailable
-              ? '所有启用模型不可用，请先检查模型连接'
+              ? '所选答题模型均不可用，请检查模型连接'
               : pastedImage && !hasEnabledVisionModel
-              ? '请先在设置中启用至少一个带 👁 的识图模型'
+              ? '请在实时辅助中勾选支持识图的答题模型'
               : manualQuestion.trim() || pastedImage
               ? '发送问题 (Enter)'
               : '请先输入问题或粘贴截图'

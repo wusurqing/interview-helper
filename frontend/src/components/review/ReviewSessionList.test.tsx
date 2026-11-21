@@ -434,8 +434,8 @@ describe('ReviewSessionList', () => {
     const fastModel = createDeferred<{ review_enabled: boolean; review_model_index: number; models: { name: string; enabled: boolean }[] }>()
     const setConfig = vi.fn()
     const models = [
-      { name: 'lite-ark', enabled: true },
-      { name: 'deepseek', enabled: true },
+      { name: 'lite-ark', enabled: true, supports_vision: true },
+      { name: 'deepseek', enabled: true, supports_vision: false },
     ]
     useInterviewStore.setState({
       config: {
@@ -454,12 +454,15 @@ describe('ReviewSessionList', () => {
     await screen.findByText('OpenAI 一面')
     fireEvent.click(screen.getByRole('button', { name: '配置' }))
 
-    const select = screen.getByRole('combobox')
-    fireEvent.change(select, { target: { value: '1' } })
-    expect(screen.getByRole('combobox')).toHaveValue('1')
-
-    fireEvent.change(screen.getByRole('combobox'), { target: { value: '0' } })
-    expect(screen.getByRole('combobox')).toHaveValue('0')
+    const picker = screen.getByRole('button', { name: '复盘分析模型' })
+    expect(picker).toHaveTextContent('lite-ark')
+    expect(picker).toHaveTextContent('识图')
+    fireEvent.click(picker)
+    fireEvent.click(screen.getByRole('radio', { name: 'deepseek' }))
+    expect(picker).toHaveTextContent('deepseek')
+    expect(picker).not.toHaveTextContent('识图')
+    fireEvent.click(screen.getByRole('radio', { name: 'lite-ark' }))
+    expect(picker).toHaveTextContent('lite-ark')
 
     expect(apiMock.updateConfig).toHaveBeenNthCalledWith(1, { review_model_index: 1 })
     expect(apiMock.updateConfig).toHaveBeenNthCalledWith(2, { review_model_index: 0 })
@@ -622,5 +625,134 @@ describe('ReviewSessionList', () => {
     expect(await screen.findByText('剩余复盘')).toBeInTheDocument()
     expect(screen.queryByText('没有复盘记录')).not.toBeInTheDocument()
     expect(apiMock.reviewSessions).toHaveBeenLastCalledWith(1, 20)
+  })
+
+  it('passes isLight to StageBadge in light mode and displays filtered counts in the header', async () => {
+    useUiPrefsStore.setState({ colorScheme: 'vscode-light-plus' } as any)
+    render(<ReviewSessionList onViewDetail={vi.fn()} />)
+
+    await screen.findByText('OpenAI 一面')
+    expect(screen.getByText('全部 · 3 场')).toBeInTheDocument()
+    const stageBadges = screen.getAllByText('一面挂')
+    expect(stageBadges.length).toBeGreaterThan(0)
+    expect(stageBadges[0].className).toContain('bg-red-50')
+    expect(stageBadges[0].className).toContain('text-red-600')
+
+    fireEvent.click(screen.getByRole('button', { name: /已完成/ }))
+    expect(screen.getByText('已完成 · 1 场')).toBeInTheDocument()
+    expect(screen.queryByText('已完成 · 3 场')).not.toBeInTheDocument()
+  })
+
+  it('does not trigger a redundant reviewSessions fetch before navigating to detail after manual import', async () => {
+    const onViewDetail = vi.fn()
+    render(<ReviewSessionList onViewDetail={onViewDetail} />)
+
+    await screen.findByText('OpenAI 一面')
+    expect(apiMock.reviewSessions).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('button', { name: '手动复盘' }))
+    fireEvent.change(screen.getByPlaceholderText(/面试官:/), {
+      target: { value: '面试官: 什么是 CAP 定理？\n候选人: 一致性、可用性和分区容错性。' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '创建并分析' }))
+
+    await waitFor(() => expect(onViewDetail).toHaveBeenCalledWith(100))
+    expect(apiMock.reviewSessions).toHaveBeenCalledTimes(1)
+  })
+
+  it('allows selecting review model when auto-review is disabled and keeps store synced on concurrent partial save failure', async () => {
+    let toggleResolve!: (v: unknown) => void
+    let modelReject!: (reason?: unknown) => void
+    const togglePromise = new Promise((res) => { toggleResolve = res })
+    const modelPromise = new Promise((_res, rej) => { modelReject = rej })
+    const models = [
+      { name: 'lite-ark', enabled: true },
+      { name: 'deepseek', enabled: true },
+    ]
+    useInterviewStore.setState({
+      config: {
+        review_enabled: false,
+        review_model_index: 0,
+        models,
+      },
+      setConfig: (next: any) => useInterviewStore.setState({ config: next }),
+    } as any)
+    apiMock.updateConfig
+      .mockReturnValueOnce(togglePromise)
+      .mockReturnValueOnce(modelPromise)
+
+    render(<ReviewSessionList onViewDetail={vi.fn()} />)
+    await screen.findByText('OpenAI 一面')
+    fireEvent.click(screen.getByRole('button', { name: '配置' }))
+
+    // Model picker must remain enabled even while auto-review is OFF
+    const picker = screen.getByRole('button', { name: '复盘分析模型' })
+    expect(picker).not.toBeDisabled()
+
+    // Start toggle ON and concurrently switch model
+    fireEvent.click(screen.getByRole('switch'))
+    fireEvent.click(picker)
+    fireEvent.click(screen.getByRole('radio', { name: 'deepseek' }))
+
+    // Toggle succeeds, model save fails -> store must reflect review_enabled: true
+    await act(async () => {
+      toggleResolve({ review_enabled: true, review_model_index: 0, models })
+      await togglePromise
+    })
+    await act(async () => {
+      modelReject(new Error('模型保存失败'))
+      await Promise.resolve()
+    })
+
+    expect(useInterviewStore.getState().config?.review_enabled).toBe(true)
+    expect(useInterviewStore.getState().config?.review_model_index).toBe(0)
+    expect(useInterviewStore.getState().toastMessage).toBe('模型保存失败')
+  })
+
+  it('preserves both fields when concurrent toggle and model saves succeed with out-of-order server state', async () => {
+    const toggleDeferred = createDeferred<any>()
+    const modelDeferred = createDeferred<any>()
+    const models = [
+      { name: 'lite-ark', enabled: true },
+      { name: 'deepseek', enabled: true },
+    ]
+    useInterviewStore.setState({
+      config: {
+        review_enabled: false,
+        review_model_index: 0,
+        models,
+      },
+      setConfig: (next: any) => useInterviewStore.setState({ config: next }),
+    } as any)
+    apiMock.updateConfig
+      .mockReturnValueOnce(toggleDeferred.promise)
+      .mockReturnValueOnce(modelDeferred.promise)
+
+    render(<ReviewSessionList onViewDetail={vi.fn()} />)
+    await screen.findByText('OpenAI 一面')
+    fireEvent.click(screen.getByRole('button', { name: '配置' }))
+
+    // Start toggle ON first, then concurrently switch model to deepseek (index 1)
+    fireEvent.click(screen.getByRole('switch'))
+    fireEvent.click(screen.getByRole('button', { name: '复盘分析模型' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'deepseek' }))
+
+    // Toggle response arrives first (server already applied toggle, model still 0)
+    await act(async () => {
+      toggleDeferred.resolve({ review_enabled: true, review_model_index: 0, models })
+      await toggleDeferred.promise
+    })
+    expect(useInterviewStore.getState().config?.review_enabled).toBe(true)
+    expect(useInterviewStore.getState().config?.review_model_index).toBe(0)
+
+    // Model response arrives second, carrying stale review_enabled: false (server committed model before toggle)
+    await act(async () => {
+      modelDeferred.resolve({ review_enabled: false, review_model_index: 1, models })
+      await modelDeferred.promise
+    })
+
+    // Store must retain committed review_enabled: true AND apply review_model_index: 1
+    expect(useInterviewStore.getState().config?.review_enabled).toBe(true)
+    expect(useInterviewStore.getState().config?.review_model_index).toBe(1)
   })
 })

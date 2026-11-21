@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import InterviewOverlay from './InterviewOverlay'
@@ -55,6 +56,7 @@ beforeEach(() => {
     qaPairs: [qa],
     streamingIds: [],
     isRecording: true,
+    toastMessage: null,
     config: { written_exam_mode: false } as never,
   })
   useUiPrefsStore.setState({
@@ -1232,5 +1234,75 @@ describe('InterviewOverlay', () => {
       shortcutsListener?.({ askFromServerScreen: { key: 'CommandOrControl+Shift+6' } })
     })
     expect(await screen.findByText((text, element) => element?.tagName.toLowerCase() === 'kbd' && /6$/.test(text))).toBeInTheDocument()
+  })
+
+  it('renders and auto-dismisses toastMessage for focus actions and errors', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      apiMock.askFromServerScreen.mockRejectedValueOnce(new Error('后端截图失败'))
+      useUiPrefsStore.setState({ interviewOverlayMode: 'focus', interviewOverlayShowBg: true })
+      localStorage.setItem('ia_overlay_mode', 'focus')
+      localStorage.setItem('ia_overlay_show_bg', '1')
+
+      render(<InterviewOverlay />)
+
+      fireEvent.click(screen.getByRole('button', { name: /^截图审题/ }))
+      const toast = await screen.findByRole('status')
+      expect(toast).toHaveTextContent('后端截图失败')
+      expect(toast.className).toContain('max-w-[calc(100%-16px)]')
+      expect(toast.className).toContain('break-words')
+
+      await act(async () => {
+        vi.advanceTimersByTime(2600)
+      })
+      expect(screen.queryByText('后端截图失败')).not.toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: /^取消生成/ }))
+      expect(await screen.findByText('已取消生成')).toBeInTheDocument()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('navigates back to the latest streaming question cleanly under StrictMode without queueMicrotask', async () => {
+    let questionListener: ((direction: 'prev' | 'next') => void) | null = null
+    ;(window as unknown as { electronAPI: unknown }).electronAPI = {
+      onOverlayQuestionCommand: (listener: (direction: 'prev' | 'next') => void) => {
+        questionListener = listener
+        return vi.fn()
+      },
+    }
+    const queueMicrotaskSpy = vi.spyOn(globalThis, 'queueMicrotask')
+    useInterviewStore.setState({
+      qaPairs: [
+        { ...qa, id: 'qa-1', question: '第一题', answer: '旧题仍在流式输出。', status: 'streaming' },
+        { ...qa, id: 'qa-2', question: '第二题', answer: '最新题正在流式输出。', status: 'streaming' },
+      ],
+      streamingIds: ['qa-1', 'qa-2'],
+    })
+    useUiPrefsStore.setState({ interviewOverlayMode: 'focus', interviewOverlayShowBg: true })
+    localStorage.setItem('ia_overlay_mode', 'focus')
+    localStorage.setItem('ia_overlay_show_bg', '1')
+
+    try {
+      render(
+        <StrictMode>
+          <InterviewOverlay />
+        </StrictMode>,
+      )
+
+      expect(screen.getByText(/最新题正在流式输出/)).toBeInTheDocument()
+      queueMicrotaskSpy.mockClear()
+
+      act(() => { questionListener?.('prev') })
+      expect(await screen.findByText(/旧题仍在流式输出/)).toBeInTheDocument()
+
+      act(() => { questionListener?.('next') })
+      expect(await screen.findByText(/最新题正在流式输出/)).toBeInTheDocument()
+      expect(screen.getByText(/当前 2\/2/)).toBeInTheDocument()
+      expect(queueMicrotaskSpy).not.toHaveBeenCalled()
+    } finally {
+      queueMicrotaskSpy.mockRestore()
+    }
   })
 })

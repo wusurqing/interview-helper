@@ -1,3 +1,4 @@
+import { Profiler } from 'react'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import ControlBar from './ControlBar'
@@ -113,13 +114,14 @@ describe('ControlBar', () => {
         whisper_model: 'base',
         whisper_language: 'auto',
         doubao_stt_app_id: '',
-        doubao_stt_access_token: '',
-        doubao_stt_api_key: '',
+        doubao_stt_access_token_configured: false,
+        doubao_stt_api_key_configured: false,
         doubao_stt_resource_id: '',
         doubao_stt_boosting_table_id: '',
         generic_stt_api_base_url: '',
-        generic_stt_api_key: '',
+        generic_stt_api_key_configured: false,
         generic_stt_model: '',
+        generic_stt_custom_headers_configured: false,
         position: '后端开发',
         language: 'Python',
         auto_detect: true,
@@ -144,6 +146,7 @@ describe('ControlBar', () => {
       isRecording: false,
       singleMic: null,
       interviewerStreaming: false,
+      candidateCaptureProvider: null,
       mmpgPhase: null,
       isPaused: false,
       lastWSError: null,
@@ -162,7 +165,61 @@ describe('ControlBar', () => {
     })
   })
 
+  it.each([
+    { written_exam_model_ids: [] },
+    { written_exam_model_ids: ['missing'] },
+    { written_exam_model_ids: ['disabled'] },
+    { written_exam_model_ids: ['no-key'] },
+    { written_exam_model_ids: ['text'] },
+  ])('requires a configured vision primary even when an interview backup is ready ($written_exam_model_ids)', (selection) => {
+    useInterviewStore.setState(({ config }) => ({
+      config: config && {
+        ...config, written_exam_mode: true, ...selection, assist_model_ids: ['backup'], assist_screenshot_model_id: 'backup',
+        models: [
+          { id: 'backup', name: 'Backup', has_api_key: true, enabled: true, supports_vision: true, supports_think: false },
+          { id: 'disabled', name: 'Off', has_api_key: true, enabled: false, supports_vision: true, supports_think: false },
+          { id: 'no-key', name: 'No Key', has_api_key: false, enabled: true, supports_vision: true, supports_think: false },
+          { id: 'text', name: 'Text', has_api_key: true, enabled: true, supports_vision: false, supports_think: false },
+        ],
+      },
+    }))
+    render(<ControlBar />)
+    fireEvent.change(screen.getByPlaceholderText('输入问题，Enter 发送…'), { target: { value: '题面' } })
+    expect(screen.getByRole('button', { name: '发送问题' })).toBeDisabled()
+    expect(screen.getByText(/请先在笔试配置中.*识图模型/)).toBeInTheDocument()
+    expect(apiMock.ask).not.toHaveBeenCalled()
+  })
+
+  it('sends an exam question with a pasted image using an exam-only model', async () => {
+    useInterviewStore.setState(({ config }) => ({
+      config: config && {
+        ...config, written_exam_mode: true, written_exam_model_ids: ['exam'], assist_model_ids: [],
+        models: [{ id: 'exam', name: 'Exam', supports_think: false, supports_vision: true, enabled: true, has_api_key: true }],
+      },
+    }))
+    render(<ControlBar />)
+    const input = screen.getByPlaceholderText('输入问题，Enter 发送…')
+    const file = new File(['image'], 'shot.png', { type: 'image/png' })
+    fireEvent.change(input, { target: { value: '分析题面' } })
+    expect(screen.getByRole('button', { name: '发送问题' })).toBeEnabled()
+    fireEvent.paste(input, { clipboardData: { items: [{ type: 'image/png', getAsFile: () => file }] } })
+    await waitFor(() => expect(screen.getByAltText('screenshot')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '发送问题' }))
+    await waitFor(() => expect(apiMock.ask).toHaveBeenCalledWith('分析题面', expect.stringMatching(/^data:image/)))
+  })
+
   it('blocks pasted screenshots when no enabled model supports vision', async () => {
+    useInterviewStore.setState(({ config }) => ({
+      config: config && {
+        ...config,
+        models: [
+          { id: 'text', name: 'TextOnly', supports_think: false, supports_vision: false, enabled: true },
+          { id: 'screen', name: 'ScreenshotModel', supports_think: false, supports_vision: true, enabled: true },
+        ],
+        assist_model_ids: ['text'],
+        assist_screenshot_model_id: 'screen',
+      },
+    }))
     render(<ControlBar />)
 
     const input = screen.getByPlaceholderText('输入问题，Enter 发送…')
@@ -181,7 +238,7 @@ describe('ControlBar', () => {
     fireEvent.click(screen.getByRole('button', { name: '发送问题' }))
 
     expect(apiMock.ask).not.toHaveBeenCalled()
-    expect(screen.getByText('请先在设置中启用至少一个带 👁 的识图模型，再粘贴截图')).toBeInTheDocument()
+    expect(screen.getByText('请先在实时辅助中勾选支持识图的答题模型，再粘贴图片')).toBeInTheDocument()
   })
 
   it('allows pasted screenshots to fall back to an enabled vision model', async () => {
@@ -257,6 +314,34 @@ describe('ControlBar', () => {
     fireEvent.click(screen.getByRole('button', { name: '继续' }))
 
     await waitFor(() => expect(apiMock.resume).toHaveBeenCalledWith())
+  })
+
+  it('blocks an unassigned interviewer engine while allowing manual questions', async () => {
+    useInterviewStore.setState((state) => ({ config: { ...state.config!, stt_provider: '', stt_configured: {} } }))
+    render(<ControlBar />)
+    expect(screen.getByRole('button', { name: '开始面试' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: '配置面试官 ASR' }))
+    expect(useInterviewStore.getState().settingsDrawerTab).toBe('realtime')
+    expect(screen.getByPlaceholderText(/输入问题/)).not.toBeDisabled()
+  })
+
+  it('resumes the captured microphone route after changing the next session engine', async () => {
+    const candidateStart = vi.spyOn(candidateMmpgController, 'start').mockResolvedValue(undefined)
+    try {
+      useInterviewStore.setState((state) => ({
+        config: { ...state.config!, stt_provider: 'doubao', candidate_asr_enabled: false, candidate_stt_provider: 'generic' },
+        candidateCaptureProvider: 'doubao_mmpg',
+        devices: [{ id: 12, name: 'Microphone', channels: 1, is_loopback: false, host_api: 'WASAPI' }],
+        singleMic: { id: 'paused-route', device_id: 12, role: 'interviewer', switching: false },
+        isRecording: true,
+        isPaused: true,
+      }))
+      render(<ControlBar />)
+      fireEvent.click(screen.getByRole('button', { name: '继续' }))
+      await waitFor(() => expect(candidateStart).toHaveBeenCalledWith('resume', 12, null, undefined, expect.any(Function), 'paused-route'))
+    } finally {
+      candidateStart.mockRestore()
+    }
   })
 
   it('resumes a paused MMPG owner after the next session is configured for written exam', async () => {
@@ -444,7 +529,7 @@ describe('ControlBar', () => {
 
     render(<ControlBar />)
 
-    expect(screen.getByText('未启用任何模型，请在设置中开启至少一个模型。')).toBeInTheDocument()
+    expect(screen.getByText('请先在实时辅助中勾选可用的答题模型。')).toBeInTheDocument()
   })
 
   it('blocks manual questions when no answer model is enabled', () => {
@@ -466,7 +551,7 @@ describe('ControlBar', () => {
 
     const send = screen.getByRole('button', { name: '发送问题' })
     expect(send).toBeDisabled()
-    expect(send).toHaveAttribute('title', '请先在设置中启用至少一个模型')
+    expect(send).toHaveAttribute('title', '请先在实时辅助中勾选可用的答题模型')
     fireEvent.click(send)
     expect(apiMock.ask).not.toHaveBeenCalled()
   })
@@ -1081,5 +1166,50 @@ describe('ControlBar', () => {
     expect(screen.queryByRole('dialog', { name: '麦克风输入测试' })).not.toBeInTheDocument()
     expect(screen.queryByText('80%')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '测试麦克风输入' })).not.toBeDisabled()
+  })
+
+  it('skips re-rendering during streaming answer chunks and updates on latest candidate transcription', () => {
+    const onRender = vi.fn()
+    useInterviewStore.setState({
+      qaPairs: [{
+        id: 'qa-1',
+        question: '什么是 MVCC？',
+        answer: '初始',
+        thinkContent: '',
+        isThinking: false,
+        timestamp: 1710000000,
+        status: 'streaming',
+      }],
+      streamingIds: ['qa-1'],
+      transcriptions: ['第一句面试官转写'],
+      candidateTranscriptions: [],
+    } as any)
+
+    render(
+      <Profiler id="control-bar" onRender={onRender}>
+        <ControlBar />
+      </Profiler>,
+    )
+    const rendersAfterMount = onRender.mock.calls.length
+
+    act(() => {
+      for (let i = 1; i <= 5; i++) {
+        useInterviewStore.setState((state) => ({
+          qaPairs: state.qaPairs.map((qa) => (
+            qa.id === 'qa-1' ? { ...qa, answer: `${qa.answer} chunk-${i}` } : qa
+          )),
+          transcriptions: [...state.transcriptions, `后续面试官转写 ${i}`],
+        }))
+      }
+    })
+
+    expect(onRender).toHaveBeenCalledTimes(rendersAfterMount)
+
+    act(() => {
+      useInterviewStore.setState({ candidateTranscriptions: ['我的最新回答'] })
+    })
+
+    expect(onRender.mock.calls.length).toBeGreaterThan(rendersAfterMount)
+    expect(screen.getByText('我的回答记录：我的最新回答')).toBeInTheDocument()
   })
 })

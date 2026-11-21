@@ -6,7 +6,7 @@ from threading import Lock, Thread
 from types import SimpleNamespace
 from uuid import uuid4
 
-from core.config import KnowledgeAnalysisSettings, ModelConfig, get_config, knowledge_model_available
+from core.config import KnowledgeAnalysisSettings, ModelConfig, get_config, knowledge_model_available, provider_connection
 from core.logger import get_logger
 from core.prompt_settings import resolve_system_prompt
 from services.llm import streaming
@@ -81,6 +81,19 @@ def start_analysis() -> dict:
         return {"pending_count": len(record_ids), "job": asdict(_job)}
 
 
+def _analysis_model_is_current(model: ModelConfig) -> bool:
+    cfg = get_config()
+    index = cfg.knowledge_analysis.model_index
+    if index is None or not 0 <= index < len(cfg.models):
+        return False
+    current = cfg.models[index]
+    return (
+        current.id == model.id and current.model == model.model
+        and knowledge_model_available(current)
+        and provider_connection(current) == provider_connection(model)
+    )
+
+
 def _run_analysis(
     job: AnalysisJob, record_ids: list[int], model: ModelConfig,
     settings: KnowledgeAnalysisSettings, think_params: dict,
@@ -91,7 +104,7 @@ def _run_analysis(
         outcome = "skipped"
         try:
             record = knowledge.get_pending_assist_record(record_id)
-            if record is not None:
+            if record is not None and _analysis_model_is_current(model):
                 tags = _extract_tags(record, model, settings, system_prompt, think_params, job.job_id)
                 if knowledge.write_analysis_tags(record, tags):
                     outcome = "succeeded"
@@ -103,6 +116,25 @@ def _run_analysis(
         _log.info("KNOWLEDGE_TAGS_RESULT job_id=%s record_id=%d outcome=%s", job.job_id, record_id, outcome)
     with _lock:
         job.status = "completed"
+
+
+def _parse_json_tags(raw: str | None) -> object:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start != -1 and end > start:
+            return json.loads(text[start : end + 1])
+        raise
 
 
 def _extract_tags(
@@ -126,7 +158,7 @@ def _extract_tags(
         trace_context={"scene": "knowledge_tags", "job_id": job_id, "record_id": record.id},
     )
     raw = response.choices[0].message.content if response.choices else None
-    tags = json.loads(raw or "")
+    tags = _parse_json_tags(raw)
     if not isinstance(tags, list) or not 3 <= len(tags) <= 5:
         raise ValueError("expected 3–5 knowledge tags")
     if any(not isinstance(tag, str) or not tag.strip() for tag in tags):

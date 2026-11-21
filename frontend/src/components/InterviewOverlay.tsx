@@ -55,6 +55,7 @@ export default function InterviewOverlay() {
   const mmpgPhase = useInterviewStore((s) => s.mmpgPhase)
   const mmpgAnswerLabel = useInterviewStore((s) => s.mmpgAnswerLabel)
   const clearSession = useInterviewStore((s) => s.clearSession)
+  const toastMessage = useInterviewStore((s) => s.toastMessage)
   const setToastMessage = useInterviewStore((s) => s.setToastMessage)
   const config = useInterviewStore((s) => s.config)
   const setConfig = useInterviewStore((s) => s.setConfig)
@@ -83,8 +84,11 @@ export default function InterviewOverlay() {
   useInterviewWS(enabled && (overlayVisible || !hasOverlayVisibilityIpc))
   const [activeFocusTabsByQaId, setActiveFocusTabsByQaId] = useState<Record<string, string>>({})
   const [busyAction, setBusyAction] = useState<string | null>(null)
-  const [reviewQaId, setReviewQaId] = useState<string | null>(null)
-  const [liveFocusQaId, setLiveFocusQaId] = useState<string | null>(null)
+  const [questionView, setQuestionView] = useState<{
+    reviewQaId: string | null
+    liveFocusQaId: string | null
+  }>({ reviewQaId: null, liveFocusQaId: null })
+  const { reviewQaId, liveFocusQaId } = questionView
   const busyActionRef = useRef<string | null>(null)
   const pinnedFocusTabsByQaIdRef = useRef<Record<string, boolean>>({})
 
@@ -132,7 +136,9 @@ export default function InterviewOverlay() {
           : '上一条回答已取消')
       : displayedQa?.status === 'error'
         ? `保存失败: ${displayedQa.errorMessage || '未知原因'}`
-        : displayedQa?.answer?.trim() || (displayedQa ? (displayedQa.isThinking ? '思考中…' : '正在组织回答…') : '')
+        : displayedQa?.retrying
+          ? plainAnswerStatus(displayedQa, true)
+          : displayedQa?.answer?.trim() || (displayedQa ? (displayedQa.isThinking ? '思考中…' : '正在组织回答…') : '')
   const activeVisionVerify =
     displayedQa?.status !== 'cancelled' && displayedQa?.status !== 'error'
       ? displayedQa?.visionVerify
@@ -333,15 +339,6 @@ export default function InterviewOverlay() {
     document.body.classList.add('overlay-window')
     applyStoredColorSchemeToDocument()
 
-    const fontHref = 'https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600&family=JetBrains+Mono:wght@400;500&display=swap'
-    let link = document.querySelector<HTMLLinkElement>(`link[href="${fontHref}"]`)
-    if (!link) {
-      link = document.createElement('link')
-      link.rel = 'stylesheet'
-      link.href = fontHref
-      document.head.appendChild(link)
-    }
-
     return () => {
       document.documentElement.classList.remove('overlay-window')
       document.body.classList.remove('overlay-window')
@@ -381,6 +378,12 @@ export default function InterviewOverlay() {
     event.preventDefault()
   }, [])
 
+  useEffect(() => {
+    if (!toastMessage) return
+    const timer = window.setTimeout(() => setToastMessage(null), 2500)
+    return () => window.clearTimeout(timer)
+  }, [setToastMessage, toastMessage])
+
   const runOverlayAction = useCallback(async (action: 'screen' | 'cancel' | 'clear' | 'hide') => {
     if (busyActionRef.current) return
     busyActionRef.current = action
@@ -388,8 +391,7 @@ export default function InterviewOverlay() {
     try {
       if (action === 'screen') {
         await api.askFromServerScreen()
-        setLiveFocusQaId(null)
-        setReviewQaId(null)
+        setQuestionView({ reviewQaId: null, liveFocusQaId: null })
         setToastMessage('已提交截图审题')
       } else if (action === 'cancel') {
         await api.cancelAsk()
@@ -411,7 +413,7 @@ export default function InterviewOverlay() {
 
   useEffect(() => {
     if (reviewQaId && !qaPairs.some((item) => item.id === reviewQaId)) {
-      setReviewQaId(null)
+      setQuestionView((current) => (current.reviewQaId ? { ...current, reviewQaId: null } : current))
     }
   }, [qaPairs, reviewQaId])
 
@@ -420,11 +422,20 @@ export default function InterviewOverlay() {
     const before = previousNewestQaId.current
     previousNewestQaId.current = newest
     if (reviewQaId) return
-    setLiveFocusQaId((current) => {
-      const currentQa = qaPairs.find(item => item.id === current)
-      if (currentQa && streamingIds.includes(currentQa.id)) return current
-      if (currentQa?.answerFormat === 'plain_text') return newest !== before ? newest : current
-      return latestQa?.id ?? null
+    setQuestionView((current) => {
+      if (current.reviewQaId) return current
+      const currentQa = qaPairs.find((item) => item.id === current.liveFocusQaId)
+      let nextLiveId: string | null
+      if (currentQa && streamingIds.includes(currentQa.id)) {
+        nextLiveId = current.liveFocusQaId
+      } else if (currentQa?.answerFormat === 'plain_text') {
+        nextLiveId = newest !== before ? newest : current.liveFocusQaId
+      } else {
+        nextLiveId = latestQa?.id ?? null
+      }
+      return nextLiveId === current.liveFocusQaId
+        ? current
+        : { ...current, liveFocusQaId: nextLiveId }
     })
   }, [latestQa?.id, qaPairs, reviewQaId, streamingIds])
 
@@ -476,27 +487,40 @@ export default function InterviewOverlay() {
 
   const moveOverlayQuestion = useCallback((direction: 'prev' | 'next') => {
     if (qaPairs.length < 2) return
-    // Functional update so rapid successive next/prev (one act / one key-repeat
-    // burst) advances from the latest pin, not a stale closure.
-    setReviewQaId((currentReviewId) => {
-      const baseId = currentReviewId ?? displayedQa?.id ?? latestQa?.id ?? qaPairs[qaPairs.length - 1]?.id
+    // Pure functional update over combined questionView state so rapid successive
+    // next/prev (one act / one key-repeat burst) advances cleanly without side effects.
+    setQuestionView((current) => {
+      const currentReview = current.reviewQaId
+        ? qaPairs.find((item) => item.id === current.reviewQaId)
+        : null
+      const currentLive = current.liveFocusQaId
+        ? qaPairs.find((item) => item.id === current.liveFocusQaId)
+        : null
+      const baseId =
+        currentReview?.id ??
+        currentLive?.id ??
+        latestQa?.id ??
+        qaPairs[qaPairs.length - 1]?.id
       const currentIndex = Math.max(0, qaPairs.findIndex((item) => item.id === baseId))
       const delta = direction === 'next' ? 1 : -1
       const nextIndex = Math.max(0, Math.min(qaPairs.length - 1, currentIndex + delta))
       const nextId = qaPairs[nextIndex]?.id ?? baseId
       // Clear pin when landing on the true latest so live auto-follow resumes.
-      // Also retarget liveFocus: an older still-streaming liveFocus would otherwise
-      // keep currentStillLive and snap the view away from the latest item.
+      // Also retarget liveFocus atomically: an older still-streaming liveFocus would
+      // otherwise keep currentStillLive and snap the view away from the latest item.
       const latestId = latestQa?.id ?? qaPairs[qaPairs.length - 1]?.id
       if (nextId === latestId) {
-        queueMicrotask(() => {
-          setLiveFocusQaId(latestId ?? null)
-        })
-        return null
+        return {
+          reviewQaId: null,
+          liveFocusQaId: latestId ?? null,
+        }
       }
-      return nextId
+      return {
+        ...current,
+        reviewQaId: nextId,
+      }
     })
-  }, [displayedQa?.id, latestQa?.id, qaPairs])
+  }, [latestQa?.id, qaPairs])
 
   useEffect(() => {
     return window.electronAPI?.onFocusTabCommand?.((direction) => { moveFocusTab(direction) })
@@ -541,6 +565,16 @@ export default function InterviewOverlay() {
       {standbyHint}
     </span>
   )
+
+  const overlayToast = toastMessage ? (
+    <div
+      role="status"
+      aria-live="polite"
+      className="ov-toast pointer-events-none fixed bottom-3 left-1/2 z-50 max-w-[calc(100%-16px)] -translate-x-1/2 break-words rounded-lg border border-white/15 bg-slate-900/90 px-3 py-1.5 text-center text-xs font-medium text-white shadow-lg backdrop-blur-sm"
+    >
+      {toastMessage}
+    </div>
+  ) : null
 
   if (overlayMode === 'focus') {
     return (
@@ -634,6 +668,7 @@ export default function InterviewOverlay() {
             )}
           </div>
         </div>
+        {overlayToast}
       </div>
     )
   }
@@ -655,6 +690,7 @@ export default function InterviewOverlay() {
           {renderedAnswer}
         </div>
       </div>
+      {overlayToast}
     </div>
   )
 }

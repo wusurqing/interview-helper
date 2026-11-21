@@ -17,7 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.generate_interviewer_mix_fixture import DEFAULT_VOICE_NAME, SCENARIOS, main as generate_fixture_main  # noqa: E402
 from scripts.replay_interviewer_pipeline import run_interviewer_pipeline_replay  # noqa: E402
-from core.config import get_config, update_config  # noqa: E402
+from core.config import SEGMENT_STT_PROVIDERS, get_config, temporary_config_override  # noqa: E402
+from api.assist.scheduler import dispatch_model_order  # noqa: E402
 
 
 @contextlib.contextmanager
@@ -26,26 +27,18 @@ def _temporary_stt_provider(provider: str):
     if not selected:
         yield
         return
-    cfg = get_config()
-    original = {
-        "stt_provider": getattr(cfg, "stt_provider", "whisper"),
-        "whisper_preload": bool(getattr(cfg, "whisper_preload", False)),
-        "assist_interviewer_asr_drain_timeout_sec": float(
-            getattr(cfg, "assist_interviewer_asr_drain_timeout_sec", 6.0) or 6.0
-        ),
-    }
-    updates = {"stt_provider": selected}
-    if selected == "whisper":
-        updates["whisper_preload"] = False
-        updates["assist_interviewer_asr_drain_timeout_sec"] = max(
-            12.0,
-            float(getattr(cfg, "assist_interviewer_asr_drain_timeout_sec", 6.0) or 6.0),
-        )
-    update_config(updates)
-    try:
+    if selected not in SEGMENT_STT_PROVIDERS:
+        raise ValueError("高频回放只支持火山原生豆包或 OpenAI 兼容 ASR")
+    # 仅做进程内内存覆写，严禁改写磁盘上的生产 backend/config.json。
+    with temporary_config_override({"stt_provider": selected}):
         yield
-    finally:
-        update_config(original)
+
+
+def _model_is_usable(model) -> bool:
+    if getattr(model, "enabled", True) is False:
+        return False
+    api_key = (getattr(model, "api_key", "") or "").strip()
+    return bool(api_key and api_key != "sk-your-api-key-here")
 
 
 def _find_model_index_by_name(model_name: str) -> int | None:
@@ -53,15 +46,21 @@ def _find_model_index_by_name(model_name: str) -> int | None:
     if not target:
         return None
     cfg = get_config()
+    exact_matches: list[int] = []
     for idx, model in enumerate(cfg.models):
         name = (getattr(model, "name", "") or "").strip().lower()
         model_id = (getattr(model, "model", "") or "").strip().lower()
         if target == name or target == model_id:
-            return idx
+            exact_matches.append(idx)
+    if exact_matches:
+        return next((idx for idx in exact_matches if _model_is_usable(cfg.models[idx])), exact_matches[0])
+    partial_matches: list[int] = []
     for idx, model in enumerate(cfg.models):
         label = f"{getattr(model, 'name', '')} {getattr(model, 'model', '')}".lower()
         if target in label:
-            return idx
+            partial_matches.append(idx)
+    if partial_matches:
+        return next((idx for idx in partial_matches if _model_is_usable(cfg.models[idx])), partial_matches[0])
     return None
 
 
@@ -74,16 +73,19 @@ def _temporary_answer_runtime(
 ):
     updates: dict[str, object] = {}
     cfg = get_config()
-    original = {
-        "active_model": int(getattr(cfg, "active_model", 0) or 0),
-        "max_parallel_answers": int(getattr(cfg, "max_parallel_answers", 2) or 2),
-        "assist_stop_answer_wait_sec": float(getattr(cfg, "assist_stop_answer_wait_sec", 3.0)),
-    }
     model_idx = _find_model_index_by_name(answer_model_name)
     if answer_model_name and model_idx is None:
         raise RuntimeError(f"找不到 answer model: {answer_model_name}")
     if model_idx is not None:
-        updates["active_model"] = model_idx
+        target_model = cfg.models[model_idx]
+        if not _model_is_usable(target_model):
+            raise RuntimeError(f"answer model 未启用或未配置有效 API Key: {answer_model_name}")
+        model_id = getattr(target_model, "id", "")
+        selected = getattr(cfg, "assist_model_ids", None)
+        if model_id and selected is not None:
+            updates["assist_model_ids"] = [model_id] + [other_id for other_id in selected if other_id != model_id]
+        else:
+            updates["active_model"] = model_idx
     if max_parallel_answers is not None:
         updates["max_parallel_answers"] = max(1, min(8, int(max_parallel_answers)))
     if answer_wait_sec is not None:
@@ -91,11 +93,9 @@ def _temporary_answer_runtime(
     if not updates:
         yield
         return
-    update_config(updates)
-    try:
+    # 仅做进程内内存覆写，严禁改写磁盘上的生产 backend/config.json。
+    with temporary_config_override(updates):
         yield
-    finally:
-        update_config(original)
 
 
 def run_replay_suite(
@@ -126,7 +126,10 @@ def run_replay_suite(
     ):
         cfg = get_config()
         effective_provider = (stt_provider or getattr(get_config(), "stt_provider", "") or "").strip()
-        effective_answer_model = getattr(cfg.models[int(getattr(cfg, "active_model", 0) or 0)], "name", "")
+        answer_order = dispatch_model_order(cfg)
+        usable_order = [idx for idx in answer_order if _model_is_usable(cfg.models[idx])]
+        chosen_idx = usable_order[0] if usable_order else (answer_order[0] if answer_order else None)
+        effective_answer_model = getattr(cfg.models[chosen_idx], "name", "") if chosen_idx is not None else ""
         effective_max_parallel = int(getattr(cfg, "max_parallel_answers", 2) or 2)
         for scenario_id in selected_ids:
             wav_path = tmp_dir / f"{scenario_id}.wav"
@@ -222,9 +225,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scenario", action="append", default=[], help="Optional scenario id filter. Repeat for multiple values.")
     parser.add_argument(
         "--stt-provider",
-        choices=["", "whisper", "doubao", "generic"],
+        choices=["", *SEGMENT_STT_PROVIDERS],
         default="",
-        help="Temporarily force STT provider during the suite. Use whisper for free local validation.",
+        help="Temporarily choose a configured segmented cloud ASR provider.",
     )
     parser.add_argument(
         "--answer-model-name",

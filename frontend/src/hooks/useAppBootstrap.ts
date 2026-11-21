@@ -35,7 +35,11 @@ export function useAppBootstrap() {
         })
         .catch(() => {})
 
-      void api.checkModelsHealth().catch(() => {})
+      void api.checkModelsHealth()
+        .then((snapshot) => {
+          if (!cancelled && snapshot) useInterviewStore.getState().setModelCatalog(snapshot)
+        })
+        .catch(() => {})
 
       // KB status: 让 KnowledgeButton 能根据 enabled+0docs 显示提醒红点
       void api

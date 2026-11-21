@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const invoked = [];
+const listeners = new Map();
 const fakeIpcRenderer = {
   invoke(channel, ...args) {
     invoked.push({ channel, args });
@@ -9,8 +10,18 @@ const fakeIpcRenderer = {
   },
   send() {},
   sendSync() { return undefined; },
-  on() {},
-  removeListener() {},
+  on(channel, fn) {
+    if (!listeners.has(channel)) listeners.set(channel, new Set());
+    listeners.get(channel).add(fn);
+  },
+  removeListener(channel, fn) {
+    listeners.get(channel)?.delete(fn);
+  },
+  emit(channel, ...args) {
+    for (const fn of [...(listeners.get(channel) || [])]) {
+      fn({}, ...args);
+    }
+  },
 };
 
 const fakeContextBridge = {
@@ -63,4 +74,35 @@ test('preload exposes all required window control methods', () => {
 test('preload exposes desktop toast and config update listeners', () => {
   assert.equal(typeof api.onDesktopToast, 'function');
   assert.equal(typeof api.onConfigUpdated, 'function');
+});
+
+test('removeOverlayStateListener removes listeners registered via onOverlayState wrapper', () => {
+  const received = [];
+  const listener = (payload) => received.push(payload);
+
+  api.onOverlayState(listener);
+  fakeIpcRenderer.emit('overlay-state', { visible: true });
+  assert.deepEqual(received, [{ visible: true }]);
+
+  api.removeOverlayStateListener(listener);
+  fakeIpcRenderer.emit('overlay-state', { visible: false });
+  assert.deepEqual(received, [{ visible: true }]);
+  assert.equal(listeners.get('overlay-state')?.size ?? 0, 0);
+});
+
+test('onOverlayState returned disposer removes only its own wrapper', () => {
+  const receivedA = [];
+  const receivedB = [];
+  const disposeA = api.onOverlayState((payload) => receivedA.push(payload));
+  const listenerB = (payload) => receivedB.push(payload);
+  api.onOverlayState(listenerB);
+
+  disposeA();
+  fakeIpcRenderer.emit('overlay-state', { mode: 'prompt' });
+  assert.deepEqual(receivedA, []);
+  assert.deepEqual(receivedB, [{ mode: 'prompt' }]);
+
+  api.removeOverlayStateListener(listenerB);
+  fakeIpcRenderer.emit('overlay-state', { mode: 'glass' });
+  assert.deepEqual(receivedB, [{ mode: 'prompt' }]);
 });

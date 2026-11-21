@@ -58,7 +58,6 @@ export const useStt = makeShallowHook((s) => ({
   sttLoaded: s.sttLoaded,
   sttLoading: s.sttLoading,
   sttActiveProvider: s.sttActiveProvider,
-  sttFallbackLoaded: s.sttFallbackLoaded,
   candidateSttLoaded: s.candidateSttLoaded,
   candidateSttLoading: s.candidateSttLoading,
   candidateSttProvider: s.candidateSttProvider,

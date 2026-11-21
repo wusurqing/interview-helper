@@ -1,1310 +1,333 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
+import { BrainCircuit, Plus, RefreshCw, Save } from 'lucide-react'
+import { getErrorMessage } from '@/lib/api'
+import { refreshConfig } from '@/lib/configSync'
 import {
-  Save,
-  Plus,
-  GripVertical,
-  RefreshCw,
-  ArrowUpToLine,
-  ArrowDownToLine,
-  Eye,
-  Trash2,
-  ChevronDown,
-  ChevronUp,
-  KeyRound,
-  Zap,
-  Loader2,
-  Sparkles,
-  BrainCircuit,
-  SlidersHorizontal,
-  X,
-} from 'lucide-react'
-import { useInterviewStore, type ModelFullInfo } from '@/stores/configStore'
-import { api } from '@/lib/api'
-import { updateConfigAndRefresh } from '@/lib/configSync'
-import {
-  Field,
-  GradientCard,
-  SaveStateBadge,
-  StatusBadge,
-  ToggleSwitch,
-  useDirtySnapshot,
-  useSettingsDirtyRegistration,
-  type SaveState,
-} from './shared'
+  hasDraftCredential,
+  modelProviders,
+  normalizeProviderUrl,
+  sameProviderConnection,
+  type CatalogModel,
+  type ProviderDraft,
+  type ProviderModel,
+  type ProviderSnapshot,
+} from '@/lib/modelProviders'
+import ModelProviderCard, { modelDraft, type VerificationByModel, type VerificationState } from './ModelProviderCard'
+import { Field, GradientCard, SaveStateBadge, useSettingsDirtyRegistration, type SaveState } from './shared'
 
-const EMPTY_MODEL: ModelFullInfo = {
-  name: '',
-  api_base_url: 'https://api.openai.com/v1',
-  api_key: '',
-  model: '',
-  api_type: 'openai',
-  supports_think: false,
-  supports_vision: false,
-  enabled: true,
-  think_enabled_params: {},
-  think_disabled_params: {},
-  has_key: false,
+function createId() {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('')
 }
 
-/** 接口协议选项：决定后端用哪种 API 形态调用（base URL 带不带 /v1 都能自动适配） */
-const API_TYPE_OPTIONS: {
-  value: NonNullable<ModelFullInfo['api_type']>
-  label: string
-  hint: string
-  urlPlaceholder: string
-}[] = [
-  {
-    value: 'openai',
-    label: 'Chat',
-    hint: 'OpenAI 兼容 Chat Completions（POST /chat/completions）。绝大多数中转站/国产模型（DeepSeek、豆包、GLM、Kimi 等）都是这个协议；Bearer 鉴权；Base URL 带不带 /v1 都能自动适配。',
-    urlPlaceholder: 'https://api.openai.com/v1（可不带 /v1）',
-  },
-  {
-    value: 'anthropic',
-    label: 'Messages',
-    hint: 'Anthropic Messages 原生协议（POST /v1/messages）。Claude 官方 API 和 claudecode 类中转用这个；自动带 x-api-key + anthropic-version 头（网关只认 Bearer 时会自动重试）；Think 用 thinking.budget_tokens。',
-    urlPlaceholder: 'https://api.anthropic.com',
-  },
-  {
-    value: 'responses',
-    label: 'Responses',
-    hint: 'OpenAI 新版 Responses API（POST /responses）。gpt-5/o 系列官方推荐入口；Think 映射为 reasoning.effort；图片用 input_image 格式，自动转换。',
-    urlPlaceholder: 'https://api.openai.com/v1（可不带 /v1）',
-  },
-]
-
-interface ModelRow {
-  id: string
-  originalIndex: number
-  model: ModelFullInfo
-  contextWindowInput: string
-}
-
-type ModelProbeResult = {
-  ok: boolean
-  detail?: string
-  latency_ms?: number
-  supports_vision: boolean
-  supports_think: boolean
-  think_style: string
-  think_params: Record<string, unknown>
-  think_disabled_params: Record<string, unknown>
-  vision_detail?: string
-  think_detail?: string
-  think_disabled_detail?: string
-}
-
-type RemoteModelListState = {
-  loading: boolean
-  models: RemoteModel[]
-  error: string | null
-  loaded: boolean
-  requestKey?: string
-}
-
-type RemoteModel = {
-  id: string
-  owned_by?: string | null
-}
-
-const EMPTY_REMOTE_MODEL_LIST: RemoteModelListState = {
-  loading: false,
-  models: [],
-  error: null,
-  loaded: false,
-}
-
-const KEEP_EXISTING_API_KEY = '__IA_KEEP_EXISTING_API_KEY__'
-const DEFAULT_TEMPERATURE = 0.5
-const DEFAULT_MAX_TOKENS = 4096
-const DEFAULT_CONTEXT_WINDOW_TOKENS = 262144
-
-function clampNumberInput(value: unknown, min: number, max: number, fallback: number): number {
-  const parsed = Number(value)
-  if (!Number.isFinite(parsed)) return fallback
-  return Math.max(min, Math.min(max, parsed))
-}
-
-function clampIntegerInput(value: unknown, min: number, max: number, fallback: number): number {
-  return Math.floor(clampNumberInput(value, min, max, fallback))
-}
-
-function parseContextWindowTokens(input: string): number | null {
-  const value = input.trim()
-  const tokens = Number(value)
-  return /^\d+$/.test(value) && Number.isSafeInteger(tokens) && tokens > 0 ? tokens : null
-}
-
-function toModelRow({ context_window_tokens, ...model }: ModelFullInfo, index: number): ModelRow {
-  return {
-    id: `${index}:${model.name}:${model.model}:${model.api_base_url}`,
-    originalIndex: index,
-    model,
-    contextWindowInput: String(context_window_tokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS),
-  }
-}
-
-function buildModelPayloadFromRows(rows: ModelRow[]) {
-  return rows.map(({ model: m, originalIndex, contextWindowInput }) => ({
-    name: m.name.trim(),
-    api_base_url: m.api_base_url.trim() || 'https://api.openai.com/v1',
-    api_key: m.api_key.trim() ? m.api_key : m.has_key ? KEEP_EXISTING_API_KEY : '',
-    model_original_index: originalIndex,
-    model: m.model.trim() || 'gpt-4o-mini',
-    api_type: m.api_type || 'openai',
-    context_window_tokens: parseContextWindowTokens(contextWindowInput),
-    supports_think: m.supports_think,
-    supports_vision: m.supports_vision,
-    enabled: m.enabled,
-    think_enabled_params: m.think_enabled_params ?? {},
-    think_disabled_params: m.think_disabled_params ?? {},
-  }))
-}
-
-function resolveActiveIndexForRows(rows: ModelRow[], activeOriginalIndex = 0) {
-  const nextActiveIndex = rows.findIndex((row) => row.originalIndex === activeOriginalIndex)
-  return nextActiveIndex >= 0 ? nextActiveIndex : 0
-}
-
-function buildQueueSnapshot(rows: ModelRow[], maxParallel: number, activeOriginalIndex = 0) {
-  return {
-    models: buildModelPayloadFromRows(rows),
-    active_model: resolveActiveIndexForRows(rows, activeOriginalIndex),
-    max_parallel_answers: maxParallel,
-  }
-}
-
-function groupRemoteModels(models: RemoteModel[]) {
-  const groups = new Map<string, RemoteModel[]>()
-  models.forEach((model) => {
-    const owner = model.owned_by?.trim() || '其他'
-    groups.set(owner, [...(groups.get(owner) ?? []), model])
-  })
-  return Array.from(groups.entries()).sort(([a], [b]) => a.localeCompare(b))
-}
-
-function remoteModelRequestKey(model: ModelFullInfo) {
-  return `${(model.api_base_url || '').trim()}\n${model.api_key || ''}\n${model.api_type || 'openai'}`
-}
-
-function apiKeyPayloadValue(model: ModelFullInfo) {
-  return model.api_key.trim() ? model.api_key : model.has_key ? KEEP_EXISTING_API_KEY : ''
-}
-
-function apiKeyPlaceholder(model: ModelFullInfo) {
-  if (model.has_key && !model.api_key.trim()) return '已保存，留空则保留现有 API Key'
-  return '填入你的 API Key'
-}
-
-function normalizeLlmForm(form: {
-  temperature: unknown
-  max_tokens: unknown
-  think_mode: boolean
-  think_effort: string
-}) {
-  return {
-    temperature: clampNumberInput(form.temperature, 0, 2, DEFAULT_TEMPERATURE),
-    max_tokens: clampIntegerInput(form.max_tokens, 256, 32768, DEFAULT_MAX_TOKENS),
-    think_mode: form.think_mode,
-    think_effort: form.think_effort,
-  }
-}
-
-function formatRemoteModelError(error: unknown): string {
-  const raw = error instanceof Error && error.message
-    ? error.message
-    : typeof error === 'string' && error.trim()
-      ? error
-      : '获取模型列表失败'
-  const lower = raw.toLowerCase()
-  if (lower.includes('request blocked') || lower.includes('blocked') || raw.includes('请求被阻止')) {
-    return `请求被上游拦截：${raw}`
-  }
-  if (raw.includes('401') || raw.includes('403') || lower.includes('invalid token') || lower.includes('unauthorized')) {
-    return `认证失败：请检查 API Key。${raw}`
-  }
-  if (raw.includes('HTTP 404') || raw.includes('HTTP 405') || lower.includes('all candidates failed') || raw.includes('未找到可用')) {
-    return `模型列表接口不可用：当前 Base URL 推导出的 /models 地址不可用，可手动填写 Model ID。${raw}`
-  }
-  if (lower.includes('timeout') || lower.includes('timed out')) {
-    return `获取模型列表超时：${raw}`
-  }
-  if (lower.includes('parse') || raw.includes('不是 JSON')) {
-    return `模型列表响应格式不兼容：${raw}`
-  }
-  return raw
-}
-
-export default function ModelsTab() {
-  const config = useInterviewStore((s) => s.config)
-  const modelHealth = useInterviewStore((s) => s.modelHealth)
-  const modelHealthDetail = useInterviewStore((s) => s.modelHealthDetail)
-  const modelHealthLatency = useInterviewStore((s) => s.modelHealthLatency)
-
-  const [modelRows, setModelRows] = useState<ModelRow[]>([])
+export default function ModelsTab({ onSavingChange }: { onSavingChange?: (saving: boolean) => void }) {
+  const activeInput = useId()
+  const [saved, setSaved] = useState<ProviderSnapshot | null>(null)
+  const [providers, setProviders] = useState<ProviderDraft[]>([])
+  const [models, setModels] = useState<ProviderModel[]>([])
+  const [activeModel, setActiveModel] = useState<string | null>(null)
+  const [verification, setVerification] = useState<Record<string, VerificationByModel>>({})
+  const [confirmed, setConfirmed] = useState<string[]>([])
+  const [session, setSession] = useState(0)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [saving, setSaving] = useState(false)
-  const [expandedIdx, setExpandedIdx] = useState<number | null>(null)
-  const [testingIdx, setTestingIdx] = useState<number | null>(null)
-  const [testResults, setTestResults] = useState<Record<number, 'ok' | 'error' | 'checking'>>({})
-  const [probeResults, setProbeResults] = useState<Record<number, ModelProbeResult>>({})
-  const [remoteModelLists, setRemoteModelLists] = useState<Record<string, RemoteModelListState>>({})
-  const [maxP, setMaxP] = useState(2)
-  const [healthChecking, setHealthChecking] = useState(false)
-  const [dragFrom, setDragFrom] = useState<number | null>(null)
-  const rowRefs = useRef<Record<number, HTMLDivElement | null>>({})
-  const nameInputRefs = useRef<Record<number, HTMLInputElement | null>>({})
-  const pendingFocusIdx = useRef<number | null>(null)
-  const modelRowsRef = useRef<ModelRow[]>([])
-  const remoteModelRequestVersions = useRef<Record<string, number>>({})
-  const remoteModelInFlightKeys = useRef<Record<string, string>>({})
-  const savingRef = useRef(false)
-  const testingIdxRef = useRef<number | null>(null)
-  const healthCheckingRef = useRef(false)
-  const llmSavingRef = useRef(false)
+  const saveInFlight = useRef(false)
+  const [saveState, setSaveState] = useState<SaveState>('idle')
+  const [saveError, setSaveError] = useState('')
+  const [refreshWarning, setRefreshWarning] = useState('')
+  const [conflict, setConflict] = useState(false)
+  const [reload, setReload] = useState(0)
+  const savedProviderById = useMemo(() => new Map(saved?.providers.map((provider) => [provider.id, provider])), [saved])
+  const savedModelById = useMemo(() => new Map(saved?.models.map((model) => [model.id, model])), [saved])
+  const knownDirty = !!saved && (
+    activeModel !== saved.active_model_id || JSON.stringify(providers) !== JSON.stringify(saved.providers)
+    || JSON.stringify(models) !== JSON.stringify(saved.models)
+  )
+  useSettingsDirtyRegistration('models', knownDirty)
 
-  const [llmForm, setLlmForm] = useState({
-    temperature: DEFAULT_TEMPERATURE,
-    max_tokens: DEFAULT_MAX_TOKENS,
-    think_mode: false,
-    think_effort: 'off',
-  })
-  const [llmSaving, setLlmSaving] = useState(false)
-  const [queueSaveState, setQueueSaveState] = useState<SaveState>('idle')
-  const [queueSaveError, setQueueSaveError] = useState<string | null>(null)
-  const [llmSaveState, setLlmSaveState] = useState<SaveState>('idle')
-  const [llmSaveError, setLlmSaveError] = useState<string | null>(null)
-  const queueSnapshot = buildQueueSnapshot(modelRows, maxP, config?.active_model ?? 0)
-  const {
-    dirty: queueDirty,
-    markSaved: markQueueSaved,
-    resetBaseline: resetQueueBaseline,
-  } = useDirtySnapshot(queueSnapshot)
-  const {
-    dirty: llmDirty,
-    markSaved: markLlmSaved,
-    resetBaseline: resetLlmBaseline,
-  } = useDirtySnapshot(llmForm)
-  useSettingsDirtyRegistration('models', queueDirty || llmDirty)
-
-  useEffect(() => {
-    modelRowsRef.current = modelRows
-  }, [modelRows])
-
-  const syncHealthFromServer = useCallback(async () => {
-    try {
-      const { health, detail, latency, fingerprint } = await api.getModelsHealth()
-      const setH = useInterviewStore.getState().setModelHealth
-      Object.entries(health ?? {}).forEach(([k, v]) => {
-        if (v === 'ok' || v === 'error' || v === 'checking') {
-          const index = Number(k)
-          setH(index, v, detail?.[k], latency?.[k], fingerprint?.[k])
-        }
-      })
-    } catch {
-      /* ignore */
-    }
+  const applySnapshot = useCallback((snapshot: ProviderSnapshot) => {
+    setSaved(snapshot)
+    setProviders(snapshot.providers)
+    setModels(snapshot.models)
+    setActiveModel(snapshot.active_model_id)
+    setConfirmed([])
   }, [])
 
-  const loadModels = useCallback(async () => {
+  useEffect(() => {
+    const controller = new AbortController()
     setLoading(true)
-    try {
-      const { models: full } = await api.getModelsFull()
-      const rows = full.map(toModelRow)
-      const currentConfig = useInterviewStore.getState().config
-      const nextMaxP = Math.min(8, Math.max(1, currentConfig?.max_parallel_answers ?? 2))
-      setModelRows(rows)
-      setMaxP(nextMaxP)
-      resetQueueBaseline(buildQueueSnapshot(rows, nextMaxP, currentConfig?.active_model ?? 0))
-      setTestResults({})
-      setProbeResults({})
-      if (full.length === 0) setExpandedIdx(0)
-    } catch {
-      useInterviewStore.getState().setToastMessage('加载模型列表失败')
-    } finally {
-      setLoading(false)
-    }
-  }, [resetQueueBaseline])
-
-  useEffect(() => {
-    void loadModels()
-  }, [loadModels])
-
-  useEffect(() => {
-    if (!config?.models?.length) return
-    const nextLlmForm = normalizeLlmForm({
-      temperature: config.temperature,
-      max_tokens: config.max_tokens,
-      think_mode: config.think_mode ?? false,
-      think_effort: config.think_effort ?? 'off',
+    setLoadError('')
+    setSaveError('')
+    setRefreshWarning('')
+    setSaveState('idle')
+    setConflict(false)
+    void modelProviders.get(controller.signal).then((data) => {
+      if (controller.signal.aborted) return
+      applySnapshot(data)
+      setVerification({})
+      setSession((current) => current + 1)
+    }).catch((error) => {
+      if (!controller.signal.aborted) setLoadError(getErrorMessage(error, '无法加载供应商配置'))
+    }).finally(() => {
+      if (!controller.signal.aborted) setLoading(false)
     })
-    const nextMaxP = Math.min(8, Math.max(1, config.max_parallel_answers ?? 2))
-    if (!queueDirty) {
-      setMaxP(nextMaxP)
-      resetQueueBaseline(buildQueueSnapshot(modelRows, nextMaxP, config.active_model ?? 0))
-    }
-    if (!llmDirty) {
-      setLlmForm(nextLlmForm)
-      resetLlmBaseline(nextLlmForm)
-    }
-    void syncHealthFromServer()
-  }, [
-    config,
-    llmDirty,
-    modelRows,
-    queueDirty,
-    resetLlmBaseline,
-    resetQueueBaseline,
-    syncHealthFromServer,
-  ])
+    return () => controller.abort()
+  }, [applySnapshot, reload])
 
-  useEffect(() => {
-    const idx = expandedIdx
-    if (idx === null || pendingFocusIdx.current !== idx) return
-    const timer = window.setTimeout(() => {
-      rowRefs.current[idx]?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' })
-      nameInputRefs.current[idx]?.focus()
-      pendingFocusIdx.current = null
-    }, 60)
-    return () => window.clearTimeout(timer)
-  }, [expandedIdx, modelRows.length])
+  function markChanged() {
+    setSaveState('idle')
+    setSaveError('')
+    setRefreshWarning('')
+  }
 
-  const clearRemoteModelList = (rowId: string) => {
-    remoteModelRequestVersions.current[rowId] = (remoteModelRequestVersions.current[rowId] ?? 0) + 1
-    setRemoteModelLists((prev) => {
-      if (!(rowId in prev)) return prev
-      const next = { ...prev }
-      delete next[rowId]
+  function newProvider() {
+    setProviders((current) => [...current, {
+      id: createId(),
+      name: '',
+      api_type: 'openai',
+      api_base_url: 'https://api.openai.com/v1',
+      has_api_key: false,
+    }])
+    markChanged()
+  }
+
+  function changeProvider(id: string, patch: Partial<ProviderDraft>) {
+    setProviders((current) => current.map((provider) => provider.id === id ? { ...provider, ...patch } : provider))
+    markChanged()
+  }
+
+  function changeModel(id: string, patch: Partial<ProviderModel>) {
+    setModels((current) => current.map((model) => model.id === id ? { ...model, ...patch } : model))
+    markChanged()
+  }
+
+  function addModel(providerId: string, remote: CatalogModel, enabled: boolean) {
+    if (enabled && verification[providerId]?.[remote.id]?.status !== 'ok') return
+    setModels((current) => {
+      if (current.some((model) => model.provider_id === providerId && model.model === remote.id)) return current
+      return [...current, { ...modelDraft(providerId, createId(), remote), enabled }]
+    })
+    markChanged()
+  }
+
+  function usageLines(usedModels: ProviderModel[]) {
+    return usedModels.flatMap((model) => {
+      const usages = [...(saved?.usages[model.id] ?? [])]
+      if (activeModel === model.id && !usages.includes('通用默认模型')) usages.push('通用默认模型')
+      return usages.length > 0 ? [model.name + '：' + usages.join('、')] : []
+    })
+  }
+
+  function rememberRemoval(ids: string[]) {
+    setConfirmed((current) => [...new Set([...current, ...ids])])
+    if (activeModel && ids.includes(activeModel)) setActiveModel(null)
+  }
+
+  function toggleModel(model: ProviderModel) {
+    if (!model.enabled && verification[model.provider_id]?.[model.model]?.status !== 'ok') return
+    if (model.enabled) {
+      const usages = usageLines([model])
+      if (usages.length && !window.confirm('取消启用后，保存时会移除以下配置中的模型：\n' + usages.join('\n'))) return
+      rememberRemoval([model.id])
+    } else {
+      setConfirmed((current) => current.filter((id) => id !== model.id))
+    }
+    changeModel(model.id, { enabled: !model.enabled })
+  }
+
+  function removeModel(model: ProviderModel) {
+    const usages = usageLines([model])
+    const question = usages.length
+      ? `删除「${model.name}」的配置后，保存时会移除以下引用：\n` + usages.join('\n')
+      : `删除「${model.name}」的配置？`
+    if (!window.confirm(question)) return
+    rememberRemoval([model.id])
+    setModels((current) => current.filter(({ id }) => id !== model.id))
+    markChanged()
+  }
+
+  function removeProvider(provider: ProviderDraft) {
+    const related = models.filter((model) => model.provider_id === provider.id)
+    const usages = usageLines(related)
+    const question = usages.length
+      ? `删除「${provider.name || '新供应商'}」后，保存时会移除以下配置中的模型：\n` + usages.join('\n')
+      : `删除「${provider.name || '新供应商'}」及它的模型？`
+    if (!window.confirm(question)) return
+    rememberRemoval(related.map((model) => model.id))
+    setProviders((current) => current.filter(({ id }) => id !== provider.id))
+    setModels((current) => current.filter(({ provider_id }) => provider_id !== provider.id))
+    setVerification((current) => {
+      const next = { ...current }
+      delete next[provider.id]
       return next
     })
+    markChanged()
   }
 
-  const clearModelProbeState = (idx: number) => {
-    setTestResults((prev) => {
-      if (!(idx in prev)) return prev
-      const next = { ...prev }
-      delete next[idx]
-      return next
+  function setProviderVerification(id: string, statuses: VerificationByModel) {
+    setVerification((current) => ({ ...current, [id]: statuses }))
+  }
+
+  function updateModelVerification(id: string, model: string, status: VerificationState) {
+    setVerification((current) => ({ ...current, [id]: { ...current[id], [model]: status } }))
+  }
+
+  function reloadConfiguration() {
+    if (knownDirty && !window.confirm('重新载入会丢弃此页面未保存的更改，确定继续？')) return
+    setReload((current) => current + 1)
+  }
+
+  async function save() {
+    if (saveInFlight.current || !saved || conflict) return
+    setSaveError('')
+    setRefreshWarning('')
+    const providerById = new Map(providers.map((provider) => [provider.id, provider]))
+    const invalidProviders = providers.find((provider) => {
+      const original = savedProviderById.get(provider.id)
+      try {
+        const url = new URL(normalizeProviderUrl(provider.api_base_url))
+        if (!provider.name.trim() || !['http:', 'https:'].includes(url.protocol)) return true
+      } catch {
+        return true
+      }
+      return !!original && !provider.api_key?.trim()
+        && (provider.api_type !== original.api_type || normalizeProviderUrl(provider.api_base_url) !== normalizeProviderUrl(original.api_base_url))
     })
-    setProbeResults((prev) => {
-      if (!(idx in prev)) return prev
-      const next = { ...prev }
-      delete next[idx]
-      return next
-    })
-  }
-
-  const updateModel = (idx: number, patch: Partial<ModelFullInfo>) => {
-    const rowId = modelRows[idx]?.id
-    if (rowId && ('api_base_url' in patch || 'api_key' in patch || 'api_type' in patch)) {
-      clearRemoteModelList(rowId)
-    }
-    if ('model' in patch || 'api_type' in patch) {
-      clearModelProbeState(idx)
-    }
-    setModelRows((prev) =>
-      prev.map((row, i) => (i === idx ? { ...row, model: { ...row.model, ...patch } } : row)),
-    )
-  }
-
-  const handleFetchRemoteModels = async (idx: number) => {
-    const row = modelRows[idx]
-    if (!row) return
-    const rowId = row.id
-    const requestKey = remoteModelRequestKey(row.model)
-    if (remoteModelInFlightKeys.current[rowId] === requestKey) return
-    remoteModelInFlightKeys.current[rowId] = requestKey
-    const requestVersion = (remoteModelRequestVersions.current[rowId] ?? 0) + 1
-    remoteModelRequestVersions.current[rowId] = requestVersion
-    const requestStillCurrent = () => {
-      const currentRow = modelRowsRef.current[idx]
-      return !!currentRow
-        && currentRow.id === rowId
-        && remoteModelRequestVersions.current[rowId] === requestVersion
-        && remoteModelRequestKey(currentRow.model) === requestKey
-    }
-    setRemoteModelLists((prev) => ({
-      ...prev,
-      [rowId]: { ...(prev[rowId] ?? EMPTY_REMOTE_MODEL_LIST), loading: true, error: null, loaded: false, requestKey },
-    }))
-    try {
-      const result = await api.listRemoteModels({
-        api_base_url: row.model.api_base_url,
-        api_key: apiKeyPayloadValue(row.model),
-        model_index: row.originalIndex,
-        api_type: row.model.api_type || 'openai',
-      })
-      setRemoteModelLists((prev) => {
-        if (!requestStillCurrent()) return prev
-        return {
-          ...prev,
-          [rowId]: {
-            loading: false,
-            models: result.models ?? [],
-            error: null,
-            loaded: true,
-            requestKey,
-          },
-        }
-      })
-      if (!result.models?.length && requestStillCurrent()) {
-        useInterviewStore.getState().setToastMessage('接口未返回可选模型')
-      }
-    } catch (e: any) {
-      const message = formatRemoteModelError(e)
-      setRemoteModelLists((prev) => {
-        if (!requestStillCurrent()) return prev
-        return {
-          ...prev,
-          [rowId]: {
-            loading: false,
-            models: [],
-            error: message,
-            loaded: true,
-            requestKey,
-          },
-        }
-      })
-      if (requestStillCurrent()) {
-        useInterviewStore.getState().setToastMessage(message)
-      }
-    } finally {
-      if (remoteModelInFlightKeys.current[rowId] === requestKey) {
-        delete remoteModelInFlightKeys.current[rowId]
-      }
-    }
-  }
-
-  const handleSelectRemoteModel = (idx: number, modelId: string) => {
-    if (!modelId) return
-    updateModel(idx, { model: modelId, name: modelId })
-  }
-
-  const addModel = () => {
-    const nextIdx = modelRows.length
-    pendingFocusIdx.current = nextIdx
-    setModelRows((prev) => [
-      ...prev,
-      {
-        id: `new-${Date.now()}-${prev.length}`,
-        originalIndex: prev.length,
-        model: { ...EMPTY_MODEL },
-        contextWindowInput: String(DEFAULT_CONTEXT_WINDOW_TOKENS),
-      },
-    ])
-    setExpandedIdx(nextIdx)
-  }
-
-  const removeModel = (idx: number) => {
-    if (modelRows.length <= 1) {
-      useInterviewStore.getState().setToastMessage('至少保留一个模型')
+    if (invalidProviders) {
+      setSaveState('error')
+      setSaveError(`请核对「${invalidProviders.name || '新供应商'}」的名称、地址和凭据。更改接口类型或地址后，请填写对应的 API Key。`)
       return
     }
-    setModelRows((prev) => prev.filter((_, i) => i !== idx))
-    if (modelRows[idx]) clearRemoteModelList(modelRows[idx].id)
-    setExpandedIdx(null)
-  }
-
-  const buildModelPayload = (rows = modelRows) => buildModelPayloadFromRows(rows)
-
-  const resolveActiveIndex = () => {
-    const activeOriginalIndex = config?.active_model ?? 0
-    const nextActiveIndex = modelRows.findIndex((row) => row.originalIndex === activeOriginalIndex)
-    return nextActiveIndex >= 0 ? nextActiveIndex : 0
-  }
-
-  const handleSaveModels = async (quiet = false, collapse = true, options?: { allowDuringAction?: boolean }) => {
-    if (savingRef.current) return { ok: false as const, skipped: true as const }
-    if (!options?.allowDuringAction && (testingIdxRef.current !== null || healthCheckingRef.current)) {
-      return { ok: false as const, skipped: true as const }
+    const invalidModel = models.find((model) => !model.name.trim() || !Number.isSafeInteger(model.context_window_tokens) || model.context_window_tokens < 1)
+    if (invalidModel) {
+      setSaveState('error')
+      setSaveError(`请核对模型「${invalidModel.name || invalidModel.model}」的名称和上下文长度。`)
+      return
     }
-    const invalidIndex = modelRows.findIndex(
-      (row) => !row.model.name.trim() || parseContextWindowTokens(row.contextWindowInput) === null,
-    )
-    if (invalidIndex >= 0) {
-      const message = modelRows[invalidIndex].model.name.trim()
-        ? '最大上下文窗口必须是有效的正整数'
-        : '模型名称不能为空'
-      setExpandedIdx(invalidIndex)
-      useInterviewStore.getState().setToastMessage(message)
-      setQueueSaveState('error')
-      setQueueSaveError(message)
-      return { ok: false as const }
+    const unverified = models.find((model) => {
+      if (!model.enabled) return false
+      const current = providerById.get(model.provider_id)
+      const original = savedProviderById.get(model.provider_id)
+      const old = savedModelById.get(model.id)
+      if (old?.enabled && old.model === model.model && original && current && sameProviderConnection(current, original)) return false
+      return verification[model.provider_id]?.[model.model]?.status !== 'ok'
+    })
+    if (unverified) {
+      setSaveState('error')
+      setSaveError(`请先用当前连接验证「${unverified.name}」，或取消启用。`)
+      return
     }
-    savingRef.current = true
+
+    saveInFlight.current = true
     setSaving(true)
-    setQueueSaveState('saving')
-    setQueueSaveError(null)
+    onSavingChange?.(true)
+    setSaveState('saving')
     try {
-      const savedActiveIndex = resolveActiveIndex()
-      const rowsToSave = modelRows.map((row, index) => ({
-        ...row,
-        id: `${index}:${row.model.name}:${row.model.model}:${row.model.api_base_url}`,
-        model: {
-          ...row.model,
-          has_key: row.model.has_key || row.model.api_key.trim().length > 0,
-        },
-      }))
-      const savedRows = rowsToSave.map((row, index) => ({
-        ...row,
-        originalIndex: index,
-        model: { ...row.model, api_key: '' },
-      }))
-      await updateConfigAndRefresh({
-        models: buildModelPayload(rowsToSave),
-        active_model: savedActiveIndex,
-        max_parallel_answers: maxP,
+      const snapshot = await modelProviders.save({
+        revision: saved.revision,
+        providers: providers.map(({ id, name, api_type, api_base_url, api_key }) => ({
+          id, name: name.trim(), api_type, api_base_url: normalizeProviderUrl(api_base_url),
+          api_key: api_key?.trim() || (api_key === null ? null : undefined),
+        })),
+        models: models.map(({ verified: _verified, ...model }) => ({ ...model, name: model.name.trim() })),
+        confirmed_remove_ids: confirmed,
+        active_model_id: activeModel,
       })
-      setModelRows(savedRows)
-      markQueueSaved(buildQueueSnapshot(savedRows, maxP, savedActiveIndex))
-      setQueueSaveState('saved')
-      if (collapse) setExpandedIdx(null)
-      setProbeResults({})
-      if (!quiet) {
-        useInterviewStore.getState().setToastMessage('模型队列已保存')
+      applySnapshot(snapshot)
+      try {
+        await refreshConfig()
+      } catch {
+        setRefreshWarning('配置已保存。应用状态刷新失败，请重新打开设置。')
       }
-      return {
-        ok: true as const,
-        rows: savedRows,
-        activeModelIndex: savedActiveIndex,
-      }
-    } catch (e: any) {
-      const message = e?.message ?? '保存失败'
-      setQueueSaveError(message)
-      setQueueSaveState('error')
-      useInterviewStore.getState().setToastMessage(message)
-      return { ok: false as const }
-    } finally {
-      savingRef.current = false
-      setSaving(false)
-    }
-  }
-
-  const handleTestModel = async (idx: number) => {
-    if (testingIdxRef.current !== null || healthCheckingRef.current || savingRef.current) return
-    if (modelRows[idx]?.model.enabled === false) {
-      useInterviewStore.getState().setToastMessage('请先启用该模型，再测试连接')
-      return
-    }
-    testingIdxRef.current = idx
-    setTestingIdx(idx)
-    setTestResults((prev) => ({ ...prev, [idx]: 'checking' }))
-    try {
-      const saveResult = await handleSaveModels(true, false, { allowDuringAction: true })
-      if (!saveResult.ok) {
-        setTestResults((prev) => ({ ...prev, [idx]: 'error' }))
-        useInterviewStore.getState().setModelHealth(idx, 'error', '请先修复模型配置保存失败的问题')
-        setExpandedIdx(idx)
-        return
-      }
-      const baseRows = saveResult.rows
-      const activeModelIndex = saveResult.activeModelIndex
-      const result = await api.probeModelCapabilities(idx)
-      setProbeResults((prev) => ({ ...prev, [idx]: result }))
-      const status = result.ok ? 'ok' : 'error'
-      setTestResults((prev) => ({ ...prev, [idx]: status }))
-      useInterviewStore.getState().setModelHealth(idx, status, result.detail, result.latency_ms)
-      if (result.ok) {
-        const nextRows = baseRows.map((row, i) =>
-          i === idx
-            ? {
-                ...row,
-                model: {
-                  ...row.model,
-                  supports_vision: result.supports_vision,
-                  supports_think: result.supports_think,
-                  think_enabled_params: result.think_params ?? {},
-                  think_disabled_params: result.think_disabled_params ?? {},
-                },
-              }
-            : row,
-        )
-        setModelRows(nextRows)
-        await updateConfigAndRefresh({
-          models: buildModelPayload(nextRows),
-          active_model: activeModelIndex,
-          max_parallel_answers: maxP,
-        })
-        markQueueSaved(buildQueueSnapshot(nextRows, maxP, activeModelIndex))
-        setQueueSaveState('saved')
-        const visionLabel = result.supports_vision ? '识图支持' : '识图未检测到'
-        const thinkLabel = result.supports_think ? `Think ${result.think_style || '支持'}` : 'Think 未检测到'
-        useInterviewStore.getState().setToastMessage(`连接可用，已自动更新：${visionLabel} · ${thinkLabel}`)
+      setSaveState('saved')
+    } catch (error) {
+      if (typeof error === 'object' && error !== null && 'status' in error && error.status === 409) {
+        setConflict(true)
+        setSaveError('配置或模型用途已变化。请重新载入，再核对需要移除的用途。')
       } else {
-        setExpandedIdx(idx)
-        useInterviewStore.getState().setToastMessage(result.detail ? `连接失败：${result.detail}` : '连接失败')
+        setSaveError(getErrorMessage(error, '保存供应商配置失败'))
       }
-    } catch (e: any) {
-      const detail = e?.message ?? '检测失败'
-      setTestResults((prev) => ({ ...prev, [idx]: 'error' }))
-      useInterviewStore.getState().setModelHealth(idx, 'error', detail)
-      setExpandedIdx(idx)
-      useInterviewStore.getState().setToastMessage(detail)
+      setSaveState('error')
     } finally {
-      testingIdxRef.current = null
-      setTestingIdx(null)
+      saveInFlight.current = false
+      setSaving(false)
+      onSavingChange?.(false)
     }
   }
 
-  const runHealthCheck = async () => {
-    if (healthCheckingRef.current || testingIdxRef.current !== null || savingRef.current) return
-    healthCheckingRef.current = true
-    setHealthChecking(true)
-    try {
-      const saveResult = await handleSaveModels(true, true, { allowDuringAction: true })
-      if (!saveResult.ok) return
-      const models = useInterviewStore.getState().config?.models ?? []
-      const enabledIndexes = models
-        .map((model, index) => ({ model, index }))
-        .filter(({ model }) => model.enabled !== false)
-        .map(({ index }) => index)
-      if (enabledIndexes.length === 0) {
-        useInterviewStore.getState().setToastMessage('没有已启用的模型可检测')
-        return
-      }
-      enabledIndexes.forEach((index) => useInterviewStore.getState().setModelHealth(index, 'checking'))
-      await api.checkModelsHealth()
-      const deadline = Date.now() + 25000
-      while (Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 2000))
-        await syncHealthFromServer()
-        const { health } = await api.getModelsHealth().catch(() => ({ health: {} as Record<string, string> }))
-        const done = enabledIndexes.every((index) => {
-          const value = health?.[String(index)]
-          return value === 'ok' || value === 'error'
-        })
-        if (done) break
-      }
-      useInterviewStore.getState().setToastMessage('模型连通性已更新')
-    } catch (e: any) {
-      useInterviewStore.getState().setToastMessage(e.message ?? '检测失败')
-    } finally {
-      healthCheckingRef.current = false
-      setHealthChecking(false)
-    }
-  }
-
-  const moveToTop = (idx: number) => {
-    if (idx <= 0) return
-    setModelRows((rows) => {
-      const next = [...rows]
-      const [item] = next.splice(idx, 1)
-      next.unshift(item)
-      return next
-    })
-  }
-
-  const moveToBottom = (idx: number) => {
-    setModelRows((rows) => {
-      if (idx >= rows.length - 1) return rows
-      const next = [...rows]
-      const [item] = next.splice(idx, 1)
-      next.push(item)
-      return next
-    })
-  }
-
-  const onDragStart = (e: React.DragEvent, listIndex: number) => {
-    setDragFrom(listIndex)
-    e.dataTransfer.setData('text/plain', String(listIndex))
-    e.dataTransfer.effectAllowed = 'move'
-  }
-  const onDragOver = (e: React.DragEvent) => {
-    e.preventDefault()
-    e.dataTransfer.dropEffect = 'move'
-  }
-  const onDrop = (e: React.DragEvent, dropIndex: number) => {
-    e.preventDefault()
-    const from = parseInt(e.dataTransfer.getData('text/plain'), 10)
-    setDragFrom(null)
-    if (Number.isNaN(from) || from === dropIndex) return
-    setModelRows((rows) => {
-      const next = [...rows]
-      const [item] = next.splice(from, 1)
-      next.splice(dropIndex, 0, item)
-      return next
-    })
-  }
-
-  const handleSaveLlm = async () => {
-    if (llmSavingRef.current) return
-    llmSavingRef.current = true
-    setLlmSaving(true)
-    setLlmSaveState('saving')
-    setLlmSaveError(null)
-    try {
-      const savedForm = normalizeLlmForm(llmForm)
-      await updateConfigAndRefresh(savedForm)
-      setLlmForm(savedForm)
-      markLlmSaved(savedForm)
-      setLlmSaveState('saved')
-      useInterviewStore.getState().setToastMessage('LLM 参数已保存')
-    } catch (e: any) {
-      const message = e?.message ?? '保存失败'
-      setLlmSaveError(message)
-      setLlmSaveState('error')
-      useInterviewStore.getState().setToastMessage(message)
-    } finally {
-      llmSavingRef.current = false
-      setLlmSaving(false)
-    }
-  }
-
-  if (loading) {
-    return <div className="flex items-center justify-center py-12 text-text-muted text-sm">加载中…</div>
-  }
-
-  const enabledCount = modelRows.filter((row) => row.model.enabled !== false).length
-  const parallelMax = Math.max(1, Math.min(8, Math.max(enabledCount, modelRows.length)))
-  const parallelOptions = Array.from({ length: parallelMax }, (_, i) => i + 1)
-  const effectiveQueueSaveState: SaveState = queueSaveState === 'saving' || queueSaveState === 'error'
-    ? queueSaveState
-    : queueDirty
-      ? 'dirty'
-      : queueSaveState === 'saved'
-        ? 'saved'
-        : 'idle'
-  const effectiveLlmSaveState: SaveState = llmSaveState === 'saving' || llmSaveState === 'error'
-    ? llmSaveState
-    : llmDirty
-      ? 'dirty'
-      : llmSaveState === 'saved'
-        ? 'saved'
-        : 'idle'
+  const enabled = models.filter((model) => {
+    const provider = providers.find(({ id }) => id === model.provider_id)
+    return model.enabled && provider && hasDraftCredential(provider, savedProviderById.get(provider.id))
+  })
+  const defaultValue = enabled.some((model) => model.id === activeModel) ? activeModel ?? '' : ''
+  const showReload = !!loadError || conflict
+  const displayedSaveState = saveState === 'idle' && knownDirty ? 'dirty' : saveState
 
   return (
-    <div className="p-5 space-y-5 pb-8">
-      <GradientCard className="overflow-hidden">
-        <div className="px-4 py-3 border-b border-bg-hover/60 space-y-3">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h3 className="text-sm font-semibold text-text-primary flex items-center gap-1.5">
-                <BrainCircuit className="w-4 h-4 text-accent-blue" />
-                模型队列
-              </h3>
-              <p className="text-[11px] text-text-muted mt-0.5 leading-relaxed">
-                从上到下就是答题优先级；启用、连通性、模型参数都在同一个列表里管理。
-              </p>
-            </div>
-            <div className="flex items-center gap-2 flex-shrink-0">
-              <SaveStateBadge mode="explicit" state={effectiveQueueSaveState} error={queueSaveError} />
-              <button
-                type="button"
-                onClick={runHealthCheck}
-                disabled={healthChecking || saving || testingIdx !== null || enabledCount === 0}
-                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-accent-blue/15 hover:bg-accent-blue/25 border border-accent-blue/30 text-accent-blue text-xs font-medium transition-colors disabled:opacity-50"
-                title={enabledCount === 0 ? '请先启用至少一个模型' : '只向已启用模型 API 发探测请求'}
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${healthChecking ? 'animate-spin' : ''}`} />
-                检测
-              </button>
-              <button
-                type="button"
-                onClick={addModel}
-                className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-accent-green/15 hover:bg-accent-green/25 border border-accent-green/30 text-accent-green text-xs font-medium transition-colors"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                添加
-              </button>
-            </div>
-          </div>
-
-          <div className="rounded-xl border border-bg-hover/60 bg-bg-primary/35 px-3 py-3">
-            <div className="flex items-center gap-2 mb-2">
-              <SlidersHorizontal className="w-3.5 h-3.5 text-text-muted" />
-              <span className="text-xs font-medium text-text-primary">并行生成路数</span>
-              <span className="text-[10px] text-text-muted ml-auto">已启用 {enabledCount} / {modelRows.length}</span>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              {parallelOptions.map((v) => (
-                <button
-                  key={v}
-                  type="button"
-                  onClick={() => setMaxP(v)}
-                  className={`min-w-[2.5rem] px-3 py-2 rounded-lg text-sm font-medium transition-all ${
-                    maxP === v
-                      ? 'bg-accent-blue text-white shadow-lg shadow-accent-blue/20'
-                      : 'bg-bg-tertiary/80 text-text-secondary hover:bg-bg-hover border border-bg-hover'
-                  }`}
-                >
-                  {v}
-                </button>
-              ))}
-            </div>
-          </div>
+    <div className="space-y-4 p-4 pb-8 sm:p-5">
+      <header className="flex flex-wrap items-center justify-between gap-2">
+        <div className="min-w-0">
+          <h2 className="flex items-center gap-2 text-sm font-semibold"><BrainCircuit className="h-4 w-4 text-accent-blue" aria-hidden />模型供应商配置</h2>
+          <p className="mt-1 text-xs text-text-muted">每个供应商只填写一套连接信息。勾选模型后，在各功能里选用。</p>
         </div>
-
-        {modelRows.length === 0 ? (
-          <div className="p-8 text-center space-y-3">
-            <BrainCircuit className="w-8 h-8 text-text-muted mx-auto" />
-            <p className="text-sm text-text-primary font-medium">尚未配置任何模型</p>
-            <p className="text-xs text-text-muted">添加一个 OpenAI 兼容模型后即可开始答题。</p>
-          </div>
-        ) : (
-          <div className="p-3 space-y-2">
-            {modelRows.map((row, idx) => {
-              const m = row.model
-              const isExpanded = expandedIdx === idx
-              const keyHasValue = m.api_key.trim().length > 0 || m.has_key
-              const tr = testResults[idx]
-              const healthDetail = modelHealthDetail[row.originalIndex]?.trim()
-              const on = m.enabled !== false
-              const st = on ? (tr ?? modelHealth[row.originalIndex]) : undefined
-              const probe = probeResults[idx]
-              const testFailureDetail = st === 'error' ? (probe?.detail || healthDetail || '').trim() : ''
-              const keyLabel = keyHasValue ? '已填写' : '未配置'
-              const healthTitle = healthDetail ? `模型连接详情：${healthDetail}` : undefined
-              const probeTitle = probe
-                ? `识图：${probe.vision_detail || (probe.supports_vision ? '支持' : '未检测到')}\nThink 开启：${probe.think_detail || (probe.supports_think ? '支持' : '未检测到')}\nThink 关闭：${probe.think_disabled_detail || '未检测'}\n开启参数：${JSON.stringify(probe.think_params ?? {})}\n关闭参数：${JSON.stringify(probe.think_disabled_params ?? {})}`
-                : undefined
-              const remoteList = remoteModelLists[row.id] ?? EMPTY_REMOTE_MODEL_LIST
-              const remoteModelGroups = groupRemoteModels(remoteList.models)
-              const thinkDisabledParams = probe?.think_disabled_params ?? {}
-              const hasThinkDisabledParams = Object.keys(thinkDisabledParams).length > 0
-              const thinkDisableConfirmed = hasThinkDisabledParams || Boolean(probe?.think_disabled_detail?.includes('无需额外参数'))
-              const needsThinkDisableProbe = probe?.supports_think && !thinkDisableConfirmed
-              const thinkDisabledLabel = hasThinkDisabledParams
-                ? `关 ${JSON.stringify(thinkDisabledParams)}`
-                : needsThinkDisableProbe
-                  ? '关 未确认'
-                  : probe?.think_disabled_detail?.includes('无需额外参数')
-                    ? '关 无需额外参数'
-                    : `关 ${JSON.stringify(thinkDisabledParams)}`
-
-              return (
-                <div
-                  key={row.id}
-                  ref={(node) => {
-                    rowRefs.current[idx] = node
-                  }}
-                  onDragOver={onDragOver}
-                  onDrop={(e) => onDrop(e, idx)}
-                  className={`rounded-xl border transition-all duration-150 ${
-                    dragFrom === idx
-                      ? 'border-accent-blue/50 bg-accent-blue/5 scale-[1.01]'
-                      : isExpanded
-                        ? 'border-accent-blue/35 bg-bg-primary/45'
-                        : 'border-bg-hover/70 bg-bg-primary/35 hover:border-bg-hover'
-                  } ${!on ? 'opacity-60' : ''}`}
-                >
-                  <div className="flex items-stretch gap-2">
-                    <div
-                      draggable
-                      onDragStart={(e) => onDragStart(e, idx)}
-                      onDragEnd={() => setDragFrom(null)}
-                      className="flex items-center px-1.5 cursor-grab active:cursor-grabbing text-text-muted hover:text-text-secondary touch-none"
-                      title="拖拽调序"
-                    >
-                      <GripVertical className="w-4 h-4" />
-                    </div>
-
-                    <div className="flex items-center justify-center w-8 flex-shrink-0 my-2 rounded-lg bg-accent-blue/20 text-accent-blue text-sm font-bold tabular-nums">
-                      {idx + 1}
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={() => setExpandedIdx(isExpanded ? null : idx)}
-                      className="min-w-0 flex-1 py-2.5 text-left"
-                    >
-                      <div className="flex items-center gap-2 min-w-0">
-                        <span className="truncate font-medium text-text-primary text-sm">{m.name || '(未命名)'}</span>
-                        {(m.api_type || 'openai') !== 'openai' && (
-                          <span
-                            className="flex-shrink-0 text-[10px] px-1.5 py-0.5 rounded-md bg-accent-violet/15 text-accent-violet font-medium"
-                            title={`接口类型：${API_TYPE_OPTIONS.find((t) => t.value === m.api_type)?.label}`}
-                          >
-                            {API_TYPE_OPTIONS.find((t) => t.value === m.api_type)?.label}
-                          </span>
-                        )}
-                        {m.supports_vision && (
-                          <span className="inline-flex items-center gap-0.5 text-[10px] text-accent-blue flex-shrink-0 px-1.5 py-0.5 rounded-md bg-accent-blue/10">
-                            <Eye className="w-3 h-3" /> 识图
-                          </span>
-                        )}
-                      </div>
-                      <div className="flex flex-wrap items-center gap-2 mt-1">
-                        <span className="text-[10px] text-text-muted truncate max-w-[180px]">{m.model || '(未设置)'}</span>
-                        <span className={`inline-flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded-full font-medium ${
-                          keyHasValue ? 'bg-accent-green/15 text-accent-green' : 'bg-accent-red/15 text-accent-red'
-                        }`}>
-                          <KeyRound className="w-2.5 h-2.5" />
-                          {keyLabel}
-                        </span>
-                        <StatusBadge
-                          status={st === 'ok' ? 'ok' : st === 'error' ? 'error' : st === 'checking' ? 'checking' : 'idle'}
-                          label={!on ? '已停用' : st === 'ok' ? (modelHealthLatency[row.originalIndex] ? `可用 · ${modelHealthLatency[row.originalIndex]}ms` : '可用') : st === 'error' ? '不可用' : st === 'checking' ? '检测中…' : '未检测'}
-                          title={on ? healthTitle : undefined}
-                        />
-                      </div>
-                    </button>
-
-                    <div className="flex items-center gap-1 py-2 pr-2">
-                      <ToggleSwitch
-                        size="sm"
-                        checked={on}
-                        onChange={(next) => updateModel(idx, { enabled: next })}
-                        title={on ? '关闭此模型' : '启用此模型'}
-                        labelOn="启用此模型"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setExpandedIdx(isExpanded ? null : idx)}
-                        className="p-1.5 rounded-lg hover:bg-bg-hover text-text-muted hover:text-text-primary"
-                        aria-label={isExpanded ? '收起模型配置' : '展开模型配置'}
-                      >
-                        {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div
-                    aria-hidden={!isExpanded}
-                    className={`grid transition-all duration-200 ${isExpanded ? 'grid-rows-[1fr] opacity-100' : 'grid-rows-[0fr] opacity-0'}`}
-                  >
-                    <div className="overflow-hidden">
-                      <div className="px-4 pb-4 space-y-3 border-t border-bg-hover/50 pt-3">
-                        <div className="grid sm:grid-cols-2 gap-3">
-                          <Field label="模型名称 *">
-                            <input
-                              ref={(node) => {
-                                nameInputRefs.current[idx] = node
-                              }}
-                              type="text"
-                              value={m.name}
-                              onChange={(e) => updateModel(idx, { name: e.target.value })}
-                              placeholder="如：GPT-4o、DeepSeek-V3"
-                              className="input-field"
-                            />
-                          </Field>
-                          <Field label="Model ID" hint="API 请求中使用的模型标识">
-                            <input
-                              type="text"
-                              value={m.model}
-                              onChange={(e) => updateModel(idx, { model: e.target.value })}
-                              placeholder="如：gpt-4o、ep-xxxxx"
-                              className="input-field"
-                            />
-                          </Field>
-                        </div>
-                        <Field label="最大上下文窗口" htmlFor={`model-context-window-${idx}`}>
-                          <div className="relative max-w-xs">
-                            <input
-                              id={`model-context-window-${idx}`}
-                              type="text"
-                              inputMode="numeric"
-                              value={row.contextWindowInput}
-                              aria-invalid={parseContextWindowTokens(row.contextWindowInput) === null || undefined}
-                              aria-describedby={`model-context-window-unit-${idx}`}
-                              onChange={(e) => {
-                                const contextWindowInput = e.target.value
-                                setModelRows((prev) => prev.map((item, i) => i === idx ? { ...item, contextWindowInput } : item))
-                              }}
-                              className="w-full rounded-lg border border-bg-hover bg-bg-tertiary/80 py-2 pl-3 pr-16 text-sm text-text-primary"
-                            />
-                            <span
-                              id={`model-context-window-unit-${idx}`}
-                              className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-xs text-text-muted"
-                            >
-                              tokens
-                            </span>
-                          </div>
-                        </Field>
-                        <Field label="接口类型" hint={API_TYPE_OPTIONS.find((t) => t.value === (m.api_type || 'openai'))?.hint}>
-                          <div className="grid grid-cols-3 gap-1.5" role="radiogroup" aria-label="接口类型">
-                            {API_TYPE_OPTIONS.map((t) => {
-                              const selected = (m.api_type || 'openai') === t.value
-                              return (
-                                <button
-                                  key={t.value}
-                                  type="button"
-                                  role="radio"
-                                  aria-checked={selected}
-                                  onClick={() => updateModel(idx, { api_type: t.value })}
-                                  className={`px-2 py-2 rounded-lg text-xs font-medium transition-all ${
-                                    selected
-                                      ? 'bg-accent-blue text-white shadow-lg shadow-accent-blue/20'
-                                      : 'bg-bg-tertiary/80 text-text-secondary hover:bg-bg-hover border border-bg-hover'
-                                  }`}
-                                >
-                                  {t.label}
-                                </button>
-                              )
-                            })}
-                          </div>
-                        </Field>
-                        <Field label="API Base URL" hint="带不带 /v1、结尾多斜杠都能自动适配">
-                          <input
-                            type="text"
-                            value={m.api_base_url}
-                            onChange={(e) => updateModel(idx, { api_base_url: e.target.value })}
-                            placeholder={API_TYPE_OPTIONS.find((t) => t.value === (m.api_type || 'openai'))?.urlPlaceholder}
-                            className="input-field"
-                          />
-                        </Field>
-                        <Field label="API Key">
-                          <div className="flex gap-2">
-                            <input
-                              type="text"
-                              value={m.api_key}
-                              onChange={(e) => updateModel(idx, { api_key: e.target.value, has_key: m.has_key })}
-                              placeholder={apiKeyPlaceholder(m)}
-                              className="input-field min-w-0 flex-1"
-                            />
-                            {m.has_key && (
-                              <button
-                                type="button"
-                                onClick={() => updateModel(idx, { api_key: '', has_key: false })}
-                                className="inline-flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-lg border border-accent-red/25 bg-accent-red/10 text-accent-red transition-colors hover:bg-accent-red/15"
-                                title="清空已保存的 API Key"
-                                aria-label="清空已保存的 API Key"
-                              >
-                                <X className="h-4 w-4" />
-                              </button>
-                            )}
-                          </div>
-                        </Field>
-                        <div className="rounded-xl border border-bg-hover/60 bg-bg-tertiary/30 px-3 py-3 space-y-2">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <button
-                              type="button"
-                              onClick={() => handleFetchRemoteModels(idx)}
-                              disabled={remoteList.loading}
-                              className="inline-flex items-center gap-1.5 rounded-lg border border-accent-blue/30 bg-accent-blue/15 px-3 py-1.5 text-xs font-medium text-accent-blue transition-colors hover:bg-accent-blue/25 disabled:opacity-60"
-                            >
-                              {remoteList.loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-                              {remoteList.loading ? '获取中…' : '获取模型'}
-                            </button>
-                            <span className="text-[10px] leading-relaxed text-text-muted">
-                              从当前 Base URL 和 API Key 读取可选模型，不会自动保存配置。
-                            </span>
-                          </div>
-                          {remoteList.models.length > 0 && (
-                            <select
-                              value=""
-                              onChange={(event) => handleSelectRemoteModel(idx, event.target.value)}
-                              className="input-field"
-                              aria-label="选择远端模型"
-                            >
-                              <option value="">选择模型</option>
-                              {remoteModelGroups.map(([owner, models]) => (
-                                <optgroup key={owner} label={owner}>
-                                  {models.map((model) => (
-                                    <option key={model.id} value={model.id}>
-                                      {model.id}
-                                    </option>
-                                  ))}
-                                </optgroup>
-                              ))}
-                            </select>
-                          )}
-                          {remoteList.loaded && remoteList.models.length === 0 && !remoteList.error && (
-                            <p className="text-[11px] text-text-muted">接口未返回可选模型，仍可手动填写 Model ID。</p>
-                          )}
-                          {remoteList.error && (
-                            <p role="alert" className="text-[11px] leading-relaxed text-accent-red">
-                              {remoteList.error}
-                            </p>
-                          )}
-                        </div>
-                        <div className="flex flex-wrap items-center gap-4 pt-1">
-                          <label className="flex items-center gap-2 cursor-pointer">
-                            <input
-                              type="checkbox"
-                              checked={m.supports_think}
-                              onChange={(e) => updateModel(idx, { supports_think: e.target.checked })}
-                              className="w-4 h-4 rounded bg-bg-tertiary border-bg-hover text-accent-blue focus:ring-accent-blue focus:ring-offset-0"
-                            />
-                            <span className="text-xs text-text-secondary">支持 Think</span>
-                          </label>
-                          <label className="flex items-center gap-2 cursor-pointer">
-                            <input
-                              type="checkbox"
-                              checked={m.supports_vision}
-                              onChange={(e) => updateModel(idx, { supports_vision: e.target.checked })}
-                              className="w-4 h-4 rounded bg-bg-tertiary border-bg-hover text-accent-blue focus:ring-accent-blue focus:ring-offset-0"
-                            />
-                            <span className="text-xs text-text-secondary">支持识图</span>
-                          </label>
-                        </div>
-                        {testFailureDetail && (
-                          <div
-                            role="alert"
-                            className="rounded-lg border border-accent-red/25 bg-accent-red/10 px-3 py-2 text-xs leading-relaxed text-accent-red"
-                          >
-                            测试失败：{testFailureDetail}
-                          </div>
-                        )}
-                        {probe && (
-                          <div
-                            className="flex flex-wrap items-center gap-2 rounded-lg border border-bg-hover/60 bg-bg-tertiary/40 px-3 py-2 text-[11px] text-text-muted"
-                            title={probeTitle}
-                          >
-                            <span className="text-text-secondary">自动探测</span>
-                            <span className={probe.supports_vision ? 'text-accent-blue' : 'text-text-muted'}>
-                              识图 {probe.supports_vision ? '支持' : '未检测到'}
-                            </span>
-                            <span className={probe.supports_think ? 'text-accent-green' : 'text-text-muted'}>
-                              Think {probe.supports_think ? (probe.think_style || '支持') : '未检测到'}
-                            </span>
-                            {probe.supports_think && (
-                              <span className="max-w-full truncate font-mono text-[10px] text-text-muted">
-                                开 {JSON.stringify(probe.think_params)}
-                              </span>
-                            )}
-                            <span className={`max-w-full truncate font-mono text-[10px] ${needsThinkDisableProbe ? 'text-accent-amber' : 'text-text-muted'}`}>
-                              {thinkDisabledLabel}
-                            </span>
-                            {needsThinkDisableProbe && (
-                              <button
-                                type="button"
-                                onClick={() => handleTestModel(idx)}
-                                disabled={testingIdx !== null || healthChecking || saving || !on}
-                                className="rounded-md border border-accent-amber/40 bg-accent-amber/10 px-1.5 py-0.5 text-[10px] font-medium text-accent-amber hover:bg-accent-amber/15 disabled:opacity-50"
-                                title="重新保存配置并探测 Think 关闭参数"
-                              >
-                                重新探测
-                              </button>
-                            )}
-                          </div>
-                        )}
-                        <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-                          <div className="flex items-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() => moveToTop(idx)}
-                              disabled={idx === 0}
-                              className="p-2 rounded-lg hover:bg-bg-hover text-text-muted hover:text-text-primary disabled:opacity-25 disabled:pointer-events-none"
-                              title="置顶"
-                            >
-                              <ArrowUpToLine className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => moveToBottom(idx)}
-                              disabled={idx >= modelRows.length - 1}
-                              className="p-2 rounded-lg hover:bg-bg-hover text-text-muted hover:text-text-primary disabled:opacity-25 disabled:pointer-events-none"
-                              title="置底"
-                            >
-                              <ArrowDownToLine className="w-4 h-4" />
-                            </button>
-                          </div>
-                          <div className="flex items-center gap-2">
-                            <span className="max-w-[180px] text-[10px] leading-relaxed text-text-muted">
-                              测试会先保存当前模型配置
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => handleTestModel(idx)}
-                              disabled={testingIdx !== null || healthChecking || saving || !on}
-                              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent-blue/15 hover:bg-accent-blue/25 border border-accent-blue/30 text-accent-blue text-xs font-medium transition-colors disabled:opacity-60"
-                              title={on ? '测试该模型连接' : '请先启用该模型'}
-                            >
-                              {testingIdx === idx ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
-                              {testingIdx === idx ? '测试中…' : '保存并测试'}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => removeModel(idx)}
-                              disabled={modelRows.length <= 1}
-                              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-accent-red hover:bg-accent-red/10 transition-colors disabled:opacity-30 disabled:pointer-events-none"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                              删除
-                            </button>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        )}
-
-        {modelRows.length > 0 && (
-          <div className="px-4 pb-4">
-            <button
-              type="button"
-              onClick={() => void handleSaveModels()}
-              disabled={saving || testingIdx !== null || healthChecking}
-              className="w-full flex items-center justify-center gap-2 py-2.5 bg-accent-blue hover:bg-accent-blue/90 text-white text-sm font-medium rounded-xl transition-colors disabled:opacity-50"
-            >
-              <Save className="w-4 h-4" />
-              {saving ? '保存中…' : '保存模型队列'}
+        <SaveStateBadge mode="explicit" state={displayedSaveState} />
+      </header>
+      <fieldset disabled={saving || loading} className="min-w-0 space-y-3">
+        {loading && <p role="status" className="text-xs text-text-muted">正在加载供应商配置…</p>}
+        {loadError && <p role="alert" className="text-xs text-accent-red">{loadError}</p>}
+        {!loading && saved && (
+          <>
+            {providers.map((provider, index) => (
+              <ModelProviderCard key={`${session}:${provider.id}`} provider={provider} original={savedProviderById.get(provider.id)}
+                models={models.filter((model) => model.provider_id === provider.id)}
+                savedModels={saved.models.filter((model) => model.provider_id === provider.id)}
+                verification={verification[provider.id] ?? {}}
+                initiallyOpen={index === 0 || !savedProviderById.has(provider.id)}
+                changed={(patch) => changeProvider(provider.id, patch)}
+                removeProvider={() => removeProvider(provider)}
+                addModel={(remote, checked) => addModel(provider.id, remote, checked)}
+                changeModel={changeModel}
+                toggleModel={toggleModel}
+                removeModel={removeModel}
+                updateVerification={(model, status) => updateModelVerification(provider.id, model, status)}
+                resetVerification={(statuses) => setProviderVerification(provider.id, statuses)}
+              />
+            ))}
+            {!providers.length && <GradientCard className="p-3"><p className="text-xs text-text-muted">添加供应商后即可获取模型或手填 Model ID。</p></GradientCard>}
+            <button type="button" onClick={newProvider} className="inline-flex items-center gap-1.5 rounded-md border border-bg-hover px-3 py-2 text-xs hover:bg-bg-hover">
+              <Plus className="h-4 w-4" aria-hidden />添加供应商
             </button>
-          </div>
+            <GradientCard className="p-3">
+              <Field label="通用默认模型" htmlFor={activeInput} hint="供简历优化等通用功能使用。实时辅助、截图答题和笔试在各自的设置中选择。">
+                <select id={activeInput} className="input-field" value={defaultValue} onChange={(event) => {
+                  setActiveModel(event.target.value || null)
+                  markChanged()
+                }}>
+                  <option value="">未选择</option>
+                  {enabled.map((model) => <option key={model.id} value={model.id}>
+                    {model.name} · {providers.find((provider) => provider.id === model.provider_id)?.name}
+                  </option>)}
+                </select>
+              </Field>
+            </GradientCard>
+          </>
         )}
-      </GradientCard>
-
-      <GradientCard className="p-4 space-y-3">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h3 className="text-sm font-semibold text-text-primary flex items-center gap-1.5">
-            <Sparkles className="w-4 h-4 text-accent-blue" />
-            生成参数
-          </h3>
-          <SaveStateBadge mode="explicit" state={effectiveLlmSaveState} error={llmSaveError} />
+        {saveError && <p role="alert" className="text-xs text-accent-red">{saveError}</p>}
+        {refreshWarning && <p role="status" className="text-xs text-accent-amber">{refreshWarning}</p>}
+        <div className="flex flex-wrap justify-end gap-2">
+          {showReload && (
+            <button type="button" onClick={reloadConfiguration} className="inline-flex items-center gap-1.5 rounded-md border border-bg-hover px-3 py-2 text-xs hover:bg-bg-hover">
+              <RefreshCw className="h-3.5 w-3.5" aria-hidden />重新载入
+            </button>
+          )}
+          {saved && (
+            <button type="button" disabled={!knownDirty || conflict} onClick={() => void save()}
+              className="inline-flex items-center gap-1.5 rounded-md bg-accent-blue/15 px-3 py-2 text-xs font-medium text-accent-blue hover:bg-accent-blue/25 disabled:opacity-50">
+              <Save className="h-3.5 w-3.5" aria-hidden />{saving ? '保存中…' : '保存供应商配置'}
+            </button>
+          )}
         </div>
-        <label className="flex items-center justify-between gap-3 cursor-pointer rounded-xl border border-bg-hover bg-bg-tertiary/30 px-3 py-3">
-          <div>
-            <span className="text-xs font-medium text-text-primary">Think（全局）</span>
-            <p className="text-[10px] text-text-muted mt-0.5 leading-snug">
-              对所有模型同时生效，与顶栏会场开关同步。
-            </p>
-          </div>
-          <ToggleSwitch
-            checked={llmForm.think_mode}
-            onChange={(next) => {
-              setLlmForm({ ...llmForm, think_mode: next, think_effort: next ? 'xhigh' : 'off' })
-            }}
-            title="全局 Think 开关"
-          />
-        </label>
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Temperature" hint="推荐 0.4-0.6">
-            <input
-              type="number"
-              step="0.1"
-              min="0"
-              max="2"
-              value={llmForm.temperature}
-              onChange={(e) => {
-                setLlmForm({
-                  ...llmForm,
-                  temperature: clampNumberInput(e.target.value, 0, 2, DEFAULT_TEMPERATURE),
-                })
-              }}
-              className="input-field"
-            />
-          </Field>
-          <Field label="Max Tokens" hint="建议 2048-4096">
-            <input
-              type="number"
-              step="256"
-              min="256"
-              max="32768"
-              value={llmForm.max_tokens}
-              onChange={(e) => {
-                setLlmForm({
-                  ...llmForm,
-                  max_tokens: clampIntegerInput(e.target.value, 256, 32768, DEFAULT_MAX_TOKENS),
-                })
-              }}
-              className="input-field"
-            />
-          </Field>
-        </div>
-        <button
-          type="button"
-          onClick={handleSaveLlm}
-          disabled={llmSaving}
-          className="w-full flex items-center justify-center gap-2 py-2.5 bg-accent-blue hover:bg-accent-blue/90 text-white text-sm font-medium rounded-xl transition-colors disabled:opacity-50"
-        >
-          <Save className="w-4 h-4" />
-          {llmSaving ? '保存中…' : '保存生成参数'}
-        </button>
-      </GradientCard>
+      </fieldset>
     </div>
   )
 }

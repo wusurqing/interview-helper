@@ -1,371 +1,126 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-
 import SpeechTab from './SpeechTab'
 import { updateConfigAndRefresh } from '@/lib/configSync'
-import { useInterviewStore } from '@/stores/configStore'
+import { mmpgFormFromConfig } from '@/lib/mmpg/settings'
+import { useInterviewStore, type AppConfig } from '@/stores/configStore'
 
-const apiMock = vi.hoisted(() => ({
-  sttTest: vi.fn(),
-}))
+const apiMock = vi.hoisted(() => ({ sttTest: vi.fn() }))
+vi.mock('@/lib/api', () => ({ api: apiMock, getErrorMessage: (_error: unknown, fallback: string) => fallback }))
+vi.mock('@/lib/configSync', () => ({ updateConfigAndRefresh: vi.fn(), refreshConfig: vi.fn() }))
 
-vi.mock('@/lib/api', () => ({
-  api: apiMock,
-}))
+function engine(name: string) {
+  const section = screen.getByRole('heading', { name }).closest('section')
+  if (!section) throw new Error('Engine section missing')
+  return within(section)
+}
 
-vi.mock('@/lib/configSync', () => ({
-  updateConfigAndRefresh: vi.fn().mockResolvedValue({ ok: true }),
-}))
-
-function createDeferred<T>() {
-  let resolve!: (value: T | PromiseLike<T>) => void
-  let reject!: (reason?: unknown) => void
-  const promise = new Promise<T>((promiseResolve, promiseReject) => {
-    resolve = promiseResolve
-    reject = promiseReject
-  })
-  return { promise, resolve, reject }
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => { resolve = done })
+  return { promise, resolve }
 }
 
 describe('SpeechTab', () => {
   beforeEach(() => {
-    vi.mocked(updateConfigAndRefresh).mockReset()
-    vi.mocked(updateConfigAndRefresh).mockResolvedValue({ ok: true } as any)
-    apiMock.sttTest.mockReset()
-    apiMock.sttTest.mockResolvedValue({ ok: true, text: 'demo' })
-
+    vi.clearAllMocks()
+    apiMock.sttTest.mockResolvedValue({ ok: true, text: '识别结果' })
     useInterviewStore.setState({
       config: {
-        stt_provider: 'iflytek',
-        whisper_model: 'base',
-        whisper_language: 'auto',
-        doubao_stt_app_id: '',
-        doubao_stt_access_token: '',
-        doubao_stt_api_key: '',
-        doubao_stt_resource_id: '',
-        doubao_stt_boosting_table_id: '',
-        generic_stt_api_base_url: '',
-        generic_stt_api_key: '',
-        generic_stt_model: '',
-        generic_stt_custom_headers: '',
-        candidate_asr_enabled: false,
-        candidate_stt_provider: 'whisper',
-        candidate_whisper_model: '',
-        candidate_whisper_language: '',
-        candidate_remote_stt_enabled: false,
-        candidate_context_enabled: true,
-        candidate_context_wait_ms: 200,
-        candidate_context_max_chars: 900,
-        candidate_context_min_chars: 6,
-        candidate_streaming_asr_enabled: true,
-        candidate_streaming_asr_interval_ms: 1500,
-        candidate_mic_compatibility_mode: true,
-        silence_threshold: 0.01,
-        silence_duration: 1.2,
-        transcription_min_sig_chars: 2,
-        assist_transcription_merge_gap_sec: 2.0,
-        assist_transcription_merge_max_sec: 12.0,
-        assist_high_churn_short_answer: false,
-        auto_detect: true,
-      },
-      options: {
-        stt_providers: ['whisper', 'doubao', 'generic'],
-        whisper_models: ['tiny', 'base'],
-      },
-      toastMessage: null,
-    } as any)
-  })
-
-  it('offers Qwen GPU ASR and saves it as the main local engine', async () => {
-    useInterviewStore.setState((state) => ({
-      config: { ...(state.config as any), stt_provider: 'whisper' },
-      options: { ...(state.options as any), stt_providers: ['whisper', 'qwen3_asr'] },
-    }) as any)
-    render(<SpeechTab />)
-    fireEvent.click(screen.getByRole('button', { name: /Qwen3-ASR/ }))
-    expect(screen.getByText(/CUDA.*FP32/)).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: '保存' }))
-    await waitFor(() => expect(updateConfigAndRefresh).toHaveBeenCalledWith(
-      expect.objectContaining({ stt_provider: 'qwen3_asr' }),
-    ))
-  })
-
-  it('shows a warning when the saved provider is no longer supported', async () => {
-    render(<SpeechTab />)
-
-    expect(await screen.findByText(/该 provider 已不再受支持/)).toBeInTheDocument()
-    expect(screen.getByText(/请切换到“通用 ASR”或“Whisper”/)).toBeInTheDocument()
-  })
-
-  it('saves MMPG for the microphone and sends an explicit null to clear a stored secret', async () => {
-    useInterviewStore.setState((state) => ({
-      config: { ...(state.config as any), stt_provider: 'doubao_mmpg', candidate_asr_enabled: true, mmpg: { volc_secret_key_configured: true } },
-      options: { ...(state.options as any), stt_providers: ['whisper', 'doubao_mmpg'], candidate_stt_providers: ['whisper', 'doubao_mmpg'] },
-    }) as any)
-    render(<SpeechTab />)
-    const option = screen.getByRole('option', { name: /豆包 MMPG/ })
-    fireEvent.change(option.closest('select')!, { target: { value: 'doubao_mmpg' } })
-    const secret = screen.getByLabelText('火山引擎 Secret Key')
-    expect(secret).toHaveValue('')
-    expect(secret).toHaveAttribute('placeholder', '已配置 · 留空保留')
-    fireEvent.click(screen.getByRole('button', { name: '清除 火山引擎 Secret Key' }))
-    fireEvent.click(screen.getByRole('button', { name: '保存' }))
-    await waitFor(() => expect(updateConfigAndRefresh).toHaveBeenCalledWith(expect.objectContaining({
-      stt_provider: 'doubao_mmpg', candidate_stt_provider: 'doubao_mmpg', mmpg: { volc_secret_key: null },
-    })))
-  })
-
-  it('exposes shared MMPG credentials when only the microphone uses it', () => {
-    useInterviewStore.setState((state) => ({
-      config: { ...state.config!, stt_provider: 'whisper', candidate_asr_enabled: true, candidate_stt_provider: 'doubao_mmpg' },
-      options: { ...state.options!, candidate_stt_providers: ['whisper', 'doubao_mmpg'] },
-    }))
-    render(<SpeechTab />)
-
-    expect(screen.getByDisplayValue('豆包 MMPG（云端）')).toBeInTheDocument()
-    expect(screen.getByLabelText('RTC App ID')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: '保存并测试 MMPG' })).not.toBeInTheDocument()
-  })
-
-  it('shows candidate microphone ASR defaults as local whisper', () => {
-    render(<SpeechTab />)
-
-    expect(screen.getByText('实时辅助语音链路')).toBeInTheDocument()
-    expect(screen.getByText('主链路 ASR（面试官 / 会议音频）')).toBeInTheDocument()
-    expect(screen.getByText('可选辅助 ASR（我的回答）')).toBeInTheDocument()
-    expect(screen.queryByText(/Beta/i)).not.toBeInTheDocument()
-    expect(screen.getByText('我的回答记录（麦克风）')).toBeInTheDocument()
-    expect(screen.getByRole('switch', { name: '我的回答记录（麦克风）' })).toHaveAttribute('aria-checked', 'false')
-    expect(screen.getAllByText(/不会触发自动答题/).length).toBeGreaterThan(0)
-    expect(screen.getByText(/实时语音只使用会议音频转写/)).toBeInTheDocument()
-    expect(screen.getByText('麦克风兼容模式')).toBeInTheDocument()
-    expect(screen.getByText('共享兼容优先')).toBeInTheDocument()
-    expect(screen.getByDisplayValue('Whisper（本地，免费）')).toBeInTheDocument()
-    expect(screen.getByText(/高级设置：/)).toBeInTheDocument()
-    expect(screen.getByText(/按发言顺序使用面试官和候选人已经转写的原话/)).toBeInTheDocument()
-    expect(screen.getByText('边听边写')).toBeInTheDocument()
-    expect(screen.getByText('手动提问等待转写 (ms)')).toBeInTheDocument()
-    expect(screen.getByDisplayValue('200')).toBeInTheDocument()
-  })
-
-  it('keeps speech context and review enabled when manual context is off', () => {
-    useInterviewStore.setState((state) => ({
-      config: {
-        ...(state.config as any),
-        stt_provider: 'whisper',
-        candidate_asr_enabled: true,
-        candidate_context_enabled: false,
-      },
-    }) as any)
-
-    render(<SpeechTab />)
-
-    expect(screen.getByText(/Whisper 本地，用于复盘和实时语音上下文/)).toBeInTheDocument()
-    expect(screen.getByText(/用于把你的真实回答写入复盘/)).toBeInTheDocument()
-    expect(screen.getByText('手动参考已关闭')).toBeInTheDocument()
-  })
-
-  it('describes both voice and manual context when manual reference is enabled', () => {
-    useInterviewStore.setState((state) => ({
-      config: {
-        ...(state.config as any),
-        stt_provider: 'whisper',
-        candidate_asr_enabled: true,
-        candidate_context_enabled: true,
-      },
-    }) as any)
-
-    render(<SpeechTab />)
-
-    expect(screen.getByText(/Whisper 本地，用于复盘、实时语音和手动提问上下文/)).toBeInTheDocument()
-    expect(screen.getByText('手动参考已开启')).toBeInTheDocument()
-  })
-
-  it('warns when candidate cloud ASR is selected without matching credentials', () => {
-    useInterviewStore.setState((state) => ({
-      config: {
-        ...(state.config as any),
-        stt_provider: 'whisper',
-        candidate_asr_enabled: true,
+        stt_provider: 'doubao',
         candidate_stt_provider: 'generic',
-        generic_stt_api_base_url: '',
-        generic_stt_api_key: '',
-        generic_stt_model: '',
-      },
-    }) as any)
-
-    render(<SpeechTab />)
-
-    expect(screen.getByDisplayValue('通用 ASR（云端，会增加成本）')).toBeInTheDocument()
-    expect(screen.getByText(/已选择 通用 ASR 麦克风 ASR，但上方 通用 ASR 凭据还没补全/)).toBeInTheDocument()
-    expect(screen.getByText(/请切到对应主链路 ASR 填写凭据并保存，或改回 Whisper/)).toBeInTheDocument()
-  })
-
-  it('does not save candidate remote STT as enabled while candidate ASR is off', async () => {
-    useInterviewStore.setState((state) => ({
-      config: {
-        ...(state.config as any),
-        stt_provider: 'whisper',
-        candidate_asr_enabled: false,
-        candidate_stt_provider: 'generic',
-        candidate_remote_stt_enabled: true,
-      },
-    }) as any)
-
-    render(<SpeechTab />)
-
-    fireEvent.click(screen.getByText('保存'))
-
-    await waitFor(() => {
-      expect(updateConfigAndRefresh).toHaveBeenCalledWith(expect.objectContaining({
-        candidate_asr_enabled: false,
-        candidate_stt_provider: 'generic',
-        candidate_remote_stt_enabled: false,
-      }))
+        candidate_asr_enabled: true,
+        mmpg: { ...mmpgFormFromConfig(), answer_delay_ms: 2600, volc_secret_key_configured: true },
+      } as AppConfig,
+      isRecording: false,
+    })
+    vi.mocked(updateConfigAndRefresh).mockImplementation(async (patch) => {
+      const prior = useInterviewStore.getState().config!
+      const config = { ...prior, ...patch, mmpg: { ...prior.mmpg, ...patch.mmpg as object | undefined } } as AppConfig
+      useInterviewStore.setState({ config })
+      return config
     })
   })
 
-  it('normalizes runtime numeric fields before saving speech settings', async () => {
-    useInterviewStore.setState((state) => ({
-      config: {
-        ...(state.config as any),
-        stt_provider: 'whisper',
-        candidate_context_wait_ms: -20,
-        candidate_context_max_chars: 99999,
-        candidate_context_min_chars: 'not-a-number',
-        candidate_streaming_asr_interval_ms: 10,
-        silence_threshold: 'not-a-number',
-        silence_duration: 99,
-        transcription_min_sig_chars: -4,
-        assist_transcription_merge_gap_sec: 99,
-        assist_transcription_merge_max_sec: -3,
-      },
-    }) as any)
-
+  it('shows cloud engine configuration separately from role and timing controls', () => {
     render(<SpeechTab />)
-
-    fireEvent.click(screen.getByText('保存'))
-
-    await waitFor(() => {
-      expect(updateConfigAndRefresh).toHaveBeenCalledWith(expect.objectContaining({
-        candidate_context_wait_ms: 0,
-        candidate_context_max_chars: 4000,
-        candidate_context_min_chars: 6,
-        candidate_streaming_asr_interval_ms: 800,
-        silence_threshold: 0.01,
-        silence_duration: 10,
-        transcription_min_sig_chars: 1,
-        assist_transcription_merge_gap_sec: 15,
-        assist_transcription_merge_max_sec: 1,
-      }))
-    })
-    expect(screen.queryByDisplayValue('NaN')).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '火山原生豆包' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'OpenAI 兼容 ASR' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '豆包 MMPG' })).toBeInTheDocument()
+    expect(screen.queryByText(/Whisper|FunASR|千问|延迟预设|回答长度/)).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('面试官 ASR 引擎')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('答题前等待时长')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('判停静音时间')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '保存并测试 MMPG' })).toBeInTheDocument()
   })
 
-  it('marks speech settings dirty and clears after saving', async () => {
-    useInterviewStore.setState((state) => ({
-      config: {
-        ...(state.config as any),
-        stt_provider: 'whisper',
-      },
-    }) as any)
+  it('saves only the changed engine fields and explicitly tests that engine', async () => {
     render(<SpeechTab />)
-
-    fireEvent.change(screen.getByDisplayValue('base'), { target: { value: 'tiny' } })
-
-    expect(screen.getAllByText('有未保存更改').length).toBeGreaterThan(0)
-    fireEvent.click(screen.getByText('保存'))
-
-    await waitFor(() => {
-      expect(updateConfigAndRefresh).toHaveBeenCalled()
-    })
-    expect(await screen.findAllByText('已保存')).not.toHaveLength(0)
+    const doubao = engine('火山原生豆包')
+    const generic = engine('OpenAI 兼容 ASR')
+    fireEvent.change(doubao.getByLabelText('API Key（新版控制台）'), { target: { value: 'draft-doubao' } })
+    fireEvent.change(generic.getByLabelText('Base URL'), { target: { value: 'https://speech.example.test/v1' } })
+    fireEvent.click(generic.getByRole('button', { name: '保存并测试' }))
+    await waitFor(() => expect(apiMock.sttTest).toHaveBeenCalledWith({ provider: 'generic' }))
+    expect(updateConfigAndRefresh).toHaveBeenCalledExactlyOnceWith({ generic_stt_api_base_url: 'https://speech.example.test/v1' })
+    expect(doubao.getByLabelText('API Key（新版控制台）')).toHaveValue('draft-doubao')
+    expect(generic.getByText('连接成功')).toBeInTheDocument()
   })
 
-  it('ignores rapid duplicate speech saves while saving is pending', async () => {
-    const save = createDeferred<{ ok: boolean }>()
-    vi.mocked(updateConfigAndRefresh).mockReturnValueOnce(save.promise as any)
-
+  it('saves a cleared MMPG secret without writing role timing or engine selection', async () => {
     render(<SpeechTab />)
+    const mmpg = engine('豆包 MMPG')
+    expect(mmpg.getByLabelText('火山引擎 Secret Key')).toHaveAttribute('placeholder', '已配置 · 留空保留')
+    fireEvent.click(mmpg.getByRole('button', { name: '清除 火山引擎 Secret Key' }))
+    fireEvent.click(mmpg.getByRole('button', { name: '保存' }))
+    await waitFor(() => expect(updateConfigAndRefresh).toHaveBeenCalledExactlyOnceWith({ mmpg: { volc_secret_key: null } }))
+  })
 
-    const saveButton = screen.getByRole('button', { name: '保存' })
+  it('coalesces double clicks while saving and testing the same engine', async () => {
+    const test = deferred<{ ok: boolean; text: string }>()
+    apiMock.sttTest.mockReturnValue(test.promise)
+    render(<SpeechTab />)
+    const generic = engine('OpenAI 兼容 ASR')
+    const button = generic.getByRole('button', { name: '保存并测试' })
     act(() => {
-      saveButton.click()
-      saveButton.click()
+      button.click()
+      button.click()
     })
-
-    expect(updateConfigAndRefresh).toHaveBeenCalledTimes(1)
-    expect(screen.getByRole('button', { name: '保存中…' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: '保存并测试' })).toBeDisabled()
-
-    await act(async () => {
-      save.resolve({ ok: true })
-      await save.promise
-    })
+    await waitFor(() => expect(apiMock.sttTest).toHaveBeenCalledTimes(1))
+    expect(generic.getByRole('button', { name: '测试中…' })).toBeDisabled()
+    await act(async () => { test.resolve({ ok: true, text: '识别结果' }) })
   })
 
-  it('keeps unsaved speech edits when config refreshes from another section', () => {
-    useInterviewStore.setState((state) => ({
+  it('masks configured segmented STT secrets and sends null only when explicitly cleared', async () => {
+    useInterviewStore.setState({
       config: {
-        ...(state.config as any),
-        stt_provider: 'whisper',
+        ...useInterviewStore.getState().config!,
+        doubao_stt_api_key_configured: true,
+        doubao_stt_access_token_configured: true,
+        generic_stt_api_key_configured: true,
+        generic_stt_custom_headers_configured: true,
       },
-    }) as any)
+    })
     render(<SpeechTab />)
+    const doubao = engine('火山原生豆包')
+    const generic = engine('OpenAI 兼容 ASR')
 
-    fireEvent.change(screen.getByDisplayValue('base'), { target: { value: 'tiny' } })
-    useInterviewStore.setState((state) => ({
-      config: {
-        ...(state.config as any),
-        max_parallel_answers: 3,
-      },
-    }) as any)
+    expect(doubao.getByLabelText('API Key（新版控制台）')).toHaveValue('')
+    expect(doubao.getByLabelText('API Key（新版控制台）')).toHaveAttribute('placeholder', '已配置 · 留空保留')
+    expect(generic.getByLabelText('自定义 Header（可选）')).toHaveValue('')
+    expect(generic.getByLabelText('自定义 Header（可选）')).toHaveAttribute('placeholder', '已配置 · 留空保留')
 
-    expect(screen.getByDisplayValue('tiny')).toBeInTheDocument()
-    expect(screen.getAllByText('有未保存更改').length).toBeGreaterThan(0)
-  })
+    // Clear and undo leaves the section clean.
+    fireEvent.click(doubao.getByRole('button', { name: '清除 API Key（新版控制台）' }))
+    expect(doubao.getByLabelText('API Key（新版控制台）')).toHaveAttribute('placeholder', '保存后清除')
+    fireEvent.click(doubao.getByRole('button', { name: '撤销清除 API Key（新版控制台）' }))
+    expect(doubao.getByRole('button', { name: '保存' })).toBeDisabled()
 
-  it('saves before testing the main STT connection', async () => {
-    render(<SpeechTab />)
-
-    fireEvent.click(screen.getByText('保存并测试'))
-
-    await waitFor(() => {
-      expect(updateConfigAndRefresh).toHaveBeenCalled()
-      expect(apiMock.sttTest).toHaveBeenCalled()
-    })
-  })
-
-  it('ignores rapid duplicate STT tests while the save-and-test flow is pending', async () => {
-    const save = createDeferred<{ ok: boolean }>()
-    const stt = createDeferred<{ ok: boolean; text: string }>()
-    vi.mocked(updateConfigAndRefresh).mockReturnValueOnce(save.promise as any)
-    apiMock.sttTest.mockReturnValueOnce(stt.promise)
-
-    render(<SpeechTab />)
-
-    const testButton = screen.getByRole('button', { name: '保存并测试' })
-    act(() => {
-      testButton.click()
-      testButton.click()
-    })
-
-    expect(updateConfigAndRefresh).toHaveBeenCalledTimes(1)
-    expect(apiMock.sttTest).not.toHaveBeenCalled()
-    expect(screen.getByRole('button', { name: '测试中…' })).toBeDisabled()
-    expect(screen.getByRole('button', { name: '保存中…' })).toBeDisabled()
-
-    await act(async () => {
-      save.resolve({ ok: true })
-      await save.promise
-    })
-    expect(apiMock.sttTest).toHaveBeenCalledTimes(1)
-
-    await act(async () => {
-      stt.resolve({ ok: true, text: 'hello' })
-      await stt.promise
-    })
-
-    expect(screen.getByText('连接成功')).toBeInTheDocument()
+    // Clearing custom headers sends explicit null without touching API key.
+    fireEvent.click(generic.getByRole('button', { name: '清除 自定义 Header（可选）' }))
+    fireEvent.click(generic.getByRole('button', { name: '保存' }))
+    await waitFor(() =>
+      expect(updateConfigAndRefresh).toHaveBeenCalledExactlyOnceWith({ generic_stt_custom_headers: null }),
+    )
   })
 })

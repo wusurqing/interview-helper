@@ -18,6 +18,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import quoteattr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -140,7 +141,8 @@ def build_scenario_ssml(
         body_parts.append(_escape_ssml_text(phrase))
         if idx < len(breaks_ms):
             body_parts.append(f"<break time='{int(breaks_ms[idx])}ms'/>")
-    voice_attr = f" name='{voice_name}'" if (voice_name or "").strip() else ""
+    cleaned_voice = (voice_name or "").strip()
+    voice_attr = f" name={quoteattr(cleaned_voice)}" if cleaned_voice else ""
     return (
         "<?xml version='1.0'?>"
         "<speak version='1.0' xml:lang='zh-CN' xmlns='http://www.w3.org/2001/10/synthesis'>"
