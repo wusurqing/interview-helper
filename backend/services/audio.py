@@ -627,12 +627,12 @@ class AudioCapture:
                     }
                 )
             try:
-                default_input = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
-                default_input = int(default_input)
-            except Exception:
-                default_input = -1
+                default_info = sd.query_devices(kind="input")
+                default_input = int(default_info["index"])
+            except (sd.PortAudioError, ValueError, TypeError, KeyError):
+                # No default input is available. Still try the selected device.
+                return attempts
             if default_input >= 0 and default_input != device_id:
-                default_info = sd.query_devices(default_input)
                 default_sr = int(default_info["default_samplerate"])
                 default_host = str(sd.query_hostapis(default_info["hostapi"])["name"])
                 attempts.append(

@@ -202,6 +202,41 @@ def _patch_fake_sounddevice(monkeypatch, *, fail_devices: set[int] | None = None
     monkeypatch.setattr(audio.sd, "InputStream", make_stream)
 
 
+def test_microphone_compatibility_falls_back_to_default_input_when_selected_stream_fails(monkeypatch):
+    from types import SimpleNamespace
+    from services import audio
+
+    _patch_fake_sounddevice(monkeypatch, fail_devices={9})
+    # Like sounddevice.default.device this pair supports [0] and [1] but is
+    # neither a list nor a tuple. The output endpoint must never be opened.
+    pair = range(3, 5)
+    monkeypatch.setattr(audio.sd, "default", SimpleNamespace(device=pair))
+
+    def query(device=None, kind=None):
+        if device is None:
+            assert kind == "input"
+            device = pair[0]
+        return {"index": device, "default_samplerate": 48000, "hostapi": 0}
+
+    monkeypatch.setattr(audio.sd, "query_devices", query)
+    make_stream = audio.sd.InputStream
+    opened = []
+
+    def observe(**kwargs):
+        opened.append((kwargs["device"], kwargs["samplerate"]))
+        return make_stream(**kwargs)
+
+    monkeypatch.setattr(audio.sd, "InputStream", observe)
+    capture = AudioCapture()
+    try:
+        capture.start(9, owner="fallback-test", mic_compatibility_mode=True)
+        assert opened == [(9, 48000), (9, 16000), (3, 48000)]
+        assert AudioCapture.active_device_owner(3) == "fallback-test"
+    finally:
+        capture.stop(owner="fallback-test")
+    assert not AudioCapture.is_device_busy(3)
+
+
 def test_global_device_lock_blocks_separate_audio_capture_instances_on_same_device(monkeypatch):
     import pytest
     from services.audio import AudioBusyError
