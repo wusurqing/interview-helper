@@ -67,17 +67,19 @@ def _parse_docx(content: bytes) -> str:
     """Extract text from a .docx file with Zip-bomb size and entry guards."""
     import zipfile
     import xml.etree.ElementTree as ET
+    import zlib
     from io import BytesIO
 
     paragraphs = []
+    xml_limit = min(MAX_DOCX_XML_BYTES, MAX_DOCX_UNCOMPRESSED_BYTES)
     try:
         with zipfile.ZipFile(BytesIO(content)) as z:
             _validate_docx_zip(z)
             if "word/document.xml" not in z.namelist():
                 raise ValueError("无效的 DOCX 文件")
             with z.open("word/document.xml") as f:
-                xml_bytes = f.read(MAX_DOCX_XML_BYTES + 1)
-            if len(xml_bytes) > MAX_DOCX_XML_BYTES:
+                xml_bytes = f.read(xml_limit + 1)
+            if len(xml_bytes) > xml_limit:
                 raise ValueError("DOCX 正文 XML 解压后体积超过安全上限")
             try:
                 root = ET.fromstring(xml_bytes)
@@ -88,7 +90,7 @@ def _parse_docx(content: bytes) -> str:
                 texts = [t.text for t in p.iter(f"{{{ns['w']}}}t") if t.text]
                 if texts:
                     paragraphs.append("".join(texts))
-    except zipfile.BadZipFile:
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, zlib.error, RuntimeError, EOFError):
         raise ValueError("无效的 DOCX 文件") from None
     return "\n".join(paragraphs)
 

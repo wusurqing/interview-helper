@@ -149,6 +149,10 @@ def _index_single_file(
         ):
             return False
 
+    if ext == ".pdf":
+        # 重建索引前清理旧页渲染缓存，避免 PDF 替换变短或失败后残留过期 page_N.png。
+        clear_pdf_cache(rel)
+
     try:
         raw = loader.load(path, rel_path=rel)
         doc_id = store.upsert_doc(

@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 import zipfile
+import zlib
 
 from core.logger import get_logger
 
@@ -53,7 +54,7 @@ def _validate_docx_archive(file_path: Path) -> None:
                         actual_total += len(chunk)
                         if actual_total > MAX_DOCX_UNCOMPRESSED_BYTES:
                             raise ValueError("DOCX 实际解压体积超过安全上限")
-    except zipfile.BadZipFile:
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, zlib.error, RuntimeError, EOFError):
         raise ValueError("无效的 DOCX 文件") from None
 
 

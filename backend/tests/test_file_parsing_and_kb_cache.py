@@ -217,3 +217,73 @@ def test_kb_vision_prefers_selected_model_and_disables_thinking(tmp_path: Path, 
     assert caption == "summary"
     assert captured["model_id"] == "v-shot"
     assert captured["think_params"] == {"reasoning_effort": "none"}
+
+
+def test_docx_rejects_corrupt_deflate_and_encrypted_runtime_errors(tmp_path: Path, monkeypatch):
+    # Corrupt deflate payload inside a structurally valid ZIP header -> zlib.error -> ValueError
+    raw_docx = bytearray(_make_minimal_docx_bytes("hello world " * 20))
+    # Flip bytes inside the compressed data region right after local file header (filename='word/document.xml', len=17)
+    data_offset = 30 + len("word/document.xml")
+    raw_docx[data_offset] ^= 0xFF
+    raw_docx[data_offset + 1] ^= 0xFF
+    corrupt_bytes = bytes(raw_docx)
+
+    with pytest.raises(ValueError, match="无效的 DOCX"):
+        resume._parse_docx(corrupt_bytes)
+
+    corrupt_file = tmp_path / "corrupt_stream.docx"
+    corrupt_file.write_bytes(corrupt_bytes)
+    with pytest.raises(ValueError, match="无效的 DOCX"):
+        kb_docx._validate_docx_archive(corrupt_file)
+
+    # Encrypted DOCX triggers RuntimeError from ZipFile.open -> normalized to ValueError
+    valid_bytes = _make_minimal_docx_bytes("secret")
+    valid_file = tmp_path / "encrypted.docx"
+    valid_file.write_bytes(valid_bytes)
+
+    def raise_encrypted(self, *args, **kwargs):
+        raise RuntimeError("File 'word/document.xml' is encrypted, password required for extraction")
+
+    monkeypatch.setattr(zipfile.ZipFile, "open", raise_encrypted)
+    with pytest.raises(ValueError, match="无效的 DOCX"):
+        resume._parse_docx(valid_bytes)
+    with pytest.raises(ValueError, match="无效的 DOCX"):
+        kb_docx._validate_docx_archive(valid_file)
+
+
+def test_kb_pdf_reindex_clears_stale_pages_when_pdf_is_replaced(tmp_path: Path, monkeypatch):
+    pytest.importorskip("pypdf")
+    kb_dir = tmp_path / "kb"
+    cache_dir = tmp_path / "kb_cache"
+    db_path = tmp_path / "kb.sqlite"
+    kb_dir.mkdir(parents=True)
+
+    pdf_path = kb_dir / "slides.pdf"
+    _make_pdf_file(pdf_path, pages=3, text_prefix="old")
+
+    cfg = cfg_mod.get_config()
+    monkeypatch.setattr(cfg, "kb_dir", str(kb_dir), raising=False)
+    monkeypatch.setattr(cfg, "kb_db_path", str(db_path), raising=False)
+    monkeypatch.setattr(cfg, "kb_cache_dir", str(cache_dir), raising=False)
+    monkeypatch.setattr(cfg, "kb_ocr_enabled", True, raising=False)
+    monkeypatch.setattr(cfg, "kb_vision_caption_enabled", True, raising=False)
+    indexer.reset()
+
+    monkeypatch.setattr(kb_pdf, "ocr_image_file", lambda p: f"ocr:{p.name}")
+    monkeypatch.setattr(kb_pdf, "vision_caption", lambda p: f"vision:{p.name}")
+
+    indexer.reindex(force=True)
+    ocr_dir, vis_dir = kb_pdf.cache_dirs_for_rel_path("slides.pdf")
+    assert (ocr_dir / "page_3.png").exists()
+    assert (vis_dir / "page_3.png").exists()
+
+    # Replace 3-page PDF with 1-page PDF and reindex_file -> page_2/page_3 renders must be purged
+    _make_pdf_file(pdf_path, pages=1, text_prefix="new")
+    indexer.reindex_file("slides.pdf", force=True)
+    assert (ocr_dir / "page_1.png").exists()
+    assert (vis_dir / "page_1.png").exists()
+    assert not (ocr_dir / "page_2.png").exists()
+    assert not (ocr_dir / "page_3.png").exists()
+    assert not (vis_dir / "page_2.png").exists()
+    assert not (vis_dir / "page_3.png").exists()
+    indexer.reset()

@@ -120,7 +120,7 @@ def _pick_vision_model():
             return by_id[preferred_id]
 
     active_idx = getattr(cfg, "active_model", None)
-    if isinstance(active_idx, int) and 0 <= active_idx < len(models):
+    if isinstance(active_idx, int) and not isinstance(active_idx, bool) and 0 <= active_idx < len(models):
         if _is_usable_vision_model(models[active_idx]):
             return models[active_idx]
 
