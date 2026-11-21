@@ -155,4 +155,3 @@ def test_provider_and_analytics_config_writes_return_409_while_corrupt(isolated_
         json={"temperature": 0.4, "max_tokens": 1024, "think_effort": "off"},
     )
     assert analytics_resp.status_code == 409
-
