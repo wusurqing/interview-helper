@@ -123,40 +123,73 @@ def retrieve(
     hit_rows: list[dict] = []
     error: dict = {}
     done = threading.Event()
+    conn_lock = threading.Lock()
+    conn_closed = False
+    finished = False
+    timed_out = False
 
     def _runner() -> None:
+        nonlocal conn_closed, finished
         try:
             rows = store.fts_search(fts_expr, limit=k, interrupt_connection=conn)
-            hit_rows.extend(rows)
+            with conn_lock:
+                if not timed_out:
+                    hit_rows.extend(rows)
+                finished = True
         except Exception as e:
-            error["e"] = str(e)
+            with conn_lock:
+                if not timed_out:
+                    error["e"] = str(e)
+                finished = True
         finally:
+            with conn_lock:
+                conn_closed = True
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             done.set()
 
     t = threading.Thread(target=_runner, name="kb-fts", daemon=True)
-    t.start()
     t0 = time.monotonic()
+    try:
+        t.start()
+    except Exception as e:  # pragma: no cover
+        with conn_lock:
+            if not conn_closed:
+                conn_closed = True
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        _log.warning("kb retriever 启动线程失败: %s", e)
+        return []
+
     if not done.wait(max(0.0, deadline_ms / 1000.0)):
-        try:
-            conn.interrupt()
-        except Exception:
-            pass
+        with conn_lock:
+            if not finished:
+                timed_out = True
+                if not conn_closed:
+                    try:
+                        conn.interrupt()
+                    except Exception:
+                        pass
         done.wait(0.05)
     elapsed_ms = int((time.monotonic() - t0) * 1000)
-    try:
-        conn.close()
-    except Exception:
-        pass
 
-    if error:
-        _log.warning("kb retrieve error q=%r: %s", q, error.get("e"))
+    with conn_lock:
+        rows_snapshot = list(hit_rows)
+        err_msg = error.get("e")
+        was_timed_out = timed_out
+
+    if err_msg:
+        _log.warning("kb retrieve error q=%r: %s", q, err_msg)
 
     hits: list[KBHit] = []
-    timed_out = not hit_rows and elapsed_ms >= deadline_ms
 
-    if hit_rows:
+    if rows_snapshot:
         min_score = float(getattr(cfg, "kb_min_score", 0.0))
-        for r in hit_rows:
+        for r in rows_snapshot:
             raw_score = float(r.get("score") or 0.0)
             # SQLite FTS5 bm25() 返回非正数，越接近 0 越相关；翻成正分给上层。
             pos = -raw_score if raw_score < 0 else raw_score
@@ -173,7 +206,7 @@ def retrieve(
                 )
             )
 
-    if timed_out:
+    if was_timed_out:
         _log.info(
             "kb retrieve timeout q=%r mode=%s deadline=%dms elapsed=%dms",
             q, mode, deadline_ms, elapsed_ms,
@@ -194,8 +227,8 @@ def retrieve(
                 "mode": mode,
                 "hit_count": len(hits),
                 "latency_ms": elapsed_ms,
-                "timed_out": timed_out,
-                "error": error.get("e"),
+                "timed_out": was_timed_out,
+                "error": err_msg,
                 "top_section_paths": [h.section_path for h in hits[:3]],
             }
         )
