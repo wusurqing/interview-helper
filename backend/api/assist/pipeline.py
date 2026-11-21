@@ -149,6 +149,11 @@ class _InterviewerRuntime:
             maxsize=_interviewer_segment_queue_maxsize
         )
         self.drain_event = threading.Event()
+        self.flush_queue: queue.Queue = queue.Queue(maxsize=10)
+        self.flush_stop_event = threading.Event()
+        self.flush_thread: Optional[threading.Thread] = None
+        self.asr_thread: Optional[threading.Thread] = None
+        self.stop_managed_by_caller = False
         self.raw_queue_drop_count = 0
         self.segment_emitted = 0
         self.segment_dropped = 0
@@ -410,16 +415,19 @@ def _maybe_build_interviewer_segment(
     return True
 
 
-def _drain_interviewer_segments(timeout_sec: float) -> tuple[bool, int]:
-    runtime = _interviewer_runtime
-    if runtime is None:
+def _drain_interviewer_segments(
+    timeout_sec: float,
+    runtime: Optional[_InterviewerRuntime] = None,
+) -> tuple[bool, int]:
+    target = _interviewer_runtime if runtime is None else runtime
+    if target is None:
         return True, 0
     deadline = time.monotonic() + max(0.0, timeout_sec)
     while time.monotonic() < deadline:
-        if _interviewer_segment_backlog(runtime) == 0:
+        if _interviewer_segment_backlog(target) == 0:
             return True, 0
         time.sleep(0.02)
-    remaining = _interviewer_segment_backlog(runtime)
+    remaining = _interviewer_segment_backlog(target)
     return remaining == 0, remaining
 
 
@@ -842,9 +850,9 @@ def cancel_mmpg_answer(request, *, reason="continuation"):
 # ASR question group handling
 # ---------------------------------------------------------------------------
 
-def _flush_asr_question_group_now(cfg, session) -> None:
+def _flush_asr_question_group_now(cfg, session, *, immediate: bool = False) -> None:
     with _asr_state_lock:
-        _asr_state.flush_question_group_now(cfg, session)
+        _asr_state.flush_question_group_now(cfg, session, immediate=immediate)
 
 
 def _try_flush_asr_question_group(cfg, session, now_mono: float, force: bool = False) -> None:
@@ -1205,7 +1213,7 @@ def drain_single_mic_worker(single_mic: SingleMicSession, operation: RoleSwitch,
                     return False
                 cfg = _interviewer_config or get_config()
                 _flush_asr_merge_buffer_now(cfg, session)
-                _flush_asr_question_group_now(cfg, session)
+                _flush_asr_question_group_now(cfg, session, immediate=True)
                 failures = runtime.segment_failures + runtime.segment_dropped
                 success = failures == runtime.reported_role_failures
                 runtime.reported_role_failures = failures
@@ -1373,6 +1381,11 @@ def stop_interview_loop():
     global _interviewer_config
     session = get_session()
     single_mic = session.single_mic
+    runtime = _interviewer_runtime
+    if runtime is not None:
+        runtime.stop_managed_by_caller = True
+        runtime.flush_stop_event.set()
+    _flush_stop_event.set()
     _stop_event.set()
     if single_mic is not None:
         single_mic.close()
@@ -1380,23 +1393,28 @@ def stop_interview_loop():
     _candidate_flush_event.set()
     _stop_capture_compat(audio_capture, owner="assist", clear_queue=False)
     _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=True)
-    runtime = _interviewer_runtime
     runtime_snapshot: Optional[dict[str, Any]] = None
 
     current_thread = threading.current_thread()
-    if _interview_thread and _interview_thread.is_alive() and _interview_thread is not current_thread:
-        _interview_thread.join(timeout=5)
+    interview_thread = _interview_thread
     _interview_thread = None
+    if interview_thread and interview_thread.is_alive() and interview_thread is not current_thread:
+        interview_thread.join(timeout=5)
+    asr_thread = (runtime.asr_thread if runtime is not None else None) or _interviewer_asr_thread
+    flush_thread = (runtime.flush_thread if runtime is not None else None) or _flush_thread
     if runtime is not None:
         try:
             _refresh_interviewer_raw_drop_count(runtime, single_mic.interviewer_input if single_mic else None)
+            runtime.flush_stop_event.set()
             runtime.drain_event.set()
             drain_timeout_sec = _interviewer_segment_drain_timeout()
-            drained, remaining = _drain_interviewer_segments(drain_timeout_sec)
-            if _interviewer_asr_thread and _interviewer_asr_thread.is_alive() and _interviewer_asr_thread is not current_thread:
-                _interviewer_asr_thread.join(timeout=drain_timeout_sec)
-                drained = _interviewer_segment_backlog(runtime) == 0
-                remaining = _interviewer_segment_backlog(runtime)
+            drain_deadline = time.monotonic() + drain_timeout_sec
+            if asr_thread and asr_thread.is_alive() and asr_thread is not current_thread:
+                asr_thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+            else:
+                _drain_interviewer_segments(max(0.0, drain_deadline - time.monotonic()), runtime=runtime)
+            remaining = _interviewer_segment_backlog(runtime)
+            drained = remaining == 0
             _ilog.info(
                 "INTERVIEWER_ASR_DRAIN drained=%s remaining=%d segment_emitted=%d segment_dropped=%d raw_queue_drop_count=%d loopback_discontinuity_count=%d max_raw_chunk_samples=%d max_segment_queue_depth=%d",
                 drained,
@@ -1421,15 +1439,20 @@ def stop_interview_loop():
         if runtime_snapshot is None:
             runtime_snapshot = _snapshot_interviewer_runtime(runtime, live=False)
         _set_last_interviewer_runtime_snapshot(runtime_snapshot)
-    if _interviewer_asr_thread and _interviewer_asr_thread.is_alive() and _interviewer_asr_thread is not current_thread:
-        _interviewer_asr_thread.join(timeout=0.2)
-    _interviewer_asr_thread = None
-    if _flush_thread and _flush_thread.is_alive() and _flush_thread is not current_thread:
-        _flush_thread.join(timeout=1)
-    _flush_thread = None
-    if _candidate_thread and _candidate_thread.is_alive() and _candidate_thread is not current_thread:
-        _candidate_thread.join(timeout=5)
+        runtime.asr_thread = None
+        runtime.flush_thread = None
+    elif asr_thread and asr_thread.is_alive() and asr_thread is not current_thread:
+        asr_thread.join(timeout=0.2)
+    if _interviewer_asr_thread is asr_thread:
+        _interviewer_asr_thread = None
+    if flush_thread and flush_thread.is_alive() and flush_thread is not current_thread:
+        flush_thread.join(timeout=1)
+    if _flush_thread is flush_thread:
+        _flush_thread = None
+    candidate_thread = _candidate_thread
     _candidate_thread = None
+    if candidate_thread and candidate_thread.is_alive() and candidate_thread is not current_thread:
+        candidate_thread.join(timeout=5)
 
     if not _interviewer_streaming:
         try:
@@ -1468,9 +1491,98 @@ def stop_interview_loop():
     if single_mic is not None:
         broadcast_single_mic(None)
     _candidate_flush_event.clear()
-    _set_interviewer_runtime(None)
+    if _interviewer_runtime is runtime:
+        _set_interviewer_runtime(None)
     gc.collect()
     _ilog.info("INTERVIEW_STOP qa_count=%d", len(session.qa_pairs))
+
+
+def _finalize_unexpected_interview_stop(
+    session,
+    transcript_epoch: int,
+    error_message: str,
+    *,
+    single_mic: SingleMicSession | None = None,
+    runtime: Optional[_InterviewerRuntime] = None,
+) -> None:
+    """Unified teardown when _interview_worker exits abnormally (device lost or crash)."""
+    global _candidate_thread, _interview_thread, _interviewer_streaming, _interviewer_config
+    with conversation_lock:
+        if session.transcript_epoch != transcript_epoch:
+            return
+    _stop_event.set()
+    _pause_event.clear()
+    _candidate_flush_event.set()
+    if single_mic is not None:
+        single_mic.close()
+    try:
+        _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=False)
+    except Exception:
+        _elog.warning("candidate capture stop during unexpected exit failed", exc_info=True)
+    current_thread = threading.current_thread()
+    candidate_thread = _candidate_thread
+    if candidate_thread and candidate_thread.is_alive() and candidate_thread is not current_thread:
+        candidate_thread.join(timeout=3.0)
+    if _candidate_thread is candidate_thread:
+        _candidate_thread = None
+    if _interview_thread is current_thread:
+        _interview_thread = None
+
+    if not _interviewer_streaming:
+        try:
+            cfg = get_capture_config()
+            now = time.monotonic()
+            _try_flush_asr_merge_buffer(cfg, session, now, True)
+            _try_flush_asr_question_group(cfg, session, now, True)
+        except Exception:
+            _elog.debug("final ASR flush during unexpected stop skipped", exc_info=True)
+    _interviewer_streaming = False
+    _interviewer_config = None
+    with _asr_state_lock, conversation_lock:
+        if session.transcript_epoch != transcript_epoch:
+            return
+        session.stop_transcript_capture()
+
+    wait_sec = float(getattr(get_config(), "assist_stop_answer_wait_sec", 3.0))
+    if wait_sec > 0 and not _wait_for_answer_work_idle(min(wait_sec, 20.0)):
+        _elog.warning("ANSWER_STOP_WAIT_TIMEOUT pending/inflight work will be cancelled")
+    cancel_answer_work(reset_session_data=False)
+
+    try:
+        review_integration.on_assist_stop(session)
+    except Exception:
+        _elog.error("review_integration.on_assist_stop failed during unexpected stop", exc_info=True)
+
+    with conversation_lock:
+        session.is_recording = False
+        session.is_paused = False
+        session.single_mic = None
+        if hasattr(session, "close_candidate_answer_window"):
+            session.close_candidate_answer_window()
+        if len(session.transcription_history) > 30:
+            session.transcription_history = session.transcription_history[-30:]
+        if hasattr(session, "candidate_transcription_history") and len(session.candidate_transcription_history) > 30:
+            session.candidate_transcription_history = session.candidate_transcription_history[-30:]
+
+    if runtime is not None:
+        remaining = _interviewer_segment_backlog(runtime)
+        _set_last_interviewer_runtime_snapshot(
+            _snapshot_interviewer_runtime(
+                runtime,
+                live=False,
+                drained=remaining == 0,
+                remaining_after_drain=remaining,
+            )
+        )
+        if _interviewer_runtime is runtime:
+            _set_interviewer_runtime(None)
+    _candidate_flush_event.clear()
+
+    broadcast({"type": "error", "message": error_message})
+    broadcast({"type": "recording", "value": False, "candidate_capture_provider": ""})
+    broadcast({"type": "paused", "value": False})
+    if single_mic is not None:
+        broadcast_single_mic(None)
 
 
 def pause_interview():
@@ -1662,11 +1774,13 @@ def submit_mmpg_question(request, *, transcript_epoch: int | None = None) -> boo
 
 
 # H4: 独立 flush worker 线程，避免阻塞音频采集主循环
-def _flush_worker():
+def _flush_worker(runtime: Optional[_InterviewerRuntime] = None):
     """独立线程处理 ASR buffer flush，避免阻塞音频采集"""
-    while not _flush_stop_event.is_set():
+    stop_event = runtime.flush_stop_event if runtime is not None else _flush_stop_event
+    flush_queue = runtime.flush_queue if runtime is not None else _flush_queue
+    while not stop_event.is_set():
         try:
-            flush_signal = _flush_queue.get(timeout=0.1)
+            flush_signal = flush_queue.get(timeout=0.1)
             if flush_signal:
                 cfg, session, now, epoch = flush_signal
                 with _asr_state_lock:
@@ -1808,23 +1922,27 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
     )
     _gc_thread.start()
 
-    # H4: 启动独立 flush 线程
-    global _flush_thread
-    _flush_thread = threading.Thread(
-        target=_flush_worker, daemon=True, name="assist-flush"
+    # H4: 启动独立 flush 线程（封装在 per-session runtime 内，防止跨会话泄漏或误 join）
+    global _flush_thread, _interviewer_asr_thread
+    runtime.flush_stop_event.clear()
+    runtime.flush_thread = threading.Thread(
+        target=_flush_worker, args=(runtime,), daemon=True, name="assist-flush"
     )
-    _flush_stop_event.clear()
-    _flush_thread.start()
+    if _interviewer_runtime is runtime:
+        _flush_thread = runtime.flush_thread
+    runtime.flush_thread.start()
 
-    global _interviewer_asr_thread
-    _interviewer_asr_thread = threading.Thread(
+    runtime.asr_thread = threading.Thread(
         target=_interviewer_asr_worker,
         args=(runtime, session, cfg),
         daemon=True,
         name="assist-interviewer-asr",
     )
-    _interviewer_asr_thread.start()
+    if _interviewer_runtime is runtime:
+        _interviewer_asr_thread = runtime.asr_thread
+    runtime.asr_thread.start()
 
+    unexpected_error: Optional[str] = None
     try:
         while not _stop_event.is_set() and session.transcript_epoch == transcript_epoch:
             if _pause_event.is_set():
@@ -1837,7 +1955,7 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
                     pause_flushed = True
                 now = time.monotonic()
                 try:
-                    _flush_queue.put_nowait((cfg, session, now, transcript_epoch))
+                    runtime.flush_queue.put_nowait((cfg, session, now, transcript_epoch))
                 except queue.Full:
                     pass
                 time.sleep(0.1)
@@ -1854,13 +1972,13 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
                     continue
             if not audio_capture.is_running:
                 _elog.error("Interview worker: audio capture stopped unexpectedly, exiting loop")
-                broadcast({"type": "error", "message": "音频采集异常中断，面试录音已停止"})
+                unexpected_error = "音频采集异常中断，面试录音已停止"
                 break
             now = time.monotonic()
             _refresh_interviewer_raw_drop_count(runtime, audio_input)
             # H4: 将 flush 逻辑移到独立线程，避免阻塞音频采集
             try:
-                _flush_queue.put_nowait((cfg, session, now, transcript_epoch))
+                runtime.flush_queue.put_nowait((cfg, session, now, transcript_epoch))
             except queue.Full:
                 pass  # 如果队列满，跳过本次 flush
 
@@ -1914,11 +2032,7 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
         _flush_interviewer_tail(runtime, vad, cfg, session, "stop_flush")
     except Exception as e:
         _elog.error("Interview worker crashed: %s", e, exc_info=True)
-        with conversation_lock:
-            if session.transcript_epoch == transcript_epoch:
-                session.is_recording = False
-                broadcast({"type": "error", "message": f"\u9762\u8bd5\u5faa\u73af\u5f02\u5e38: {e}"})
-                broadcast({"type": "recording", "value": False})
+        unexpected_error = f"\u9762\u8bd5\u5faa\u73af\u5f02\u5e38: {e}"
     finally:
         # 保证 worker 任何退出路径 (正常 / 异常 / 早退) 都释放音频设备。
         # AudioCapture.stop 是幂等的: 即使外部 stop_interview_loop 已经先调过,
@@ -1937,20 +2051,35 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
             _gc_thread.join(timeout=0.5)
         except Exception:
             pass
-        if _interviewer_runtime is runtime:
-            _flush_stop_event.set()
+        runtime.flush_stop_event.set()
+        flush_thread = runtime.flush_thread
         try:
-            if _flush_thread and _flush_thread.is_alive():
-                _flush_thread.join(timeout=0.5)
+            if flush_thread and flush_thread.is_alive():
+                flush_thread.join(timeout=0.5)
         except Exception:
             pass
-        try:
-            if _interviewer_asr_thread and _interviewer_asr_thread.is_alive():
-                runtime.drain_event.set()
-                _interviewer_asr_thread.join(timeout=_interviewer_segment_drain_timeout())
-        except Exception:
-            pass
+        if _flush_thread is flush_thread:
+            _flush_thread = None
+        if not runtime.stop_managed_by_caller:
+            asr_thread = runtime.asr_thread
+            try:
+                if asr_thread and asr_thread.is_alive():
+                    runtime.drain_event.set()
+                    asr_thread.join(timeout=_interviewer_segment_drain_timeout())
+            except Exception:
+                pass
+            if _interviewer_asr_thread is asr_thread:
+                _interviewer_asr_thread = None
         _refresh_interviewer_raw_drop_count(runtime, audio_input)
+
+    if unexpected_error is not None and not runtime.stop_managed_by_caller and not _stop_event.is_set():
+        _finalize_unexpected_interview_stop(
+            session,
+            transcript_epoch,
+            unexpected_error,
+            single_mic=single_mic,
+            runtime=runtime,
+        )
 
 
 def _publish_candidate_transcription(

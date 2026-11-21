@@ -99,7 +99,7 @@ class AssistAsrStateMachine:
         }))
         return "queued" if queued else "no_answer_model"
 
-    def flush_question_group_now(self, cfg, session) -> None:
+    def flush_question_group_now(self, cfg, session, *, immediate: bool = False) -> None:
         group = self.pending_group
         if group is None:
             return
@@ -117,6 +117,7 @@ class AssistAsrStateMachine:
         if group.transcript_anchors:
             session.group_transcript_question(group.transcript_anchors)
         now_mono = self.clock()
+        grace_sec = 0.0 if immediate else _asr_late_constraint_grace_sec(cfg)
         turn_id = self.begin_asr_turn()
         self.logger.info(
             "ASR_QUESTION turn=%d utterances=%d text=%r",
@@ -133,8 +134,8 @@ class AssistAsrStateMachine:
                     "origin": "asr",
                     "asr_turn_id": turn_id,
                     "utterances": list(group.utterances),
-                    "dispatch_after_mono": now_mono + _asr_late_constraint_grace_sec(cfg),
-                    "asr_tail_grace_until_mono": now_mono + _asr_late_constraint_grace_sec(cfg),
+                    "dispatch_after_mono": 0.0 if immediate else now_mono + grace_sec,
+                    "asr_tail_grace_until_mono": 0.0 if immediate else now_mono + grace_sec,
                     **({"transcript_anchor": group.transcript_anchor} if group.transcript_anchor else {}),
                 },
             )
@@ -154,7 +155,9 @@ class AssistAsrStateMachine:
             max_wait = max(max_wait, fast_confirm + confirm)
         since_last = now_mono - group.last_mono
         age = now_mono - group.first_mono
-        if force or age >= max_wait:
+        if force:
+            self.flush_question_group_now(cfg, session, immediate=True)
+        elif age >= max_wait:
             self.flush_question_group_now(cfg, session)
         elif group.has_promote and len(group.utterances) == 1 and since_last >= fast_confirm:
             self.flush_question_group_now(cfg, session)

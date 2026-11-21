@@ -1064,3 +1064,134 @@ def test_interview_worker_detects_capture_stopped_and_exits(monkeypatch):
     )
     # audio.stop 在 finally 里仍应被调用
     assert "assist" in audio.stop_calls
+
+
+def test_unexpected_capture_stop_clears_recording_stops_candidate_and_finalizes_review(monkeypatch):
+    audio = _RecordingAudioCapture()
+    candidate_audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    _wire_common_fakes(monkeypatch, audio, session)
+    monkeypatch.setattr(pipeline, "_candidate_audio_capture", candidate_audio)
+    monkeypatch.setattr(pipeline, "_wait_for_answer_work_idle", lambda _timeout: True)
+    monkeypatch.setattr(pipeline, "cancel_answer_work", lambda **_kwargs: None)
+
+    broadcast_log: list[dict] = []
+    review_stopped: list[object] = []
+    candidate_exited = threading.Event()
+    monkeypatch.setattr(pipeline, "broadcast", broadcast_log.append)
+    monkeypatch.setattr(pipeline.review_integration, "on_assist_stop", review_stopped.append)
+
+    def _fake_candidate_worker():
+        while not pipeline._stop_event.is_set():
+            time.sleep(0.01)
+        candidate_exited.set()
+
+    cand_thread = threading.Thread(target=_fake_candidate_worker, daemon=True)
+    cand_thread.start()
+    pipeline._candidate_thread = cand_thread
+
+    iter_count = {"n": 0}
+
+    def _chunk_provider():
+        iter_count["n"] += 1
+        if iter_count["n"] > 1:
+            audio._is_running = False
+        return None
+
+    audio._chunk_provider = _chunk_provider
+
+    worker = threading.Thread(target=pipeline._interview_worker, daemon=True)
+    worker.start()
+    worker.join(timeout=3.0)
+
+    assert not worker.is_alive()
+    assert candidate_exited.wait(timeout=2.0)
+    assert session.is_recording is False
+    assert session.is_paused is False
+    assert review_stopped == [session]
+    assert "assist-candidate" in candidate_audio.stop_calls
+    assert any(msg.get("type") == "recording" and msg.get("value") is False for msg in broadcast_log)
+    assert any(msg.get("type") == "error" and "音频采集异常中断" in msg.get("message", "") for msg in broadcast_log)
+
+
+def test_stop_interview_loop_stops_runtime_flush_thread_and_uses_single_drain_deadline(monkeypatch):
+    audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    _wire_common_fakes(monkeypatch, audio, session)
+    monkeypatch.setattr(pipeline, "_wait_for_answer_work_idle", lambda _timeout: True)
+    monkeypatch.setattr(pipeline, "cancel_answer_work", lambda **_kwargs: None)
+    monkeypatch.setattr(pipeline.review_integration, "on_assist_stop", lambda _s: None)
+    monkeypatch.setattr(
+        pipeline,
+        "get_config",
+        lambda: AppConfig(
+            stt_provider="doubao",
+            doubao_stt_api_key="test-asr",
+            assist_stop_answer_wait_sec=0,
+            assist_interviewer_asr_drain_timeout_sec=0.5,
+        ),
+    )
+
+    runtime = pipeline._new_interviewer_runtime()
+    runtime.transcript_epoch = session.transcript_epoch
+    runtime.segment_queue.put(
+        pipeline.InterviewerSegment(np.zeros(1600, dtype=np.float32), 16000, 0.0, 0.1, 0.1, "silence", False)
+    )
+    release_stuck_asr = threading.Event()
+
+    def _stuck_asr():
+        # Block longer than 1x drain_timeout_sec (0.5s) to prove stop_interview_loop does not wait 2x!
+        release_stuck_asr.wait(timeout=3.0)
+
+    flush_thread = threading.Thread(target=pipeline._flush_worker, args=(runtime,), daemon=True)
+    asr_thread = threading.Thread(target=_stuck_asr, daemon=True)
+    runtime.flush_thread = flush_thread
+    runtime.asr_thread = asr_thread
+    flush_thread.start()
+    asr_thread.start()
+    pipeline._set_interviewer_runtime(runtime)
+
+    try:
+        started = time.monotonic()
+        pipeline.stop_interview_loop()
+        elapsed = time.monotonic() - started
+
+        # Flush thread must have been explicitly stopped by stop_interview_loop even with no _interview_thread.
+        assert runtime.flush_stop_event.is_set() is True
+        assert not flush_thread.is_alive()
+        # Unified single deadline (0.5s): must NOT double-wait (~1.0s+).
+        assert elapsed < 0.9, f"Expected single drain deadline (~0.5s), took {elapsed:.2f}s"
+    finally:
+        release_stuck_asr.set()
+        asr_thread.join(timeout=1.0)
+
+
+def test_old_worker_finally_only_joins_its_own_runtime_threads_not_new_session(monkeypatch):
+    audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    _wire_common_fakes(monkeypatch, audio, session)
+
+    new_runtime = pipeline._new_interviewer_runtime()
+    new_runtime_flush_alive = threading.Event()
+    new_runtime_flush = threading.Thread(target=pipeline._flush_worker, args=(new_runtime,), daemon=True)
+    new_runtime.flush_thread = new_runtime_flush
+    new_runtime_flush.start()
+    new_runtime_flush_alive.set()
+
+    def _swap_to_new_session():
+        # Simulate a new session taking over globals while old worker is still unwinding.
+        pipeline._set_interviewer_runtime(new_runtime)
+        pipeline._flush_thread = new_runtime_flush
+        pipeline._stop_event.set()
+        return None
+
+    audio._chunk_provider = _swap_to_new_session
+
+    try:
+        pipeline._interview_worker()
+        # New session's flush_stop_event and flush_thread must remain completely untouched!
+        assert not new_runtime.flush_stop_event.is_set()
+        assert new_runtime_flush.is_alive()
+    finally:
+        new_runtime.flush_stop_event.set()
+        new_runtime_flush.join(timeout=1.0)
