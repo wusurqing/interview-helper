@@ -227,3 +227,86 @@ def test_cli_reindex_outputs_stats(setup_kb, capsys):
     out = capsys.readouterr().out
     assert exit_code == 0
     assert "total_docs" in out
+
+
+def test_remove_file_during_reindex_does_not_resurrect_ghost_doc(setup_kb, monkeypatch):
+    """reindex 已扫描并正在加载某文件时并发删除：删除必须等重建结束，不能被重建写回幽灵文档。"""
+    import threading
+
+    indexer, kb_dir, _ = setup_kb
+    (kb_dir / "a.md").write_text("# A\n\nalpha", encoding="utf-8")
+
+    from services.kb.loaders import markdown as md_mod
+
+    real_load = md_mod.MarkdownLoader.load
+    loading = threading.Event()
+    release = threading.Event()
+
+    def slow_load(self, file_path, *, rel_path):
+        raw = real_load(self, file_path, rel_path=rel_path)
+        loading.set()
+        assert release.wait(timeout=5.0)
+        return raw
+
+    monkeypatch.setattr(md_mod.MarkdownLoader, "load", slow_load)
+
+    errors: list[BaseException] = []
+
+    def run(fn, *args):
+        try:
+            fn(*args)
+        except BaseException as e:  # pragma: no cover - surfaced via assert below
+            errors.append(e)
+
+    t_reindex = threading.Thread(target=run, args=(indexer.reindex, True))
+    t_reindex.start()
+    try:
+        assert loading.wait(timeout=5.0)
+        t_remove = threading.Thread(target=run, args=(indexer.remove_file, "a.md"))
+        t_remove.start()
+        # 重建持有互斥期间删除不得完成（否则重建随后会把记录写回）
+        t_remove.join(timeout=0.3)
+        assert t_remove.is_alive()
+    finally:
+        release.set()
+    t_reindex.join(timeout=5.0)
+    t_remove.join(timeout=5.0)
+    assert not t_reindex.is_alive() and not t_remove.is_alive()
+    assert errors == []
+
+    assert not (kb_dir / "a.md").exists()
+    assert indexer.list_docs() == []
+    assert indexer.stats()["total_chunks"] == 0
+
+
+def test_kb_delete_route_runs_on_index_lane(setup_kb, monkeypatch):
+    """删除接口必须与 reindex/reindex_file 同走 KB 索引泳道，而不是查询泳道。"""
+    import threading
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from api import kb as kb_api
+    from core import resource_lanes as rl
+
+    indexer, kb_dir, _ = setup_kb
+    (kb_dir / "a.md").write_text("# A\n\nt", encoding="utf-8")
+    seen: dict[str, str] = {}
+    real_remove = indexer.remove_file
+
+    def spy_remove(rel):
+        seen["thread"] = threading.current_thread().name
+        return real_remove(rel)
+
+    monkeypatch.setattr(indexer, "remove_file", spy_remove)
+
+    app = FastAPI()
+    app.include_router(kb_api.router, prefix="/api")
+    try:
+        with TestClient(app) as client:
+            res = client.delete("/api/kb/docs", params={"path": "a.md"})
+        assert res.status_code == 200
+        assert seen["thread"].startswith("ia-kb-index")
+        assert not (kb_dir / "a.md").exists()
+    finally:
+        rl.shutdown_resource_lanes(wait=True)

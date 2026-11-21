@@ -128,6 +128,12 @@ def _write_upload_bytes(rel_str: str, content: bytes) -> None:
     dest.write_bytes(content)
 
 
+def _save_and_index_upload(rel_str: str, content: bytes) -> dict:
+    with indexer._mutation_lock:
+        _write_upload_bytes(rel_str, content)
+        return indexer.reindex_file(rel_str)
+
+
 def _safe_rel_path(subdir: str, filename: str, allowed_exts: set[str]) -> Path:
     """阻断 path traversal、绝对路径、Windows 驱动器相对路径、不允许的扩展名 (.doc 单独 415)。"""
     name = (filename or "").strip()
@@ -172,14 +178,13 @@ async def kb_upload(
 
     rel_str = rel.as_posix()
     try:
-        await run_in_threadpool(_write_upload_bytes, rel_str, content)
+        info = await _run_kb_index_lane(_save_and_index_upload, rel_str, content)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"invalid path: {e}") from e
     except OSError:
         _log.exception("kb upload write failed path=%s", rel_str)
         raise HTTPException(status_code=500, detail="保存知识库文件失败，请检查磁盘权限") from None
 
-    info = await _run_kb_index_lane(indexer.reindex_file, rel_str)
     return {
         "path": rel_str,
         "size": len(content),
@@ -208,5 +213,7 @@ async def kb_delete_doc(path: str) -> dict:
         await run_in_threadpool(indexer.resolve_kb_file, rel)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"invalid path: {e}") from e
-    await _run_kb_query_lane(indexer.remove_file, rel)
+    # 删除会改写索引与磁盘文件，必须与 reindex/reindex_file 同走索引泳道（indexer 内另有互斥锁兜底），
+    # 否则可能与进行中的重建并发，被重建把已删除文件写回成幽灵文档。
+    await _run_kb_index_lane(indexer.remove_file, rel)
     return {"ok": True, "path": rel}

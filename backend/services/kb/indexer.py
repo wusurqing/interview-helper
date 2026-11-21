@@ -18,6 +18,11 @@ _log = get_logger(__name__)
 
 _store: Optional[KBStore] = None
 _lock = threading.RLock()
+# 串行化所有“写索引 + 动磁盘文件”的操作（reindex / reindex_file / remove_file）。
+# 与 _lock 分离：_lock 只保护单例获取，查询路径不会被长时间的重建阻塞。
+# 不能依赖调用方泳道串行：删除与重建可能来自不同泳道/线程（或 IA_KB_INDEX_WORKERS>1），
+# 若不互斥，reindex 已扫描/加载到的文件被并发删除后，会被 upsert_doc/replace_chunks 写回成幽灵文档。
+_mutation_lock = threading.RLock()
 
 _FAILED_DOC_EXTENSIONS = {".doc"}
 _DOC_FAIL_MSG = "不支持 .doc，请在 Word 里另存为 .docx 后再上传"
@@ -169,6 +174,11 @@ def _index_single_file(
 
 
 def reindex(force: bool = False) -> dict[str, Any]:
+    with _mutation_lock:
+        return _reindex_locked(force)
+
+
+def _reindex_locked(force: bool) -> dict[str, Any]:
     cfg = get_config()
     kb_dir = resolve_path(cfg.kb_dir)
     kb_dir.mkdir(parents=True, exist_ok=True)
@@ -209,6 +219,11 @@ def reindex_file(rel_path: str, *, force: bool = True) -> dict[str, Any]:
     """按相对路径增量重建单文件索引（不再触发全库 rglob 扫描）；文件不存在时删除记录。"""
     norm = validate_rel_path(rel_path)
     path = resolve_kb_file(norm)
+    with _mutation_lock:
+        return _reindex_file_locked(path, norm, force=force)
+
+
+def _reindex_file_locked(path: Path, norm: str, *, force: bool) -> dict[str, Any]:
     store = _get_store()
     if not path.exists() or not path.is_file():
         store.delete_doc(norm)
@@ -242,13 +257,16 @@ def remove_file(rel_path: str) -> None:
     except ValueError as e:
         _log.warning("kb indexer remove_file 拒绝非法路径 %r: %s", rel_path, e)
         return
-    store = _get_store()
-    store.delete_doc(validate_rel_path(rel_path))
-    try:
-        if full.is_file() or full.is_symlink():
-            full.unlink()
-    except Exception as e:  # pragma: no cover
-        _log.warning("kb indexer remove_file 删除磁盘文件失败 %s: %s", rel_path, e)
+    norm = validate_rel_path(rel_path)
+    # 先删磁盘再删索引，且整体与 reindex 互斥：即使锁外有人绕过（如 CLI 直接 rglob），
+    # 文件已不在盘上，下一次 reindex 也会清掉残留记录，不会复活。
+    with _mutation_lock:
+        try:
+            if full.is_file() or full.is_symlink():
+                full.unlink()
+        except Exception as e:  # pragma: no cover
+            _log.warning("kb indexer remove_file 删除磁盘文件失败 %s: %s", rel_path, e)
+        _get_store().delete_doc(norm)
 
 
 __all__ = [
