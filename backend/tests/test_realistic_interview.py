@@ -14,8 +14,6 @@ import os
 import statistics
 from dataclasses import dataclass, field
 
-import aiohttp
-
 BASE = os.environ.get("BASE_URL", "http://127.0.0.1:18080")
 WS_URL = BASE.replace("http", "ws") + "/ws"
 API_ASK = BASE + "/api/ask"
@@ -124,6 +122,8 @@ class RoundResult:
 
 
 async def run_test():
+    import aiohttp
+
     print(f"\n{'='*76}")
     print(f"  真实面试场景模拟 — {len(QUESTIONS)} 轮对话")
     print("  测试: 中英混合名词 | 口语停顿 | 连续追问性能 | 上下文关联")

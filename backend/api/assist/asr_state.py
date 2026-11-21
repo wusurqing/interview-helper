@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
+from core.session import conversation_lock
 from services.stt import (
     build_asr_question_group_text,
     classify_asr_question_candidate,
@@ -78,7 +79,8 @@ class AssistAsrStateMachine:
         text = text.strip()
         if not text:
             return "empty"
-        session.add_transcription(text)
+        with conversation_lock:
+            session.add_transcription(text)
         self.broadcast({"type": "transcription", "text": text})
         return self.submit_final_question(cfg, session, text, mmpg_trace)
 
@@ -99,7 +101,7 @@ class AssistAsrStateMachine:
         }))
         return "queued" if queued else "no_answer_model"
 
-    def flush_question_group_now(self, cfg, session) -> None:
+    def flush_question_group_now(self, cfg, session, *, immediate: bool = False) -> None:
         group = self.pending_group
         if group is None:
             return
@@ -117,6 +119,7 @@ class AssistAsrStateMachine:
         if group.transcript_anchors:
             session.group_transcript_question(group.transcript_anchors)
         now_mono = self.clock()
+        grace_sec = 0.0 if immediate else _asr_late_constraint_grace_sec(cfg)
         turn_id = self.begin_asr_turn()
         self.logger.info(
             "ASR_QUESTION turn=%d utterances=%d text=%r",
@@ -133,9 +136,10 @@ class AssistAsrStateMachine:
                     "origin": "asr",
                     "asr_turn_id": turn_id,
                     "utterances": list(group.utterances),
-                    "dispatch_after_mono": now_mono + _asr_late_constraint_grace_sec(cfg),
-                    "asr_tail_grace_until_mono": now_mono + _asr_late_constraint_grace_sec(cfg),
+                    "dispatch_after_mono": 0.0 if immediate else now_mono + grace_sec,
+                    "asr_tail_grace_until_mono": 0.0 if immediate else now_mono + grace_sec,
                     **({"transcript_anchor": group.transcript_anchor} if group.transcript_anchor else {}),
+                    **({"transcript_anchors": tuple(group.transcript_anchors)} if group.transcript_anchors else {}),
                 },
             )
         )
@@ -154,7 +158,9 @@ class AssistAsrStateMachine:
             max_wait = max(max_wait, fast_confirm + confirm)
         since_last = now_mono - group.last_mono
         age = now_mono - group.first_mono
-        if force or age >= max_wait:
+        if force:
+            self.flush_question_group_now(cfg, session, immediate=True)
+        elif age >= max_wait:
             self.flush_question_group_now(cfg, session)
         elif group.has_promote and len(group.utterances) == 1 and since_last >= fast_confirm:
             self.flush_question_group_now(cfg, session)
@@ -180,9 +186,17 @@ class AssistAsrStateMachine:
             self.pending_group is None
             and kind == "candidate"
             and is_asr_question_constraint_tail(cleaned)
-            and self.append_late_constraint_tail(cleaned, source, now_mono, transcript_anchor)
         ):
-            return
+            try:
+                merged_tail = self.append_late_constraint_tail(
+                    cleaned, source, now_mono, transcript_anchor, transcript_anchors,
+                )
+            except TypeError:
+                merged_tail = self.append_late_constraint_tail(
+                    cleaned, source, now_mono, transcript_anchor,
+                )
+            if merged_tail:
+                return
         if (
             self.pending_group is not None
             and kind == "candidate"
@@ -228,7 +242,8 @@ class AssistAsrStateMachine:
         pub = transcription_for_publish(merged_raw, min_sig)
         if not pub:
             return
-        session.add_transcription(pub)
+        with conversation_lock:
+            session.add_transcription(pub)
         self.broadcast({"type": "transcription", "text": pub})
         if self._automatic_answers_enabled(cfg):
             source = (
@@ -280,7 +295,8 @@ class AssistAsrStateMachine:
             return
         gap = float(getattr(cfg, "assist_transcription_merge_gap_sec", 2.0) or 0.0)
         if gap <= 0:
-            session.add_transcription(pub)
+            with conversation_lock:
+                session.add_transcription(pub)
             self.broadcast({"type": "transcription", "text": pub})
             if self._automatic_answers_enabled(cfg):
                 source = (

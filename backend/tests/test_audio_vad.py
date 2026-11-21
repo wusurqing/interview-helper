@@ -179,3 +179,389 @@ def test_windows_microphone_initializes_com_on_stream_open_and_close(monkeypatch
     capture.stop(owner="assist")
 
     assert operations == ["init", "start", "uninit", "init", "stop", "close", "uninit"]
+
+
+def _patch_fake_sounddevice(monkeypatch, *, fail_devices: set[int] | None = None):
+    from types import SimpleNamespace
+    from services import audio
+
+    fail = fail_devices or set()
+    monkeypatch.setattr(audio.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        audio.sd,
+        "query_devices",
+        lambda dev=None, *_args: {"default_samplerate": 16000, "hostapi": 0},
+    )
+    monkeypatch.setattr(audio.sd, "query_hostapis", lambda *_: {"name": "ALSA"})
+
+    def make_stream(**kwargs):
+        if kwargs["device"] in fail:
+            raise OSError(f"device {kwargs['device']} failed")
+        return SimpleNamespace(start=lambda: None, stop=lambda: None, close=lambda: None)
+
+    monkeypatch.setattr(audio.sd, "InputStream", make_stream)
+
+
+def test_microphone_compatibility_falls_back_to_default_input_when_selected_stream_fails(monkeypatch):
+    from types import SimpleNamespace
+    from services import audio
+
+    _patch_fake_sounddevice(monkeypatch, fail_devices={9})
+    # Like sounddevice.default.device this pair supports [0] and [1] but is
+    # neither a list nor a tuple. The output endpoint must never be opened.
+    pair = range(3, 5)
+    monkeypatch.setattr(audio.sd, "default", SimpleNamespace(device=pair))
+
+    def query(device=None, kind=None):
+        if device is None:
+            assert kind == "input"
+            device = pair[0]
+        return {"index": device, "default_samplerate": 48000, "hostapi": 0}
+
+    monkeypatch.setattr(audio.sd, "query_devices", query)
+    make_stream = audio.sd.InputStream
+    opened = []
+
+    def observe(**kwargs):
+        opened.append((kwargs["device"], kwargs["samplerate"]))
+        return make_stream(**kwargs)
+
+    monkeypatch.setattr(audio.sd, "InputStream", observe)
+    capture = AudioCapture()
+    try:
+        capture.start(9, owner="fallback-test", mic_compatibility_mode=True)
+        assert opened == [(9, 48000), (9, 16000), (3, 48000)]
+        assert AudioCapture.active_device_owner(3) == "fallback-test"
+    finally:
+        capture.stop(owner="fallback-test")
+    assert not AudioCapture.is_device_busy(3)
+
+
+def test_global_device_lock_blocks_separate_audio_capture_instances_on_same_device(monkeypatch):
+    import pytest
+    from services.audio import AudioBusyError
+
+    _patch_fake_sounddevice(monkeypatch)
+    first = AudioCapture()
+    second = AudioCapture()
+    other_dev = AudioCapture()
+
+    first.start(7, owner="assist")
+    try:
+        assert AudioCapture.is_device_busy(7) is True
+        assert AudioCapture.active_device_owner(7) == "assist"
+
+        # Different device on a second instance must still succeed (e.g. loopback + candidate mic).
+        other_dev.start(8, owner="assist-candidate")
+        assert AudioCapture.is_device_busy(8) is True
+
+        # Same device on another instance must raise AudioBusyError even with same or different owner.
+        with pytest.raises(AudioBusyError) as exc:
+            second.start(7, owner="audio-test")
+        assert exc.value.current_owner == "assist"
+        assert exc.value.requested_owner == "audio-test"
+
+        # Calling stop() on the failed second instance must NOT release first's claim.
+        second.stop(owner="audio-test")
+        assert AudioCapture.is_device_busy(7) is True
+        assert AudioCapture.active_device_owner(7) == "assist"
+    finally:
+        other_dev.stop(owner="assist-candidate")
+        first.stop(owner="assist")
+
+    assert AudioCapture.is_device_busy(7) is False
+    assert AudioCapture.is_device_busy(8) is False
+
+
+def test_global_device_lock_releases_on_startup_failure(monkeypatch):
+    import pytest
+
+    _patch_fake_sounddevice(monkeypatch, fail_devices={11})
+    cap1 = AudioCapture()
+    with pytest.raises(RuntimeError):
+        cap1.start(11, owner="audio-test")
+
+    assert AudioCapture.is_device_busy(11) is False
+    assert cap1.is_running is False
+    assert cap1.current_owner is None
+
+    # Now allow device 11 to succeed and verify another instance can acquire it.
+    _patch_fake_sounddevice(monkeypatch)
+    cap2 = AudioCapture()
+    cap2.start(11, owner="assist")
+    try:
+        assert AudioCapture.is_device_busy(11) is True
+    finally:
+        cap2.stop(owner="assist")
+    assert AudioCapture.is_device_busy(11) is False
+
+
+def test_sound_test_local_captures_raise_audio_busy_and_routes_map_to_409(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    import pytest
+    from fastapi import HTTPException
+    from api.assist import routes, sound_test
+    from services.audio import AudioBusyError
+
+    _patch_fake_sounddevice(monkeypatch)
+    monkeypatch.setattr(routes, "get_session", lambda: SimpleNamespace(is_recording=False, is_paused=False))
+    monkeypatch.setattr(
+        routes,
+        "get_config",
+        lambda: SimpleNamespace(stt_provider="doubao", doubao_stt_api_key="test-key"),
+    )
+
+    holder = AudioCapture()
+    holder.start(12, owner="assist")
+    try:
+        with pytest.raises(AudioBusyError) as input_busy:
+            sound_test.test_input_audio(12, duration_sec=0.5)
+        assert input_busy.value.current_owner == "assist"
+
+        with pytest.raises(AudioBusyError) as monitor_busy:
+            sound_test.start_input_level_monitor(12)
+        assert monitor_busy.value.current_owner == "assist"
+
+        with pytest.raises(AudioBusyError) as replay_busy:
+            sound_test.replay_preflight_capture_stt(12, repeats=1)
+        assert replay_busy.value.current_owner == "assist"
+
+        with pytest.raises(HTTPException) as route_input:
+            asyncio.run(routes.api_audio_test_input({"device_id": 12}))
+        assert route_input.value.status_code == 409
+
+        with pytest.raises(HTTPException) as route_monitor:
+            asyncio.run(routes.api_audio_test_input_start({"device_id": 12}))
+        assert route_monitor.value.status_code == 409
+
+        with pytest.raises(HTTPException) as route_replay:
+            asyncio.run(routes.api_preflight_replay({"device_id": 12, "repeats": 1}))
+        assert route_replay.value.status_code == 409
+    finally:
+        holder.stop(owner="assist")
+    assert AudioCapture.is_device_busy(12) is False
+
+
+def test_soundcard_reader_crash_clears_owner_and_stale_token_cannot_revoke_restarted_claim(monkeypatch):
+    import threading
+    from services import audio
+
+    _patch_fake_sounddevice(monkeypatch)
+    cap = AudioCapture()
+    cap.start(15, owner="assist")
+    try:
+        old_token = cap._sc_stop
+        cap.stop(owner="assist")
+        assert AudioCapture.is_device_busy(15) is False
+
+        # Restart same instance on device 15 -> gets a fresh token.
+        cap.start(15, owner="assist-v2")
+        assert cap._sc_stop is not old_token
+        # Simulated delayed release from an older reader token must NOT revoke the active claim.
+        cap._release_devices({15}, token=old_token)
+        assert AudioCapture.is_device_busy(15) is True
+        assert AudioCapture.active_device_owner(15) == "assist-v2"
+    finally:
+        cap.stop(owner="assist-v2")
+    assert AudioCapture.is_device_busy(15) is False
+
+    # Also exercise actual soundcard _reader crash path releasing _ACTIVE_DEVICES and clearing owner.
+    crashed = threading.Event()
+    monkeypatch.setitem(audio._SC_ID_MAP, 20099, "fake-guid")
+
+    class _BoomSC:
+        @staticmethod
+        def get_microphone(_guid, include_loopback=True):
+            crashed.set()
+            raise RuntimeError("WASAPI device disconnected")
+
+    monkeypatch.setattr(audio, "_sc", _BoomSC, raising=False)
+    sc_cap = AudioCapture()
+    sc_cap.start(20099, owner="assist")
+    assert crashed.wait(timeout=2.0)
+    sc_cap._sc_thread.join(timeout=2.0)
+    assert sc_cap.is_running is False
+    assert sc_cap.current_owner is None
+    assert AudioCapture.is_device_busy(20099) is False
+
+
+def test_concurrent_input_level_monitor_start_serializes_and_never_orphans_device(monkeypatch):
+    import threading
+    from api.assist import sound_test
+
+    _patch_fake_sounddevice(monkeypatch)
+    orig_start = AudioCapture.start
+    entered_first = threading.Event()
+    release_first = threading.Event()
+
+    def slow_start(self, dev_id, *args, **kwargs):
+        orig_start(self, dev_id, *args, **kwargs)
+        if dev_id == 41:
+            entered_first.set()
+            release_first.wait(timeout=2.0)
+
+    monkeypatch.setattr(AudioCapture, "start", slow_start)
+
+    t1 = threading.Thread(target=sound_test.start_input_level_monitor, args=(41,), daemon=True)
+    t2 = threading.Thread(target=sound_test.start_input_level_monitor, args=(42,), daemon=True)
+    t1.start()
+    assert entered_first.wait(timeout=2.0)
+    t2.start()
+    release_first.set()
+    t1.join(timeout=3.0)
+    t2.join(timeout=3.0)
+
+    sound_test.stop_input_level_monitor()
+    assert AudioCapture.is_device_busy(41) is False
+    assert AudioCapture.is_device_busy(42) is False
+    assert sound_test.get_input_level_status()["running"] is False
+
+
+def test_soundcard_hot_path_never_calls_catch_warnings(monkeypatch):
+    import threading
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from services import audio
+
+    recorded_chunks: list[np.ndarray] = []
+    enough = threading.Event()
+    calls = {"count": 0}
+
+    def forbid_catch_warnings(*_args, **_kwargs):
+        raise AssertionError("warnings.catch_warnings must not be called on 64ms WASAPI hot path")
+
+    class _FakeRecorder:
+        def record(self, numframes: int):
+            calls["count"] += 1
+            if calls["count"] >= 4:
+                enough.set()
+            return np.ones((numframes, 1), dtype=np.float32) * 0.05
+
+    class _FakeMic:
+        name = "Fake Loopback"
+
+        @contextmanager
+        def recorder(self, **_kwargs):
+            yield _FakeRecorder()
+
+    class _FakeSC:
+        @staticmethod
+        def get_microphone(_guid, include_loopback=True):
+            return _FakeMic()
+
+    monkeypatch.setattr(audio.warnings, "catch_warnings", forbid_catch_warnings)
+    monkeypatch.setattr(audio, "_sc", _FakeSC, raising=False)
+    monkeypatch.setitem(audio._SC_ID_MAP, 20088, "guid-88")
+
+    cap = AudioCapture()
+    cap.start(20088, on_audio=recorded_chunks.append, owner="assist")
+    try:
+        assert enough.wait(timeout=2.0)
+    finally:
+        cap.stop(owner="assist")
+
+    assert calls["count"] >= 4
+    assert len(recorded_chunks) >= 1
+
+
+def test_soundcard_device_cache_concurrent_read_write_is_thread_safe(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from services import audio
+
+    speakers = [
+        SimpleNamespace(id=f"guid-{i}", name=f"Speaker {i}", channels=2)
+        for i in range(6)
+    ]
+
+    class _FakeSC:
+        @staticmethod
+        def default_speaker():
+            return speakers[0]
+
+        @staticmethod
+        def all_speakers():
+            return list(speakers)
+
+    monkeypatch.setattr(audio, "_HAS_SC", True)
+    monkeypatch.setattr(audio, "_sc", _FakeSC, raising=False)
+    monkeypatch.setattr(audio, "_SC_DEVICE_CACHE", {})
+    monkeypatch.setattr(audio, "_SC_ID_MAP", {})
+
+    errors: list[Exception] = []
+    barrier = threading.Barrier(6)
+
+    def writer():
+        try:
+            barrier.wait(timeout=5.0)
+            for _ in range(40):
+                devs = audio._get_sc_loopback_devices()
+                assert len(devs) == 6
+        except Exception as exc:
+            errors.append(exc)
+
+    def reader():
+        try:
+            barrier.wait(timeout=5.0)
+            for _ in range(80):
+                for idx in range(6):
+                    guid = audio._lookup_sc_speaker_guid(audio._SC_ID_BASE + idx)
+                    assert guid is None or guid.startswith("guid-")
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer) for _ in range(3)] + [
+        threading.Thread(target=reader) for _ in range(3)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    assert not errors
+    for idx in range(6):
+        assert audio._lookup_sc_speaker_guid(audio._SC_ID_BASE + idx) is not None
+
+
+def test_loopback_device_enumeration_preserves_speaker_channels(monkeypatch):
+    from types import SimpleNamespace
+    from services import audio
+
+    speaker = SimpleNamespace(name="Test speaker", id="loopback-test-id", channels=6)
+    monkeypatch.setattr(audio, "_HAS_SC", True)
+    monkeypatch.setattr(audio, "_sc", SimpleNamespace(
+        default_speaker=lambda: speaker, all_speakers=lambda: [speaker],
+    ), raising=False)
+    monkeypatch.setattr(audio, "_SC_DEVICE_CACHE", {})
+    monkeypatch.setattr(audio, "_SC_ID_MAP", {})
+    monkeypatch.setattr(audio.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(audio.sd, "query_devices", lambda: [])
+
+    [device] = AudioCapture.list_devices()
+    assert device["is_default_output"] and device["is_loopback"]
+    assert device["channels"] == 6 and device["sample_rate"] == 16000
+    assert audio._lookup_sc_speaker_guid(device["id"]) == speaker.id
+
+
+def test_microphone_compatibility_ignores_broken_default_input_metadata(monkeypatch):
+    from services import audio
+
+    _patch_fake_sounddevice(monkeypatch)
+
+    def query(device=None, kind=None):
+        if device is None:
+            assert kind == "input"
+            return {"index": 3, "default_samplerate": 48000, "hostapi": 99}
+        return {"index": device, "default_samplerate": 48000, "hostapi": 0}
+
+    def query_hostapis(idx):
+        if idx == 99:
+            raise KeyError(99)
+        return {"name": "ALSA"}
+
+    monkeypatch.setattr(audio.sd, "query_devices", query)
+    monkeypatch.setattr(audio.sd, "query_hostapis", query_hostapis)
+
+    attempts = AudioCapture()._sounddevice_attempts(9, True)
+    assert [(item["device"], item["samplerate"]) for item in attempts] == [(9, 48000), (9, 16000)]

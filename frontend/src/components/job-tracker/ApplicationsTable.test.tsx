@@ -177,4 +177,376 @@ describe('ApplicationsTable', () => {
 
     expect(openReviews).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }))
   })
+
+  it('edits and saves new duplicate-title todos even when crypto.randomUUID is unavailable', async () => {
+    const onPatch = vi.fn().mockResolvedValue(true)
+    const originalCrypto = globalThis.crypto
+    let counter = 0
+    Object.defineProperty(globalThis, 'crypto', {
+      configurable: true,
+      value: {
+        getRandomValues: (arr: Uint8Array) => {
+          counter += 1
+          for (let i = 0; i < arr.length; i += 1) arr[i] = (i * 37 + counter * 13) & 0xff
+          return arr
+        },
+      },
+    })
+
+    try {
+      render(
+        <ApplicationsTable
+          applications={[
+            app({
+              todos: [{ id: 'existing-1', title: '跟进 HR', done: true }],
+            }),
+          ]}
+          offerByAppId={new Map()}
+          onPatch={onPatch}
+          onDelete={vi.fn()}
+          onOpenOffer={vi.fn()}
+          onOpenReviews={vi.fn()}
+          search=""
+          selectedId={1}
+          onSelect={vi.fn()}
+          compactDetailLayout={false}
+        />,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /补充信息/ }))
+      fireEvent.change(screen.getByLabelText('待办清单'), {
+        target: { value: '跟进 HR\n跟进 HR\n准备二面' },
+      })
+
+      await act(async () => {
+        fireEvent.click(screen.getAllByRole('button', { name: '保存补充信息' })[0])
+      })
+
+      expect(onPatch).toHaveBeenCalledTimes(1)
+      const [, patchPayload] = onPatch.mock.calls[0]
+      expect(patchPayload.todos).toHaveLength(3)
+      expect(patchPayload.todos[0]).toMatchObject({ id: 'existing-1', title: '跟进 HR', done: true })
+      expect(patchPayload.todos[1].id).toBeTruthy()
+      expect(patchPayload.todos[1].id).not.toBe('existing-1')
+      expect(patchPayload.todos[2].id).toBeTruthy()
+      expect(patchPayload.todos[2].id).not.toBe(patchPayload.todos[1].id)
+    } finally {
+      Object.defineProperty(globalThis, 'crypto', {
+        configurable: true,
+        value: originalCrypto,
+      })
+    }
+  })
+
+  it('preserves unsaved core edits, saveNotice, and open panels when saving extras updates updated_at', async () => {
+    const initial = app({
+      id: 1,
+      company: 'ByteDance',
+      notes: 'old note',
+      todos: [],
+      updated_at: 1710000000,
+    })
+    const second = app({
+      id: 2,
+      company: 'Alibaba',
+      notes: 'other note',
+      updated_at: 1710000005,
+    })
+
+    let currentApps = [initial, second]
+    let rerenderFn!: (ui: React.ReactElement) => void
+    const onPatch = vi.fn(async (id: number, patch: Partial<Application>) => {
+      currentApps = currentApps.map((item) => (
+        item.id === id
+          ? { ...item, ...patch, updated_at: item.updated_at + 100 }
+          : item
+      ))
+      rerenderFn(
+        <ApplicationsTable
+          applications={currentApps}
+          offerByAppId={new Map()}
+          onPatch={onPatch}
+          onDelete={vi.fn()}
+          onOpenOffer={vi.fn()}
+          onOpenReviews={vi.fn()}
+          search=""
+          selectedId={1}
+          onSelect={vi.fn()}
+          compactDetailLayout={false}
+        />,
+      )
+      return true
+    })
+
+    const { rerender } = render(
+      <ApplicationsTable
+        applications={currentApps}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+    rerenderFn = rerender
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑核心信息' }))
+    fireEvent.change(screen.getByLabelText('公司名称'), { target: { value: 'ByteDance AI' } })
+
+    fireEvent.click(screen.getByRole('button', { name: /补充信息/ }))
+    fireEvent.change(screen.getByLabelText('备注'), { target: { value: 'new extra note' } })
+    fireEvent.change(screen.getByLabelText('待办清单'), { target: { value: '准备系统设计' } })
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '保存补充信息' }))
+    })
+
+    expect(onPatch).toHaveBeenCalledTimes(1)
+    expect(screen.getByLabelText('公司名称')).toHaveValue('ByteDance AI')
+    expect(screen.getByLabelText('备注')).toHaveValue('new extra note')
+    expect(screen.getByText('已保存补充信息')).toBeInTheDocument()
+    expect(screen.getByText('核心待保存')).toBeInTheDocument()
+
+    // Switching to another application resets draft and closes edit panels
+    rerender(
+      <ApplicationsTable
+        applications={currentApps}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={2}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+    expect(screen.queryByLabelText('公司名称')).not.toBeInTheDocument()
+    expect(screen.queryByText('已保存补充信息')).not.toBeInTheDocument()
+  })
+
+  it('reacts immediately in quick progress section when draft.stage switches between ongoing and terminal', () => {
+    render(
+      <ApplicationsTable
+        applications={[app({ stage: 'interview1' })]}
+        offerByAppId={new Map()}
+        onPatch={vi.fn()}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+
+    expect(screen.getByText('更新进度')).toBeInTheDocument()
+    expect(screen.getByLabelText('下次跟进')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('当前阶段'), { target: { value: 'interview1_rejected' } })
+    expect(screen.getByText('改结果')).toBeInTheDocument()
+    expect(screen.queryByLabelText('下次跟进')).not.toBeInTheDocument()
+    expect(screen.getByText('已结束 · 不进入待跟进')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('当前阶段'), { target: { value: 'interview2' } })
+    expect(screen.getByText('更新进度')).toBeInTheDocument()
+    expect(screen.getByLabelText('下次跟进')).toBeInTheDocument()
+  })
+
+  it('uses non-blocking two-step delete confirmation with double-click lock instead of window.confirm', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const pendingDelete = deferred<boolean>()
+    const onDelete = vi.fn(() => pendingDelete.promise)
+
+    try {
+      render(
+        <ApplicationsTable
+          applications={[app()]}
+          offerByAppId={new Map()}
+          onPatch={vi.fn()}
+          onDelete={onDelete}
+          onOpenOffer={vi.fn()}
+          onOpenReviews={vi.fn()}
+          search=""
+          selectedId={1}
+          onSelect={vi.fn()}
+          compactDetailLayout={false}
+        />,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /补充信息/ }))
+      fireEvent.click(screen.getByRole('button', { name: '删除这条记录' }))
+
+      expect(confirmSpy).not.toHaveBeenCalled()
+      expect(onDelete).not.toHaveBeenCalled()
+      expect(screen.getByText(/确认删除「ByteDance」/)).toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: '取消' }))
+      expect(screen.queryByRole('button', { name: '确认删除' })).not.toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: '删除这条记录' }))
+      const confirmBtn = screen.getByRole('button', { name: '确认删除' })
+      act(() => {
+        confirmBtn.click()
+        confirmBtn.click()
+      })
+
+      expect(onDelete).toHaveBeenCalledTimes(1)
+      expect(onDelete).toHaveBeenCalledWith(1)
+      expect(screen.getByRole('button', { name: '删除中...' })).toBeDisabled()
+
+      await act(async () => {
+        pendingDelete.resolve(true)
+        await pendingDelete.promise
+      })
+
+      expect(screen.queryByRole('button', { name: '确认删除' })).not.toBeInTheDocument()
+    } finally {
+      confirmSpy.mockRestore()
+    }
+  })
+
+  it('does not revert an in-flight edit when an unrelated same-id refresh arrives before the save settles', async () => {
+    const initial = app({
+      id: 1,
+      company: 'ByteDance',
+      notes: 'old note',
+      updated_at: 1710000000,
+    })
+    const pendingCore = deferred<boolean>()
+    const onPatch = vi.fn(() => pendingCore.promise)
+
+    const { rerender } = render(
+      <ApplicationsTable
+        applications={[initial]}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑核心信息' }))
+    fireEvent.change(screen.getByLabelText('公司名称'), { target: { value: 'Acme Corp' } })
+    fireEvent.click(screen.getAllByRole('button', { name: '保存核心信息' })[0])
+
+    // Unrelated refresh delivers a new object reference for id=1 before onPatch resolves
+    rerender(
+      <ApplicationsTable
+        applications={[{ ...initial, updated_at: 1710000010 }]}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+
+    // In-flight company edit must remain intact
+    expect((screen.getByLabelText('公司名称') as HTMLInputElement).value).toBe('Acme Corp')
+
+    // Even if the in-flight save fails, user edit must stay so they can retry
+    await act(async () => {
+      pendingCore.resolve(false)
+      await pendingCore.promise
+    })
+
+    expect((screen.getByLabelText('公司名称') as HTMLInputElement).value).toBe('Acme Corp')
+  })
+
+  it('preserves in-flight extras edits when an earlier committed core update arrives asynchronously', async () => {
+    const initial = app({
+      id: 1,
+      company: 'ByteDance',
+      notes: 'old note',
+      updated_at: 1710000000,
+    })
+    const extrasSave = deferred<boolean>()
+    const onPatch = vi.fn()
+      .mockResolvedValueOnce(true) // core resolves before parent commits transition
+      .mockImplementationOnce(() => extrasSave.promise)
+
+    const { rerender } = render(
+      <ApplicationsTable
+        applications={[initial]}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑核心信息' }))
+    fireEvent.click(screen.getByRole('button', { name: /补充信息/ }))
+    fireEvent.change(screen.getByLabelText('公司名称'), { target: { value: 'Acme Corp' } })
+    fireEvent.change(screen.getByLabelText('备注'), { target: { value: 'new note' } })
+
+    // 1. Save core (resolves true before applications prop updates)
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole('button', { name: '保存核心信息' })[0])
+    })
+
+    // 2. Immediately save extras while core's prop update hasn't landed yet
+    fireEvent.click(screen.getAllByRole('button', { name: '保存补充信息' })[0])
+
+    // 3. Core's prop update lands (still has old note!)
+    rerender(
+      <ApplicationsTable
+        applications={[{ ...initial, company: 'Acme Corp', notes: 'old note', updated_at: 1710000020 }]}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+
+    // In-flight notes must NOT be wiped back to 'old note'
+    expect((screen.getByLabelText('备注') as HTMLTextAreaElement).value).toBe('new note')
+
+    // 4. Extras save settles and commits
+    await act(async () => {
+      extrasSave.resolve(true)
+      await extrasSave.promise
+    })
+    rerender(
+      <ApplicationsTable
+        applications={[{ ...initial, company: 'Acme Corp', notes: 'new note', updated_at: 1710000030 }]}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+    expect((screen.getByLabelText('备注') as HTMLTextAreaElement).value).toBe('new note')
+  })
 })

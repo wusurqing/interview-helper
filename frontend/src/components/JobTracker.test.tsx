@@ -18,7 +18,7 @@ const apiMock = vi.hoisted(() => ({
 
 vi.mock('@/lib/api', () => ({ api: apiMock }))
 vi.mock('./job-tracker/KanbanBoard', () => ({
-  default: ({ applications, search, onStageChange }: any) => {
+  default: ({ applications, search, onStageChange, onReorderInStage, disabledReorderStages }: any) => {
     const q = search.trim()
     const visible = applications.filter((app: any) => {
       if (!q) return true
@@ -33,7 +33,19 @@ vi.mock('./job-tracker/KanbanBoard', () => ({
       ].some((value) => String(value).toLowerCase().includes(q.toLowerCase()))
     })
     return (
-      <div>
+      <div data-disabled-reorder-stages={disabledReorderStages ? Array.from(disabledReorderStages).sort().join(',') : ''}>
+        <button
+          type="button"
+          onClick={() => onReorderInStage?.('interview1', visible.filter((a: any) => a.stage === 'interview1').map((a: any) => a.id).reverse())}
+        >
+          重排一面子集
+        </button>
+        <button
+          type="button"
+          onClick={() => onReorderInStage?.('rejected', visible.map((a: any) => a.id))}
+        >
+          重排挂了列
+        </button>
         {visible.map((app: any) => (
           <div key={app.id}>
             <span>{app.company}</span>
@@ -602,7 +614,7 @@ describe('JobTracker', () => {
     render(<JobTracker />)
     await waitFor(() => expect(screen.getAllByText('Acme').length).toBeGreaterThan(0))
 
-    fireEvent.click(screen.getByRole('button', { name: '补 1 条待办' }))
+    fireEvent.click(await screen.findByRole('button', { name: '补 1 条待办' }))
     fireEvent.change(
       screen.getByLabelText('待办清单'),
       { target: { value: '周五前跟进 recruiter' } },
@@ -1209,5 +1221,200 @@ describe('JobTracker', () => {
     fireEvent.click(screen.getByRole('button', { name: '返回列表' }))
 
     expect(await screen.findByRole('button', { name: '查看 Acme 详情' })).toBeInTheDocument()
+  })
+
+  it('does not report undo success or clear notice when deleting newly created record fails', async () => {
+    apiMock.jobTrackerDeleteApplication.mockRejectedValueOnce(new Error('删除接口失败'))
+
+    render(<JobTracker />)
+    await waitFor(() => expect(screen.getAllByText('Acme').length).toBeGreaterThan(0))
+
+    fireEvent.click(screen.getByRole('button', { name: '新增记录' }))
+    fireEvent.change(screen.getByPlaceholderText('例如 OpenAI'), { target: { value: 'OpenAI' } })
+    fireEvent.click(screen.getByRole('button', { name: '创建记录' }))
+
+    expect(await screen.findByText('已创建 OpenAI')).toBeInTheDocument()
+    ;(useInterviewStore.getState().setToastMessage as any).mockClear()
+
+    fireEvent.click(screen.getByRole('button', { name: '撤销' }))
+
+    await waitFor(() => expect(apiMock.jobTrackerDeleteApplication).toHaveBeenCalledWith(2))
+    expect(screen.getByText('已创建 OpenAI')).toBeInTheDocument()
+    expect(useInterviewStore.getState().setToastMessage).toHaveBeenCalledWith('删除接口失败')
+    expect(useInterviewStore.getState().setToastMessage).not.toHaveBeenCalledWith('已撤销 OpenAI')
+  })
+
+  it('clears invalid jobTrackerDeepLink and shows toast after applications load', async () => {
+    useUiPrefsStore.setState({
+      appMode: 'job-tracker',
+      jobTrackerDeepLink: {
+        applicationId: 999,
+        openReviews: true,
+      },
+      reviewDeepLinkSessionId: null,
+    } as any)
+
+    render(<JobTracker />)
+
+    await waitFor(() => {
+      expect(useUiPrefsStore.getState().jobTrackerDeepLink).toBeNull()
+    })
+    expect(useInterviewStore.getState().setToastMessage).toHaveBeenCalledWith('未找到对应的求职记录，可能已被删除')
+  })
+
+  it('renders ApplicationReviewsModal as an accessible dialog, closes on Escape/backdrop, and reflects latest app data', async () => {
+    apiMock.jobTrackerApplications
+      .mockResolvedValueOnce({
+        items: [applicationRow(1, 'Acme', {
+          stage: 'interview1',
+          review_summary: {
+            review_count: 1,
+            latest_review_id: 11,
+            latest_avg_score: 7.1,
+            latest_review_at: 1710003600,
+            latest_status: 'completed',
+          },
+        })],
+      })
+      .mockResolvedValueOnce({
+        items: [applicationRow(1, 'Acme Updated', {
+          stage: 'interview2',
+          review_summary: {
+            review_count: 1,
+            latest_review_id: 11,
+            latest_avg_score: 7.1,
+            latest_review_at: 1710003600,
+            latest_status: 'completed',
+          },
+        })],
+      })
+
+    render(<JobTracker />)
+    await waitFor(() => expect(screen.getAllByText('Acme').length).toBeGreaterThan(0))
+
+    fireEvent.click(screen.getAllByRole('button', { name: /查看 Acme 的 1 场关联复盘/ })[0])
+    const dialog = await screen.findByRole('dialog', { name: '关联复盘' })
+    expect(dialog).toHaveAttribute('aria-modal', 'true')
+    expect(within(dialog).getByText(/Acme · Frontend/)).toBeInTheDocument()
+
+    // Trigger refresh while modal is open -> modal derives updated record by id
+    fireEvent.click(screen.getByTitle('刷新'))
+    await waitFor(() => expect(within(dialog).getByText(/Acme Updated · Frontend/)).toBeInTheDocument())
+
+    // Escape closes modal
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '关联复盘' })).not.toBeInTheDocument())
+
+    // Reopen and close by backdrop click
+    fireEvent.click(screen.getAllByRole('button', { name: /查看 Acme Updated 的 1 场关联复盘/ })[0])
+    const dialog2 = await screen.findByRole('dialog', { name: '关联复盘' })
+    fireEvent.click(dialog2.parentElement as HTMLElement)
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '关联复盘' })).not.toBeInTheDocument())
+  })
+
+  it('passes filtered stages as disabled to KanbanBoard and prevents HTTP 400 subset/rejected reorders', async () => {
+    const dueSoon = dayjs().add(1, 'day').unix()
+    const farFuture = dayjs().add(20, 'day').unix()
+    apiMock.jobTrackerApplications.mockResolvedValueOnce({
+      items: [
+        applicationRow(1, 'DueA', { stage: 'interview1', sort_order: 0, next_followup_at: dueSoon }),
+        applicationRow(2, 'LaterB', { stage: 'interview1', sort_order: 1, next_followup_at: farFuture }),
+        applicationRow(3, 'DueC', { stage: 'interview1', sort_order: 2, next_followup_at: dueSoon }),
+        applicationRow(4, 'RejD', { stage: 'interview1_rejected', sort_order: 0 }),
+      ],
+    })
+    apiMock.jobTrackerReorderStage.mockResolvedValue({ ok: true })
+
+    render(<JobTracker />)
+    await waitFor(() => expect(screen.getAllByText('DueA').length).toBeGreaterThan(0))
+
+    fireEvent.click(screen.getByRole('button', { name: /待跟进 · 2/ }))
+    fireEvent.click(screen.getByRole('button', { name: '整理模式' }))
+
+    const boardHost = await waitFor(() => {
+      const node = document.querySelector('[data-disabled-reorder-stages]')
+      expect(node).not.toBeNull()
+      return node as HTMLElement
+    })
+    expect(boardHost.getAttribute('data-disabled-reorder-stages')).toContain('interview1')
+    expect(boardHost.getAttribute('data-disabled-reorder-stages')).toContain('rejected')
+
+    // Even if onReorderInStage receives a subset [3, 1], JobTracker merges back into full stage [3, 2, 1]
+    fireEvent.click(screen.getByRole('button', { name: '重排一面子集' }))
+    await waitFor(() => {
+      expect(apiMock.jobTrackerReorderStage).toHaveBeenCalledWith('interview1', [3, 2, 1])
+    })
+
+    // Rejected merged column reorder is blocked completely
+    apiMock.jobTrackerReorderStage.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: '重排挂了列' }))
+    expect(apiMock.jobTrackerReorderStage).not.toHaveBeenCalled()
+  })
+
+  it('refreshes dueSoonCutoff across midnight and vertically centers search clear button', async () => {
+    const baseNow = new Date('2026-05-10T23:59:58')
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    vi.setSystemTime(baseNow)
+    try {
+      // Follow-up is on 2026-05-14 10:00 (4 days away on May 10, 3 days away after midnight May 11!)
+      const followupOnMay14 = dayjs('2026-05-14T10:00:00').unix()
+      apiMock.jobTrackerApplications.mockResolvedValueOnce({
+        items: [
+          applicationRow(1, 'MidnightCo', { stage: 'interview1', next_followup_at: followupOnMay14 }),
+        ],
+      })
+
+      render(<JobTracker />)
+      await waitFor(() => expect(screen.getAllByText('MidnightCo').length).toBeGreaterThan(0))
+      expect(screen.getByRole('button', { name: /待跟进 · 0/ })).toBeInTheDocument()
+
+      const searchInput = screen.getByPlaceholderText('搜索公司 / 岗位 / 城市 / 待办')
+      fireEvent.change(searchInput, { target: { value: 'Mid' } })
+      const clearBtn = screen.getByRole('button', { name: '清空搜索' })
+      expect(clearBtn.className).toContain('-translate-y-1/2')
+
+      await act(async () => {
+        vi.advanceTimersByTime(5000)
+      })
+
+      await waitFor(() => expect(screen.getByRole('button', { name: /待跟进 · 1/ })).toBeInTheDocument())
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('resolves deep link cleanly when a refresh loads the newly created target record', async () => {
+    let resolveReloadApps!: (value: { items: unknown[] }) => void
+    const reloadAppsPromise = new Promise<{ items: unknown[] }>((res) => { resolveReloadApps = res })
+
+    apiMock.jobTrackerApplications
+      .mockResolvedValueOnce({ items: [applicationRow(1, 'ExistingCo')] })
+      .mockReturnValueOnce(reloadAppsPromise)
+    apiMock.jobTrackerListOffers
+      .mockResolvedValueOnce({ items: [] })
+      .mockResolvedValueOnce({ items: [] })
+
+    render(<JobTracker />)
+    await waitFor(() => expect(screen.getAllByText('ExistingCo').length).toBeGreaterThan(0))
+
+    // Start a refresh, then set a deep link pointing to record #99 coming in that refresh
+    fireEvent.click(screen.getByTitle('刷新'))
+    act(() => {
+      useUiPrefsStore.setState({
+        appMode: 'job-tracker',
+        jobTrackerDeepLink: { applicationId: 99, openReviews: false },
+      })
+    })
+
+    await act(async () => {
+      resolveReloadApps({
+        items: [applicationRow(1, 'ExistingCo'), applicationRow(99, 'FreshLinkedCo')],
+      })
+      await reloadAppsPromise
+    })
+
+    await waitFor(() => expect(screen.getByText(/已定位到 FreshLinkedCo/)).toBeInTheDocument())
+    expect(useInterviewStore.getState().toastMessage).not.toBe('未找到对应的求职记录，可能已被删除')
+    expect(useUiPrefsStore.getState().jobTrackerDeepLink).toBeNull()
   })
 })

@@ -20,6 +20,15 @@ def _write(tmp: Path, name: str, content: str) -> Path:
     return p
 
 
+def _write_pdf(path: Path, *page_texts: str) -> None:
+    import fitz
+
+    with fitz.open() as doc:
+        for text in page_texts:
+            doc.new_page().insert_text((72, 72), text)
+        doc.save(path)
+
+
 def test_dispatch_unknown_extension_returns_none(tmp_path: Path):
     p = _write(tmp_path, "a.unknown", "whatever")
     assert dispatch_loader(p) is None
@@ -104,16 +113,8 @@ def test_docx_headings_become_sections(tmp_path: Path):
 
 def test_pdf_l1_extracts_text_per_page(tmp_path: Path):
     pytest.importorskip("pypdf")
-    pytest.importorskip("reportlab.pdfgen.canvas")
-    from reportlab.pdfgen import canvas
-
     p = tmp_path / "notes.pdf"
-    c = canvas.Canvas(str(p))
-    c.drawString(100, 750, "Page one: Redis persistence")
-    c.showPage()
-    c.drawString(100, 750, "Page two: Go GMP")
-    c.showPage()
-    c.save()
+    _write_pdf(p, "Page one: Redis persistence", "Page two: Go GMP")
 
     loader = dispatch_loader(p)
     assert loader is not None
@@ -129,14 +130,8 @@ def test_pdf_l1_extracts_text_per_page(tmp_path: Path):
 def test_pdf_l2_ocr_stubbed(monkeypatch, tmp_path: Path):
     """用 stub 模拟 OCR，避免依赖 rapidocr 模型。"""
     pytest.importorskip("pypdf")
-    pytest.importorskip("reportlab.pdfgen.canvas")
-    from reportlab.pdfgen import canvas
-
     p = tmp_path / "scan.pdf"
-    c = canvas.Canvas(str(p))
-    # 只画 3 个字符，文本层极短，触发 OCR 分支
-    c.drawString(100, 750, "abc")
-    c.save()
+    _write_pdf(p, "abc")
 
     from services.kb.loaders import pdf as pdf_loader
     monkeypatch.setattr(
@@ -156,13 +151,8 @@ def test_pdf_l2_ocr_stubbed(monkeypatch, tmp_path: Path):
 def test_pdf_l3_vision_stubbed(monkeypatch, tmp_path: Path):
     """用 stub 模拟 Vision caption。"""
     pytest.importorskip("pypdf")
-    pytest.importorskip("reportlab.pdfgen.canvas")
-    from reportlab.pdfgen import canvas
-
     p = tmp_path / "diagram.pdf"
-    c = canvas.Canvas(str(p))
-    c.drawString(100, 750, "some text")
-    c.save()
+    _write_pdf(p, "some text")
 
     from services.kb.loaders import pdf as pdf_loader
     monkeypatch.setattr(

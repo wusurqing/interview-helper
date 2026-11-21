@@ -79,14 +79,14 @@ export interface AppConfig {
   stt_configured?: Partial<Record<import('@/lib/speechProviders').SpeechProvider, boolean>>
   mmpg?: import('@/lib/mmpg/settings').MmpgConfig
   doubao_stt_app_id: string
-  doubao_stt_access_token: string
-  doubao_stt_api_key: string
+  doubao_stt_access_token_configured?: boolean
+  doubao_stt_api_key_configured?: boolean
   doubao_stt_resource_id: string
   doubao_stt_boosting_table_id: string
   generic_stt_api_base_url: string
-  generic_stt_api_key: string
+  generic_stt_api_key_configured?: boolean
   generic_stt_model: string
-  generic_stt_custom_headers: string
+  generic_stt_custom_headers_configured?: boolean
   candidate_asr_enabled?: boolean
   candidate_stt_provider?: string
   candidate_context_enabled?: boolean
@@ -157,6 +157,11 @@ export interface AppConfig {
   /** 复盘分析使用的模型索引 */
   review_model_index?: number | null
   review_model_id?: string | null
+  config_corrupt?: boolean
+  config_corrupt_info?: {
+    error: string
+    backup_filename: string | null
+  } | null
 }
 
 export type SingleMicRole = 'interviewer' | 'candidate'

@@ -9,7 +9,7 @@ import { useInterviewStore } from '@/stores/configStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 import { updateConfigAndRefresh } from '@/lib/configSync'
 import { COLOR_SCHEME_OPTIONS } from '@/lib/colorScheme'
-import { Section, Field, SaveStateBadge, matchSettingsSearch, useAutoSaveSetting, useSettingsSearch } from './shared'
+import { Field, SaveStateBadge, matchSettingsSearch, useAutoSaveSetting, useSettingsSearch } from './shared'
 
 function Collapsible({ title, searchTitle, icon, defaultOpen = false, alwaysOpen = false, keywords, children }: {
   title: React.ReactNode

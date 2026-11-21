@@ -6,6 +6,7 @@ import numpy as np
 import queue
 import time
 import threading
+from collections import deque
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Callable, Literal, Optional
@@ -111,7 +112,10 @@ _commit_buffer: dict[int, Callable[[], None]] = {}
 _skipped_commit_seqs: set[int] = set()
 _next_commit_seq = 0
 _next_submit_seq = 0
+_commit_draining = False
 _commit_lock = threading.Lock()
+_exam_cancel_lock = threading.Lock()
+_cancelled_exam_preflight_ids: deque[str] = deque(maxlen=128)
 
 _knowledge_worker: Optional[BoundedTaskWorker] = None
 _asr_state = AssistAsrStateMachine(
@@ -146,6 +150,11 @@ class _InterviewerRuntime:
             maxsize=_interviewer_segment_queue_maxsize
         )
         self.drain_event = threading.Event()
+        self.flush_queue: queue.Queue = queue.Queue(maxsize=10)
+        self.flush_stop_event = threading.Event()
+        self.flush_thread: Optional[threading.Thread] = None
+        self.asr_thread: Optional[threading.Thread] = None
+        self.stop_managed_by_caller = False
         self.raw_queue_drop_count = 0
         self.segment_emitted = 0
         self.segment_dropped = 0
@@ -407,16 +416,19 @@ def _maybe_build_interviewer_segment(
     return True
 
 
-def _drain_interviewer_segments(timeout_sec: float) -> tuple[bool, int]:
-    runtime = _interviewer_runtime
-    if runtime is None:
+def _drain_interviewer_segments(
+    timeout_sec: float,
+    runtime: Optional[_InterviewerRuntime] = None,
+) -> tuple[bool, int]:
+    target = _interviewer_runtime if runtime is None else runtime
+    if target is None:
         return True, 0
     deadline = time.monotonic() + max(0.0, timeout_sec)
     while time.monotonic() < deadline:
-        if _interviewer_segment_backlog(runtime) == 0:
+        if _interviewer_segment_backlog(target) == 0:
             return True, 0
         time.sleep(0.02)
-    remaining = _interviewer_segment_backlog(runtime)
+    remaining = _interviewer_segment_backlog(target)
     return remaining == 0, remaining
 
 
@@ -548,20 +560,56 @@ def _reset_answer_state(reset_session_data: bool = False, *, invalidate_capture:
     for task in tasks:
         if request := task_meta(task).get("mmpg_request"):
             _cancel_mmpg_request(request, reason="stopped")
-    # commit 相关操作单独处理
+    # commit 相关操作单独处理（不在 _commit_lock 内执行 apply_fn）
     with _commit_lock:
         discarded = [_commit_buffer.pop(seq) for seq in list(_commit_buffer) if seq < next_commit_seq]
         _skipped_commit_seqs.difference_update({seq for seq in _skipped_commit_seqs if seq < next_commit_seq})
         _next_commit_seq = max(_next_commit_seq, next_commit_seq)
-        _drain_commit_queue_locked()
     for commit in discarded:
         if isinstance(commit, AnswerCommit):
             commit.cancel()
+    _drain_commit_queue()
 
 
 def cancel_answer_work(reset_session_data: bool = False, *, invalidate_capture: bool = False):
     _bump_generation()
     _reset_answer_state(reset_session_data, invalidate_capture=invalidate_capture)
+
+
+def _is_exam_preflight_cancelled(preflight_id: str) -> bool:
+    if not preflight_id:
+        return False
+    with _exam_cancel_lock:
+        return preflight_id in _cancelled_exam_preflight_ids
+
+
+def cancel_exam_preflight_task(preflight_id: str) -> bool:
+    """Cancel a timed-out or obsolete exam preflight task and release its slot & commit seq."""
+    target = (preflight_id or "").strip()
+    if not target:
+        return False
+    with _exam_cancel_lock:
+        if target not in _cancelled_exam_preflight_ids:
+            _cancelled_exam_preflight_ids.append(target)
+    skipped_seqs: list[int] = []
+    with _dispatch_lock:
+        kept: list[tuple[TaskPayload, int, int]] = []
+        for task, seq, tv in _pending:
+            if str(task_meta(task).get("exam_preflight_id") or "") == target:
+                skipped_seqs.append(seq)
+                continue
+            kept.append((task, seq, tv))
+        _pending[:] = kept
+        for seq, (_reservation, task) in list(_in_flight_tasks.items()):
+            if str(task_meta(task).get("exam_preflight_id") or "") == target:
+                _in_flight_tasks.pop(seq, None)
+                skipped_seqs.append(seq)
+        _dispatch_changed.notify_all()
+    for seq in skipped_seqs:
+        _mark_seq_skipped(seq)
+    if skipped_seqs:
+        _try_dispatch()
+    return bool(skipped_seqs)
 
 
 def init_background_workers():
@@ -637,13 +685,39 @@ def _physical_busy_models_locked() -> set[ModelReservation]:
     return scheduler_physical_busy_models(_in_flight_tasks)
 
 
-def _drain_commit_queue_locked():
+def _pop_next_ready_commit_locked() -> Optional[Callable[[], None]]:
     global _next_commit_seq
-    _next_commit_seq = drain_commit_queue(
-        _commit_buffer,
-        _skipped_commit_seqs,
-        _next_commit_seq,
-    )
+    while _next_commit_seq in _skipped_commit_seqs:
+        _skipped_commit_seqs.discard(_next_commit_seq)
+        _next_commit_seq += 1
+    apply_fn = _commit_buffer.pop(_next_commit_seq, None)
+    if apply_fn is not None:
+        _next_commit_seq += 1
+    return apply_fn
+
+
+def _drain_commit_queue() -> None:
+    """Drain ready commits strictly in seq order without holding _commit_lock during apply_fn."""
+    global _commit_draining
+    with _commit_lock:
+        if _commit_draining:
+            return
+        _commit_draining = True
+    try:
+        while True:
+            with _commit_lock:
+                apply_fn = _pop_next_ready_commit_locked()
+                if apply_fn is None:
+                    _commit_draining = False
+                    return
+            try:
+                apply_fn()
+            except Exception:
+                _elog.exception("Commit apply_fn failed; continuing commit queue drain")
+    except BaseException:
+        with _commit_lock:
+            _commit_draining = False
+        raise
 
 
 def _mark_seq_skipped(seq: int):
@@ -652,9 +726,9 @@ def _mark_seq_skipped(seq: int):
             return
         discarded = _commit_buffer.pop(seq, None)
         _skipped_commit_seqs.add(seq)
-        _drain_commit_queue_locked()
     if isinstance(discarded, AnswerCommit):
         discarded.cancel()
+    _drain_commit_queue()
 
 
 def _answer_work_idle() -> bool:
@@ -662,7 +736,7 @@ def _answer_work_idle() -> bool:
         pending = bool(_pending)
         in_flight = bool(_in_flight_tasks)
     with _commit_lock:
-        commits = bool(_commit_buffer)
+        commits = bool(_commit_buffer) or _commit_draining
     return not pending and not in_flight and not commits
 
 
@@ -803,9 +877,9 @@ def cancel_mmpg_answer(request, *, reason="continuation"):
 # ASR question group handling
 # ---------------------------------------------------------------------------
 
-def _flush_asr_question_group_now(cfg, session) -> None:
+def _flush_asr_question_group_now(cfg, session, *, immediate: bool = False) -> None:
     with _asr_state_lock:
-        _asr_state.flush_question_group_now(cfg, session)
+        _asr_state.flush_question_group_now(cfg, session, immediate=immediate)
 
 
 def _try_flush_asr_question_group(cfg, session, now_mono: float, force: bool = False) -> None:
@@ -819,11 +893,20 @@ def _handle_auto_detect_asr_text(cfg, session, pub: str, source: str, now_mono: 
 
 
 def _append_late_asr_constraint_tail(
-    text: str, source: str, now_mono: float, transcript_anchor: str | None = None,
+    text: str,
+    source: str,
+    now_mono: float,
+    transcript_anchor: str | None = None,
+    transcript_anchors: tuple[str, ...] = (),
 ) -> bool:
     cleaned = (text or "").strip()
     if not cleaned:
         return False
+    anchors_to_group: list[str] = []
+    merged = False
+    incoming_anchors: list[str] = [str(a) for a in transcript_anchors if a]
+    if transcript_anchor and transcript_anchor not in incoming_anchors:
+        incoming_anchors.append(transcript_anchor)
     with _dispatch_lock:
         for idx in range(len(_pending) - 1, -1, -1):
             task, seq, session_version = _pending[idx]
@@ -841,8 +924,20 @@ def _append_late_asr_constraint_tail(
             utterances.append(cleaned)
             updated_question = build_asr_question_group_text(utterances) or f"{question}\n{cleaned}".strip()
             updated_meta = {**meta, "utterances": utterances, "late_constraint_tail": True}
-            if transcript_anchor:
-                updated_meta["transcript_anchor"] = transcript_anchor
+            if incoming_anchors:
+                anchors = [
+                    str(a) for a in (meta.get("transcript_anchors") or ())
+                    if a
+                ]
+                prev_anchor = meta.get("transcript_anchor")
+                if not anchors and prev_anchor:
+                    anchors.append(str(prev_anchor))
+                for anchor in incoming_anchors:
+                    if anchor not in anchors:
+                        anchors.append(anchor)
+                updated_meta["transcript_anchor"] = transcript_anchor or incoming_anchors[-1]
+                updated_meta["transcript_anchors"] = tuple(anchors)
+                anchors_to_group = anchors
             _pending[idx] = (
                 (updated_question, image, manual_input, task_source, updated_meta),
                 seq,
@@ -854,8 +949,29 @@ def _append_late_asr_constraint_tail(
                 cleaned[:80],
                 updated_question[:150],
             )
-            return True
-    return False
+            merged = True
+            break
+    if merged and anchors_to_group:
+        get_session().group_transcript_question(anchors_to_group)
+    return merged
+
+
+def _dispatch_delayed_pending_now() -> None:
+    """Release any ASR late-constraint grace hold on queued tasks once recording stops or role switches."""
+    released = False
+    with _dispatch_lock:
+        for idx, (task, seq, tv) in enumerate(_pending):
+            meta = task_meta(task)
+            if float(meta.get("dispatch_after_mono", 0.0) or 0.0) > 0.0:
+                updated_meta = {
+                    **meta,
+                    "dispatch_after_mono": 0.0,
+                    "asr_tail_grace_until_mono": 0.0,
+                }
+                _pending[idx] = ((task[0], task[1], task[2], task[3], updated_meta), seq, tv)
+                released = True
+    if released:
+        _try_dispatch()
 
 
 # ---------------------------------------------------------------------------
@@ -953,19 +1069,68 @@ def _try_dispatch():
             continue
         if step.claim is None:
             return
-        assert worker_model_idx is not None
-        threading.Thread(
-            target=_run_answer_worker,
-            args=(
-                step.claim.task,
+        if worker_model_idx is None:
+            _elog.error(
+                "DISPATCH_MODEL_UNRESOLVED seq=%d selected_idx=%s",
                 step.claim.seq,
-                worker_model_idx,
-                step.claim.session_version,
-                model_cfg_snapshot,
-                config_snapshot,
-            ),
-            daemon=True,
-        ).start()
+                step.claim.model_idx,
+            )
+            with _dispatch_changed:
+                _in_flight_tasks.pop(step.claim.seq, None)
+                _dispatch_changed.notify_all()
+            _mark_seq_skipped(step.claim.seq)
+            request = task_meta(step.claim.task).get("mmpg_request")
+            if request and request.on_finished:
+                try:
+                    request.on_finished()
+                except Exception:
+                    pass
+            message = EXAM_MODEL_STALE if task_is_written_exam(step.claim.task, cfg) else (
+                "选中的答题模型已不可用，请在实时辅助中重新选择。"
+            )
+            if preflight_id := task_meta(step.claim.task).get("exam_preflight_id"):
+                from .exam_test import record_exam_preflight_answer_event
+
+                record_exam_preflight_answer_event({
+                    "type": "answer_error", "exam_preflight_id": preflight_id, "message": message,
+                })
+            else:
+                broadcast({"type": "error", "message": message})
+            continue
+        try:
+            threading.Thread(
+                target=_run_answer_worker,
+                args=(
+                    step.claim.task,
+                    step.claim.seq,
+                    worker_model_idx,
+                    step.claim.session_version,
+                    model_cfg_snapshot,
+                    config_snapshot,
+                ),
+                daemon=True,
+            ).start()
+        except Exception:
+            _elog.exception("Failed to start answer worker thread seq=%d", step.claim.seq)
+            with _dispatch_changed:
+                _in_flight_tasks.pop(step.claim.seq, None)
+                _dispatch_changed.notify_all()
+            _mark_seq_skipped(step.claim.seq)
+            request = task_meta(step.claim.task).get("mmpg_request")
+            if request and request.on_finished:
+                try:
+                    request.on_finished()
+                except Exception:
+                    pass
+            if preflight_id := task_meta(step.claim.task).get("exam_preflight_id"):
+                from .exam_test import record_exam_preflight_answer_event
+
+                record_exam_preflight_answer_event({
+                    "type": "answer_error", "exam_preflight_id": preflight_id, "message": "启动答题线程失败，请重试",
+                })
+            else:
+                broadcast({"type": "error", "message": "启动答题线程失败，请重试"})
+            return
 
 
 def _run_answer_worker(
@@ -991,7 +1156,12 @@ def _run_answer_worker(
             _dispatch_changed.notify_all()
         request = task_meta(task).get("mmpg_request")
         if request and request.on_finished:
-            request.on_finished()
+            try:
+                request.on_finished()
+            except RuntimeError as exc:
+                _elog.debug("mmpg request.on_finished skipped (event loop closed): %s", exc)
+            except Exception as exc:
+                _elog.warning("mmpg request.on_finished failed: %s", exc)
         _try_dispatch()
 
 
@@ -1011,7 +1181,7 @@ def _reserve_answer_retry(
                 if live_exam_model_index(routing, current, model_id) is not None:
                     return index
             return None
-        return scheduler_pick_model_index(task, busy, cfg, lambda _index: None, excluded_indices=attempted)
+        return scheduler_pick_model_index(task, busy, cfg, get_model_health, excluded_indices=attempted)
 
     with _dispatch_changed:
         if seq not in _in_flight_tasks:
@@ -1041,11 +1211,14 @@ def _reserve_answer_retry(
 
 
 def _flush_commit(seq: int, apply_fn: Callable[[], None]):
+    accepted = False
     with _commit_lock:
         if seq >= _next_commit_seq and seq not in _skipped_commit_seqs:
             _commit_buffer[seq] = apply_fn
-            _drain_commit_queue_locked()
-            return
+            accepted = True
+    if accepted:
+        _drain_commit_queue()
+        return
     if isinstance(apply_fn, AnswerCommit):
         apply_fn.cancel()
 
@@ -1166,10 +1339,11 @@ def drain_single_mic_worker(single_mic: SingleMicSession, operation: RoleSwitch,
                     return False
                 cfg = _interviewer_config or get_config()
                 _flush_asr_merge_buffer_now(cfg, session)
-                _flush_asr_question_group_now(cfg, session)
+                _flush_asr_question_group_now(cfg, session, immediate=True)
                 failures = runtime.segment_failures + runtime.segment_dropped
                 success = failures == runtime.reported_role_failures
                 runtime.reported_role_failures = failures
+            _dispatch_delayed_pending_now()
             return success
         if _stop_event.wait(0.02):
             break
@@ -1238,95 +1412,117 @@ def start_nonblocking(
     with conversation_lock:
         existing_qa_ids = frozenset(qa.id for qa in session.qa_pairs) if single_mic is not None else frozenset()
 
-    if device_id is not None:
-        capture_is_loopback = _device_is_loopback(device_id)
+    capture_opened = False
+    started_state = False
+    try:
+        if device_id is not None:
+            capture_is_loopback = _device_is_loopback(device_id)
 
-        if single_mic is not None:
-            _open_single_mic(single_mic, start_cfg)
-        elif stream_audio is None:
-            audio_capture.start(device_id, owner="assist")
-        else:
-            audio_capture.start(device_id, on_audio=stream_audio, owner="assist", queue_audio=False)
-
-        with conversation_lock:
-            session.last_device_id = int(device_id)
-            session.capture_is_loopback = capture_is_loopback
-        _ilog.info("INTERVIEW_START device=%s loopback=%s", device_id, capture_is_loopback)
-    else:
-        with conversation_lock:
-            session.last_device_id = _UNSET_DEVICE_ID
-            session.last_candidate_mic_device_id = _UNSET_DEVICE_ID
-            session.capture_is_loopback = False
-        _ilog.info("INTERVIEW_START no_device (written_exam_mode)")
-
-    _interviewer_streaming = stream_audio is not None and device_id is not None
-    _interviewer_config = copy.deepcopy(start_cfg) if device_id is not None else None
-    with _asr_state_lock, conversation_lock:
-        session.begin_transcript_capture()
-        session.single_mic = single_mic
-        session.is_recording = True
-        session.is_paused = False
-
-    recording = {"type": "recording", "value": True, "candidate_capture_provider": candidate_capture_provider()}
-    if _interviewer_streaming:
-        recording["interviewer_streaming"] = True
-    broadcast(recording)
-    broadcast({"type": "paused", "value": False})
-
-    if device_id is not None and not _interviewer_streaming:
-        _start_interview_worker_thread_if_needed()
-
-    cfg = get_capture_config()
-    if (
-        device_id is not None
-        and candidate_mic_device_id is not None
-        and bool(getattr(cfg, "candidate_asr_enabled", False))
-        and (single_mic is not None or int(candidate_mic_device_id) != int(device_id))
-    ):
-        try:
-            with conversation_lock:
-                session.last_candidate_mic_device_id = int(candidate_mic_device_id)
-            if single_mic is None:
-                _start_candidate_capture(int(candidate_mic_device_id), cfg)
-            else:
-                _start_candidate_capture(int(candidate_mic_device_id), cfg, single_mic=single_mic)
-            review_candidate_device_id = int(candidate_mic_device_id)
-            _ilog.info("CANDIDATE_ASR_START device=%s", candidate_mic_device_id)
-        except Exception as exc:
             if single_mic is not None:
-                stop_interview_loop()
-                raise
+                _open_single_mic(single_mic, start_cfg)
+            elif stream_audio is None:
+                audio_capture.start(device_id, owner="assist")
+            else:
+                audio_capture.start(device_id, on_audio=stream_audio, owner="assist", queue_audio=False)
+            capture_opened = True
+
+            with conversation_lock:
+                session.last_device_id = int(device_id)
+                session.capture_is_loopback = capture_is_loopback
+            _ilog.info("INTERVIEW_START device=%s loopback=%s", device_id, capture_is_loopback)
+        else:
+            with conversation_lock:
+                session.last_device_id = _UNSET_DEVICE_ID
+                session.last_candidate_mic_device_id = _UNSET_DEVICE_ID
+                session.capture_is_loopback = False
+            _ilog.info("INTERVIEW_START no_device (written_exam_mode)")
+
+        _interviewer_streaming = stream_audio is not None and device_id is not None
+        _interviewer_config = copy.deepcopy(start_cfg) if device_id is not None else None
+        with _asr_state_lock, conversation_lock:
+            session.begin_transcript_capture()
+            session.single_mic = single_mic
+            session.is_recording = True
+            session.is_paused = False
+        started_state = True
+
+        recording = {"type": "recording", "value": True, "candidate_capture_provider": candidate_capture_provider()}
+        if _interviewer_streaming:
+            recording["interviewer_streaming"] = True
+        broadcast(recording)
+        broadcast({"type": "paused", "value": False})
+
+        if device_id is not None and not _interviewer_streaming:
+            _start_interview_worker_thread_if_needed()
+
+        cfg = get_capture_config()
+        if (
+            device_id is not None
+            and candidate_mic_device_id is not None
+            and bool(getattr(cfg, "candidate_asr_enabled", False))
+            and (single_mic is not None or int(candidate_mic_device_id) != int(device_id))
+        ):
+            try:
+                with conversation_lock:
+                    session.last_candidate_mic_device_id = int(candidate_mic_device_id)
+                if single_mic is None:
+                    _start_candidate_capture(int(candidate_mic_device_id), cfg)
+                else:
+                    _start_candidate_capture(int(candidate_mic_device_id), cfg, single_mic=single_mic)
+                review_candidate_device_id = int(candidate_mic_device_id)
+                _ilog.info("CANDIDATE_ASR_START device=%s", candidate_mic_device_id)
+            except Exception as exc:
+                if single_mic is not None:
+                    raise
+                with conversation_lock:
+                    session.last_candidate_mic_device_id = _UNSET_DEVICE_ID
+                _elog.warning("CANDIDATE_ASR_START_FAIL device=%s err=%s", candidate_mic_device_id, exc)
+                broadcast({
+                    "type": "candidate_asr_status",
+                    "loaded": False,
+                    "loading": False,
+                    "provider": "off",
+                    "error": str(exc)[:160],
+                    "reason": "mic_unavailable",
+                    "safe_degraded": True,
+                })
+        elif device_id is not None:
             with conversation_lock:
                 session.last_candidate_mic_device_id = _UNSET_DEVICE_ID
-            _elog.warning("CANDIDATE_ASR_START_FAIL device=%s err=%s", candidate_mic_device_id, exc)
-            broadcast({
-                "type": "candidate_asr_status",
-                "loaded": False,
-                "loading": False,
-                "provider": "off",
-                "error": str(exc)[:160],
-                "reason": "mic_unavailable",
-                "safe_degraded": True,
-            })
-    elif device_id is not None:
-        with conversation_lock:
-            session.last_candidate_mic_device_id = _UNSET_DEVICE_ID
-        reason = "disabled" if not bool(getattr(cfg, "candidate_asr_enabled", False)) else "missing_or_same_device"
-        broadcast({"type": "candidate_asr_status", "loaded": False, "loading": False, "provider": "off", "reason": reason})
+            reason = "disabled" if not bool(getattr(cfg, "candidate_asr_enabled", False)) else "missing_or_same_device"
+            broadcast({"type": "candidate_asr_status", "loaded": False, "loading": False, "provider": "off", "reason": reason})
 
-    if single_mic is not None:
-        broadcast_single_mic(single_mic)
+        if single_mic is not None:
+            broadcast_single_mic(single_mic)
 
-    # 创建 review session（如果满足条件）
-    review_integration.on_assist_start(
-        interviewer_device_id=device_id,
-        candidate_device_id=review_candidate_device_id,
-        candidate_asr_enabled=bool(getattr(cfg, "candidate_asr_enabled", False)),
-        written_exam_mode=not _interviewer_streaming and bool(getattr(cfg, "written_exam_mode", False)),
-        **({
-            "single_mic": True, "existing_qa_ids": existing_qa_ids,
-        } if single_mic is not None else {}),
-    )
+        # 创建 review session（如果满足条件）
+        review_integration.on_assist_start(
+            interviewer_device_id=device_id,
+            candidate_device_id=review_candidate_device_id,
+            candidate_asr_enabled=bool(getattr(cfg, "candidate_asr_enabled", False)),
+            written_exam_mode=not _interviewer_streaming and bool(getattr(cfg, "written_exam_mode", False)),
+            **({
+                "single_mic": True, "existing_qa_ids": existing_qa_ids,
+            } if single_mic is not None else {}),
+        )
+    except Exception:
+        if started_state:
+            try:
+                stop_interview_loop()
+            except Exception:
+                _elog.exception("start_nonblocking rollback via stop_interview_loop failed")
+        elif capture_opened:
+            try:
+                _stop_capture_compat(audio_capture, owner="assist", clear_queue=True)
+            except Exception:
+                _elog.exception("start_nonblocking rollback audio_capture.stop failed")
+            _interviewer_streaming = False
+            _interviewer_config = None
+            with conversation_lock:
+                session.is_recording = False
+                session.is_paused = False
+                session.single_mic = None
+        raise
 
 
 def stop_interview_loop():
@@ -1334,30 +1530,40 @@ def stop_interview_loop():
     global _interviewer_config
     session = get_session()
     single_mic = session.single_mic
+    runtime = _interviewer_runtime
+    if runtime is not None:
+        runtime.stop_managed_by_caller = True
+        runtime.flush_stop_event.set()
+    _flush_stop_event.set()
     _stop_event.set()
     if single_mic is not None:
         single_mic.close()
     _pause_event.clear()
     _candidate_flush_event.set()
     _stop_capture_compat(audio_capture, owner="assist", clear_queue=False)
-    _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=True)
-    runtime = _interviewer_runtime
+    _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=False)
     runtime_snapshot: Optional[dict[str, Any]] = None
 
     current_thread = threading.current_thread()
-    if _interview_thread and _interview_thread.is_alive() and _interview_thread is not current_thread:
-        _interview_thread.join(timeout=5)
+    interview_thread = _interview_thread
     _interview_thread = None
+    if interview_thread and interview_thread.is_alive() and interview_thread is not current_thread:
+        interview_thread.join(timeout=5)
+    asr_thread = (runtime.asr_thread if runtime is not None else None) or _interviewer_asr_thread
+    flush_thread = (runtime.flush_thread if runtime is not None else None) or _flush_thread
     if runtime is not None:
         try:
             _refresh_interviewer_raw_drop_count(runtime, single_mic.interviewer_input if single_mic else None)
+            runtime.flush_stop_event.set()
             runtime.drain_event.set()
             drain_timeout_sec = _interviewer_segment_drain_timeout()
-            drained, remaining = _drain_interviewer_segments(drain_timeout_sec)
-            if _interviewer_asr_thread and _interviewer_asr_thread.is_alive() and _interviewer_asr_thread is not current_thread:
-                _interviewer_asr_thread.join(timeout=drain_timeout_sec)
-                drained = _interviewer_segment_backlog(runtime) == 0
-                remaining = _interviewer_segment_backlog(runtime)
+            drain_deadline = time.monotonic() + drain_timeout_sec
+            if asr_thread and asr_thread.is_alive() and asr_thread is not current_thread:
+                asr_thread.join(timeout=max(0.0, drain_deadline - time.monotonic()))
+            else:
+                _drain_interviewer_segments(max(0.0, drain_deadline - time.monotonic()), runtime=runtime)
+            remaining = _interviewer_segment_backlog(runtime)
+            drained = remaining == 0
             _ilog.info(
                 "INTERVIEWER_ASR_DRAIN drained=%s remaining=%d segment_emitted=%d segment_dropped=%d raw_queue_drop_count=%d loopback_discontinuity_count=%d max_raw_chunk_samples=%d max_segment_queue_depth=%d",
                 drained,
@@ -1382,15 +1588,20 @@ def stop_interview_loop():
         if runtime_snapshot is None:
             runtime_snapshot = _snapshot_interviewer_runtime(runtime, live=False)
         _set_last_interviewer_runtime_snapshot(runtime_snapshot)
-    if _interviewer_asr_thread and _interviewer_asr_thread.is_alive() and _interviewer_asr_thread is not current_thread:
-        _interviewer_asr_thread.join(timeout=0.2)
-    _interviewer_asr_thread = None
-    if _flush_thread and _flush_thread.is_alive() and _flush_thread is not current_thread:
-        _flush_thread.join(timeout=1)
-    _flush_thread = None
-    if _candidate_thread and _candidate_thread.is_alive() and _candidate_thread is not current_thread:
-        _candidate_thread.join(timeout=5)
+        runtime.asr_thread = None
+        runtime.flush_thread = None
+    elif asr_thread and asr_thread.is_alive() and asr_thread is not current_thread:
+        asr_thread.join(timeout=0.2)
+    if _interviewer_asr_thread is asr_thread:
+        _interviewer_asr_thread = None
+    if flush_thread and flush_thread.is_alive() and flush_thread is not current_thread:
+        flush_thread.join(timeout=1)
+    if _flush_thread is flush_thread:
+        _flush_thread = None
+    candidate_thread = _candidate_thread
     _candidate_thread = None
+    if candidate_thread and candidate_thread.is_alive() and candidate_thread is not current_thread:
+        candidate_thread.join(timeout=5)
 
     if not _interviewer_streaming:
         try:
@@ -1400,6 +1611,7 @@ def stop_interview_loop():
             _try_flush_asr_question_group(cfg, session, now, True)
         except Exception:
             _elog.debug("final ASR flush during stop skipped", exc_info=True)
+    _dispatch_delayed_pending_now()
     _interviewer_streaming = False
     _interviewer_config = None
     with _asr_state_lock, conversation_lock:
@@ -1429,9 +1641,111 @@ def stop_interview_loop():
     if single_mic is not None:
         broadcast_single_mic(None)
     _candidate_flush_event.clear()
-    _set_interviewer_runtime(None)
+    if _interviewer_runtime is runtime:
+        _set_interviewer_runtime(None)
     gc.collect()
     _ilog.info("INTERVIEW_STOP qa_count=%d", len(session.qa_pairs))
+
+
+def _finalize_unexpected_interview_stop(
+    session,
+    transcript_epoch: int,
+    error_message: str,
+    *,
+    single_mic: SingleMicSession | None = None,
+    runtime: Optional[_InterviewerRuntime] = None,
+) -> None:
+    """Unified teardown when _interview_worker exits abnormally (device lost or crash)."""
+    global _candidate_thread, _interview_thread, _interviewer_streaming, _interviewer_config
+    current_thread = threading.current_thread()
+    try:
+        with conversation_lock:
+            if session.transcript_epoch != transcript_epoch:
+                return
+        _stop_event.set()
+        _pause_event.clear()
+        _candidate_flush_event.set()
+        if single_mic is not None:
+            single_mic.close()
+            try:
+                _stop_capture_compat(audio_capture, owner="assist", clear_queue=False)
+            except Exception:
+                _elog.warning("interviewer capture stop during unexpected exit failed", exc_info=True)
+        try:
+            _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=False)
+        except Exception:
+            _elog.warning("candidate capture stop during unexpected exit failed", exc_info=True)
+        candidate_thread = _candidate_thread
+        if candidate_thread and candidate_thread.is_alive() and candidate_thread is not current_thread:
+            candidate_thread.join(timeout=3.0)
+        if _candidate_thread is candidate_thread:
+            _candidate_thread = None
+
+        if not _interviewer_streaming:
+            try:
+                cfg = get_capture_config()
+                now = time.monotonic()
+                _try_flush_asr_merge_buffer(cfg, session, now, True)
+                _try_flush_asr_question_group(cfg, session, now, True)
+            except Exception:
+                _elog.debug("final ASR flush during unexpected stop skipped", exc_info=True)
+        _dispatch_delayed_pending_now()
+        _interviewer_streaming = False
+        _interviewer_config = None
+        with _asr_state_lock, conversation_lock:
+            if session.transcript_epoch != transcript_epoch:
+                return
+            session.stop_transcript_capture()
+            stopped_epoch = session.transcript_epoch
+
+        wait_sec = float(getattr(get_config(), "assist_stop_answer_wait_sec", 3.0))
+        if wait_sec > 0 and not _wait_for_answer_work_idle(min(wait_sec, 20.0)):
+            _elog.warning("ANSWER_STOP_WAIT_TIMEOUT pending/inflight work will be cancelled")
+        with conversation_lock:
+            if session.transcript_epoch != stopped_epoch:
+                return
+        cancel_answer_work(reset_session_data=False)
+
+        try:
+            review_integration.on_assist_stop(session)
+        except Exception:
+            _elog.error("review_integration.on_assist_stop failed during unexpected stop", exc_info=True)
+
+        with conversation_lock:
+            if session.transcript_epoch != stopped_epoch:
+                return
+            session.is_recording = False
+            session.is_paused = False
+            session.single_mic = None
+            if hasattr(session, "close_candidate_answer_window"):
+                session.close_candidate_answer_window()
+            if len(session.transcription_history) > 30:
+                session.transcription_history = session.transcription_history[-30:]
+            if hasattr(session, "candidate_transcription_history") and len(session.candidate_transcription_history) > 30:
+                session.candidate_transcription_history = session.candidate_transcription_history[-30:]
+
+        if runtime is not None:
+            remaining = _interviewer_segment_backlog(runtime)
+            _set_last_interviewer_runtime_snapshot(
+                _snapshot_interviewer_runtime(
+                    runtime,
+                    live=False,
+                    drained=remaining == 0,
+                    remaining_after_drain=remaining,
+                )
+            )
+            if _interviewer_runtime is runtime:
+                _set_interviewer_runtime(None)
+        _candidate_flush_event.clear()
+
+        broadcast({"type": "error", "message": error_message})
+        broadcast({"type": "recording", "value": False, "candidate_capture_provider": ""})
+        broadcast({"type": "paused", "value": False})
+        if single_mic is not None:
+            broadcast_single_mic(None)
+    finally:
+        if _interview_thread is current_thread:
+            _interview_thread = None
 
 
 def pause_interview():
@@ -1440,9 +1754,9 @@ def pause_interview():
     if session.single_mic is not None:
         session.single_mic.pause()
         broadcast_single_mic(session.single_mic)
-    _candidate_flush_event.set()
     _stop_capture_compat(audio_capture, owner="assist", clear_queue=False)
     _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=False)
+    _candidate_flush_event.set()
     with conversation_lock:
         session.is_paused = True
     broadcast({"type": "paused", "value": True})
@@ -1623,11 +1937,13 @@ def submit_mmpg_question(request, *, transcript_epoch: int | None = None) -> boo
 
 
 # H4: 独立 flush worker 线程，避免阻塞音频采集主循环
-def _flush_worker():
+def _flush_worker(runtime: Optional[_InterviewerRuntime] = None):
     """独立线程处理 ASR buffer flush，避免阻塞音频采集"""
-    while not _flush_stop_event.is_set():
+    stop_event = runtime.flush_stop_event if runtime is not None else _flush_stop_event
+    flush_queue = runtime.flush_queue if runtime is not None else _flush_queue
+    while not stop_event.is_set():
         try:
-            flush_signal = _flush_queue.get(timeout=0.1)
+            flush_signal = flush_queue.get(timeout=0.1)
             if flush_signal:
                 cfg, session, now, epoch = flush_signal
                 with _asr_state_lock:
@@ -1769,23 +2085,26 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
     )
     _gc_thread.start()
 
-    # H4: 启动独立 flush 线程
-    global _flush_thread
-    _flush_thread = threading.Thread(
-        target=_flush_worker, daemon=True, name="assist-flush"
+    # H4: 启动独立 flush 线程（封装在 per-session runtime 内，防止跨会话泄漏或误 join）
+    global _flush_thread, _interviewer_asr_thread
+    runtime.flush_thread = threading.Thread(
+        target=_flush_worker, args=(runtime,), daemon=True, name="assist-flush"
     )
-    _flush_stop_event.clear()
-    _flush_thread.start()
+    if _interviewer_runtime is runtime:
+        _flush_thread = runtime.flush_thread
+    runtime.flush_thread.start()
 
-    global _interviewer_asr_thread
-    _interviewer_asr_thread = threading.Thread(
+    runtime.asr_thread = threading.Thread(
         target=_interviewer_asr_worker,
         args=(runtime, session, cfg),
         daemon=True,
         name="assist-interviewer-asr",
     )
-    _interviewer_asr_thread.start()
+    if _interviewer_runtime is runtime:
+        _interviewer_asr_thread = runtime.asr_thread
+    runtime.asr_thread.start()
 
+    unexpected_error: Optional[str] = None
     try:
         while not _stop_event.is_set() and session.transcript_epoch == transcript_epoch:
             if _pause_event.is_set():
@@ -1798,7 +2117,7 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
                     pause_flushed = True
                 now = time.monotonic()
                 try:
-                    _flush_queue.put_nowait((cfg, session, now, transcript_epoch))
+                    runtime.flush_queue.put_nowait((cfg, session, now, transcript_epoch))
                 except queue.Full:
                     pass
                 time.sleep(0.1)
@@ -1814,27 +2133,28 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
                 if _pause_event.is_set() or _stop_event.is_set():
                     continue
             if not audio_capture.is_running:
+                if _pause_event.is_set() or _stop_event.is_set():
+                    continue
                 _elog.error("Interview worker: audio capture stopped unexpectedly, exiting loop")
-                broadcast({"type": "error", "message": "音频采集异常中断，面试录音已停止"})
+                unexpected_error = "音频采集异常中断，面试录音已停止"
                 break
             now = time.monotonic()
             _refresh_interviewer_raw_drop_count(runtime, audio_input)
             # H4: 将 flush 逻辑移到独立线程，避免阻塞音频采集
             try:
-                _flush_queue.put_nowait((cfg, session, now, transcript_epoch))
+                runtime.flush_queue.put_nowait((cfg, session, now, transcript_epoch))
             except queue.Full:
                 pass  # 如果队列满，跳过本次 flush
 
             chunks = audio_input.drain_audio_chunks(timeout=0.1, max_chunks=6)
             if not chunks:
-                time.sleep(0.05)
                 continue
+            batch_end_mono = time.monotonic()
             energy = AudioCapture.compute_energy(np.concatenate(chunks))
             broadcast({"type": "audio_level", "value": round(energy, 4)})
 
             offset_samples = 0
             total_samples = sum(len(chunk) for chunk in chunks)
-            batch_end_mono = now
             batch_start_mono = max(0.0, batch_end_mono - (total_samples / AudioCapture.SAMPLE_RATE))
             _log_interviewer_chunk_gap(
                 runtime,
@@ -1875,11 +2195,7 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
         _flush_interviewer_tail(runtime, vad, cfg, session, "stop_flush")
     except Exception as e:
         _elog.error("Interview worker crashed: %s", e, exc_info=True)
-        with conversation_lock:
-            if session.transcript_epoch == transcript_epoch:
-                session.is_recording = False
-                broadcast({"type": "error", "message": f"\u9762\u8bd5\u5faa\u73af\u5f02\u5e38: {e}"})
-                broadcast({"type": "recording", "value": False})
+        unexpected_error = f"\u9762\u8bd5\u5faa\u73af\u5f02\u5e38: {e}"
     finally:
         # 保证 worker 任何退出路径 (正常 / 异常 / 早退) 都释放音频设备。
         # AudioCapture.stop 是幂等的: 即使外部 stop_interview_loop 已经先调过,
@@ -1898,20 +2214,35 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
             _gc_thread.join(timeout=0.5)
         except Exception:
             pass
-        if _interviewer_runtime is runtime:
-            _flush_stop_event.set()
+        runtime.flush_stop_event.set()
+        flush_thread = runtime.flush_thread
         try:
-            if _flush_thread and _flush_thread.is_alive():
-                _flush_thread.join(timeout=0.5)
+            if flush_thread and flush_thread.is_alive():
+                flush_thread.join(timeout=0.5)
         except Exception:
             pass
-        try:
-            if _interviewer_asr_thread and _interviewer_asr_thread.is_alive():
-                runtime.drain_event.set()
-                _interviewer_asr_thread.join(timeout=_interviewer_segment_drain_timeout())
-        except Exception:
-            pass
+        if _flush_thread is flush_thread:
+            _flush_thread = None
+        if not runtime.stop_managed_by_caller:
+            asr_thread = runtime.asr_thread
+            try:
+                if asr_thread and asr_thread.is_alive():
+                    runtime.drain_event.set()
+                    asr_thread.join(timeout=_interviewer_segment_drain_timeout())
+            except Exception:
+                pass
+            if _interviewer_asr_thread is asr_thread:
+                _interviewer_asr_thread = None
         _refresh_interviewer_raw_drop_count(runtime, audio_input)
+
+    if unexpected_error is not None and not runtime.stop_managed_by_caller and not _stop_event.is_set():
+        _finalize_unexpected_interview_stop(
+            session,
+            transcript_epoch,
+            unexpected_error,
+            single_mic=single_mic,
+            runtime=runtime,
+        )
 
 
 def _publish_candidate_transcription(
@@ -1928,7 +2259,8 @@ def _publish_candidate_transcription(
     cleaned = (text or "").strip()
     if not cleaned:
         return
-    recent_interviewer = session.transcription_history[-3:]
+    with conversation_lock:
+        recent_interviewer = list(session.transcription_history[-3:])
     for item in recent_interviewer:
         interviewer_text = (item or "").strip()
         if len(cleaned) < 12 or len(interviewer_text) < 12:
@@ -2085,7 +2417,9 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
         return True
 
     def drain_candidate_input():
-        while is_current():
+        for _ in range(200):
+            if not is_current():
+                break
             chunks = audio_input.drain_audio_chunks(timeout=0.0, max_chunks=6)
             if not chunks or not feed_candidate_chunks(chunks):
                 break
@@ -2095,7 +2429,7 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
             if _pause_event.is_set():
                 if _candidate_flush_event.is_set():
                     _candidate_flush_event.clear()
-                    if single_mic is not None:
+                    if single_mic is not None or getattr(audio_input, "is_running", None) is False:
                         drain_candidate_input()
                     finalize_candidate_audio(vad.flush(), "PAUSE_FINAL")
                     if single_mic is not None:
@@ -2106,10 +2440,22 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
             if single_mic is not None:
                 operation = audio_input.take_barrier()
                 if operation is not None:
-                    success = finalize_candidate_audio(vad.flush(), "ROLE_SWITCH")
-                    vad = new_vad()
-                    operation.complete(success and not candidate_final_failed)
-                    candidate_final_failed = False
+                    success = False
+                    try:
+                        success = finalize_candidate_audio(vad.flush(), "ROLE_SWITCH") and not candidate_final_failed
+                    finally:
+                        vad = new_vad()
+                        candidate_final_failed = False
+                        operation.complete(success)
+            elif getattr(audio_input, "is_running", True) is False:
+                if _pause_event.is_set():
+                    continue
+                if _stop_event.is_set():
+                    break
+                _elog.warning("Candidate worker: audio capture stopped unexpectedly, exiting loop")
+                if is_current():
+                    report_stt_error(provider, "candidate", "候选人麦克风采集异常中断，已停止记录我的回答")
+                break
             chunks = audio_input.drain_audio_chunks(timeout=0.1, max_chunks=6)
             if not chunks:
                 continue
@@ -2121,7 +2467,9 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
                         return
                     session.mark_candidate_asr_busy(segment_qa_id)
 
-        if single_mic is not None and is_current():
+        if single_mic is None and _stop_event.is_set() and getattr(audio_input, "is_running", None) is True:
+            _stop_capture_compat(audio_input, owner="assist-candidate", clear_queue=False)
+        if (single_mic is not None or getattr(audio_input, "is_running", None) is False) and is_current():
             drain_candidate_input()
         finalize_candidate_audio(vad.flush(), "FLUSH_FINAL")
     except Exception:
@@ -2152,6 +2500,7 @@ def _process_question_parallel(
     my_gen = _capture_generation()
     my_asr_turn = int(_task_meta(task).get("asr_turn_id", 0)) if _is_asr_task(task) else 0
     request = _task_meta(task).get("mmpg_request")
+    exam_preflight_id = str(_task_meta(task).get("exam_preflight_id") or "")
     routing = task_meta(task).get("answer_routing")
 
     def resolve_exam_model(index):
@@ -2172,6 +2521,8 @@ def _process_question_parallel(
 
     def aborted() -> bool:
         if session_stale() or (request and request.cancelled):
+            return True
+        if exam_preflight_id and _is_exam_preflight_cancelled(exam_preflight_id):
             return True
         if my_gen != _answer_generation:
             return True
@@ -2198,7 +2549,7 @@ def _process_question_parallel(
             broadcast=broadcast,
             logger=_ilog,
             error_logger=_elog,
-            start_abort_check=aborted if request is not None else session_stale,
+            start_abort_check=aborted,
             model_cfg_snapshot=model_cfg_snapshot,
             config_snapshot=config_snapshot,
             resolve_exam_model=resolve_exam_model if routing is not None and routing.written_exam else None,

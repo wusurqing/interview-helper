@@ -14,6 +14,9 @@ jobs:
   # ── Detect what changed ─────────────────────────────────────
   changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       frontend: ${{ steps.filter.outputs.frontend }}
@@ -27,6 +30,8 @@ jobs:
           filters: |
             backend:
               - 'backend/**'
+              - 'start.py'
+              - 'tools/mmpg-probe/**'
               - '.github/workflows/ci.yml'
             frontend:
               - 'frontend/**'
@@ -65,7 +70,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest httpx ruff
+          pip install pytest pytest-asyncio httpx ruff
 
       - name: Lint — ruff
         run: ruff check .
@@ -74,8 +79,11 @@ jobs:
         run: python -m py_compile main.py api/assist/pipeline.py api/common/router.py
 
       - name: Run unit tests
-        run: |
-          python -m pytest tests/test_api_contracts.py tests/test_wave1_backend_concurrency.py tests/test_session_integration.py tests/test_assist_asr_interrupt.py tests/test_preflight_real_audio.py tests/test_prompt_polish.py tests/test_bench_prompt.py tests/test_router_p0.py tests/test_pipeline_p0.py tests/test_resume_optimizer.py tests/test_cloud_asr_contract.py tests/test_stt_doubao.py tests/test_stt_generic_http.py tests/test_stt_mmpg.py tests/test_mmpg_turns.py tests/test_single_mic_mmpg_integration.py -q --tb=short
+        run: python -m pytest tests -q --tb=short
+
+      - name: Run MMPG probe tests
+        working-directory: tools/mmpg-probe
+        run: python -m pytest test_probe.py -q --tb=short
 
   # ── Frontend ─────────────────────────────────────────────
   frontend:
@@ -135,13 +143,23 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python test runner
+        run: pip install pytest
+
       - name: Install dependencies
         # Tests only need the Electron package to be resolvable; skipping its
         # binary download keeps this job fast and avoids a flaky external fetch.
         run: npm ci --ignore-scripts
 
       - name: Run desktop unit tests
-        run: node --test multiScreenBatch.test.js windowOptions.test.js shortcuts.test.js preload.test.js overlayVisibility.test.js mainWindowOpacity.test.js
+        run: npm test
+
+      - name: Run desktop Python mouse-hook tests
+        run: python -m pytest test_prompt_mouse_hook.py -q --tb=short
 
   # ── Playwright E2E (mocked backend, no live API needed) ──
   e2e-playwright:
@@ -306,16 +324,18 @@ jobs:
         run: npm ci
 
       - name: Run end-to-end smoke
-        run: python scripts/e2e_test.py
+        run: |
+          python -m unittest discover -s scripts -p test_e2e_smoke.py
+          python scripts/e2e_test.py
+        env:
+          IA_SMOKE_LOG_DIR: ${{ runner.temp }}/ia-smoke-logs
 
       - name: Upload backend log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-smoke-logs
-          path: |
-            log/
-            backend/data/
+          path: ${{ runner.temp }}/ia-smoke-logs
           retention-days: 3
           if-no-files-found: ignore
 
@@ -324,12 +344,16 @@ jobs:
   # When this gate fails on visual diff, regenerate baselines on the
   # branch via the `update-visual-snapshots` workflow.
   ci-gate:
-    needs: [backend, frontend, desktop, e2e-playwright, e2e-smoke, e2e-visual]
+    needs: [changes, backend, frontend, desktop, e2e-playwright, e2e-smoke, e2e-visual]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check all required jobs succeeded or were skipped
         run: |
+          if [ "${{ needs.changes.result }}" != success ]; then
+            echo "Could not determine the checks required for this change"
+            exit 1
+          fi
           ok=true
           for r in "${{ needs.backend.result }}" \
                    "${{ needs.frontend.result }}" \

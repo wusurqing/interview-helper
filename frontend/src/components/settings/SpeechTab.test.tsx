@@ -90,4 +90,37 @@ describe('SpeechTab', () => {
     expect(generic.getByRole('button', { name: '测试中…' })).toBeDisabled()
     await act(async () => { test.resolve({ ok: true, text: '识别结果' }) })
   })
+
+  it('masks configured segmented STT secrets and sends null only when explicitly cleared', async () => {
+    useInterviewStore.setState({
+      config: {
+        ...useInterviewStore.getState().config!,
+        doubao_stt_api_key_configured: true,
+        doubao_stt_access_token_configured: true,
+        generic_stt_api_key_configured: true,
+        generic_stt_custom_headers_configured: true,
+      },
+    })
+    render(<SpeechTab />)
+    const doubao = engine('火山原生豆包')
+    const generic = engine('OpenAI 兼容 ASR')
+
+    expect(doubao.getByLabelText('API Key（新版控制台）')).toHaveValue('')
+    expect(doubao.getByLabelText('API Key（新版控制台）')).toHaveAttribute('placeholder', '已配置 · 留空保留')
+    expect(generic.getByLabelText('自定义 Header（可选）')).toHaveValue('')
+    expect(generic.getByLabelText('自定义 Header（可选）')).toHaveAttribute('placeholder', '已配置 · 留空保留')
+
+    // Clear and undo leaves the section clean.
+    fireEvent.click(doubao.getByRole('button', { name: '清除 API Key（新版控制台）' }))
+    expect(doubao.getByLabelText('API Key（新版控制台）')).toHaveAttribute('placeholder', '保存后清除')
+    fireEvent.click(doubao.getByRole('button', { name: '撤销清除 API Key（新版控制台）' }))
+    expect(doubao.getByRole('button', { name: '保存' })).toBeDisabled()
+
+    // Clearing custom headers sends explicit null without touching API key.
+    fireEvent.click(generic.getByRole('button', { name: '清除 自定义 Header（可选）' }))
+    fireEvent.click(generic.getByRole('button', { name: '保存' }))
+    await waitFor(() =>
+      expect(updateConfigAndRefresh).toHaveBeenCalledExactlyOnceWith({ generic_stt_custom_headers: null }),
+    )
+  })
 })

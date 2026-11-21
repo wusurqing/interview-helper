@@ -41,9 +41,15 @@ PREFLIGHT_SCENARIOS = [
 ]
 
 PREFLIGHT_EXPECTED_PHRASE = "请介绍一下你最近做过的项目"
-PREFLIGHT_AUDIO_PATH = Path(__file__).resolve().parents[2] / "assets" / "preflight_phrase.wav"
+PREFLIGHT_FIXTURES_DIR = Path(__file__).resolve().parents[2] / "assets"
+PREFLIGHT_AUDIO_PATH = PREFLIGHT_FIXTURES_DIR / "preflight_phrase.wav"
+PREFLIGHT_REPLAY_FIXTURES: dict[str, Path] = {
+    "default": PREFLIGHT_AUDIO_PATH,
+    "preflight_phrase": PREFLIGHT_AUDIO_PATH,
+}
 
 _running = False
+_replay_running = False
 _lock = threading.Lock()
 _log = get_logger("assist.preflight")
 _status: dict = {
@@ -59,6 +65,7 @@ _status: dict = {
     "finished_at": None,
 }
 _level_lock = threading.Lock()
+_level_lifecycle_lock = threading.Lock()
 _level_stop_event = threading.Event()
 _level_thread: Optional[threading.Thread] = None
 _level_status: dict = {
@@ -114,6 +121,26 @@ def _set_step(step: str, status: str, detail: str = "", extra: Optional[dict] = 
     broadcast(msg)
 
 
+def is_preflight_replay_running() -> bool:
+    with _lock:
+        return bool(_replay_running)
+
+
+def begin_preflight_replay() -> bool:
+    global _replay_running
+    with _lock:
+        if _running or _replay_running:
+            return False
+        _replay_running = True
+        return True
+
+
+def end_preflight_replay() -> None:
+    global _replay_running
+    with _lock:
+        _replay_running = False
+
+
 def get_preflight_status() -> dict:
     with _lock:
         return {
@@ -143,18 +170,49 @@ def collect_capture_audio(cap: AudioCapture, duration_sec: float, poll_interval:
     return np.concatenate(chunks)
 
 
+def resolve_preflight_fixture(fixture_id: Optional[str] = None) -> Path:
+    """将 HTTP 回放请求中的 fixture_id 解析为受控目录内的 WAV 文件。"""
+    if fixture_id is None:
+        key = "default"
+    elif isinstance(fixture_id, str):
+        key = fixture_id.strip() or "default"
+    else:
+        raise ValueError("fixture_id 必须是字符串")
+    candidate = PREFLIGHT_REPLAY_FIXTURES.get(key)
+    if candidate is None:
+        raise ValueError("不支持的测试音频 fixture_id")
+    raw = str(candidate)
+    if raw.startswith(("\\\\", "//")):
+        raise ValueError("不支持网络共享路径")
+    root = PREFLIGHT_FIXTURES_DIR.resolve()
+    resolved = candidate.resolve()
+    if resolved == root or not resolved.is_relative_to(root):
+        raise ValueError("测试音频路径越出受控目录")
+    if resolved.suffix.lower() != ".wav":
+        raise ValueError("测试音频必须是 .wav 文件")
+    return resolved
+
+
 def play_preflight_audio() -> float:
     if not PREFLIGHT_AUDIO_PATH.exists():
-        raise RuntimeError(f"测试音频不存在: {PREFLIGHT_AUDIO_PATH}")
+        raise FileNotFoundError("内置测试音频不存在")
     started = time.monotonic()
     play_audio_file(PREFLIGHT_AUDIO_PATH)
     return time.monotonic() - started
 
 
 def play_audio_fixture(audio_path: str | Path | None = None) -> float:
-    target = Path(audio_path) if audio_path else PREFLIGHT_AUDIO_PATH
+    if audio_path is not None:
+        raw = str(audio_path).strip()
+        if not raw or raw.startswith(("\\\\", "//")):
+            raise ValueError("不支持的测试音频路径")
+        target = Path(raw)
+        if target.suffix.lower() != ".wav":
+            raise ValueError("仅支持 .wav 测试音频文件")
+    else:
+        target = PREFLIGHT_AUDIO_PATH
     if not target.exists():
-        raise RuntimeError(f"测试音频不存在: {target}")
+        raise FileNotFoundError("测试音频不存在")
     started = time.monotonic()
     play_audio_file(target)
     return time.monotonic() - started
@@ -392,12 +450,19 @@ def get_input_level_status() -> dict:
         return dict(_level_status)
 
 
-def _run_input_level_monitor(device_id: int, stop_event: threading.Event) -> None:
-    cap = AudioCapture()
+def _run_input_level_monitor(
+    device_id: int,
+    stop_event: threading.Event,
+    cap: Optional[AudioCapture] = None,
+) -> None:
+    started_here = cap is None
+    if cap is None:
+        cap = AudioCapture()
     rms = 0.0
     peak = 0.0
     try:
-        cap.start(int(device_id), owner="audio-level-test", mic_compatibility_mode=True)
+        if started_here:
+            cap.start(int(device_id), owner="audio-level-test", mic_compatibility_mode=True)
         _set_level_status(running=True, error=None)
         while not stop_event.is_set():
             chunk = cap.get_audio_chunk(max_chunks=4)
@@ -424,37 +489,14 @@ def _run_input_level_monitor(device_id: int, stop_event: threading.Event) -> Non
         try:
             cap.stop(owner="audio-level-test")
         finally:
-            _set_level_status(running=False)
+            current = threading.current_thread()
+            with _level_lock:
+                if _level_thread is current or _level_thread is None:
+                    _level_status["running"] = False
+                    _level_status["updated_at"] = time.time()
 
 
-def start_input_level_monitor(device_id: int) -> dict:
-    global _level_thread, _level_stop_event, _level_status
-    stop_input_level_monitor()
-    with _level_lock:
-        _level_stop_event = threading.Event()
-        _level_status = {
-            "running": True,
-            "device_id": int(device_id),
-            "rms": 0.0,
-            "peak": 0.0,
-            "level_pct": 0,
-            "has_signal": False,
-            "error": None,
-            "started_at": time.time(),
-            "updated_at": time.time(),
-        }
-        thread = threading.Thread(
-            target=_run_input_level_monitor,
-            args=(int(device_id), _level_stop_event),
-            daemon=True,
-            name="audio-level-test",
-        )
-        _level_thread = thread
-    thread.start()
-    return get_input_level_status()
-
-
-def stop_input_level_monitor() -> dict:
+def _stop_input_level_monitor_locked() -> dict:
     global _level_thread
     with _level_lock:
         thread = _level_thread
@@ -467,6 +509,54 @@ def stop_input_level_monitor() -> dict:
         _level_status["running"] = False
         _level_status["updated_at"] = time.time()
     return get_input_level_status()
+
+
+def start_input_level_monitor(device_id: int) -> dict:
+    global _level_thread, _level_stop_event, _level_status
+    with _level_lifecycle_lock:
+        _stop_input_level_monitor_locked()
+        cap = AudioCapture()
+        try:
+            cap.start(int(device_id), owner="audio-level-test", mic_compatibility_mode=True)
+        except Exception as exc:
+            _set_level_status(device_id=int(device_id), running=False, error=str(exc))
+            raise
+        with _level_lock:
+            _level_stop_event = threading.Event()
+            _level_status = {
+                "running": True,
+                "device_id": int(device_id),
+                "rms": 0.0,
+                "peak": 0.0,
+                "level_pct": 0,
+                "has_signal": False,
+                "error": None,
+                "started_at": time.time(),
+                "updated_at": time.time(),
+            }
+            thread = threading.Thread(
+                target=_run_input_level_monitor,
+                args=(int(device_id), _level_stop_event, cap),
+                daemon=True,
+                name="audio-level-test",
+            )
+            _level_thread = thread
+        try:
+            thread.start()
+        except Exception:
+            with _level_lock:
+                if _level_thread is thread:
+                    _level_thread = None
+                _level_status["running"] = False
+                _level_status["updated_at"] = time.time()
+            cap.stop(owner="audio-level-test")
+            raise
+        return get_input_level_status()
+
+
+def stop_input_level_monitor() -> dict:
+    with _level_lifecycle_lock:
+        return _stop_input_level_monitor_locked()
 
 
 def resolve_preflight_scenario(scenario_id: str) -> dict:
@@ -562,7 +652,10 @@ def _run_preflight(device_id: Optional[int], scenario_id: str):
         _set_step("playback", "running", "准备播放测试音频…")
         _set_step("capture", "running", "准备捕获真实音频…")
         try:
-            cap.start(device_id)
+            try:
+                cap.start(device_id, owner="audio-preflight")
+            except TypeError:
+                cap.start(device_id)
             time.sleep(0.15)
             captured, playback_elapsed = collect_capture_audio_during_playback(
                 cap,
@@ -571,7 +664,10 @@ def _run_preflight(device_id: Optional[int], scenario_id: str):
             )
             _set_step("playback", "pass", f"测试音频已播放（{playback_elapsed:.2f}s）")
         finally:
-            cap.stop()
+            try:
+                cap.stop(owner="audio-preflight")
+            except TypeError:
+                cap.stop()
 
         if captured is None or len(captured) == 0:
             _set_step("capture", "fail", "未捕获到有效音频")
@@ -642,12 +738,34 @@ def _run_preflight(device_id: Optional[int], scenario_id: str):
 
 def start_preflight(device_id: Optional[int] = None, scenario_id: str = "self_intro"):
     global _running
+    scenario = resolve_preflight_scenario(scenario_id)
+    resolved_scenario_id = scenario.get("id", scenario_id)
+    expected_phrase = scenario.get("expected_phrase") or PREFLIGHT_EXPECTED_PHRASE
     with _lock:
-        if _running:
+        if _running or _replay_running:
             return False
         _running = True
-    t = threading.Thread(target=_run_preflight, args=(device_id, scenario_id), daemon=True)
-    t.start()
+        _status.update(
+            running=True,
+            scenario_id=resolved_scenario_id,
+            device_id=device_id,
+            expected_phrase=expected_phrase,
+            captured_transcript=None,
+            match_ok=None,
+            steps={},
+            error=None,
+            started_at=time.time(),
+            finished_at=None,
+        )
+    try:
+        t = threading.Thread(target=_run_preflight, args=(device_id, scenario_id), daemon=True)
+        t.start()
+    except Exception:
+        with _lock:
+            _running = False
+            _status["running"] = False
+            _status["finished_at"] = time.time()
+        raise
     return True
 
 

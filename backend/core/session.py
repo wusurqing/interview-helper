@@ -59,6 +59,7 @@ class Session:
     capture_is_loopback: bool = True
     single_mic: "SingleMicSession | None" = field(default=None, repr=False, compare=False)
     created_at: float = field(default_factory=time.time)
+    session_version: int = 0
     system_summary: str = ""
     _compaction_running: bool = False
     _live_transcript: LiveTranscript = field(default_factory=LiveTranscript, repr=False, compare=False)
@@ -383,31 +384,33 @@ class Session:
         try:
             schedule_compaction(self)
         except Exception:
-            self._compaction_running = False
+            return
 
     def clear(self):
-        self._live_transcript.reset()
-        self.transcription_history.clear()
-        self.candidate_transcription_history.clear()
-        self.candidate_answer_segments.clear()
-        self.conversation_history.clear()
-        self.qa_pairs.clear()
-        self.current_transcription = ""
-        self.current_candidate_transcription = ""
-        self.current_candidate_qa_id = ""
-        self.candidate_asr_busy = False
-        self.candidate_asr_active_qa_id = ""
-        self.candidate_asr_activity_at = 0.0
-        self.is_recording = False
-        self.is_paused = False
-        self.last_device_id = -1
-        self.last_candidate_mic_device_id = -1
-        self.capture_is_loopback = True
-        self.single_mic = None
-        self.created_at = time.time()
-        self.system_summary = ""
-        self._compaction_running = False
-        self.last_llm_history_stats = {}
+        with conversation_lock:
+            self._live_transcript.reset()
+            self.transcription_history.clear()
+            self.candidate_transcription_history.clear()
+            self.candidate_answer_segments.clear()
+            self.conversation_history.clear()
+            self.qa_pairs.clear()
+            self.current_transcription = ""
+            self.current_candidate_transcription = ""
+            self.current_candidate_qa_id = ""
+            self.candidate_asr_busy = False
+            self.candidate_asr_active_qa_id = ""
+            self.candidate_asr_activity_at = 0.0
+            self.is_recording = False
+            self.is_paused = False
+            self.last_device_id = -1
+            self.last_candidate_mic_device_id = -1
+            self.capture_is_loopback = True
+            self.single_mic = None
+            self.created_at = time.time()
+            self.session_version += 1
+            self.system_summary = ""
+            self._compaction_running = False
+            self.last_llm_history_stats = {}
 
     def snapshot(self) -> dict:
         return {

@@ -1,9 +1,11 @@
 """Offline checks only: no provider connection and no real credentials."""
 import asyncio
 import json
+import logging
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 import server
 
@@ -89,6 +91,39 @@ class ProbeContractTests(unittest.TestCase):
         self.assertFalse(server.local_request_allowed('localhost:18765', 'https://example.com', '127.0.0.1', True))
         self.assertFalse(server.local_request_allowed('evil.example:18765', None, '127.0.0.1'))
         self.assertFalse(server.local_request_allowed('localhost:18765', None, '192.0.2.1'))
+
+    def test_create_app_suppresses_websockets_logger_under_factory_mode(self):
+        ws_logger = logging.getLogger('websockets')
+        prev_level = ws_logger.level
+        try:
+            ws_logger.setLevel(logging.DEBUG)
+            server.create_app()
+            self.assertGreaterEqual(ws_logger.level, logging.WARNING)
+        finally:
+            ws_logger.setLevel(prev_level)
+
+    def test_run_ps1_passes_warning_log_level(self):
+        script = (Path(__file__).parent / 'run.ps1').read_text(encoding='utf-8')
+        self.assertIn('--factory', script)
+        self.assertIn('--log-level warning', script)
+
+    def test_connect_mmpg_passes_silent_wire_logger(self):
+        captured = {}
+
+        async def fake_connect(url, **kwargs):
+            captured['url'] = url
+            captured['kwargs'] = kwargs
+            return FakeCloud()
+
+        from websockets.asyncio import client as ws_client
+
+        with mock.patch.object(ws_client, 'connect', side_effect=fake_connect):
+            asyncio.run(server.connect_mmpg(fake_config()))
+
+        wire_logger = captured['kwargs'].get('logger')
+        self.assertIs(wire_logger, server._WIRE_LOGGER)
+        self.assertGreater(wire_logger.level, logging.CRITICAL)
+        self.assertFalse(wire_logger.propagate)
 
 
 class FakeCloud:

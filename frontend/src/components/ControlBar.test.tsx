@@ -1,3 +1,4 @@
+import { Profiler } from 'react'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import ControlBar from './ControlBar'
@@ -113,13 +114,14 @@ describe('ControlBar', () => {
         whisper_model: 'base',
         whisper_language: 'auto',
         doubao_stt_app_id: '',
-        doubao_stt_access_token: '',
-        doubao_stt_api_key: '',
+        doubao_stt_access_token_configured: false,
+        doubao_stt_api_key_configured: false,
         doubao_stt_resource_id: '',
         doubao_stt_boosting_table_id: '',
         generic_stt_api_base_url: '',
-        generic_stt_api_key: '',
+        generic_stt_api_key_configured: false,
         generic_stt_model: '',
+        generic_stt_custom_headers_configured: false,
         position: '后端开发',
         language: 'Python',
         auto_detect: true,
@@ -1164,5 +1166,50 @@ describe('ControlBar', () => {
     expect(screen.queryByRole('dialog', { name: '麦克风输入测试' })).not.toBeInTheDocument()
     expect(screen.queryByText('80%')).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '测试麦克风输入' })).not.toBeDisabled()
+  })
+
+  it('skips re-rendering during streaming answer chunks and updates on latest candidate transcription', () => {
+    const onRender = vi.fn()
+    useInterviewStore.setState({
+      qaPairs: [{
+        id: 'qa-1',
+        question: '什么是 MVCC？',
+        answer: '初始',
+        thinkContent: '',
+        isThinking: false,
+        timestamp: 1710000000,
+        status: 'streaming',
+      }],
+      streamingIds: ['qa-1'],
+      transcriptions: ['第一句面试官转写'],
+      candidateTranscriptions: [],
+    } as any)
+
+    render(
+      <Profiler id="control-bar" onRender={onRender}>
+        <ControlBar />
+      </Profiler>,
+    )
+    const rendersAfterMount = onRender.mock.calls.length
+
+    act(() => {
+      for (let i = 1; i <= 5; i++) {
+        useInterviewStore.setState((state) => ({
+          qaPairs: state.qaPairs.map((qa) => (
+            qa.id === 'qa-1' ? { ...qa, answer: `${qa.answer} chunk-${i}` } : qa
+          )),
+          transcriptions: [...state.transcriptions, `后续面试官转写 ${i}`],
+        }))
+      }
+    })
+
+    expect(onRender).toHaveBeenCalledTimes(rendersAfterMount)
+
+    act(() => {
+      useInterviewStore.setState({ candidateTranscriptions: ['我的最新回答'] })
+    })
+
+    expect(onRender.mock.calls.length).toBeGreaterThan(rendersAfterMount)
+    expect(screen.getByText('我的回答记录：我的最新回答')).toBeInTheDocument()
   })
 })

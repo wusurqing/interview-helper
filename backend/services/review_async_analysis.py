@@ -1,18 +1,57 @@
 """
 后台分析任务：异步分析 review session
 """
-import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 import re
+import threading
 from collections.abc import Mapping
 from typing import Any, Optional
 
 from core.config import get_config
+from core.env import env_int
 from core.logger import get_logger
 from services.storage import review
 from services import review_analysis
 
 logger = get_logger(__name__)
 _SCORE_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_MAX_ANALYSIS_WORKERS = env_int("IA_REVIEW_ANALYSIS_WORKERS", 2, minimum=1)
+_executor_lock = threading.Lock()
+_executor: Optional[ThreadPoolExecutor] = None
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    global _executor
+    with _executor_lock:
+        if _executor is None:
+            _executor = ThreadPoolExecutor(
+                max_workers=_MAX_ANALYSIS_WORKERS,
+                thread_name_prefix="review-analysis",
+            )
+        return _executor
+
+
+def _log_future_exception(future: Future[Any]) -> None:
+    try:
+        future.result()
+    except Exception:
+        logger.exception("Unhandled exception in review analysis worker")
+
+
+def _submit_analysis_worker(session_id: int, system_prompts: dict[str, str]) -> Future[Any]:
+    future = _get_executor().submit(_analyze_session_worker, session_id, system_prompts)
+    future.add_done_callback(_log_future_exception)
+    return future
+
+
+def shutdown_executor(*, wait: bool = False) -> None:
+    """停机时关闭复盘分析有界线程池。"""
+    global _executor
+    with _executor_lock:
+        executor = _executor
+        _executor = None
+    if executor is not None:
+        executor.shutdown(wait=wait)
 
 
 def _score_values(scorecard: Any) -> list[float]:
@@ -39,18 +78,14 @@ def _score_values(scorecard: Any) -> list[float]:
 def analyze_session_async(session_id: int):
     """
     异步分析 session
-    在后台线程中执行，不阻塞主流程
+    提交到有界线程池中执行，不阻塞主流程
     """
     configured = getattr(get_config(), "system_prompts", None)
     system_prompts = dict(configured) if isinstance(configured, Mapping) else {}
-    review.update_session_status(session_id, "analyzing")
-    thread = threading.Thread(
-        target=_analyze_session_worker,
-        args=(session_id, system_prompts),
-        daemon=True,
-    )
-    thread.start()
+    review.ensure_session_analyzing(session_id)
+    future = _submit_analysis_worker(session_id, system_prompts)
     logger.info("Started background analysis for session_id=%d", session_id)
+    return future
 
 
 def _analyze_session_worker(session_id: int, system_prompts: Mapping[str, str] | None = None):

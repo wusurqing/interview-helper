@@ -21,17 +21,47 @@ const genericFields = [
   { key: 'generic_stt_api_base_url', label: 'Base URL', hint: '填写 OpenAI 兼容接口地址，例如 https://api.example.com/v1。' },
   { key: 'generic_stt_api_key', label: 'API Key', secret: true },
   { key: 'generic_stt_model', label: 'Model' },
-  { key: 'generic_stt_custom_headers', label: '自定义 Header（可选）', multiline: true, hint: '使用 JSON 对象，或每行填写一组 Key: Value。' },
+  {
+    key: 'generic_stt_custom_headers',
+    label: '自定义 Header（可选）',
+    secret: true,
+    multiline: true,
+    hint: '使用 JSON 对象，或每行填写一组 Key: Value；留空保留已保存配置。',
+  },
 ] as const
 
-type EngineField = {
-  key: typeof doubaoFields[number]['key'] | typeof genericFields[number]['key']
-  label: string
-  hint?: string
-  secret?: boolean
-  multiline?: boolean
-  defaultValue?: string
-}
+type PublicEngineFieldKey =
+  | 'doubao_stt_app_id'
+  | 'doubao_stt_resource_id'
+  | 'doubao_stt_boosting_table_id'
+  | 'generic_stt_api_base_url'
+  | 'generic_stt_model'
+
+type SecretEngineFieldKey =
+  | 'doubao_stt_api_key'
+  | 'doubao_stt_access_token'
+  | 'generic_stt_api_key'
+  | 'generic_stt_custom_headers'
+
+type EngineField =
+  | {
+      key: PublicEngineFieldKey
+      label: string
+      hint?: string
+      secret?: false
+      multiline?: boolean
+      defaultValue?: string
+    }
+  | {
+      key: SecretEngineFieldKey
+      label: string
+      hint?: string
+      secret: true
+      multiline?: boolean
+      defaultValue?: string
+    }
+
+type EngineForm = Partial<Record<PublicEngineFieldKey, string>> & Partial<Record<SecretEngineFieldKey, string | null>>
 
 const saveButton = 'rounded-lg border border-accent-blue/30 bg-accent-blue/15 px-3 py-1.5 text-xs font-medium text-accent-blue disabled:opacity-50'
 
@@ -42,8 +72,12 @@ function ProviderStatus({ configured }: { configured: boolean }) {
 function SegmentedEngineSettings({
   provider, title, fields, config,
 }: { provider: SegmentedSpeechProvider; title: string; fields: readonly EngineField[]; config: AppConfig }) {
-  const saved = Object.fromEntries(fields.map(({ key, defaultValue }) => [key, config[key] ?? defaultValue ?? ''])) as Partial<Record<EngineField['key'], string>>
-  const draft = useSpeechSettingsDraft('speech-' + provider, saved)
+  const saved = Object.fromEntries(
+    fields
+      .filter((field): field is Extract<EngineField, { secret?: false }> => !field.secret)
+      .map(({ key, defaultValue }) => [key, config[key] ?? defaultValue ?? '']),
+  ) as EngineForm
+  const draft = useSpeechSettingsDraft<EngineForm>('speech-' + provider, saved)
   const [testResult, setTestResult] = useState<{ ok: boolean; detail?: string; text?: string } | null>(null)
   const [testing, setTesting] = useState(false)
   const testRef = useRef(false)
@@ -69,27 +103,84 @@ function SegmentedEngineSettings({
     <Section title={title} icon={<Cloud size={14} />} keywords="云端 语音 识别 分段 STT 凭据 API Key 热词 测试">
       <ProviderStatus configured={Boolean(config.stt_configured?.[provider])} />
       <fieldset disabled={busy} className="grid gap-3 sm:grid-cols-2">
-        {fields.map(({ key, label, hint, secret, multiline }) => (
-          <Field label={label} htmlFor={key} hint={hint} key={key}>
-            {multiline ? (
-              <textarea
-                id={key}
-                className="input-field min-h-20 font-mono"
-                value={draft.form[key]}
-                onChange={(event) => { draft.edit({ [key]: event.target.value }); setTestResult(null) }}
-              />
-            ) : (
-              <input
-                id={key}
-                className="input-field"
-                type={secret ? 'password' : 'text'}
-                autoComplete={secret ? 'off' : undefined}
-                value={draft.form[key]}
-                onChange={(event) => { draft.edit({ [key]: event.target.value }); setTestResult(null) }}
-              />
-            )}
-          </Field>
-        ))}
+        {fields.map((field) => {
+          const { key, label, hint, multiline } = field
+          if (field.secret) {
+            const configured = Boolean(config[`${field.key}_configured`])
+            const cleared = draft.form[field.key] === null
+            const value = draft.form[field.key] ?? ''
+            const placeholder = cleared ? '保存后清除' : configured ? '已配置 · 留空保留' : '未配置'
+            const clearButton = (configured || value || cleared) && (
+              <button
+                type="button"
+                className="text-xs text-accent-blue shrink-0"
+                aria-label={cleared ? `撤销清除 ${label}` : `清除 ${label}`}
+                onClick={() => {
+                  draft.edit({ [field.key]: cleared || !configured ? undefined : null })
+                  setTestResult(null)
+                }}
+              >
+                {cleared ? '撤销' : '清除'}
+              </button>
+            )
+            return (
+              <Field label={label} htmlFor={key} hint={hint} key={key}>
+                {multiline ? (
+                  <div className="space-y-1.5">
+                    <textarea
+                      id={key}
+                      className="input-field min-h-20 font-mono"
+                      autoComplete="off"
+                      value={value}
+                      placeholder={placeholder}
+                      onChange={(event) => {
+                        draft.edit({ [field.key]: event.target.value || undefined })
+                        setTestResult(null)
+                      }}
+                    />
+                    {clearButton && <div className="flex justify-end">{clearButton}</div>}
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <input
+                      id={key}
+                      className="input-field"
+                      type="password"
+                      autoComplete="off"
+                      value={value}
+                      placeholder={placeholder}
+                      onChange={(event) => {
+                        draft.edit({ [field.key]: event.target.value || undefined })
+                        setTestResult(null)
+                      }}
+                    />
+                    {clearButton}
+                  </div>
+                )}
+              </Field>
+            )
+          }
+          return (
+            <Field label={label} htmlFor={key} hint={hint} key={key}>
+              {multiline ? (
+                <textarea
+                  id={key}
+                  className="input-field min-h-20 font-mono"
+                  value={draft.form[field.key] ?? ''}
+                  onChange={(event) => { draft.edit({ [field.key]: event.target.value }); setTestResult(null) }}
+                />
+              ) : (
+                <input
+                  id={key}
+                  className="input-field"
+                  type="text"
+                  value={draft.form[field.key] ?? ''}
+                  onChange={(event) => { draft.edit({ [field.key]: event.target.value }); setTestResult(null) }}
+                />
+              )}
+            </Field>
+          )
+        })}
       </fieldset>
       <div className="flex flex-wrap items-center justify-end gap-2">
         <SaveStateBadge mode="explicit" state={draft.state} error={draft.error} />

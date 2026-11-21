@@ -10,10 +10,16 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from core.logger import get_logger
+from services.storage.sqlite_utils import (
+    enable_wal_mode,
+    open_sqlite_connection,
+    sqlite_connection,
+)
 
 from ._tokenize import cjk_bigram_text
 from .types import Chunk
@@ -64,21 +70,32 @@ class KBStore:
         self._lock = threading.RLock()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=5.0, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        return conn
+        return open_sqlite_connection(
+            self.db_path,
+            timeout=5.0,
+            foreign_keys=True,
+        )
+
+    @contextmanager
+    def _connection(self, *, transactional: bool = False) -> Iterator[sqlite3.Connection]:
+        with sqlite_connection(
+            self.db_path,
+            timeout=5.0,
+            foreign_keys=True,
+            transactional=transactional,
+        ) as conn:
+            yield conn
 
     def close(self) -> None:
         pass
 
     def init_schema(self) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
+            enable_wal_mode(conn)
             conn.executescript(_SCHEMA_SQL)
 
     def list_tables(self) -> set[str]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
             ).fetchall()
@@ -92,7 +109,7 @@ class KBStore:
         loader: str,
         title: Optional[str],
     ) -> int:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection(transactional=True) as conn:
             conn.execute(
                 """
                 INSERT INTO kb_doc(path, mtime, size, loader, title, status, error)
@@ -111,7 +128,7 @@ class KBStore:
             return int(row["id"])
 
     def set_status(self, path: str, status: str, error: Optional[str]) -> None:
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection(transactional=True) as conn:
             conn.execute(
                 "UPDATE kb_doc SET status=?, error=? WHERE path=?",
                 (status, error, path),
@@ -119,7 +136,7 @@ class KBStore:
 
     def delete_doc(self, path: str) -> None:
         """删 kb_doc + 先清相关 FTS 行 (外键 cascade 不会触及 FTS 独立表)。"""
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection(transactional=True) as conn:
             row = conn.execute("SELECT id FROM kb_doc WHERE path=?", (path,)).fetchone()
             if row is None:
                 return
@@ -130,7 +147,7 @@ class KBStore:
             conn.execute("DELETE FROM kb_doc WHERE id=?", (row["id"],))
 
     def get_doc(self, path: str) -> Optional[dict[str, Any]]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute("SELECT * FROM kb_doc WHERE path=?", (path,)).fetchone()
         return dict(row) if row else None
 
@@ -140,14 +157,19 @@ class KBStore:
             "(SELECT COUNT(*) FROM kb_chunk c WHERE c.doc_id=d.id) AS chunk_count "
             "FROM kb_doc d ORDER BY d.path"
         )
+        params: tuple[Any, ...] = ()
         if limit is not None:
-            sql += f" LIMIT {int(limit)}"
-        with self._connect() as conn:
-            rows = conn.execute(sql).fetchall()
+            limit_val = int(limit)
+            if limit_val < 1:
+                raise ValueError("limit must be >= 1")
+            sql += " LIMIT ?"
+            params = (limit_val,)
+        with self._connection() as conn:
+            rows = conn.execute(sql, params).fetchall()
         return [dict(r) for r in rows]
 
     def stats(self) -> dict[str, Any]:
-        with self._connect() as conn:
+        with self._connection() as conn:
             doc_n = conn.execute("SELECT COUNT(*) AS n FROM kb_doc").fetchone()["n"]
             chunk_n = conn.execute("SELECT COUNT(*) AS n FROM kb_chunk").fetchone()["n"]
             last = conn.execute("SELECT MAX(mtime) AS m FROM kb_doc").fetchone()["m"]
@@ -160,7 +182,7 @@ class KBStore:
     def replace_chunks(self, doc_id: int, chunks: Iterable[Chunk]) -> None:
         """事务内替换 doc 的所有 chunk, 同步写 kb_fts (含 bigram)。"""
         chunks_list = list(chunks)
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection(transactional=True) as conn:
             old_ids = [
                 r["id"]
                 for r in conn.execute(
@@ -196,6 +218,9 @@ class KBStore:
         interrupt_connection: Optional[sqlite3.Connection] = None,
     ) -> list[dict[str, Any]]:
         """query 必须是已经 bigram/token 化后的 FTS5 MATCH 表达式。"""
+        limit_val = int(limit)
+        if limit_val < 1:
+            return []
         conn = interrupt_connection or self._connect()
         own_conn = interrupt_connection is None
         try:
@@ -210,7 +235,7 @@ class KBStore:
                 ORDER BY score
                 LIMIT ?
                 """,
-                (query, limit),
+                (query, limit_val),
             ).fetchall()
             return [dict(r) for r in rows]
         finally:

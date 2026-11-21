@@ -103,19 +103,54 @@ DEMO_SESSIONS = [
 ]
 
 
-def create_demo_session(session_data):
-    """创建一个演示会话"""
-    # 计算时间戳
-    now = datetime.now()
-    started_dt = now + timedelta(days=session_data['started_offset_days'])
-    started_at = started_dt.timestamp()
-    ended_at = started_at + session_data['duration_min'] * 60
+def _all_existing_sessions() -> list[dict]:
+    sessions: list[dict] = []
+    page = 1
+    page_size = review.MAX_REVIEW_PAGE_SIZE
+    while True:
+        batch = review.list_sessions(page=page, page_size=page_size)
+        items = batch.get("items") or []
+        sessions.extend(items)
+        if len(sessions) >= int(batch.get("total") or 0) or not items:
+            break
+        page += 1
+    return sessions
 
-    # 创建 session
+
+def _session_started_at(session_data: dict, *, now: datetime | None = None) -> float:
+    base = (now or datetime.now()).replace(hour=10, minute=0, second=0, microsecond=0)
+    started_dt = base + timedelta(days=session_data['started_offset_days'])
+    return started_dt.timestamp()
+
+
+def create_demo_session(session_data, *, existing_sessions: list[dict] | None = None, now: datetime | None = None):
+    """创建一个演示会话（已存在相同 started_at 或同公司/岗位 demo 会话时返回 None 去重）"""
+    started_at = _session_started_at(session_data, now=now)
+    ended_at = started_at + session_data['duration_min'] * 60
+    company = session_data['company']
+    role = session_data['role']
+
+    existing = existing_sessions if existing_sessions is not None else _all_existing_sessions()
+    for item in existing:
+        existing_started = item.get('started_at')
+        if existing_started is not None and abs(float(existing_started) - started_at) < 1.0:
+            return None
+        if (
+            item.get('source') == 'demo'
+            and item.get('company') == company
+            and item.get('role') == role
+        ):
+            return None
+
+    # 通过存储层标准接口写入公司、岗位与标题（内置 _db_lock + 事务）
     session_id = review.create_session(
         started_at=started_at,
         interviewer_enabled=True,
         candidate_enabled=True,
+        source='demo',
+        title=f"{company} - {role}",
+        company=company,
+        role=role,
     )
 
     # 添加 turns
@@ -132,24 +167,17 @@ def create_demo_session(session_data):
             analysis_status='pending',
         )
 
-    # 结束 session
-    review.end_session(session_id=session_id, ended_at=ended_at)
+    # 结束 session：未运行 LLM 分析的演示数据应置为 recorded，避免误标 completed
+    review.end_session(session_id=session_id, status='recorded', ended_at=ended_at)
 
-    # 更新公司和岗位信息
-    import sqlite3
-    db_path = Path(__file__).parent.parent / 'data' / 'review.db'
-    conn = sqlite3.connect(str(db_path))
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        UPDATE review_sessions
-        SET company = ?, role = ?
-        WHERE id = ?
-        """,
-        (session_data['company'], session_data['role'], session_id)
-    )
-    conn.commit()
-    conn.close()
+    if existing_sessions is not None:
+        existing_sessions.append({
+            'id': session_id,
+            'started_at': started_at,
+            'source': 'demo',
+            'company': company,
+            'role': role,
+        })
 
     return session_id
 
@@ -158,20 +186,26 @@ def main():
     """主函数"""
     print("正在创建演示面试记录...")
 
+    existing_sessions = _all_existing_sessions()
     created_count = 0
+    skipped_count = 0
     for session_data in DEMO_SESSIONS:
         try:
-            session_id = create_demo_session(session_data)
+            session_id = create_demo_session(session_data, existing_sessions=existing_sessions)
+            if session_id is None:
+                skipped_count += 1
+                print(f"[SKIP] 已存在演示会话: {session_data['company']} - {session_data['role']}")
+                continue
             created_count += 1
             print(f"[OK] 创建会话 {session_id}: {session_data['company']} - {session_data['role']}")
         except Exception as e:
             print(f"[ERROR] 创建失败: {e}")
             logger.error(f"Failed to create demo session: {e}", exc_info=True)
 
-    print(f"\n成功创建 {created_count} 个演示会话")
+    print(f"\n成功创建 {created_count} 个演示会话（跳过重复 {skipped_count} 个）")
 
     # 显示统计
-    stats = review.get_session_list(page=1, page_size=1)
+    stats = review.list_sessions(page=1, page_size=1)
     print(f"数据库中现有 {stats['total']} 场面试记录")
 
 

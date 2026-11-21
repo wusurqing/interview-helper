@@ -148,3 +148,74 @@ def test_only_short_interviewer_empty_segment_is_retried_with_silence(monkeypatc
     monkeypatch.setattr(stt_factory, "get_stt_engine", lambda *_args, **_options: SimpleNamespace(transcribe=transcribe))
     assert stt_factory.transcribe_segment(np.zeros(16000), 16000, config_snapshot=cfg, scope=scope) == ""
     assert lengths == expected
+
+
+def test_generic_http_stt_strips_content_type_from_custom_headers_and_reuses_session(monkeypatch):
+    from services.stt import engines
+
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+        headers = {"content-type": "application/json"}
+
+        def json(self):
+            return {"text": "自定义头测试"}
+
+    session = engines._get_generic_stt_session()
+    assert engines._get_generic_stt_session() is session
+
+    def fake_session_post(url, headers=None, files=None, data=None, timeout=None):
+        captured["headers"] = headers
+        return _Resp()
+
+    monkeypatch.setattr(session, "post", fake_session_post)
+
+    for raw_custom in (
+        '{"Content-Type": "application/json", "X-Custom": "val1"}',
+        "content-type: multipart/form-data\nX-Custom: val2",
+    ):
+        engine = GenericHTTPSTT(
+            api_base_url="https://asr.example.com/v1",
+            api_key="sk-test",
+            model="whisper-1",
+            custom_headers=raw_custom,
+        )
+        assert engine.transcribe(np.zeros(320, dtype=np.float32)) == "自定义头测试"
+        lowered_keys = {k.lower() for k in captured["headers"]}
+        assert "content-type" not in lowered_keys
+        assert "x-custom" in lowered_keys
+
+
+def test_generic_http_stt_session_blocks_cookies_and_closes_on_shutdown():
+    import gc
+    import threading
+    from services.stt import engines
+
+    engines.close_generic_stt_sessions()
+    session = engines._get_generic_stt_session()
+    session.cookies.set("sid", "secret", domain="asr.example.com")
+    assert dict(session.cookies) == {}
+
+    def worker():
+        s = engines._get_generic_stt_session()
+        s.cookies.set("worker_sid", "secret", domain="asr.example.com")
+        assert dict(s.cookies) == {}
+
+    t = threading.Thread(target=worker)
+    t.start()
+    t.join()
+    gc.collect()
+
+    closed = {"called": False}
+    orig_close = session.close
+
+    def tracked_close():
+        closed["called"] = True
+        orig_close()
+
+    session.close = tracked_close
+    engines.close_generic_stt_sessions()
+    assert closed["called"] is True
+    assert engines._get_generic_stt_session() is not session
+    engines.close_generic_stt_sessions()

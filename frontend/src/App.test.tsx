@@ -319,6 +319,84 @@ describe('App bootstrap', () => {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth })
     }
   })
+
+  it('mounts a single TranscriptionPanel/AnswerPanel tree per matchMedia viewport and switches on resize', async () => {
+    const originalMatchMedia = window.matchMedia
+    let matches = true
+    const listeners = new Set<(e: MediaQueryListEvent) => void>()
+    const matchMediaMock = vi.fn().mockImplementation((query: string) => ({
+      get matches() {
+        return matches
+      },
+      media: query,
+      onchange: null,
+      addEventListener: (_type: string, cb: (e: MediaQueryListEvent) => void) => {
+        listeners.add(cb)
+      },
+      removeEventListener: (_type: string, cb: (e: MediaQueryListEvent) => void) => {
+        listeners.delete(cb)
+      },
+      addListener: (cb: (e: MediaQueryListEvent) => void) => {
+        listeners.add(cb)
+      },
+      removeListener: (cb: (e: MediaQueryListEvent) => void) => {
+        listeners.delete(cb)
+      },
+      dispatchEvent: () => true,
+    }))
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: matchMediaMock })
+
+    try {
+      render(<App />)
+      await screen.findByRole('tab', { name: '面试辅助', selected: true })
+
+      expect(screen.getAllByText('transcript')).toHaveLength(1)
+      expect(screen.getAllByText('answer')).toHaveLength(1)
+
+      act(() => {
+        matches = false
+        for (const cb of listeners) {
+          cb({ matches: false, media: '(min-width: 768px)' } as MediaQueryListEvent)
+        }
+      })
+
+      expect(screen.getAllByText('transcript')).toHaveLength(1)
+      expect(screen.queryByText('answer')).not.toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: 'AI 答案' }))
+      expect(screen.queryByText('transcript')).not.toBeInTheDocument()
+      expect(screen.getAllByText('answer')).toHaveLength(1)
+
+      act(() => {
+        matches = true
+        for (const cb of listeners) {
+          cb({ matches: true, media: '(min-width: 768px)' } as MediaQueryListEvent)
+        }
+      })
+
+      expect(screen.getAllByText('transcript')).toHaveLength(1)
+      expect(screen.getAllByText('answer')).toHaveLength(1)
+    } finally {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia })
+    }
+  })
+
+  it('tolerates minimal matchMedia objects without addEventListener or addListener', async () => {
+    const originalMatchMedia = window.matchMedia
+    Object.defineProperty(window, 'matchMedia', {
+      configurable: true,
+      value: vi.fn().mockReturnValue({ matches: true, media: '(min-width: 768px)' }),
+    })
+
+    try {
+      render(<App />)
+      await screen.findByRole('tab', { name: '面试辅助', selected: true })
+      expect(screen.getAllByText('transcript')).toHaveLength(1)
+      expect(screen.getAllByText('answer')).toHaveLength(1)
+    } finally {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia })
+    }
+  })
 })
 
 describe('Window control buttons', () => {

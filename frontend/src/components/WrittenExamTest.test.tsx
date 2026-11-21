@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import WrittenExamTest from './WrittenExamTest'
+import { useInterviewWS } from '@/hooks/useInterviewWS'
 import { useInterviewStore } from '@/stores/configStore'
 
 const apiMock = vi.hoisted(() => ({
@@ -13,7 +14,13 @@ vi.mock('@/lib/backendUrl', () => ({ buildWsUrl: () => 'ws://example.test/ws' })
 
 class FakeWebSocket {
   static instances: FakeWebSocket[] = []
+  static OPEN = 1
+  static CONNECTING = 0
+  readyState = FakeWebSocket.OPEN
+  onopen: (() => void) | null = null
   onmessage: ((event: MessageEvent) => void) | null = null
+  onclose: ((ev?: CloseEvent) => void) | null = null
+  onerror: ((ev?: Event) => void) | null = null
   closed = false
   sent: string[] = []
   constructor(public url: string) {
@@ -28,6 +35,11 @@ class FakeWebSocket {
   emit(data: unknown) {
     this.onmessage?.({ data: JSON.stringify(data) } as MessageEvent)
   }
+}
+
+function WrittenExamTestWithSharedWS() {
+  useInterviewWS(true)
+  return <WrittenExamTest />
 }
 
 function deferred<T>() {
@@ -62,6 +74,13 @@ describe('WrittenExamTest', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it('does not open its own raw WebSocket when rendered standalone', async () => {
+    render(<WrittenExamTest />)
+    await waitFor(() => expect(apiMock.examPreflightStatus).toHaveBeenCalledTimes(1))
+    expect(FakeWebSocket.instances).toHaveLength(0)
   })
 
   it('starts fixed screenshot code preflight and renders answer result', async () => {
@@ -90,7 +109,7 @@ describe('WrittenExamTest', () => {
           done: { status: 'done', detail: '笔试链路检测完成' },
         },
       })
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     fireEvent.click(screen.getByRole('button', { name: '开始检测' }))
     expect(apiMock.examPreflightRun).toHaveBeenCalledTimes(1)
@@ -130,7 +149,7 @@ describe('WrittenExamTest', () => {
     const pendingRun = deferred<{ ok: boolean; preflight_id: string }>()
     apiMock.examPreflightRun.mockReturnValueOnce(pendingRun.promise)
 
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     const startButton = screen.getByRole('button', { name: '开始检测' })
     act(() => {
@@ -176,7 +195,7 @@ describe('WrittenExamTest', () => {
       })
     apiMock.examPreflightRun.mockResolvedValueOnce({ ok: true, preflight_id: 'preflight-new' })
 
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     fireEvent.click(screen.getByRole('button', { name: '开始检测' }))
 
@@ -209,7 +228,7 @@ describe('WrittenExamTest', () => {
       .mockReturnValueOnce(completedStatus.promise)
     apiMock.examPreflightRun.mockResolvedValueOnce({ ok: true, preflight_id: 'preflight-race' })
 
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
     fireEvent.click(screen.getByRole('button', { name: '开始检测' }))
 
     await waitFor(() => {
@@ -305,7 +324,7 @@ describe('WrittenExamTest', () => {
         },
       })
 
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
     await act(async () => {
       await Promise.resolve()
     })
@@ -329,7 +348,7 @@ describe('WrittenExamTest', () => {
   })
 
   it('replies to backend websocket heartbeats', async () => {
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     const ws = FakeWebSocket.instances[0]
     await act(async () => {
@@ -363,7 +382,7 @@ describe('WrittenExamTest', () => {
       },
     })
 
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     await waitFor(() => {
       expect(screen.getByText('已生成固定截图代码题')).toBeInTheDocument()
@@ -374,7 +393,7 @@ describe('WrittenExamTest', () => {
   })
 
   it('keeps one websocket while filtering stale preflight streams', async () => {
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     expect(FakeWebSocket.instances).toHaveLength(1)
     const ws = FakeWebSocket.instances[0]
@@ -442,7 +461,7 @@ describe('WrittenExamTest', () => {
   })
 
   it('does not regress completed steps when duplicate running events arrive late', async () => {
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     const ws = FakeWebSocket.instances[0]
     await act(async () => {
@@ -498,7 +517,7 @@ describe('WrittenExamTest', () => {
   })
 
   it('marks answer errors on the LLM and UI preflight steps', async () => {
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     const ws = FakeWebSocket.instances[0]
     await act(async () => {
@@ -523,7 +542,7 @@ describe('WrittenExamTest', () => {
 
   it('marks startup request failures as failed preflight steps', async () => {
     apiMock.examPreflightRun.mockRejectedValueOnce(new Error('笔试链路检测已在运行中'))
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     fireEvent.click(screen.getByRole('button', { name: '开始检测' }))
 
@@ -536,7 +555,7 @@ describe('WrittenExamTest', () => {
   })
 
   it('ignores stale stream events while waiting for the new preflight id', async () => {
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     const ws = FakeWebSocket.instances[0]
     await act(async () => {
@@ -609,7 +628,7 @@ describe('WrittenExamTest', () => {
       },
     })
 
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     expect((await screen.findAllByText('检测异常: 模型回答为空')).length).toBeGreaterThan(0)
     expect(screen.getByText('未收到可展示的笔试答案')).toBeInTheDocument()
@@ -626,7 +645,7 @@ describe('WrittenExamTest', () => {
       },
     } as any)
 
-    render(<WrittenExamTest />)
+    render(<WrittenExamTestWithSharedWS />)
 
     expect(screen.getByText(/请先在笔试配置中.*识图模型/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '开始检测' })).toBeDisabled()

@@ -867,3 +867,148 @@ def test_mmpg_single_mic_switch_rejects_stale_id_timeout_and_recovered_audio_gat
             await manager.detach(owner)
 
     asyncio.run(check())
+
+
+def test_mmpg_offer_audio_catches_closed_loop_runtime_error_and_monotonic_renew(monkeypatch, caplog):
+    from services.stt import mmpg
+    from services.stt.mmpg import MmpgError, MmpgManager
+
+    manager = MmpgManager(lambda: CONFIG, str)
+    manager._set_audio_gate(1)
+
+    class ClosedLoop:
+        def call_soon_threadsafe(self, _cb):
+            raise RuntimeError("Event loop is closed")
+
+    manager._loop = ClosedLoop()
+    assert manager.offer_audio(np.array([0.1, -0.1], dtype=np.float32)) is False
+    assert manager._wake_pending is False
+
+    async def check_renew():
+        cloud = CloudSocket()
+        controls = []
+
+        async def connector(_):
+            cloud.push("session.created")
+            return cloud
+
+        async def send(msg):
+            if isinstance(msg, dict):
+                controls.append(msg)
+
+        mgr = MmpgManager(lambda: CONFIG, str, connector=connector)
+        owner = object()
+        mgr.attach(owner, send)
+        mgr.start(owner, "test", [1])
+        try:
+            await wait_until(lambda: any(m["type"] == "rtc_join" for m in controls))
+            gen = mgr.status()["generation"]
+            await mgr.rtc_event(owner, {"type": "rtc_ready", "generation": gen})
+            await wait_until(lambda: mgr.status()["state"] == "listening")
+            mgr._current.token_issued_at = time.monotonic() - 2.0
+            await mgr.rtc_event(owner, {"type": "renew", "generation": gen})
+            assert any(m["type"] == "rtc_token" for m in controls)
+        finally:
+            await mgr.detach(owner)
+
+    asyncio.run(check_renew())
+
+    pytest.importorskip("volcenginesdkcore")
+    from websockets.asyncio import client
+
+    async def failing_connect(*_a, **_kw):
+        raise OSError("network unreachable")
+
+    monkeypatch.setattr(client, "connect", failing_connect)
+    logger = logging.getLogger("mmpg.diagnostics")
+    attach_handler = not logger.propagate
+    if attach_handler:
+        logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level("WARNING", logger="mmpg.diagnostics"):
+            with pytest.raises(MmpgError, match="cloud_connection_failed"):
+                asyncio.run(mmpg.connect_mmpg(CONFIG))
+    finally:
+        if attach_handler:
+            logger.removeHandler(caplog.handler)
+    assert "connect_mmpg failed kind=OSError" in caplog.text
+
+
+def test_mmpg_test_timeout_tracks_and_cleans_up_timeout_task():
+    from services.stt.mmpg import MmpgManager
+
+    async def check_timeout():
+        cloud = CloudSocket()
+        controls = []
+
+        async def connector(_):
+            cloud.push("session.created")
+            return cloud
+
+        async def send(msg):
+            if isinstance(msg, dict):
+                controls.append(msg)
+
+        mgr = MmpgManager(lambda: CONFIG, str, connector=connector, test_timeout=0.05)
+        owner = object()
+        mgr.attach(owner, send)
+        mgr.start(owner, "test", [1])
+        run = mgr._run
+        try:
+            await wait_until(lambda: mgr.status()["state"] == "idle" and mgr.status()["reason"] == "test_timeout")
+            await wait_until(lambda: run.timeout_task is None)
+            assert run.timeout_task is None
+        finally:
+            await mgr.detach(owner)
+
+    asyncio.run(check_timeout())
+
+
+def test_mmpg_schedule_timeout_test_skips_when_stopping_and_handles_concurrent_slow_close():
+    from services.stt.mmpg import MmpgManager
+
+    async def check_race():
+        class SlowCloseCloud(CloudSocket):
+            async def close(self):
+                await asyncio.sleep(0.08)
+                await super().close()
+
+        cloud = SlowCloseCloud()
+        controls = []
+
+        async def connector(_):
+            cloud.push("session.created")
+            return cloud
+
+        async def send(msg):
+            if isinstance(msg, dict):
+                controls.append(msg)
+
+        mgr = MmpgManager(lambda: CONFIG, str, connector=connector, test_timeout=0.04)
+        owner = object()
+        mgr.attach(owner, send)
+        mgr.start(owner, "test", [1])
+        run = mgr._run
+        try:
+            await wait_until(lambda: any(m["type"] == "rtc_join" for m in controls))
+            await asyncio.sleep(0.045)
+            await mgr.stop("user_stop")
+            await wait_until(lambda: run.timeout_task is None)
+            assert mgr.status()["state"] == "idle"
+            assert run.timeout_task is None
+        finally:
+            await mgr.detach(owner)
+
+        # Calling _schedule_timeout_test after stop_reason is set must be a no-op
+        mgr2 = MmpgManager(lambda: CONFIG, str, connector=connector, test_timeout=10.0)
+        mgr2.attach(owner, send)
+        mgr2.start(owner, "test", [1])
+        run2 = mgr2._run
+        try:
+            run2.stop_reason = "user_stop"
+            mgr2._schedule_timeout_test(run2)
+            assert run2.timeout_task is None
+        finally:
+            await mgr2.detach(owner)
+
+    asyncio.run(check_race())

@@ -1,8 +1,16 @@
-"""Recover a review session from interview.log events.
+"""Recover a review session from interview.log events (with optional knowledge.db backfill).
 
 This is intended for crash/force-close cases where review_sessions contains a
 recording session but /api/assist/stop never ran, so review_turns were not
 written.
+
+Log redaction boundary:
+    Current interview.log redacts CANDIDATE_ASR_* transcript text and only logs
+    ``chars=<n>``. When ``text=`` is absent from logs, this script can backfill
+    candidate answers (and full reference answers) from ``knowledge.db``
+    (``question_records``) matched by ``qa_id``. Any turn whose ``qa_id`` was
+    never persisted to ``knowledge.db`` cannot recover redacted candidate text
+    from logs alone and will be stored with ``is_partial=True``.
 
 Usage:
     python -m scripts.recover_review_from_logs --session-id 872
@@ -13,9 +21,7 @@ from __future__ import annotations
 
 import argparse
 import ast
-import os
 import re
-import sqlite3
 import sys
 import time
 from collections import OrderedDict
@@ -26,14 +32,15 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from services.storage import review  # noqa: E402
-from services.storage.review import DB_PATH  # noqa: E402
+from services.storage import knowledge, review  # noqa: E402
+from services.storage.sqlite_utils import sqlite_connection  # noqa: E402
 
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 QA_ID_RE = re.compile(r"\bid=([^\s]+)")
 SEGMENT_RE = re.compile(r"\bsegment=([^\s]+)")
 CANDIDATE_QA_RE = re.compile(r"\bqa_id=([^\s]+)")
+CHARS_RE = re.compile(r"\bchars=(\d+)")
 ANSWER_LEN_RE = re.compile(r"\banswer_len=(\d+)")
 MODEL_RE = re.compile(r"\bmodel=([^\s]+)")
 
@@ -52,6 +59,8 @@ class LogTurn:
     reference_answer: str = ""
     answer_done: bool = False
     candidate_segments: "OrderedDict[str, CandidateSegment]" = field(default_factory=OrderedDict)
+    redacted_candidate_chars: int = 0
+    candidate_backfilled: bool = False
 
     @property
     def candidate_answer(self) -> str:
@@ -147,11 +156,13 @@ def parse_log_sessions(log_path: Path, *, until: Optional[float] = None) -> list
                 pending_question = ""
                 continue
 
-            if "ANSWER_DONE" in line:
+            if "ANSWER_DONE" in line and "EXAM_PREFLIGHT_ANSWER_DONE" not in line:
                 qa_match = QA_ID_RE.search(line)
                 if not qa_match:
                     continue
                 qa_id = qa_match.group(1)
+                if qa_id in ("", "None", "null"):
+                    continue
                 turn = current.turns.get(qa_id)
                 if turn is None:
                     turn = LogTurn(qa_id=qa_id, seq=len(current.turns) + 1)
@@ -166,31 +177,122 @@ def parse_log_sessions(log_path: Path, *, until: Optional[float] = None) -> list
                 )
                 continue
 
-            if "CANDIDATE_ASR_" in line and "qa_id=" in line and "text=" in line:
+            if (
+                "CANDIDATE_ASR_" in line
+                and "CANDIDATE_ASR_SEGMENT_START" not in line
+                and "qa_id=" in line
+            ):
                 qa_match = CANDIDATE_QA_RE.search(line)
                 seg_match = SEGMENT_RE.search(line)
                 if not qa_match:
                     continue
                 qa_id = qa_match.group(1)
-                segment_id = seg_match.group(1) if seg_match else f"{qa_id}-segment-{len(current.turns)}"
-                text = _extract_repr(line, "text")
-                if not text:
+                if qa_id in ("", "None", "null"):
+                    continue
+                has_text = "text=" in line
+                chars_match = None if has_text else CHARS_RE.search(line)
+                if not has_text and chars_match is None:
                     continue
                 turn = current.turns.get(qa_id)
                 if turn is None:
                     turn = LogTurn(qa_id=qa_id, seq=len(current.turns) + 1)
                     current.turns[qa_id] = turn
-                existing = turn.candidate_segments.get(segment_id)
-                is_final = "CANDIDATE_ASR_FINAL" in line
-                if existing is None or is_final or not existing.is_final:
-                    turn.candidate_segments[segment_id] = CandidateSegment(
-                        text=text,
-                        is_final=is_final,
+                if has_text:
+                    segment_id = seg_match.group(1) if seg_match else f"{qa_id}-segment-{len(current.turns)}"
+                    text = _extract_repr(line, "text")
+                    if not text:
+                        continue
+                    existing = turn.candidate_segments.get(segment_id)
+                    is_final = "CANDIDATE_ASR_FINAL" in line or "final=True" in line
+                    if existing is None or is_final or not existing.is_final:
+                        turn.candidate_segments[segment_id] = CandidateSegment(
+                            text=text,
+                            is_final=is_final,
+                        )
+                elif chars_match is not None:
+                    turn.redacted_candidate_chars = max(
+                        turn.redacted_candidate_chars,
+                        int(chars_match.group(1)),
                     )
 
     if current is not None:
         sessions.append(current)
     return sessions
+
+
+def backfill_turns_from_knowledge_db(
+    log_session: LogSession,
+    knowledge_db_path: Optional[Path] = None,
+) -> dict[str, int]:
+    """Backfill redacted candidate answers (and full reference answers) from knowledge.db by qa_id."""
+    stats = {"matched_turns": 0, "candidate_filled": 0, "reference_filled": 0}
+    db_path = Path(knowledge_db_path) if knowledge_db_path is not None else Path(knowledge.DB_PATH)
+    if not db_path.exists() or not log_session.turns:
+        return stats
+
+    with sqlite_connection(db_path) as conn:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'question_records'"
+        ).fetchone()
+        if not table_exists:
+            return stats
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(question_records)").fetchall()
+        }
+        if "qa_id" not in columns:
+            return stats
+        has_candidate_col = "candidate_answer" in columns
+        select_cols = "question, answer, candidate_answer" if has_candidate_col else "question, answer"
+        order_col = "created_at DESC, id DESC" if "created_at" in columns else "id DESC"
+        for qa_id, turn in log_session.turns.items():
+            if not qa_id or qa_id in ("None", "null"):
+                continue
+            rows = conn.execute(
+                f"""
+                SELECT {select_cols}
+                FROM question_records
+                WHERE qa_id = ?
+                ORDER BY {order_col}
+                """,
+                (qa_id,),
+            ).fetchall()
+            if not rows:
+                continue
+            stats["matched_turns"] += 1
+            db_question = next(
+                (q for row in rows if (q := _clean_question(str(row["question"] or "")))),
+                "",
+            )
+            db_answer = next(
+                (a for row in rows if (a := str(row["answer"] or "").strip())),
+                "",
+            )
+            db_candidate = (
+                next(
+                    (c for row in rows if (c := str(row["candidate_answer"] or "").strip())),
+                    "",
+                )
+                if has_candidate_col
+                else ""
+            )
+            if not turn.question and db_question:
+                turn.question = db_question
+            if not turn.candidate_answer and db_candidate:
+                turn.candidate_segments["knowledge-db"] = CandidateSegment(
+                    text=db_candidate,
+                    is_final=True,
+                )
+                turn.candidate_backfilled = True
+                stats["candidate_filled"] += 1
+            if db_answer and (
+                not turn.reference_answer
+                or turn.reference_answer.startswith("系统参考答案已生成（")
+            ):
+                turn.reference_answer = db_answer
+                turn.answer_done = True
+                stats["reference_filled"] += 1
+    return stats
 
 
 def select_log_session(
@@ -219,13 +321,12 @@ def select_log_session(
 
 
 def _delete_existing_turns(session_id: int) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with review._db_lock, review._connect(transactional=True) as conn:
         conn.execute("DELETE FROM review_turns WHERE session_id = ?", (session_id,))
         conn.execute(
             "UPDATE review_sessions SET turn_count = 0, updated_at = ? WHERE id = ?",
             (time.time(), session_id),
         )
-        conn.commit()
 
 
 def recover_session(
@@ -234,7 +335,11 @@ def recover_session(
     session_id: Optional[int],
     overwrite: bool,
     dry_run: bool,
+    knowledge_db_path: Optional[Path] = None,
 ) -> int:
+    if knowledge_db_path is not None:
+        backfill_turns_from_knowledge_db(log_session, knowledge_db_path=knowledge_db_path)
+
     turns = [turn for turn in log_session.turns.values() if turn.question.strip()]
     if not turns:
         raise RuntimeError("日志会话里没有可恢复的问题")
@@ -264,7 +369,8 @@ def recover_session(
         if dry_run:
             print(
                 f"[DRY] #{idx} {turn.qa_id} partial={is_partial} "
-                f"question={turn.question[:80]!r} candidate_chars={len(candidate_answer)}"
+                f"question={turn.question[:80]!r} candidate_chars={len(candidate_answer)} "
+                f"redacted_chars={turn.redacted_candidate_chars} backfilled={turn.candidate_backfilled}"
             )
             continue
         review.add_turn(
@@ -284,22 +390,32 @@ def recover_session(
         status = "partial_capture" if any(
             (not turn.candidate_answer) or (not turn.answer_done)
             for turn in turns
-        ) else "completed"
+        ) else "recorded"
         review.end_session(session_id=session_id, status=status, ended_at=ended_at)
     return int(session_id or 0)
 
 
-def main() -> None:
+def main(argv: Optional[list[str]] = None) -> None:
     backend_dir = Path(__file__).resolve().parent.parent
     default_log = backend_dir.parent / "log" / "interview.log"
     parser = argparse.ArgumentParser(description="Recover review turns from interview.log")
     parser.add_argument("--log", default=str(default_log), help="interview.log path")
+    parser.add_argument(
+        "--knowledge-db",
+        default=str(knowledge.DB_PATH),
+        help="knowledge.db path for backfilling redacted candidate/reference answers by qa_id",
+    )
+    parser.add_argument(
+        "--no-knowledge-db",
+        action="store_true",
+        help="disable knowledge.db backfill (redacted candidate answers will remain empty)",
+    )
     parser.add_argument("--session-id", type=int, default=None, help="existing review session id")
     parser.add_argument("--since", default="", help='start time, e.g. "2026-06-24 10:48:35"')
     parser.add_argument("--until", default="", help='end time, e.g. "2026-06-24 11:40:00"')
     parser.add_argument("--overwrite", action="store_true", help="replace existing turns for session")
     parser.add_argument("--dry-run", action="store_true", help="show recovered turns without writing")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     log_path = Path(args.log)
     if not log_path.exists():
@@ -326,6 +442,27 @@ def main() -> None:
     )
     if selected is None:
         raise SystemExit("没有找到匹配的日志会话")
+
+    kb_path = None if args.no_knowledge_db or not args.knowledge_db else Path(args.knowledge_db)
+    if kb_path is not None:
+        stats = backfill_turns_from_knowledge_db(selected, knowledge_db_path=kb_path)
+        print(
+            "knowledge.db 回填统计: "
+            f"matched={stats['matched_turns']} "
+            f"candidate_filled={stats['candidate_filled']} "
+            f"reference_filled={stats['reference_filled']}"
+        )
+
+    unresolved_redacted = sum(
+        1
+        for turn in selected.turns.values()
+        if turn.redacted_candidate_chars > 0 and not turn.candidate_answer
+    )
+    if unresolved_redacted:
+        print(
+            f"[NOTE] 有 {unresolved_redacted} 轮候选人回答在日志中已脱敏（仅保留 chars）"
+            "且在 knowledge.db 中未找到可回填记录，将标记为 is_partial=True。"
+        )
 
     target_id = args.session_id or (int(target_session["id"]) if target_session else None)
     print(

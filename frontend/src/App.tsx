@@ -22,6 +22,7 @@ import SessionSettingsPopover from '@/components/SessionSettingsPopover'
 import KnowledgeButton from '@/components/kb/KnowledgeButton'
 import KnowledgeDrawer from '@/components/kb/KnowledgeDrawer'
 import { AppToastStack } from '@/components/app/AppToastStack'
+import { ConfigCorruptBanner } from '@/components/app/ConfigCorruptBanner'
 import { InitErrorScreen } from '@/components/app/InitErrorScreen'
 import VisionBadge from '@/components/VisionBadge'
 import { ModelPriorityDropdown } from '@/components/app/ModelPriorityDropdown'
@@ -40,6 +41,46 @@ const APP_MODE_TABS = [
   ['job-tracker', '求职看板'],
 ] as const
 type WorkspaceTab = typeof APP_MODE_TABS[number][0]
+
+const DESKTOP_MEDIA_QUERY = '(min-width: 768px)'
+
+function getIsDesktopViewport(): boolean {
+  if (typeof window === 'undefined') return true
+  if (typeof window.matchMedia === 'function') {
+    return window.matchMedia(DESKTOP_MEDIA_QUERY).matches
+  }
+  return window.innerWidth >= 768
+}
+
+function useIsDesktopViewport(): boolean {
+  const [isDesktop, setIsDesktop] = useState<boolean>(getIsDesktopViewport)
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+    if (typeof window.matchMedia === 'function') {
+      const mql = window.matchMedia(DESKTOP_MEDIA_QUERY)
+      const update = (e?: MediaQueryListEvent) => {
+        setIsDesktop(e ? e.matches : mql.matches)
+      }
+      update()
+      if (typeof mql.addEventListener === 'function') {
+        mql.addEventListener('change', update)
+        return () => mql.removeEventListener('change', update)
+      }
+      if (typeof mql.addListener === 'function') {
+        mql.addListener(update)
+        return () => mql.removeListener?.(update)
+      }
+      return undefined
+    }
+    const onResize = () => setIsDesktop(window.innerWidth >= 768)
+    onResize()
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  return isDesktop
+}
 
 export default function App() {
   useInterviewWS()
@@ -75,6 +116,7 @@ export default function App() {
     : sttLoaded
   const speechStatus = sttLoading ? '连接中' : sttLoaded ? '就绪' : '未就绪'
   const [mobileTab, setMobileTab] = useState<'transcript' | 'answer'>('transcript')
+  const isDesktopViewport = useIsDesktopViewport()
   const appMode = useUiPrefsStore((s) => s.appMode)
   const setAppMode = useUiPrefsStore((s) => s.setAppMode)
   const activeTab = appMode === 'assist' && isExamMode ? 'exam' : appMode
@@ -542,6 +584,8 @@ export default function App() {
         </div>
       </header>
 
+      <ConfigCorruptBanner />
+
       {/* ── Assist Mode ── */}
       {appMode === 'assist' && (
         <>
@@ -557,74 +601,74 @@ export default function App() {
             </button>
           </div>}
 
-          <div
-            ref={assistSplitContainerRef}
-            className={`flex-1 ${isExamMode ? 'flex' : 'hidden md:flex'} overflow-hidden min-h-0`}
-          >
-            {!isExamMode && !assistTranscriptCollapsed && (
-              <>
+          {isExamMode || isDesktopViewport ? (
             <div
-              className="flex flex-col min-w-0 flex-shrink-0 border-r border-bg-tertiary"
-              style={{
-                width: `${assistSplitPct}%`,
-                minWidth: '220px',
-                maxWidth: '70%',
-              }}
+              ref={assistSplitContainerRef}
+              className="flex-1 flex overflow-hidden min-h-0"
             >
-              <TranscriptionPanel />
-            </div>
-            <div
-              role="separator"
-              aria-orientation="vertical"
-              aria-label="拖动调节转录区与答案区宽度"
-              aria-valuemin={24}
-              aria-valuemax={62}
-              aria-valuenow={Math.round(assistSplitPct)}
-              tabIndex={0}
-              className="w-1 flex-shrink-0 cursor-col-resize group relative z-10 outline-none focus-visible:ring-2 focus-visible:ring-accent-blue/50 focus-visible:ring-inset bg-bg-hover/30 hover:bg-accent-blue/20 active:bg-accent-blue/40 transition-all duration-150"
-              title="拖动调节左右宽度；双击恢复默认比例"
-              onMouseDown={(e) => {
-                e.preventDefault()
-                assistSplitDragging.current = true
-                document.body.style.cursor = 'col-resize'
-                document.body.style.userSelect = 'none'
-              }}
-              onDoubleClick={(e) => {
-                e.preventDefault()
-                const c = 32
-                assistSplitPctRef.current = c
-                persistAssistSplitPct(c)
-              }}
-              onKeyDown={(e) => {
-                if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+              {!isExamMode && !assistTranscriptCollapsed && (
+                <>
+              <div
+                className="flex flex-col min-w-0 flex-shrink-0 border-r border-bg-tertiary"
+                style={{
+                  width: `${assistSplitPct}%`,
+                  minWidth: '220px',
+                  maxWidth: '70%',
+                }}
+              >
+                <TranscriptionPanel />
+              </div>
+              <div
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="拖动调节转录区与答案区宽度"
+                aria-valuemin={24}
+                aria-valuemax={62}
+                aria-valuenow={Math.round(assistSplitPct)}
+                tabIndex={0}
+                className="w-1 flex-shrink-0 cursor-col-resize group relative z-10 outline-none focus-visible:ring-2 focus-visible:ring-accent-blue/50 focus-visible:ring-inset bg-bg-hover/30 hover:bg-accent-blue/20 active:bg-accent-blue/40 transition-all duration-150"
+                title="拖动调节左右宽度；双击恢复默认比例"
+                onMouseDown={(e) => {
                   e.preventDefault()
-                  const delta = e.key === 'ArrowLeft' ? -2 : 2
-                  const c = Math.min(62, Math.max(24, assistSplitPctRef.current + delta))
+                  assistSplitDragging.current = true
+                  document.body.style.cursor = 'col-resize'
+                  document.body.style.userSelect = 'none'
+                }}
+                onDoubleClick={(e) => {
+                  e.preventDefault()
+                  const c = 32
                   assistSplitPctRef.current = c
                   persistAssistSplitPct(c)
-                }
-                if (e.key === 'Home' || e.key === 'End') {
-                  e.preventDefault()
-                  const c = e.key === 'Home' ? 24 : 62
-                  assistSplitPctRef.current = c
-                  persistAssistSplitPct(c)
-                }
-              }}
-            >
-              <span
-                className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-bg-hover group-hover:bg-accent-blue/50 pointer-events-none"
-                aria-hidden
-              />
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                    e.preventDefault()
+                    const delta = e.key === 'ArrowLeft' ? -2 : 2
+                    const c = Math.min(62, Math.max(24, assistSplitPctRef.current + delta))
+                    assistSplitPctRef.current = c
+                    persistAssistSplitPct(c)
+                  }
+                  if (e.key === 'Home' || e.key === 'End') {
+                    e.preventDefault()
+                    const c = e.key === 'Home' ? 24 : 62
+                    assistSplitPctRef.current = c
+                    persistAssistSplitPct(c)
+                  }
+                }}
+              >
+                <span
+                  className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-bg-hover group-hover:bg-accent-blue/50 pointer-events-none"
+                  aria-hidden
+                />
+              </div>
+                </>
+              )}
+              <div className="flex-1 flex flex-col min-w-0 min-h-0">
+                <AnswerPanel />
+              </div>
             </div>
-              </>
-            )}
-            <div className="flex-1 flex flex-col min-w-0 min-h-0">
-              <AnswerPanel />
-            </div>
-          </div>
-
-          {!isExamMode && (
-            <div className="flex-1 flex md:hidden overflow-hidden min-h-0">
+          ) : (
+            <div className="flex-1 flex overflow-hidden min-h-0">
               {mobileTab === 'transcript' ? <TranscriptionPanel /> : <AnswerPanel />}
             </div>
           )}

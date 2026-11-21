@@ -1,6 +1,7 @@
 """LLM client management, token tracking, and streaming generation."""
 
 import asyncio
+from collections import OrderedDict
 from concurrent.futures import CancelledError
 import threading
 import json
@@ -10,7 +11,7 @@ from openai import OpenAI
 import openai
 import requests
 import httpx
-from typing import Callable, Generator, Optional
+from typing import Any, Callable, Generator, Optional
 from core.config import get_config
 from core.logger import get_logger
 from services.llm import trace
@@ -193,8 +194,37 @@ def _classify_exception(e: BaseException) -> LLMError:
 # Client helpers (pooled by api_key + base_url)
 # ---------------------------------------------------------------------------
 
-_client_cache: dict[tuple[str, str], OpenAI] = {}
+_CLIENT_CACHE_MAX_SIZE = 32
+_DEFAULT_SDK_TIMEOUT = httpx.Timeout(90.0, connect=10.0)
+_client_cache: OrderedDict[tuple[str, str], OpenAI] = OrderedDict()
 _client_cache_lock = threading.Lock()
+
+
+def _build_sdk_timeout(timeout: tuple[float, float] | float | httpx.Timeout) -> httpx.Timeout:
+    """Preserve separate connect/read timeouts when passing request timeout to the OpenAI SDK."""
+    if isinstance(timeout, httpx.Timeout):
+        return timeout
+    if isinstance(timeout, tuple) and len(timeout) == 2:
+        return httpx.Timeout(float(timeout[1]), connect=float(timeout[0]))
+    return httpx.Timeout(float(timeout))
+
+
+def _close_client_quietly(client: Any) -> None:
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            pass
+
+
+def close_cached_clients() -> None:
+    """Close and clear all cached OpenAI SDK clients."""
+    with _client_cache_lock:
+        clients = list(_client_cache.values())
+        _client_cache.clear()
+    for client in clients:
+        _close_client_quietly(client)
 
 
 def _openai_compat_headers() -> dict[str, str]:
@@ -218,17 +248,32 @@ def get_client_for_model(model_cfg) -> OpenAI:
     """
     base = normalize_api_base_url(model_cfg.api_base_url, get_api_type(model_cfg))
     key = (model_cfg.api_key, base)
+    evicted_clients: list[Any] = []
     with _client_cache_lock:
         client = _client_cache.get(key)
-        if client is None:
-            client = OpenAI(
-                api_key=model_cfg.api_key,
-                base_url=base,
-                default_headers=_openai_compat_headers(),
-                http_client=trace.TracingHttpxClient(),
-            )
-            _client_cache[key] = client
-        return client
+        if client is not None:
+            if isinstance(_client_cache, OrderedDict):
+                _client_cache.move_to_end(key)
+            return client
+        client = OpenAI(
+            api_key=model_cfg.api_key,
+            base_url=base,
+            timeout=_DEFAULT_SDK_TIMEOUT,
+            max_retries=0,
+            default_headers=_openai_compat_headers(),
+            http_client=trace.TracingHttpxClient(),
+        )
+        _client_cache[key] = client
+        while len(_client_cache) > _CLIENT_CACHE_MAX_SIZE:
+            if isinstance(_client_cache, OrderedDict):
+                _, evicted = _client_cache.popitem(last=False)
+            else:
+                oldest_key = next(iter(_client_cache))
+                evicted = _client_cache.pop(oldest_key)
+            evicted_clients.append(evicted)
+    for evicted in evicted_clients:
+        _close_client_quietly(evicted)
+    return client
 
 
 def has_vision_model() -> bool:
@@ -267,12 +312,14 @@ def chat_completion_create(
     api_type = get_api_type(model_cfg)
     if api_type == "openai":
         client = get_client_for_model(model_cfg)
+        if isinstance(client, OpenAI) and getattr(client, "max_retries", 0) != 0:
+            client = client.with_options(max_retries=0)
         extra_kwargs: dict = {}
         if think_params:
             extra_kwargs["extra_body"] = {key: value for key, value in think_params.items() if key != "messages"}
         # gpt-5/o1/o3/o4 只认 max_completion_tokens；timeout 必须显式传给 SDK，
         # 否则用 SDK 默认（600s 带重试），慢供应商会拖死调用方。
-        extra_kwargs["timeout"] = float(timeout[1] if isinstance(timeout, tuple) else timeout)
+        extra_kwargs["timeout"] = _build_sdk_timeout(timeout)
         try:
             return client.chat.completions.create(
                 model=model_cfg.model,
@@ -319,7 +366,9 @@ def _vision_via_http(model_cfg, messages: list[dict]) -> str:
         stream=False,
     )
     result = post_chat_blocking(model_cfg.api_base_url, api_type, model_cfg.api_key, payload)
-    return (result.choices[0].message.content or "").strip()
+    choices = getattr(result, "choices", None) or []
+    first_msg = getattr(choices[0], "message", None) if choices else None
+    return (getattr(first_msg, "content", None) or "").strip()
 
 
 def vision_extract_text(image_base64_list: list[str]) -> str:
@@ -347,7 +396,9 @@ def vision_extract_text(image_base64_list: list[str]) -> str:
     try:
         r = chat_completion_create(model, vision_messages, temperature=0, max_tokens=4096,
                                    trace_context={"scene": "resume_vision_ocr"})
-        return (r.choices[0].message.content or "").strip()
+        choices = getattr(r, "choices", None) or []
+        first_msg = getattr(choices[0], "message", None) if choices else None
+        return (getattr(first_msg, "content", None) or "").strip()
     except TypeError as e:
         if "by_alias" not in str(e):
             raise ValueError(f"\u8bc6\u56fe\u6a21\u578b\u89e3\u6790\u5931\u8d25: {e}") from e
@@ -648,7 +699,14 @@ def _should_emit_think(model_cfg, cfg) -> bool:
     )
 
 
-def _try_stream_with_model(model_cfg, full_messages, cfg, *, think_params=None):
+def _try_stream_with_model(
+    model_cfg,
+    full_messages,
+    cfg,
+    *,
+    think_params=None,
+    timeout: tuple[float, float] = (10, 90),
+):
     api_type = get_api_type(model_cfg)
     if think_params is None:
         think_params = _build_think_params(model_cfg, cfg)
@@ -663,12 +721,17 @@ def _try_stream_with_model(model_cfg, full_messages, cfg, *, think_params=None):
             stream=True,
             think_params=think_params,
         )
-        return post_chat_stream(model_cfg.api_base_url, api_type, model_cfg.api_key, payload)
+        if timeout == (10, 90):
+            return post_chat_stream(model_cfg.api_base_url, api_type, model_cfg.api_key, payload)
+        return post_chat_stream(model_cfg.api_base_url, api_type, model_cfg.api_key, payload, timeout=timeout)
     client = get_client_for_model(model_cfg)
+    if isinstance(client, OpenAI) and getattr(client, "max_retries", 0) != 0:
+        client = client.with_options(max_retries=0)
     extra_kwargs: dict = {}
     if think_params:
         extra_kwargs["extra_body"] = {key: value for key, value in think_params.items() if key != "messages"}
     extra_kwargs["stream_options"] = {"include_usage": True}
+    extra_kwargs["timeout"] = _build_sdk_timeout(timeout)
     token_kwargs = _completion_token_kwargs(model_cfg, cfg.max_tokens)
     try:
         response = client.chat.completions.create(
@@ -683,16 +746,23 @@ def _try_stream_with_model(model_cfg, full_messages, cfg, *, think_params=None):
     except openai.NotFoundError as e:
         # 规范化补的 /v1 猜错（网关路径特殊）→ 按候选 URL 裸 HTTP 重试
         _log.warning("SDK stream 404, retry via HTTP candidates model=%s: %s", model_cfg.name, e)
-        return _stream_via_http(model_cfg, full_messages, cfg, think_params)
+        return _stream_via_http(model_cfg, full_messages, cfg, think_params, timeout=timeout)
     except TypeError as e:
         # 某些环境中 openai-sdk + pydantic 组合会在解析流式响应时抛 by_alias 异常。
         if "by_alias" not in str(e):
             raise
         _log.warning("SDK stream failed, fallback to HTTP stream model=%s err=%s", model_cfg.name, e)
-        return _stream_via_http(model_cfg, full_messages, cfg, think_params)
+        return _stream_via_http(model_cfg, full_messages, cfg, think_params, timeout=timeout)
 
 
-def _stream_via_http(model_cfg, full_messages, cfg, think_params):
+def _stream_via_http(
+    model_cfg,
+    full_messages,
+    cfg,
+    think_params,
+    *,
+    timeout: tuple[float, float] = (10, 90),
+):
     """OpenAI 兼容的裸 HTTP SSE 流式（SDK 不可用/404 时的降级路径）。"""
     payload = build_chat_payload(
         "openai",
@@ -703,7 +773,9 @@ def _stream_via_http(model_cfg, full_messages, cfg, think_params):
         stream=True,
         think_params=think_params,
     )
-    return post_chat_stream(model_cfg.api_base_url, "openai", model_cfg.api_key, payload)
+    if timeout == (10, 90):
+        return post_chat_stream(model_cfg.api_base_url, "openai", model_cfg.api_key, payload)
+    return post_chat_stream(model_cfg.api_base_url, "openai", model_cfg.api_key, payload, timeout=timeout)
 
 
 def _config_with_think_override(cfg, override_think_mode: Optional[bool]):
@@ -756,26 +828,31 @@ def chat_stream(
                 full_messages_adj = full_messages
 
             response = _try_stream_with_model(model, full_messages_adj, cfg)
-            last_usage = (0, 0)
-            for chunk in response:
-                if abort_check and abort_check():
-                    return
-                if chunk.choices:
-                    delta = chunk.choices[0].delta
-                    reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-                    if reasoning and _should_emit_think(model, cfg):
-                        yield ("think", reasoning)
-                    if delta.content:
-                        yield ("text", delta.content)
-                if hasattr(chunk, "usage") and chunk.usage:
-                    prompt_delta, completion_delta, last_usage = _usage_delta(
-                        chunk.usage.prompt_tokens or 0,
-                        chunk.usage.completion_tokens or 0,
-                        last_usage,
-                    )
-                    _add_tokens(prompt_delta, completion_delta, model.name)
-                    _broadcast_tokens()
-            return
+            try:
+                last_usage = (0, 0)
+                for chunk in response:
+                    if abort_check and abort_check():
+                        return
+                    if chunk.choices:
+                        delta = chunk.choices[0].delta
+                        reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                        if reasoning and _should_emit_think(model, cfg):
+                            yield ("think", reasoning)
+                        if delta.content:
+                            yield ("text", delta.content)
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        prompt_delta, completion_delta, last_usage = _usage_delta(
+                            chunk.usage.prompt_tokens or 0,
+                            chunk.usage.completion_tokens or 0,
+                            last_usage,
+                        )
+                        _add_tokens(prompt_delta, completion_delta, model.name)
+                        _broadcast_tokens()
+                return
+            finally:
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
 
         except _RETRYABLE_ERRORS as e:
             err = _classify_exception(e)
@@ -860,7 +937,10 @@ def _mmpg_stream(model, messages, cfg, request, abort_check, *, think_params=Non
             raise
     finally:
         if loop.is_running():
-            asyncio.run_coroutine_threadsafe(stream.aclose(), loop).result()
+            try:
+                asyncio.run_coroutine_threadsafe(stream.aclose(), loop).result(timeout=5.0)
+            except (RuntimeError, TimeoutError, Exception) as exc:
+                _log.debug("mmpg stream aclose cleanup ignored: %s", exc)
         get_logger("mmpg.diagnostics").info(
             "group=%s revision=%s event=request_released cancelled=%s",
             request.group_id, request.revision, request.cancelled,
@@ -940,5 +1020,5 @@ def chat_stream_single_model(
     finally:
         if "response" in locals():
             close = getattr(response, "close", None)
-            if close is not None:
+            if callable(close):
                 close()

@@ -63,7 +63,7 @@ try {
             }
         }
     }
-    & $probePython -m uvicorn server:create_app --factory --host 127.0.0.1 --port 18765 --no-access-log
+    & $probePython -m uvicorn server:create_app --factory --host 127.0.0.1 --port 18765 --no-access-log --log-level warning
     if ($LASTEXITCODE -ne 0) { throw 'Local server stopped with an error. Check whether port 18765 is already in use.' }
 } finally {
     if ($null -ne $browserJob) {

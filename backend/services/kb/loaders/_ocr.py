@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
 from typing import Any
 
 from core.logger import get_logger
@@ -9,19 +10,23 @@ from core.logger import get_logger
 _log = get_logger(__name__)
 
 _ocr_engine: Any = None
+_ocr_lock = threading.Lock()
 
 
 def _get_engine() -> Any:
     global _ocr_engine
     if _ocr_engine is not None:
         return _ocr_engine
-    try:
-        from rapidocr_onnxruntime import RapidOCR  # type: ignore
-        _ocr_engine = RapidOCR()
-    except Exception as e:  # pragma: no cover
-        _log.info("rapidocr 未安装或加载失败，禁用 OCR: %s", e)
-        _ocr_engine = False
-    return _ocr_engine
+    with _ocr_lock:
+        if _ocr_engine is not None:
+            return _ocr_engine
+        try:
+            from rapidocr_onnxruntime import RapidOCR  # type: ignore
+            _ocr_engine = RapidOCR()
+        except Exception as e:  # pragma: no cover
+            _log.info("rapidocr 未安装或加载失败，禁用 OCR: %s", e)
+            _ocr_engine = False
+        return _ocr_engine
 
 
 def ocr_image_file(image_path: Path) -> str:

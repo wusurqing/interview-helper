@@ -2,21 +2,29 @@ import json
 import sqlite3
 import threading
 import time
-from contextlib import closing
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterator, Optional
 
 from services.storage.paths import sqlite_path
+from services.storage.sqlite_utils import (
+    enable_wal_mode,
+    open_sqlite_connection,
+    sqlite_connection,
+)
 
 DB_PATH = sqlite_path("knowledge.db")
 _db_lock = threading.Lock()
 
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return open_sqlite_connection(DB_PATH)
+
+
+@contextmanager
+def _connect(*, transactional: bool = False) -> Iterator[sqlite3.Connection]:
+    with sqlite_connection(DB_PATH, transactional=transactional) as conn:
+        yield conn
 
 
 def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -26,29 +34,28 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition
 
 
 def init_db():
-    with _db_lock:
-        conn = _get_conn()
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS question_records (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                qa_id TEXT,
-                session_type TEXT,
-                question TEXT,
-                answer TEXT,
-                candidate_answer TEXT,
-                score REAL,
-                tags TEXT,
-                created_at REAL
-            )
-        """)
-        _ensure_column(conn, "question_records", "qa_id", "TEXT")
-        _ensure_column(conn, "question_records", "candidate_answer", "TEXT")
-        try:
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_question_records_qa_id ON question_records(qa_id)")
-        except Exception:
-            pass
-        conn.commit()
-        conn.close()
+    with _db_lock, _connect() as conn:
+        enable_wal_mode(conn)
+        with conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS question_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    qa_id TEXT,
+                    session_type TEXT,
+                    question TEXT,
+                    answer TEXT,
+                    candidate_answer TEXT,
+                    score REAL,
+                    tags TEXT,
+                    created_at REAL
+                )
+            """)
+            _ensure_column(conn, "question_records", "qa_id", "TEXT")
+            _ensure_column(conn, "question_records", "candidate_answer", "TEXT")
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_question_records_qa_id ON question_records(qa_id)")
+            except Exception:
+                pass
 
 
 init_db()
@@ -80,8 +87,7 @@ def save_record(
     candidate_answer: str = "",
     qa_id: str = "",
 ):
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect(transactional=True) as conn:
         conn.execute(
             "INSERT INTO question_records (qa_id, session_type, question, answer, candidate_answer, score, tags, created_at) VALUES (?,?,?,?,?,?,?,?)",
             (
@@ -95,8 +101,6 @@ def save_record(
                 time.time(),
             ),
         )
-        conn.commit()
-        conn.close()
 
 
 def update_candidate_answer_for_qa(
@@ -107,7 +111,7 @@ def update_candidate_answer_for_qa(
     answer_text = (candidate_answer or "").strip()
     if not qa_key or not answer_text:
         return False
-    with _db_lock, closing(_get_conn()) as conn, conn:
+    with _db_lock, _connect(transactional=True) as conn:
         result = conn.execute(
             """UPDATE question_records SET candidate_answer = ?
                WHERE id = (SELECT id FROM question_records WHERE qa_id = ?
@@ -127,13 +131,13 @@ class AnalysisRecord:
 
 
 def pending_assist_ids() -> list[int]:
-    with _db_lock, closing(_get_conn()) as conn:
+    with _db_lock, _connect() as conn:
         rows = conn.execute("SELECT id, tags FROM question_records WHERE session_type = 'assist' ORDER BY id")
         return [row["id"] for row in rows if not _stored_tags(row["tags"])]
 
 
 def get_pending_assist_record(record_id: int) -> AnalysisRecord | None:
-    with _db_lock, closing(_get_conn()) as conn:
+    with _db_lock, _connect() as conn:
         row = conn.execute(
             """SELECT id, question, answer, candidate_answer, tags FROM question_records
                WHERE id = ? AND session_type = 'assist'""",
@@ -145,7 +149,7 @@ def get_pending_assist_record(record_id: int) -> AnalysisRecord | None:
 
 
 def write_analysis_tags(record: AnalysisRecord, tags: list[str]) -> bool:
-    with _db_lock, closing(_get_conn()) as conn, conn:
+    with _db_lock, _connect(transactional=True) as conn:
         result = conn.execute(
             """UPDATE question_records SET tags = ? WHERE id = ? AND session_type = 'assist'
                AND question IS ? AND answer IS ? AND candidate_answer IS ? AND tags IS ?""",
@@ -158,13 +162,11 @@ def write_analysis_tags(record: AnalysisRecord, tags: list[str]) -> bool:
 def get_summary(session_types: Optional[tuple[str, ...]] = None) -> list[dict]:
     """Return per-tag aggregated stats: avg score, count, recent trend."""
     where_sql, params = _session_type_where(session_types)
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect() as conn:
         rows = conn.execute(
             f"SELECT tags, score, created_at FROM question_records{where_sql} ORDER BY created_at DESC",
             params,
         ).fetchall()
-        conn.close()
 
     tag_data: dict[str, list[dict]] = {}
     for row in rows:
@@ -206,8 +208,7 @@ def get_history(
 ) -> dict:
     offset = (page - 1) * page_size
     where_sql, params = _session_type_where(session_types)
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect() as conn:
         total = conn.execute(
             f"SELECT COUNT(*) as c FROM question_records{where_sql}",
             params,
@@ -216,7 +217,6 @@ def get_history(
             f"SELECT * FROM question_records{where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
             [*params, page_size, offset],
         ).fetchall()
-        conn.close()
 
     records = []
     for row in rows:
@@ -236,8 +236,5 @@ def get_history(
 
 
 def reset_all():
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect(transactional=True) as conn:
         conn.execute("DELETE FROM question_records")
-        conn.commit()
-        conn.close()

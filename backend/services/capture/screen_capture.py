@@ -3,8 +3,9 @@
 
 from __future__ import annotations
 
-import os
+import base64
 import json
+import os
 import subprocess
 import sys
 
@@ -19,13 +20,38 @@ _log = get_logger("capture.screen")
 
 
 def _capture_payload_to_data_url(raw: str) -> str:
+    payload = None
     try:
-        payload = json.loads(raw)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            payload = parsed
     except json.JSONDecodeError:
+        # 依赖库杂音可能污染 stdout 前几行，尝试从末尾提取 JSON 载荷
+        for line in reversed(raw.splitlines()):
+            candidate = line.strip()
+            if not candidate.startswith("{"):
+                continue
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and parsed.get("data"):
+                payload = parsed
+                break
+
+    if payload is None:
+        # 兼容旧版纯 base64 输出，严格校验 ASCII/base64 避免把异常杂音透传给前端
+        if "\ufffd" in raw or not raw.isascii():
+            raise ScreenCaptureError("截屏数据异常")
+        try:
+            base64.b64decode(raw, validate=True)
+        except Exception as e:
+            raise ScreenCaptureError("截屏数据异常") from e
         return f"data:image/png;base64,{raw}"
+
     data = str(payload.get("data") or "")
     mime = str(payload.get("mime") or "image/png")
-    if not data:
+    if not data or not data.isascii():
         raise ScreenCaptureError("截屏数据异常")
     _log.info(
         "SCREEN_CAPTURE_ENCODE mime=%s original=%sx%s encoded=%sx%s bytes_before=%s bytes_after=%s compressed=%s fallback=%s",
@@ -91,7 +117,7 @@ def capture_primary_region_data_url(region: str = "left_half", max_long_edge: in
             f" 详情: {err}"
         )
 
-    raw = (proc.stdout or b"").decode("ascii", errors="strict").strip()
+    raw = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
     if len(raw) < 100:
         raise ScreenCaptureError("截屏数据异常")
     return _capture_payload_to_data_url(raw)

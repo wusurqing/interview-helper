@@ -10,11 +10,17 @@ import sqlite3
 import threading
 import time
 import uuid
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
 
 from core.config import get_config, update_config
 from services.resume import parse_resume_bytes, summarize_resume
 from services.storage.paths import data_dir, sqlite_path
+from services.storage.sqlite_utils import (
+    enable_wal_mode,
+    open_sqlite_connection,
+    sqlite_connection,
+)
 
 MAX_ENTRIES = 10
 # 单次上传字节数上限。Router 层 (api.common.router) 也以此为流式校验阈值,
@@ -31,13 +37,12 @@ def _uploads_dir() -> str:
 
 
 def _ensure_resume_summary_column(conn: sqlite3.Connection) -> None:
-    """旧库可能缺列，避免 SELECT/UPDATE 报错或 INSERT 与表结构不一致。"""
+    """旧库可能缺列，在 init_db() 一次性迁移，避免每次建连执行 PRAGMA table_info。"""
     try:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(resume_entries)").fetchall()]
         if not cols or "resume_summary" in cols:
             return
         conn.execute("ALTER TABLE resume_entries ADD COLUMN resume_summary TEXT")
-        conn.commit()
     except sqlite3.OperationalError:
         pass
 
@@ -51,41 +56,36 @@ def _row_get(row: sqlite3.Row, key: str, default: Any = None) -> Any:
 
 
 def _conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    _ensure_resume_summary_column(conn)
-    return conn
+    return open_sqlite_connection(DB_PATH)
+
+
+@contextmanager
+def _connect(*, transactional: bool = False) -> Iterator[sqlite3.Connection]:
+    with sqlite_connection(DB_PATH, transactional=transactional) as conn:
+        yield conn
 
 
 def init_db() -> None:
-    with _db_lock:
-        conn = _conn()
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS resume_entries (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                original_filename TEXT NOT NULL,
-                stored_basename TEXT NOT NULL UNIQUE,
-                file_size INTEGER NOT NULL,
-                created_at REAL NOT NULL,
-                last_used_at REAL NOT NULL,
-                parsed_ok INTEGER NOT NULL DEFAULT 0,
-                preview TEXT,
-                parse_error TEXT
+    with _db_lock, _connect() as conn:
+        enable_wal_mode(conn)
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS resume_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    original_filename TEXT NOT NULL,
+                    stored_basename TEXT NOT NULL UNIQUE,
+                    file_size INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    last_used_at REAL NOT NULL,
+                    parsed_ok INTEGER NOT NULL DEFAULT 0,
+                    preview TEXT,
+                    parse_error TEXT,
+                    resume_summary TEXT
+                )
+                """
             )
-            """
-        )
-        _migrate_add_resume_summary(conn)
-        conn.commit()
-        conn.close()
-
-
-def _migrate_add_resume_summary(conn: sqlite3.Connection) -> None:
-    try:
-        conn.execute("ALTER TABLE resume_entries ADD COLUMN resume_summary TEXT")
-    except sqlite3.OperationalError:
-        pass
+            _ensure_resume_summary_column(conn)
 
 
 init_db()
@@ -98,14 +98,9 @@ def _safe_ext(filename: str) -> str:
     return ext[:12]
 
 
-def _delete_row_and_file(conn: sqlite3.Connection, entry_id: int) -> None:
-    row = conn.execute(
-        "SELECT stored_basename FROM resume_entries WHERE id = ?", (entry_id,)
-    ).fetchone()
-    if not row:
+def _unlink_stored_file(basename: str) -> None:
+    if not basename:
         return
-    basename = row["stored_basename"]
-    conn.execute("DELETE FROM resume_entries WHERE id = ?", (entry_id,))
     path = os.path.join(_uploads_dir(), basename)
     if os.path.isfile(path):
         try:
@@ -120,23 +115,26 @@ def _clear_config_if_active(entry_id: int) -> None:
         update_config({"resume_text": None, "resume_active_history_id": None})
 
 
-def _evict_excess(conn: sqlite3.Connection) -> None:
+def _evict_excess_rows(conn: sqlite3.Connection) -> list[tuple[int, str]]:
     total = conn.execute("SELECT COUNT(*) AS c FROM resume_entries").fetchone()["c"]
     excess = int(total) - MAX_ENTRIES
     if excess <= 0:
-        return
+        return []
     rows = conn.execute(
         """
-        SELECT id FROM resume_entries
+        SELECT id, stored_basename FROM resume_entries
         ORDER BY last_used_at ASC, id ASC
         LIMIT ?
         """,
         (excess,),
     ).fetchall()
+    evicted: list[tuple[int, str]] = []
     for row in rows:
         eid = int(row["id"])
-        _clear_config_if_active(eid)
-        _delete_row_and_file(conn, eid)
+        basename = str(row["stored_basename"] or "")
+        conn.execute("DELETE FROM resume_entries WHERE id = ?", (eid,))
+        evicted.append((eid, basename))
+    return evicted
 
 
 def _row_to_item(row: sqlite3.Row, active_id: Optional[int]) -> dict[str, Any]:
@@ -157,22 +155,18 @@ def list_entries() -> list[dict[str, Any]]:
     """按 last_used_at 升序：旧在上、新在下。"""
     cfg = get_config()
     active_id = cfg.resume_active_history_id
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect() as conn:
         rows = conn.execute(
             "SELECT * FROM resume_entries ORDER BY last_used_at ASC, id ASC"
         ).fetchall()
-        conn.close()
     return [_row_to_item(r, active_id) for r in rows]
 
 
 def get_filename_for_id(entry_id: int) -> Optional[str]:
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect() as conn:
         row = conn.execute(
             "SELECT original_filename FROM resume_entries WHERE id = ?", (entry_id,)
         ).fetchone()
-        conn.close()
     return row["original_filename"] if row else None
 
 
@@ -210,10 +204,10 @@ def add_upload(content: bytes, original_filename: str) -> dict[str, Any]:
         parse_error = str(e)[:500]
 
     history_id: int
-    with _db_lock:
-        conn = _conn()
-        try:
-            conn.execute(
+    evicted: list[tuple[int, str]] = []
+    try:
+        with _db_lock, _connect(transactional=True) as conn:
+            cur = conn.execute(
                 """
                 INSERT INTO resume_entries (
                     original_filename, stored_basename, file_size,
@@ -232,20 +226,19 @@ def add_upload(content: bytes, original_filename: str) -> dict[str, Any]:
                     summary if summary else "",
                 ),
             )
-            conn.commit()
-            history_id = int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
-            _evict_excess(conn)
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            conn.close()
-            try:
-                if os.path.isfile(disk_path):
-                    os.unlink(disk_path)
-            except OSError:
-                pass
-            raise
-        conn.close()
+            history_id = int(cur.lastrowid)
+            evicted = _evict_excess_rows(conn)
+    except Exception:
+        try:
+            if os.path.isfile(disk_path):
+                os.unlink(disk_path)
+        except OSError:
+            pass
+        raise
+
+    for eid, basename in evicted:
+        _clear_config_if_active(eid)
+        _unlink_stored_file(basename)
 
     result = {
         "ok": True,
@@ -265,13 +258,11 @@ def add_upload(content: bytes, original_filename: str) -> dict[str, Any]:
 
 
 def _read_entry_bytes(entry_id: int) -> tuple[bytes, str, str]:
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect() as conn:
         row = conn.execute(
             "SELECT stored_basename, original_filename FROM resume_entries WHERE id = ?",
             (entry_id,),
         ).fetchone()
-        conn.close()
     if not row:
         raise FileNotFoundError("记录不存在")
     basename = row["stored_basename"]
@@ -286,23 +277,18 @@ def _read_entry_bytes(entry_id: int) -> tuple[bytes, str, str]:
 def apply_entry(entry_id: int) -> dict[str, Any]:
     """从历史选用：若库中已有完整 resume_summary 则直接选用（秒开）；否则从文件解析后写入。"""
     now = time.time()
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect() as conn:
         row = conn.execute("SELECT * FROM resume_entries WHERE id = ?", (entry_id,)).fetchone()
-        conn.close()
     if not row:
         raise FileNotFoundError("记录不存在")
 
     cached = (_row_get(row, "resume_summary", "") or "").strip()
     if cached:
-        with _db_lock:
-            conn = _conn()
+        with _db_lock, _connect(transactional=True) as conn:
             conn.execute(
                 "UPDATE resume_entries SET last_used_at = ? WHERE id = ?",
                 (now, entry_id),
             )
-            conn.commit()
-            conn.close()
         update_config({"resume_text": cached, "resume_active_history_id": entry_id})
         return {
             "ok": True,
@@ -320,8 +306,7 @@ def apply_entry(entry_id: int) -> dict[str, Any]:
         raise ValueError(str(e)) from e
 
     preview_text = (summary or "")[:500]
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect(transactional=True) as conn:
         conn.execute(
             """
             UPDATE resume_entries
@@ -331,8 +316,6 @@ def apply_entry(entry_id: int) -> dict[str, Any]:
             """,
             (now, preview_text, summary, entry_id),
         )
-        conn.commit()
-        conn.close()
 
     update_config({"resume_text": summary, "resume_active_history_id": entry_id})
 
@@ -346,22 +329,24 @@ def apply_entry(entry_id: int) -> dict[str, Any]:
 
 
 def delete_entry(entry_id: int) -> None:
-    with _db_lock:
-        conn = _conn()
-        _clear_config_if_active(entry_id)
-        _delete_row_and_file(conn, entry_id)
-        conn.commit()
-        conn.close()
+    basename = ""
+    with _db_lock, _connect(transactional=True) as conn:
+        row = conn.execute(
+            "SELECT stored_basename FROM resume_entries WHERE id = ?", (entry_id,)
+        ).fetchone()
+        if row:
+            basename = str(row["stored_basename"] or "")
+            conn.execute("DELETE FROM resume_entries WHERE id = ?", (entry_id,))
+    _clear_config_if_active(entry_id)
+    _unlink_stored_file(basename)
 
 
 def get_entry_detail(entry_id: int) -> dict[str, Any]:
     """返回单条历史摘要用于预览/编辑。不在此接口同步全量重解析 PDF（大文件会拖垮请求）。"""
     cfg = get_config()
     active_id = cfg.resume_active_history_id
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect() as conn:
         row = conn.execute("SELECT * FROM resume_entries WHERE id = ?", (entry_id,)).fetchone()
-        conn.close()
     if not row:
         raise FileNotFoundError("记录不存在")
     rs = (_row_get(row, "resume_summary", "") or "").strip()
@@ -379,11 +364,9 @@ def update_entry_summary(entry_id: int, summary: str) -> dict[str, Any]:
     if len(summary) > 400_000:
         raise ValueError("简历摘要过长（上限约 40 万字符）")
     preview_text = summary[:500]
-    with _db_lock:
-        conn = _conn()
+    with _db_lock, _connect(transactional=True) as conn:
         row = conn.execute("SELECT id FROM resume_entries WHERE id = ?", (entry_id,)).fetchone()
         if not row:
-            conn.close()
             raise FileNotFoundError("记录不存在")
         conn.execute(
             """
@@ -393,8 +376,6 @@ def update_entry_summary(entry_id: int, summary: str) -> dict[str, Any]:
             """,
             (summary, preview_text, entry_id),
         )
-        conn.commit()
-        conn.close()
     cfg = get_config()
     if cfg.resume_active_history_id == entry_id:
         update_config({"resume_text": summary})

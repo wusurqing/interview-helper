@@ -108,3 +108,44 @@ def test_schedule_self_verify_persists_result_before_broadcast(monkeypatch):
         "reason": "样例不通过",
     }]
     assert seen_snapshot == [{"verdict": "FAIL", "reason": "样例不通过"}]
+
+
+def test_parse_verdict_handles_non_dict_json_and_nested_braces():
+    assert vision_verify._parse_verdict("[]")["verdict"] == "UNKNOWN"
+    assert vision_verify._parse_verdict('[{"verdict": "PASS", "reason": "wrapped"}]')["verdict"] == "UNKNOWN"
+    assert vision_verify._parse_verdict('"PASS"')["verdict"] == "UNKNOWN"
+    assert vision_verify._parse_verdict("123")["verdict"] == "UNKNOWN"
+
+    nested = '判定如下：{"verdict": "FAIL", "meta": {"case": 1}, "reason": "输出集合应为 {1, 2} 而非 {3}"} 结束'
+    parsed = vision_verify._parse_verdict(nested)
+    assert parsed == {
+        "verdict": "FAIL",
+        "reason": "输出集合应为 {1, 2} 而非 {3}",
+    }
+
+
+def test_verify_blocking_passes_disable_think_params_for_reasoning_model(monkeypatch):
+    captured: dict[str, object] = {}
+    model_cfg = SimpleNamespace(
+        model="doubao-seed-2.0-pro",
+        api_base_url="https://ark.cn-beijing.volces.com/api/v3",
+        api_type="openai",
+        supports_think=True,
+    )
+    llm_result = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"verdict":"PASS","reason":"ok"}'))],
+        usage=None,
+    )
+
+    def _fake_create(_model_cfg, _messages, **kwargs):
+        captured.update(kwargs)
+        return llm_result
+
+    monkeypatch.setattr("services.llm.streaming.chat_completion_create", _fake_create)
+    result = vision_verify._verify_blocking("ans", "data:image/png;base64,a", model_cfg=model_cfg)
+    assert result["verdict"] == "PASS"
+    assert captured["think_params"] == {
+        "thinking": {"type": "disabled"},
+        "think_mode": False,
+        "enable_thinking": False,
+    }

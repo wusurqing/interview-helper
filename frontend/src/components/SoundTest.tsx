@@ -16,7 +16,7 @@ import {
 } from 'lucide-react'
 import { api } from '@/lib/api'
 import { useInterviewStore } from '@/stores/configStore'
-import { buildWsUrl } from '@/lib/backendUrl'
+import { subscribeSoundPreflight, type PreflightWsMessage } from '@/lib/preflightWsBus'
 import { getAssistModelEntries } from '@/lib/assistModels'
 import { speechProviders } from '@/lib/speechProviders'
 
@@ -126,64 +126,57 @@ export default function SoundTest() {
     return () => document.removeEventListener('mousedown', onClick)
   }, [])
 
-  const handleMessage = useCallback((event: MessageEvent) => {
-    try {
-      const msg = JSON.parse(event.data)
-      if (msg.type !== 'preflight_step') return
-      const { step, status, detail, answer, question, transcript, expected_phrase, first_token_ms, total_ms, model_name } = msg
-      if (step === 'done') {
-        runRequestRef.current = false
-        setDone(true)
-        setRunning(false)
-        void api.preflightStatus().then((status) => {
-          const statusSteps = normalizeStatusSteps(status?.steps)
-          setSteps((prev) => ({
-            ...prev,
-            ...Object.fromEntries(
-              Object.entries(statusSteps).map(([key, value]) => [
-                key,
-                { ...(prev[key] ?? { status: 'idle', detail: '' }), ...value },
-              ]),
-            ),
-            match: {
-              ...(prev.match ?? { status: 'idle', detail: '' }),
-              ...statusSteps.match,
-              transcript: status?.captured_transcript ?? prev.match?.transcript,
-              expected_phrase: status?.expected_phrase ?? prev.match?.expected_phrase,
-            },
-          }))
-        }).catch(() => {})
-        return
-      }
-      if (step === 'error') {
-        runRequestRef.current = false
-        setRunning(false)
-        setErrorMsg(detail || '\u8bd5\u97f3\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u8bbe\u5907\u548c\u914d\u7f6e')
-        return
-      }
-      setSteps((prev) => ({
-        ...prev,
-        [step]: { status, detail, answer, question, transcript, expected_phrase, first_token_ms, total_ms, model_name },
-      }))
-    } catch {}
+  const handleMessage = useCallback((msg: PreflightWsMessage) => {
+    if (msg.type !== 'preflight_step') return
+    const {
+      step,
+      status,
+      detail,
+      answer,
+      question,
+      transcript,
+      expected_phrase,
+      first_token_ms,
+      total_ms,
+      model_name,
+    } = msg as Record<string, any>
+    if (step === 'done') {
+      runRequestRef.current = false
+      setDone(true)
+      setRunning(false)
+      void api.preflightStatus().then((statusResp) => {
+        const statusSteps = normalizeStatusSteps(statusResp?.steps)
+        setSteps((prev) => ({
+          ...prev,
+          ...Object.fromEntries(
+            Object.entries(statusSteps).map(([key, value]) => [
+              key,
+              { ...(prev[key] ?? { status: 'idle', detail: '' }), ...value },
+            ]),
+          ),
+          match: {
+            ...(prev.match ?? { status: 'idle', detail: '' }),
+            ...statusSteps.match,
+            transcript: statusResp?.captured_transcript ?? prev.match?.transcript,
+            expected_phrase: statusResp?.expected_phrase ?? prev.match?.expected_phrase,
+          },
+        }))
+      }).catch(() => {})
+      return
+    }
+    if (step === 'error') {
+      runRequestRef.current = false
+      setRunning(false)
+      setErrorMsg(detail || '\u8bd5\u97f3\u5931\u8d25\uff0c\u8bf7\u68c0\u67e5\u8bbe\u5907\u548c\u914d\u7f6e')
+      return
+    }
+    setSteps((prev) => ({
+      ...prev,
+      [step]: { status, detail, answer, question, transcript, expected_phrase, first_token_ms, total_ms, model_name },
+    }))
   }, [])
 
-  useEffect(() => {
-    const ws = new WebSocket(buildWsUrl('/ws'))
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data)
-        if (msg?.type === 'ping') {
-          ws.send(JSON.stringify({ type: 'pong' }))
-          return
-        }
-      } catch {
-        /* malformed frames are ignored by the component message parser */
-      }
-      handleMessage(event)
-    }
-    return () => { ws.close() }
-  }, [handleMessage])
+  useEffect(() => subscribeSoundPreflight(handleMessage), [handleMessage])
 
   const selectedDevice = (() => {
     const loopback = devices.find((d) => d.is_loopback && d.is_default_output) ?? devices.find((d) => d.is_loopback)

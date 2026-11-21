@@ -1,5 +1,6 @@
 import ReactMarkdown from 'react-markdown'
 import { PrismLight as SyntaxHighlighter } from 'react-syntax-highlighter'
+import { MarkdownLink } from './MarkdownLink'
 import bash from 'react-syntax-highlighter/dist/esm/languages/prism/bash'
 import c from 'react-syntax-highlighter/dist/esm/languages/prism/c'
 import cpp from 'react-syntax-highlighter/dist/esm/languages/prism/cpp'
@@ -157,6 +158,7 @@ function useMarkdownComponents(colorScheme: ColorSchemeId) {
   const prismStyle = prismThemeForScheme(colorScheme)
   return useMemo(
     () => ({
+      a: MarkdownLink,
       code({ className, children, ...props }: { className?: string; children?: React.ReactNode } & Record<string, unknown>) {
         const codeStr = String(children).replace(/\n$/, '')
         const requestedLang = parseMarkdownFenceLanguage(className)

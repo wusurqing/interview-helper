@@ -1,4 +1,11 @@
-from core.config import DEFAULT_CONTEXT_WINDOW_TOKENS, MMPG_SECRET_FIELDS, Mmpg, get_provider_layout, model_health_fingerprint
+from core.config import (
+    DEFAULT_CONTEXT_WINDOW_TOKENS,
+    MMPG_SECRET_FIELDS,
+    Mmpg,
+    get_config_corrupt_state,
+    get_provider_layout,
+    model_health_fingerprint,
+)
 from services.storage.resume_history import get_filename_for_id
 from services.stt import configured_stt_routes
 
@@ -9,6 +16,7 @@ def build_config_payload(cfg) -> dict:
     provider_names = {provider.id: provider.name for provider in providers}
     provider_ids = {model.id: model.provider_id for model in layout}
     resume_active_history_id = getattr(cfg, "resume_active_history_id", None)
+    corrupt_state = get_config_corrupt_state()
     mmpg = (getattr(cfg, "mmpg", None) or Mmpg()).model_dump()
     for field in MMPG_SECRET_FIELDS:
         mmpg[f"{field}_configured"] = bool(mmpg.pop(field))
@@ -54,14 +62,14 @@ def build_config_payload(cfg) -> dict:
         "stt_configured": configured_stt_routes(cfg),
         "mmpg": mmpg,
         "doubao_stt_app_id": cfg.doubao_stt_app_id or "",
-        "doubao_stt_access_token": cfg.doubao_stt_access_token or "",
-        "doubao_stt_api_key": getattr(cfg, "doubao_stt_api_key", "") or "",
+        "doubao_stt_access_token_configured": bool((cfg.doubao_stt_access_token or "").strip()),
+        "doubao_stt_api_key_configured": bool((getattr(cfg, "doubao_stt_api_key", "") or "").strip()),
         "doubao_stt_resource_id": cfg.doubao_stt_resource_id or "",
         "doubao_stt_boosting_table_id": cfg.doubao_stt_boosting_table_id or "",
         "generic_stt_api_base_url": getattr(cfg, "generic_stt_api_base_url", "") or "",
-        "generic_stt_api_key": getattr(cfg, "generic_stt_api_key", "") or "",
+        "generic_stt_api_key_configured": bool((getattr(cfg, "generic_stt_api_key", "") or "").strip()),
         "generic_stt_model": getattr(cfg, "generic_stt_model", "") or "",
-        "generic_stt_custom_headers": getattr(cfg, "generic_stt_custom_headers", "") or "",
+        "generic_stt_custom_headers_configured": bool((getattr(cfg, "generic_stt_custom_headers", "") or "").strip()),
         "candidate_asr_enabled": bool(getattr(cfg, "candidate_asr_enabled", False)),
         "candidate_stt_provider": getattr(cfg, "candidate_stt_provider", "") or "",
         "candidate_context_enabled": bool(getattr(cfg, "candidate_context_enabled", True)),
@@ -138,4 +146,13 @@ def build_config_payload(cfg) -> dict:
         "review_enabled": bool(getattr(cfg, "review_enabled", False)),
         "review_model_index": cfg.review_model_index,
         "review_model_id": cfg.review_model_id,
+        "config_corrupt": corrupt_state is not None,
+        "config_corrupt_info": (
+            {
+                "error": corrupt_state["error"],
+                "backup_filename": corrupt_state.get("backup_filename"),
+            }
+            if corrupt_state is not None
+            else None
+        ),
     }

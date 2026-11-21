@@ -306,3 +306,151 @@ def test_start_exam_preflight_does_not_spawn_during_active_session(
 
     assert exam_test.start_exam_preflight() is None
     assert exam_test._running is False
+
+
+def test_start_exam_preflight_initializes_status_running_synchronously_before_worker_executes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    exam_test._finish_preflight()
+    monkeypatch.setattr(
+        exam_test,
+        "get_session",
+        lambda: SimpleNamespace(is_recording=False, is_paused=False),
+    )
+
+    deferred: list[tuple] = []
+
+    class DeferredThread:
+        def __init__(self, *, target, args=(), daemon=False, name=""):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            deferred.append((self.target, self.args))
+
+    monkeypatch.setattr(exam_test.threading, "Thread", DeferredThread)
+
+    preflight_id = exam_test.start_exam_preflight()
+    try:
+        assert isinstance(preflight_id, str)
+        assert len(deferred) == 1
+        # Even before the background thread has run a single line, status must already be running!
+        status = exam_test.get_exam_preflight_status()
+        assert status["running"] is True
+        assert status["preflight_id"] == preflight_id
+        assert status["steps"] == {}
+        assert status["error"] is None
+        assert status["finished_at"] is None
+        assert exam_test.is_exam_preflight_running() is True
+    finally:
+        exam_test._finish_preflight()
+
+
+def test_start_exam_preflight_resets_state_when_thread_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    exam_test._finish_preflight()
+    monkeypatch.setattr(
+        exam_test,
+        "get_session",
+        lambda: SimpleNamespace(is_recording=False, is_paused=False),
+    )
+
+    class BrokenThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("cannot start thread")
+
+    monkeypatch.setattr(exam_test.threading, "Thread", BrokenThread)
+
+    with pytest.raises(RuntimeError, match="cannot start thread"):
+        exam_test.start_exam_preflight()
+
+    assert exam_test.is_exam_preflight_running() is False
+    assert exam_test.get_exam_preflight_status()["running"] is False
+
+
+def test_exam_preflight_timeout_cancels_inflight_task_and_unblocks_commit_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    pipeline.cancel_answer_work(reset_session_data=False)
+    monkeypatch.setattr(exam_test, "broadcast", lambda _msg: None)
+    monkeypatch.setattr(pipeline, "_try_dispatch", lambda: None)
+
+    preflight_id = "exam-preflight-stuck-1"
+    exam_task = exam_test._exam_preflight_task("data:image/png;base64,fake", preflight_id)
+    other_task = ("普通手动问题", None, True, "manual_text", {"origin": "manual"})
+
+    with pipeline._commit_lock:
+        base_seq = pipeline._next_commit_seq
+    with pipeline._dispatch_lock:
+        pipeline._in_flight_tasks[base_seq] = ("model-exam", exam_task)
+        pipeline._in_flight_tasks[base_seq + 1] = ("model-other", other_task)
+
+    committed: list[str] = []
+    pipeline._flush_commit(base_seq + 1, lambda: committed.append("other-committed"))
+    # Blocked behind base_seq until base_seq completes or is skipped.
+    assert committed == []
+
+    exam_test._running = True
+    exam_test._set_status(
+        running=True,
+        preflight_id=preflight_id,
+        qa_id="qa-stuck",
+        steps={"llm": {"status": "running", "detail": "等待模型"}},
+        error=None,
+        finished_at=None,
+    )
+
+    try:
+        assert exam_test._expire_exam_preflight(preflight_id, timeout_sec=180.0) is True
+        assert pipeline._is_exam_preflight_cancelled(preflight_id) is True
+        with pipeline._dispatch_lock:
+            assert base_seq not in pipeline._in_flight_tasks
+            assert base_seq + 1 in pipeline._in_flight_tasks
+        # Skipping base_seq immediately drains base_seq + 1 from _commit_buffer!
+        assert committed == ["other-committed"]
+    finally:
+        pipeline.cancel_answer_work(reset_session_data=False)
+
+
+def test_cancelled_exam_preflight_commit_does_not_broadcast_ghost_answer_done(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from api.assist import answer_worker
+    from core.config import AppConfig, ModelConfig
+
+    cfg = AppConfig(
+        models=[ModelConfig(id="v1", name="Vision", api_key="sk-test", enabled=True, supports_vision=True)],
+        written_exam_mode=True,
+        written_exam_model_ids=["v1"],
+    )
+    aborted_flag = {"cancelled": False}
+    broadcasts: list[dict] = []
+    deferred_commits: list = []
+
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", lambda *_a, **_kw: iter([("text", "题解")]))
+    monkeypatch.setattr(answer_worker, "get_token_stats", lambda: {"prompt": 1, "completion": 1, "total": 2, "by_model": {}})
+
+    deps = answer_worker.AnswerWorkerDeps(
+        abort_check=lambda: aborted_flag["cancelled"],
+        is_session_current=lambda _v: True,
+        flush_commit=lambda _seq, fn: deferred_commits.append(fn),
+        mark_seq_skipped=lambda _seq: None,
+        submit_knowledge_record=lambda *_a: True,
+        broadcast=broadcasts.append,
+        logger=SimpleNamespace(info=lambda *_a, **_kw: None),
+        error_logger=SimpleNamespace(warning=lambda *_a, **_kw: None, error=lambda *_a, **_kw: None),
+        config_snapshot=cfg,
+    )
+
+    task = exam_test._exam_preflight_task("data:image/png;base64,fake", "exam-preflight-late-cancel")
+    answer_worker.process_question_parallel(task, seq=0, model_idx=0, sess_v=0, deps=deps)
+    assert len(deferred_commits) == 1
+
+    # Simulate timeout cancelling the preflight after _commit was scheduled.
+    aborted_flag["cancelled"] = True
+    deferred_commits[0]()
+    assert not any(event.get("type") == "answer_done" for event in broadcasts)

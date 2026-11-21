@@ -4,16 +4,29 @@ import platform
 import subprocess
 import tempfile
 
+MAX_RESUME_PDF_PAGES = 20
+MAX_DOCX_ZIP_ENTRIES = 1000
+MAX_DOCX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+MAX_DOCX_XML_BYTES = 20 * 1024 * 1024
 
-def _pdf_to_images_base64(file_path: str, dpi: int = 150) -> list[str]:
+
+def _pdf_to_images_base64(
+    file_path: str,
+    dpi: int = 150,
+    *,
+    max_pages: int | None = None,
+) -> list[str]:
     """用 PyMuPDF 将 PDF 每页转为 PNG 的 base64，无系统依赖。"""
     try:
         import fitz
     except ImportError:
         raise ValueError("解析图片版 PDF 需要安装 PyMuPDF：pip install pymupdf") from None
+    limit = MAX_RESUME_PDF_PAGES if max_pages is None else max(1, int(max_pages))
     out = []
     doc = fitz.open(file_path)
     try:
+        if len(doc) > limit:
+            raise ValueError(f"PDF 页数过多（{len(doc)} 页，上限 {limit} 页）")
         for page in doc:
             pix = page.get_pixmap(dpi=dpi)
             png_bytes = pix.tobytes("png")
@@ -37,23 +50,48 @@ def parse_pdf(file_path: str) -> str:
     return vision_extract_text(images_b64)
 
 
+def _validate_docx_zip(z) -> None:
+    infos = z.infolist()
+    if len(infos) > MAX_DOCX_ZIP_ENTRIES:
+        raise ValueError(f"DOCX 压缩包条目数超过上限（{len(infos)} > {MAX_DOCX_ZIP_ENTRIES}）")
+    total_uncompressed = 0
+    for info in infos:
+        if info.file_size < 0:
+            raise ValueError("无效的 DOCX 文件")
+        total_uncompressed += info.file_size
+        if total_uncompressed > MAX_DOCX_UNCOMPRESSED_BYTES:
+            raise ValueError("DOCX 解压后体积超过安全上限，请检查文件是否异常")
+
+
 def _parse_docx(content: bytes) -> str:
-    """Extract text from a .docx file."""
+    """Extract text from a .docx file with Zip-bomb size and entry guards."""
     import zipfile
     import xml.etree.ElementTree as ET
+    import zlib
     from io import BytesIO
 
     paragraphs = []
-    with zipfile.ZipFile(BytesIO(content)) as z:
-        if "word/document.xml" not in z.namelist():
-            raise ValueError("无效的 DOCX 文件")
-        with z.open("word/document.xml") as f:
-            tree = ET.parse(f)
-        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
-        for p in tree.iter(f"{{{ns['w']}}}p"):
-            texts = [t.text for t in p.iter(f"{{{ns['w']}}}t") if t.text]
-            if texts:
-                paragraphs.append("".join(texts))
+    xml_limit = min(MAX_DOCX_XML_BYTES, MAX_DOCX_UNCOMPRESSED_BYTES)
+    try:
+        with zipfile.ZipFile(BytesIO(content)) as z:
+            _validate_docx_zip(z)
+            if "word/document.xml" not in z.namelist():
+                raise ValueError("无效的 DOCX 文件")
+            with z.open("word/document.xml") as f:
+                xml_bytes = f.read(xml_limit + 1)
+            if len(xml_bytes) > xml_limit:
+                raise ValueError("DOCX 正文 XML 解压后体积超过安全上限")
+            try:
+                root = ET.fromstring(xml_bytes)
+            except ET.ParseError:
+                raise ValueError("无效的 DOCX 文件") from None
+            ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            for p in root.iter(f"{{{ns['w']}}}p"):
+                texts = [t.text for t in p.iter(f"{{{ns['w']}}}t") if t.text]
+                if texts:
+                    paragraphs.append("".join(texts))
+    except (zipfile.BadZipFile, zipfile.LargeZipFile, zlib.error, RuntimeError, EOFError):
+        raise ValueError("无效的 DOCX 文件") from None
     return "\n".join(paragraphs)
 
 

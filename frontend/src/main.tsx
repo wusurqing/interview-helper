@@ -1,10 +1,12 @@
-import React from 'react'
+import React, { Suspense, lazy } from 'react'
 import ReactDOM from 'react-dom/client'
 import './lib/auth' // 抽取 URL 中的 ?t=<token>(必须先于其他 import 触发副作用)
-import App from './App'
-import InterviewOverlay from './components/InterviewOverlay'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { markStandalone } from './lib/wsLeader'
 import './index.css'
+
+const App = lazy(() => import('./App'))
+const InterviewOverlay = lazy(() => import('./components/InterviewOverlay'))
 
 const isOverlayView = new URLSearchParams(window.location.search).get('overlay') === '1'
 
@@ -14,6 +16,10 @@ if (isOverlayView) markStandalone()
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    {isOverlayView ? <InterviewOverlay /> : <App />}
+    <ErrorBoundary isOverlay={isOverlayView}>
+      <Suspense fallback={null}>
+        {isOverlayView ? <InterviewOverlay /> : <App />}
+      </Suspense>
+    </ErrorBoundary>
   </React.StrictMode>,
 )

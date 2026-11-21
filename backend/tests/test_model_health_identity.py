@@ -106,3 +106,91 @@ def test_api_key_change_invalidates_existing_health(monkeypatch: pytest.MonkeyPa
     model.api_key = "sk-new"
 
     assert model_health.get_model_health(0) is None
+
+
+def test_claude_think_probe_uses_min_1024_budget_and_matching_max_tokens(monkeypatch: pytest.MonkeyPatch):
+    claude_model = _model("Claude", "claude-3-7-sonnet")
+    candidates = dict(model_health._think_probe_candidates(claude_model))
+    assert candidates["claude_thinking_budget"]["thinking"]["budget_tokens"] >= 1024
+
+    seen_payloads: list[dict] = []
+
+    def fake_post_chat(_model_cfg, payload: dict, timeout: int = 12):
+        seen_payloads.append(payload)
+        return {"choices": [{"message": {"content": "2", "reasoning_content": "1+1=2"}}]}, 10
+
+    monkeypatch.setattr(model_health, "_post_chat", fake_post_chat)
+    ok, style, params, _detail = model_health._probe_think(claude_model)
+    assert ok is True
+    assert style == "claude_thinking_budget"
+    budget = params["thinking"]["budget_tokens"]
+    assert budget >= 1024
+    assert seen_payloads[0]["max_tokens"] > budget
+
+
+def test_probe_think_rejects_empty_response_body_and_short_circuits_non_param_errors(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    model = _model("DeepSeek", "deepseek-r1")
+    calls = {"think": 0, "disable": 0}
+
+    # Empty response body (neither reasoning nor text) must not be treated as think accepted
+    monkeypatch.setattr(model_health, "_post_chat", lambda *_a, **_kw: ({}, 5))
+    ok, style, params, detail = model_health._probe_think(model)
+    assert ok is False
+    assert style == ""
+    assert params == {}
+    assert "未返回有效内容" in detail
+
+    # Non-parameter error (e.g., HTTP 401 / timeout) must break immediately instead of trying all candidates
+    def fail_think(*_a, **_kw):
+        calls["think"] += 1
+        raise RuntimeError("HTTP 401: Unauthorized")
+
+    monkeypatch.setattr(model_health, "_post_chat", fail_think)
+    ok, _style, _params, detail = model_health._probe_think(model)
+    assert ok is False
+    assert calls["think"] == 1
+    assert "401" in detail
+
+    def fail_disable(*_a, **_kw):
+        calls["disable"] += 1
+        raise RuntimeError("Read timed out")
+
+    monkeypatch.setattr(model_health, "_post_chat", fail_disable)
+    disabled_params, disable_detail = model_health._probe_disable_think(model)
+    assert disabled_params == {}
+    assert calls["disable"] == 1
+    assert "timed out" in disable_detail
+
+
+def test_start_all_model_checks_acquires_lock_when_collecting_stale_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    first = _model("first", "model-a")
+    cfg = SimpleNamespace(models=[first])
+    monkeypatch.setattr(model_health, "get_config", lambda: cfg)
+    monkeypatch.setattr(model_health, "start_single_model_check", lambda _i: True)
+
+    model_health._model_health[3] = "ok"
+    model_health._model_health_detail[3] = ""
+
+    lock_held_on_iter = {"ok": False}
+    real_lock = model_health._model_health_lock
+
+    class CheckedHealthDict(dict):
+        def __iter__(self):
+            # RLock._is_owned() is available in CPython threading.RLock
+            is_owned = getattr(real_lock, "_is_owned", None)
+            if callable(is_owned):
+                lock_held_on_iter["ok"] = bool(is_owned())
+            else:
+                lock_held_on_iter["ok"] = True
+            return super().__iter__()
+
+    checked = CheckedHealthDict(model_health._model_health)
+    monkeypatch.setattr(model_health, "_model_health", checked)
+
+    assert model_health.start_all_model_checks() is True
+    assert lock_held_on_iter["ok"] is True
+    assert 3 not in model_health._model_health

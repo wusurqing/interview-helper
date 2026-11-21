@@ -32,8 +32,12 @@ def _microphone_com():
         yield
         return
 
-    # WASAPI stream operations can run on different server worker threads.
-    ole = ctypes.windll.ole32
+    ole = getattr(getattr(ctypes, "windll", None), "ole32", None)
+    if ole is None:
+        yield
+        return
+
+    # WASAPI enumeration and stream operations can run on different server worker threads.
     initialized = ole.CoInitializeEx(None, 0) >= 0  # COINIT_MULTITHREADED
     try:
         yield
@@ -62,15 +66,34 @@ class AudioBusyError(RuntimeError):
 # ---------------------------------------------------------------------------
 try:
     import soundcard as _sc
+    if platform.system() == "Windows":
+        from soundcard import mediafoundation
+        from services.soundcard_windows import configure_property_buffers
+
+        configure_property_buffers(mediafoundation)
     _HAS_SC = True
 except Exception:
     _HAS_SC = False
 
+# 一次性注册静态 warning 过滤，避免在 64ms WASAPI 热路径中调用非线程安全的 warnings.catch_warnings()
+warnings.filterwarnings(
+    "ignore",
+    message=r".*fromstring is deprecated.*",
+    category=DeprecationWarning,
+)
+
 # Stable mapping: integer device_id (20000+N) -> soundcard speaker GUID
 # Populated by list_devices(); used by start() to find the right device.
 _SC_ID_BASE = 20000
+_SC_CACHE_LOCK = threading.Lock()
 _SC_ID_MAP: dict[int, str] = {}   # id -> speaker.id (GUID)
 _SC_DEVICE_CACHE: dict[int, dict[str, str]] = {}   # id -> stable device metadata
+
+# Process-wide per-device occupancy registry so separate AudioCapture instances
+# (e.g. assist main/candidate pipelines and sound_test local captures) cannot
+# open the same physical device concurrently.
+_ACTIVE_DEVICES_LOCK = threading.Lock()
+_ACTIVE_DEVICES: dict[int, tuple["AudioCapture", Optional[str], Optional[threading.Event]]] = {}
 
 
 def _audio_device_sort_key(device: dict) -> tuple[int, str]:
@@ -93,52 +116,68 @@ def _is_sc_id(device_id) -> bool:
         return False
 
 
+def _lookup_sc_speaker_guid(device_id: int) -> Optional[str]:
+    with _SC_CACHE_LOCK:
+        return _SC_ID_MAP.get(device_id)
+
+
 def _get_sc_loopback_devices() -> list[dict]:
     """Return soundcard-based WASAPI loopback device entries."""
+    from collections import Counter
+
     if not _HAS_SC:
         return []
-    previous_by_guid = {
-        meta.get("guid"): int(dev_id)
-        for dev_id, meta in _SC_DEVICE_CACHE.items()
-        if meta.get("guid")
-    }
-    previous_by_name = {
-        meta.get("name"): int(dev_id)
-        for dev_id, meta in _SC_DEVICE_CACHE.items()
-        if meta.get("name")
-    }
-    result = []
-    next_map: dict[int, str] = {}
-    next_cache: dict[int, dict[str, str]] = {}
-    used_ids: set[int] = set()
-    try:
-        default_id = _sc.default_speaker().id
-        speakers = _sc.all_speakers()
-        for n, spk in enumerate(speakers):
-            dev_id = previous_by_guid.get(spk.id) or previous_by_name.get(spk.name) or (_SC_ID_BASE + n)
-            while dev_id in used_ids:
-                dev_id += 1
-            used_ids.add(dev_id)
-            next_map[dev_id] = spk.id
-            next_cache[dev_id] = {"guid": spk.id, "name": spk.name}
-            is_default = (spk.id == default_id)
-            label = ("★ " if is_default else "") + spk.name + " (系统音频)"
+    with _SC_CACHE_LOCK:
+        with _microphone_com():
+            try:
+                speakers = [(spk.id, spk.name, getattr(spk, "channels", 2)) for spk in _sc.all_speakers()]
+            except Exception as exc:
+                # A failed native query is not evidence that all outputs disconnected.
+                _alog.warning("soundcard loopback enumeration failed: %s", exc)
+                return []
+            default_id = None
+            if speakers:
+                try:
+                    default_id = getattr(_sc.default_speaker(), "id", None)
+                except Exception:
+                    default_id = None
+
+        live_guids = {guid for guid, _, _ in speakers}
+        live_names = Counter(name for _, name, _ in speakers)
+        previous_by_guid = {meta["guid"]: dev_id for dev_id, meta in _SC_DEVICE_CACHE.items()}
+        previous_names = Counter(meta["name"] for meta in _SC_DEVICE_CACHE.values())
+        # An unambiguous name can recover a changed GUID, but must never take
+        # the ID of an endpoint still present under a new display name.
+        replacement_ids = {
+            meta["name"]: dev_id for dev_id, meta in _SC_DEVICE_CACHE.items()
+            if meta["guid"] not in live_guids and meta["name"] and previous_names[meta["name"]] == 1
+        }
+        next_id = max(_SC_DEVICE_CACHE, default=_SC_ID_BASE - 1) + 1
+        result = []
+        next_map: dict[int, str] = {}
+        for guid, name, channels in speakers:
+            dev_id = previous_by_guid.get(guid)
+            if dev_id is None and live_names[name] == 1:
+                dev_id = replacement_ids.get(name)
+            if dev_id is None:
+                dev_id = next_id
+                next_id += 1
+            next_map[dev_id] = guid
+            _SC_DEVICE_CACHE[dev_id] = {"guid": guid, "name": name}
+            is_default = bool(default_id and guid == default_id)
+            label = ("★ " if is_default else "") + name + " (系统音频)"
             result.append({
                 "id": dev_id,
                 "name": label,
-                "channels": getattr(spk, "channels", 2),
-                "sample_rate": 16000,
+                "channels": channels,
+                "sample_rate": AudioCapture.SAMPLE_RATE,
                 "is_loopback": True,
                 "category": "system_audio",
                 "host_api": "WASAPI (soundcard)",
                 "is_default_output": is_default,
             })
-    except Exception:
-        pass
-    if next_map:
         _SC_ID_MAP.clear()
         _SC_ID_MAP.update(next_map)
-        _SC_DEVICE_CACHE.update(next_cache)
     # default output first
     result.sort(key=_audio_device_sort_key)
     return result
@@ -221,6 +260,7 @@ class AudioCapture:
         self._use_agc: bool = False
         # Ownership token: only one caller (for example "assist") may hold the device
         self._owner: Optional[str] = None
+        self._claimed_device_ids: set[int] = set()
         self._dropped_chunks_count = 0
         self._loopback_discontinuity_count = 0
         self._max_queue_chunk_samples = 0
@@ -276,7 +316,7 @@ class AudioCapture:
         return result
 
     @staticmethod
-    def get_platform_info() -> dict:
+    def get_platform_info(devices: Optional[list[dict]] = None) -> dict:
         system = platform.system()
         info = {
             "platform": system,
@@ -285,8 +325,8 @@ class AudioCapture:
             "has_loopback": False,
         }
         if system == "Darwin":
-            devices = AudioCapture.list_devices()
-            has_loopback = any(d["is_loopback"] for d in devices)
+            dev_list = devices if devices is not None else AudioCapture.list_devices()
+            has_loopback = any(d["is_loopback"] for d in dev_list)
             info["has_loopback"] = has_loopback
             if not has_loopback:
                 info["needs_virtual_device"] = True
@@ -297,8 +337,8 @@ class AudioCapture:
                     "然后在「音频 MIDI 设置」中创建多输出设备。"
                 )
         elif system == "Windows":
-            devices = AudioCapture.list_devices()
-            has_loopback = any(d["is_loopback"] for d in devices)
+            dev_list = devices if devices is not None else AudioCapture.list_devices()
+            has_loopback = any(d["is_loopback"] for d in dev_list)
             info["has_loopback"] = has_loopback
             if not has_loopback:
                 info["needs_virtual_device"] = True
@@ -322,6 +362,58 @@ class AudioCapture:
         return audio
 
     # ------------------------------------------------------------------
+    # Global per-device occupancy registry
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def active_device_owner(device_id: int) -> Optional[str]:
+        with _ACTIVE_DEVICES_LOCK:
+            entry = _ACTIVE_DEVICES.get(int(device_id))
+            return entry[1] if entry is not None else None
+
+    @staticmethod
+    def is_device_busy(device_id: int) -> bool:
+        with _ACTIVE_DEVICES_LOCK:
+            return int(device_id) in _ACTIVE_DEVICES
+
+    def _claim_device(self, device_id: int, owner: Optional[str]) -> None:
+        dev_key = int(device_id)
+        token = self._sc_stop
+        with _ACTIVE_DEVICES_LOCK:
+            existing = _ACTIVE_DEVICES.get(dev_key)
+            if existing is not None and existing[0] is not self:
+                raise AudioBusyError(existing[1], owner)
+            _ACTIVE_DEVICES[dev_key] = (self, owner, token)
+            self._claimed_device_ids.add(dev_key)
+
+    def _update_claimed_owner(self, owner: Optional[str]) -> None:
+        with _ACTIVE_DEVICES_LOCK:
+            for dev_key in list(self._claimed_device_ids):
+                existing = _ACTIVE_DEVICES.get(dev_key)
+                if existing is not None and existing[0] is self:
+                    _ACTIVE_DEVICES[dev_key] = (self, owner, existing[2])
+
+    def _release_devices(
+        self,
+        device_ids: Optional[set[int]] = None,
+        *,
+        token: Optional[threading.Event] = None,
+    ) -> None:
+        with _ACTIVE_DEVICES_LOCK:
+            targets = list(self._claimed_device_ids if device_ids is None else device_ids)
+            for dev_key in targets:
+                existing = _ACTIVE_DEVICES.get(dev_key)
+                if (
+                    existing is not None
+                    and existing[0] is self
+                    and (token is None or existing[2] is token)
+                ):
+                    _ACTIVE_DEVICES.pop(dev_key, None)
+                    self._claimed_device_ids.discard(dev_key)
+                elif token is None:
+                    self._claimed_device_ids.discard(dev_key)
+
+    # ------------------------------------------------------------------
     # Start / Stop
     # ------------------------------------------------------------------
 
@@ -340,6 +432,7 @@ class AudioCapture:
         - 已运行且 owner 不一致:抛出 AudioBusyError(409)
         - 已运行且 owner 相同:静默 no-op(等价旧行为)
         - 已运行但当前无 owner 标签:沿用旧行为 no-op
+        - 若其他 AudioCapture 实例已占用同一 device_id:抛出 AudioBusyError(409)
         """
         with self._lock:
             if self._running:
@@ -347,7 +440,16 @@ class AudioCapture:
                     raise AudioBusyError(self._owner, owner)
                 if owner is not None and self._owner is None:
                     self._owner = owner
+                    self._update_claimed_owner(owner)
                 return
+            norm_device_id = int(device_id)
+            prev_stop_event = self._sc_stop
+            self._sc_stop = threading.Event()
+            try:
+                self._claim_device(norm_device_id, owner)
+            except Exception:
+                self._sc_stop = prev_stop_event
+                raise
             self._callback = on_audio
             self._queue_audio = queue_audio
             self._running = True
@@ -355,20 +457,25 @@ class AudioCapture:
             self._audio_queue = queue.Queue(maxsize=940)
             self._resample_state = [None]
             self._agc_peak = 0.0
-            self._sc_stop = threading.Event()
             self._dropped_chunks_count = 0
             self._loopback_discontinuity_count = 0
             self._max_queue_chunk_samples = 0
             self._last_queue_chunk_samples = 0
             self._seen_soundcard_warning_messages = set()
 
-            if _is_sc_id(device_id):
-                self._use_agc = True
-                self._start_soundcard(int(device_id))
-            else:
-                self._use_agc = False
-                with _microphone_com():
-                    self._start_sounddevice(int(device_id), mic_compatibility_mode=mic_compatibility_mode)
+            try:
+                if _is_sc_id(norm_device_id):
+                    self._use_agc = True
+                    self._start_soundcard(norm_device_id)
+                else:
+                    self._use_agc = False
+                    with _microphone_com():
+                        self._start_sounddevice(norm_device_id, mic_compatibility_mode=mic_compatibility_mode)
+            except Exception:
+                self._running = False
+                self._owner = None
+                self._release_devices()
+                raise
 
     def _iter_queueable_chunks(self, audio: np.ndarray):
         limit = max(1, int(getattr(self, "MAX_QUEUE_CHUNK_SAMPLES", self.BLOCK_SIZE * 4) or 1))
@@ -410,13 +517,11 @@ class AudioCapture:
     # soundcard path -------------------------------------------------------
 
     def _start_soundcard(self, device_id: int):
-        speaker_guid = _SC_ID_MAP.get(device_id)
-        if speaker_guid is None:
-            speaker_guid = _SC_DEVICE_CACHE.get(device_id, {}).get("guid")
+        speaker_guid = _lookup_sc_speaker_guid(device_id)
         if speaker_guid is None:
             # Map may have been rebuilt; try refreshing
             _get_sc_loopback_devices()
-            speaker_guid = _SC_ID_MAP.get(device_id)
+            speaker_guid = _lookup_sc_speaker_guid(device_id)
         if speaker_guid is None:
             self._running = False
             raise RuntimeError(f"找不到系统音频设备 ID={device_id}，请刷新页面重新选择设备")
@@ -437,7 +542,7 @@ class AudioCapture:
                     mic = _sc.get_microphone(active_guid, include_loopback=True)
                 except IndexError:
                     _get_sc_loopback_devices()
-                    active_guid = _SC_ID_MAP.get(device_id) or _SC_DEVICE_CACHE.get(device_id, {}).get("guid")
+                    active_guid = _lookup_sc_speaker_guid(device_id)
                     if active_guid is None:
                         raise RuntimeError(f"系统音频设备已失效 ID={device_id}，请刷新页面重新选择设备")
                     mic = _sc.get_microphone(active_guid, include_loopback=True)
@@ -445,33 +550,17 @@ class AudioCapture:
                 pending_chunks: list[np.ndarray] = []
                 pending_samples = 0
                 with mic.recorder(samplerate=self.SAMPLE_RATE,
-                                  channels=1,
+                                  channels=self.CHANNELS,
                                   blocksize=self.LOOPBACK_RECORDER_BLOCK_SIZE) as rec:
                     while not stop_event.is_set() and self._running:
-                        with warnings.catch_warnings(record=True) as caught:
-                            warnings.simplefilter("always")
-                            # SoundCard docs recommend using a fixed numframes that is
-                            # noticeably smaller than blocksize on WASAPI to reduce
-                            # latency spikes and backend-sized chunk jitter.
-                            data = rec.record(numframes=self.LOOPBACK_RECORD_NUMFRAMES)
+                        # SoundCard docs recommend using a fixed numframes that is
+                        # noticeably smaller than blocksize on WASAPI to reduce
+                        # latency spikes and backend-sized chunk jitter.
+                        data = rec.record(numframes=self.LOOPBACK_RECORD_NUMFRAMES)
                         if self._sc_stop is not stop_event:
                             return
                         if stop_event.is_set() and not self._queue_audio:
                             return
-                        if caught:
-                            for warning in caught:
-                                warning_text = str(getattr(warning, "message", "") or "")
-                                if "data discontinuity in recording" in warning_text.lower():
-                                    self._loopback_discontinuity_count += 1
-                                    _alog.warning(
-                                        "soundcard_loopback_discontinuity count=%d",
-                                        self._loopback_discontinuity_count,
-                                    )
-                                elif "fromstring is deprecated" in warning_text.lower():
-                                    continue
-                                elif warning_text not in self._seen_soundcard_warning_messages:
-                                    self._seen_soundcard_warning_messages.add(warning_text)
-                                    _alog.warning("soundcard warning: %s", warning_text)
                         if data is None or len(data) <= 0:
                             continue
                         mono = data[:, 0].copy()
@@ -486,8 +575,14 @@ class AudioCapture:
                     self._push(np.concatenate(pending_chunks))
             except Exception as e:
                 _alog.error("soundcard error: %s", e, exc_info=True)
-                if self._sc_stop is stop_event:
-                    self._running = False
+                with _ACTIVE_DEVICES_LOCK:
+                    if self._sc_stop is stop_event:
+                        existing = _ACTIVE_DEVICES.get(device_id)
+                        if existing is not None and existing[0] is self and existing[2] is stop_event:
+                            _ACTIVE_DEVICES.pop(device_id, None)
+                        self._claimed_device_ids.discard(device_id)
+                        self._owner = None
+                        self._running = False
             finally:
                 try:
                     ctypes.windll.ole32.CoUninitialize()
@@ -543,24 +638,24 @@ class AudioCapture:
                     }
                 )
             try:
-                default_input = sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device
-                default_input = int(default_input)
+                default_info = sd.query_devices(kind="input")
+                default_input = int(default_info["index"])
+                if default_input >= 0 and default_input != device_id:
+                    default_sr = int(default_info["default_samplerate"])
+                    default_host = str(sd.query_hostapis(default_info["hostapi"])["name"])
+                    attempts.append(
+                        {
+                            "device": default_input,
+                            "samplerate": default_sr,
+                            "native_sr": default_sr,
+                            "blocksize": self.BLOCK_SIZE * 2,
+                            "extra_settings": self._wasapi_shared_settings(default_host),
+                            "label": f"default:{default_input} shared",
+                        }
+                    )
             except Exception:
-                default_input = -1
-            if default_input >= 0 and default_input != device_id:
-                default_info = sd.query_devices(default_input)
-                default_sr = int(default_info["default_samplerate"])
-                default_host = str(sd.query_hostapis(default_info["hostapi"])["name"])
-                attempts.append(
-                    {
-                        "device": default_input,
-                        "samplerate": default_sr,
-                        "native_sr": default_sr,
-                        "blocksize": self.BLOCK_SIZE * 2,
-                        "extra_settings": self._wasapi_shared_settings(default_host),
-                        "label": f"default:{default_input} shared",
-                    }
-                )
+                # No usable default input fallback metadata; still try the selected device.
+                return attempts
         return attempts
 
     def _start_sounddevice(self, device_id: int, mic_compatibility_mode: bool = False):
@@ -582,6 +677,16 @@ class AudioCapture:
             raise RuntimeError(f"无法查询麦克风设备: {e}")
 
         for attempt in attempts:
+            attempt_dev = int(attempt["device"])
+            claimed_extra = False
+            if attempt_dev != device_id:
+                try:
+                    self._claim_device(attempt_dev, self._owner)
+                    claimed_extra = True
+                except AudioBusyError as e:
+                    last_error = e
+                    _alog.warning("sounddevice mic fallback busy (%s): %s", attempt["label"], e)
+                    continue
             try:
                 self._native_sr = int(attempt["native_sr"])
                 kwargs = {
@@ -599,6 +704,8 @@ class AudioCapture:
                 _alog.info("sounddevice mic opened: %s", attempt["label"])
                 return
             except Exception as e:
+                if claimed_extra:
+                    self._release_devices({attempt_dev})
                 last_error = e
                 if self._stream:
                     try:
@@ -644,6 +751,7 @@ class AudioCapture:
                 self._sc_thread.join(timeout=1.0)
             self._sc_thread = None
             self._owner = None
+            self._release_devices()
             if clear_queue:
                 # H1: 清空音频队列，避免长时间录音后内存泄漏
                 with self._audio_queue.mutex:
@@ -896,7 +1004,13 @@ audio_capture = AudioCapture()
 
 
 def load_wav_file(path: str | Path) -> tuple[np.ndarray, int]:
-    with wave.open(str(path), 'rb') as wf:
+    raw = str(path or "").strip()
+    if not raw or raw.startswith(("\\\\", "//")):
+        raise ValueError("不支持的 WAV 音频路径")
+    wav_path = Path(raw)
+    if wav_path.suffix.lower() != ".wav":
+        raise ValueError("仅支持 .wav 测试音频文件")
+    with wave.open(str(wav_path), 'rb') as wf:
         sr = wf.getframerate()
         channels = wf.getnchannels()
         width = wf.getsampwidth()
@@ -911,5 +1025,6 @@ def load_wav_file(path: str | Path) -> tuple[np.ndarray, int]:
 
 def play_audio_file(path: str | Path):
     audio, sr = load_wav_file(path)
-    sd.play(audio, sr)
-    sd.wait()
+    with _microphone_com():
+        sd.play(audio, sr)
+        sd.wait()

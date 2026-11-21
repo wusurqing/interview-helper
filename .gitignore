@@ -44,6 +44,7 @@ backend/job_tracker.db-wal
 backend/data/review.db
 backend/data/review.db-wal
 backend/data/review.db-shm
+backend/data/review_media/
 
 # Knowledge Base（用户上传的笔记/文件 + FTS 索引 + OCR/Vision 缓存）
 backend/data/kb/

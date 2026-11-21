@@ -9,8 +9,10 @@
 """
 from __future__ import annotations
 
+import copy
 import threading
-from typing import Iterable, List, Sequence
+from types import SimpleNamespace
+from typing import Iterable, List, Optional, Sequence
 
 from core.logger import get_logger
 
@@ -70,7 +72,7 @@ def summarize_messages(messages: Sequence[dict], prior_summary: str = "") -> str
     # 延迟导入,避免循环依赖 (services.llm <-> core.session 路径)
     from core.config import get_config
     from services.llm import _add_tokens
-    from services.llm.streaming import chat_completion_create
+    from services.llm.streaming import _build_think_params, chat_completion_create
 
     cfg = get_config()
     model_cfg = cfg.get_active_model()
@@ -81,23 +83,33 @@ def summarize_messages(messages: Sequence[dict], prior_summary: str = "") -> str
         prior=prior_summary.strip() or "(无)",
         chunk=rendered,
     )
+    max_tokens = 600
+    think_params = _build_think_params(
+        model_cfg,
+        SimpleNamespace(think_mode=False, think_effort="off", max_tokens=max_tokens),
+    )
     response = chat_completion_create(
         model_cfg,
         [{"role": "user", "content": prompt}],
         temperature=0.2,
-        max_tokens=600,
+        max_tokens=max_tokens,
+        think_params=think_params,
         trace_context={"scene": "memory_compaction"},
     )
     usage = getattr(response, "usage", None)
     if usage:
         _add_tokens(usage.prompt_tokens or 0, usage.completion_tokens or 0)
-    if not response.choices:
-        return prior_summary or ""
-    text = (response.choices[0].message.content or "").strip()
-    return text or (prior_summary or "")
+    choices = getattr(response, "choices", None)
+    if not choices:
+        raise RuntimeError("memory compaction returned empty choices")
+    message = getattr(choices[0], "message", None)
+    text = (getattr(message, "content", None) or "").strip()
+    if not text:
+        raise RuntimeError("memory compaction returned empty summary text")
+    return text
 
 
-def schedule_compaction(target_session) -> None:
+def schedule_compaction(target_session) -> Optional[threading.Thread]:
     """供 Session 内部调用:在守护线程中执行一次压缩,然后回写。
 
     target_session 必须暴露:
@@ -105,36 +117,74 @@ def schedule_compaction(target_session) -> None:
       - SUMMARY_KEEP_RECENT (int)
       - system_summary (str)
       - _compaction_running (bool)
+      - session_version (int, 可选，默认 0)
     """
     from core.session import conversation_lock
 
-    keep = getattr(target_session, "SUMMARY_KEEP_RECENT", 4)
+    keep = max(0, int(getattr(target_session, "SUMMARY_KEEP_RECENT", 4)))
 
     with conversation_lock:
         if target_session._compaction_running:
-            return
+            return None
         history = target_session.conversation_history
         if len(history) <= keep:
-            return
+            return None
         snapshot_len = len(history) - keep
-        snapshot = list(history[:snapshot_len])
+        snapshot_refs = tuple(history[:snapshot_len])
+        snapshot = copy.deepcopy(history[:snapshot_len])
         prior = target_session.system_summary or ""
+        captured_version = getattr(target_session, "session_version", 0)
         target_session._compaction_running = True
 
     def _worker() -> None:
-        new_summary: str
+        compaction_ok = False
+        new_summary = prior
         try:
             new_summary = summarize_messages(snapshot, prior)
+            compaction_ok = True
         except Exception as e:  # noqa: BLE001
-            _log.warning("memory compaction failed, keep prior summary: %s", e)
-            new_summary = prior
+            _log.warning("memory compaction failed, keep prior summary and history: %s", e)
         with conversation_lock:
+            same_session = getattr(target_session, "session_version", 0) == captured_version
             try:
-                # 仅在历史仍包含我们 snapshot 的部分时,才裁掉相应数量
-                if len(target_session.conversation_history) >= snapshot_len:
-                    target_session.conversation_history = target_session.conversation_history[snapshot_len:]
-                target_session.system_summary = new_summary
+                if not same_session:
+                    _log.debug(
+                        "discard stale memory compaction result (captured_v=%s current_v=%s)",
+                        captured_version,
+                        getattr(target_session, "session_version", 0),
+                    )
+                    return
+                if not compaction_ok:
+                    return
+                current_history = target_session.conversation_history
+                prefix_unchanged = (
+                    len(current_history) >= snapshot_len
+                    and all(cur is ref for cur, ref in zip(current_history, snapshot_refs))
+                    and current_history[:snapshot_len] == snapshot
+                )
+                summary_unchanged = (target_session.system_summary or "") == prior
+                if prefix_unchanged and summary_unchanged:
+                    target_session.conversation_history = current_history[snapshot_len:]
+                    target_session.system_summary = new_summary
+                else:
+                    _log.debug(
+                        "skip memory compaction writeback because session state drifted "
+                        "(len=%d snapshot_len=%d prefix_unchanged=%s summary_unchanged=%s)",
+                        len(current_history),
+                        snapshot_len,
+                        prefix_unchanged,
+                        summary_unchanged,
+                    )
             finally:
-                target_session._compaction_running = False
+                if same_session:
+                    target_session._compaction_running = False
 
-    threading.Thread(target=_worker, name="memory-compactor", daemon=True).start()
+    try:
+        thread = threading.Thread(target=_worker, name="memory-compactor", daemon=True)
+        thread.start()
+    except Exception:
+        with conversation_lock:
+            if getattr(target_session, "session_version", 0) == captured_version:
+                target_session._compaction_running = False
+        raise
+    return thread

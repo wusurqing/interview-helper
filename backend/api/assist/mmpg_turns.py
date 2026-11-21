@@ -1,10 +1,14 @@
 """Collect continuous MMPG utterances before and during answer generation."""
 
 import asyncio
+from collections import OrderedDict
+from contextlib import suppress
 from dataclasses import dataclass, field
 from threading import RLock
 from typing import Callable
 from uuid import uuid4
+
+_MAX_SEEN_TRACES = 2048
 
 
 @dataclass
@@ -34,8 +38,9 @@ class MmpgRequest:
             if self.cancelled or self.completed_qa_id:
                 return False
             self.cancelled = True
-            if self.stream_read is not None:
-                self.loop.call_soon_threadsafe(self.stream_read.cancel)
+            if self.stream_read is not None and self.loop is not None and not self.loop.is_closed():
+                with suppress(RuntimeError):
+                    self.loop.call_soon_threadsafe(self.stream_read.cancel)
             return True
 
 
@@ -56,7 +61,7 @@ class _Question:
 class MmpgTurns:
     def __init__(self, *, submit, cancel, publish, enabled, clock, call_later,
                  answer_delay_ms, followup_window_ms, log=None, cancel_on_clear=None, record_final=None,
-                 allow_answer=lambda: True):
+                 allow_answer=lambda: True, max_seen: int = _MAX_SEEN_TRACES):
         self._submit = submit
         self._cancel = cancel
         self._cancel_on_clear = cancel_on_clear or cancel
@@ -73,8 +78,17 @@ class MmpgTurns:
         self._timer = None
         self._timer_version = 0
         self._order = 0
-        self._seen = set()
+        self._max_seen = max(1, int(max_seen))
+        self._seen: OrderedDict[str, None] = OrderedDict()
         self.phase = "idle"
+
+    def _mark_seen(self, trace: str) -> None:
+        if trace in self._seen:
+            self._seen.move_to_end(trace)
+            return
+        self._seen[trace] = None
+        while len(self._seen) > self._max_seen:
+            self._seen.popitem(last=False)
 
     def _set_phase(self, phase):
         if self.phase != phase:
@@ -112,7 +126,8 @@ class MmpgTurns:
         group, self._group = self._group, None
         self._cancel_timer()
         if group:
-            self._seen.update(group.speaking)
+            for trace in group.speaking:
+                self._mark_seen(trace)
             if group.request and (cancel_running or group.followup_until is None):
                 self._cancel_on_clear(group.request)
             self._log("group_cleared", group=group.id)
@@ -148,7 +163,7 @@ class MmpgTurns:
     def started(self, trace):
         if not self._enabled():
             self.clear()
-            self._seen.add(trace)
+            self._mark_seen(trace)
             return
         if trace in self._seen:
             return
@@ -187,7 +202,7 @@ class MmpgTurns:
         if trace in self._seen:
             return
         if not self._allow_answer():
-            self._seen.add(trace)
+            self._mark_seen(trace)
             if text and self._record_final is not None and self._enabled():
                 self._record_final(text, trace, None)
             return
@@ -198,7 +213,7 @@ class MmpgTurns:
         if group is None or trace not in group.speaking:
             return
         order = group.speaking.pop(trace)
-        self._seen.add(trace)
+        self._mark_seen(trace)
         if text:
             group.utterances[trace] = (order, text)
             if self._record_final is not None:
@@ -222,7 +237,7 @@ class MmpgTurns:
         if self._group and trace in self._group.speaking:
             self.final(trace, "")
         else:
-            self._seen.add(trace)
+            self._mark_seen(trace)
 
     def _answer(self, group):
         if self._group is not group or group.speaking:

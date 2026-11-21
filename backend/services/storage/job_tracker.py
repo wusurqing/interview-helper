@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import threading
 import time
-from typing import Any, Optional
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional
 
+from core.logger import get_logger
 from services.storage.paths import sqlite_path
+from services.storage.sqlite_utils import (
+    enable_wal_mode,
+    open_sqlite_connection,
+    sqlite_connection,
+)
+
+_log = get_logger(__name__)
 
 DB_PATH = sqlite_path("job_tracker.db")
 _db_lock = threading.Lock()
@@ -34,58 +42,63 @@ STAGE_VALUES = (
 
 
 def _get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
+    return open_sqlite_connection(DB_PATH, foreign_keys=True)
+
+
+@contextmanager
+def _connect(*, transactional: bool = False) -> Iterator[sqlite3.Connection]:
+    with sqlite_connection(
+        DB_PATH,
+        foreign_keys=True,
+        transactional=transactional,
+    ) as conn:
+        yield conn
 
 
 def init_db() -> None:
-    with _db_lock:
-        conn = _get_conn()
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS applications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                company TEXT NOT NULL DEFAULT '',
-                position TEXT NOT NULL DEFAULT '',
-                city TEXT NOT NULL DEFAULT '',
-                stage TEXT NOT NULL DEFAULT 'applied',
-                applied_at REAL,
-                next_followup_at REAL,
-                interviewer_info TEXT NOT NULL DEFAULT '',
-                feedback TEXT NOT NULL DEFAULT '',
-                todos_json TEXT NOT NULL DEFAULT '[]',
-                notes TEXT NOT NULL DEFAULT '',
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                sort_order INTEGER NOT NULL DEFAULT 0
+    with _db_lock, _connect() as conn:
+        enable_wal_mode(conn)
+        with conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS applications (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    company TEXT NOT NULL DEFAULT '',
+                    position TEXT NOT NULL DEFAULT '',
+                    city TEXT NOT NULL DEFAULT '',
+                    stage TEXT NOT NULL DEFAULT 'applied',
+                    applied_at REAL,
+                    next_followup_at REAL,
+                    interviewer_info TEXT NOT NULL DEFAULT '',
+                    feedback TEXT NOT NULL DEFAULT '',
+                    todos_json TEXT NOT NULL DEFAULT '[]',
+                    notes TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                )
+                """
             )
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS offers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                application_id INTEGER NOT NULL UNIQUE,
-                base_salary TEXT NOT NULL DEFAULT '',
-                total_pkg_note TEXT NOT NULL DEFAULT '',
-                bonus TEXT NOT NULL DEFAULT '',
-                equity TEXT NOT NULL DEFAULT '',
-                benefits_json TEXT NOT NULL DEFAULT '[]',
-                wfh TEXT NOT NULL DEFAULT '',
-                location TEXT NOT NULL DEFAULT '',
-                pros TEXT NOT NULL DEFAULT '',
-                cons TEXT NOT NULL DEFAULT '',
-                deadline REAL,
-                created_at REAL NOT NULL,
-                FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS offers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    application_id INTEGER NOT NULL UNIQUE,
+                    base_salary TEXT NOT NULL DEFAULT '',
+                    total_pkg_note TEXT NOT NULL DEFAULT '',
+                    bonus TEXT NOT NULL DEFAULT '',
+                    equity TEXT NOT NULL DEFAULT '',
+                    benefits_json TEXT NOT NULL DEFAULT '[]',
+                    wfh TEXT NOT NULL DEFAULT '',
+                    location TEXT NOT NULL DEFAULT '',
+                    pros TEXT NOT NULL DEFAULT '',
+                    cons TEXT NOT NULL DEFAULT '',
+                    deadline REAL,
+                    created_at REAL NOT NULL,
+                    FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
+                )
+                """
             )
-            """
-        )
-        conn.commit()
-        conn.close()
 
 
 init_db()
@@ -144,21 +157,31 @@ def list_applications(
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     sql = f"SELECT * FROM applications{where} ORDER BY {col} {direction}, id DESC"
 
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect() as conn:
         cur = conn.execute(sql, params)
         rows = [_row_app(r) for r in cur.fetchall()]
-        conn.close()
     return rows
 
 
 def get_application(app_id: int) -> Optional[dict[str, Any]]:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect() as conn:
         cur = conn.execute("SELECT * FROM applications WHERE id = ?", (app_id,))
         r = cur.fetchone()
-        conn.close()
     return _row_app(r) if r else None
+
+
+def get_applications_by_ids(app_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """按 ID 列表批量查询投递记录，避免上层（如复盘列表）产生 N+1 查询。"""
+    ids = sorted({int(i) for i in app_ids if int(i) > 0})
+    if not ids:
+        return {}
+    placeholders = ",".join("?" * len(ids))
+    with _db_lock, _connect() as conn:
+        rows = conn.execute(
+            f"SELECT * FROM applications WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+    return {int(r["id"]): _row_app(r) for r in rows}
 
 
 def create_application(data: dict[str, Any]) -> dict[str, Any]:
@@ -172,8 +195,7 @@ def create_application(data: dict[str, Any]) -> dict[str, Any]:
     else:
         todos_json = "[]"
 
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect(transactional=True) as conn:
         cur = conn.execute(
             """
             INSERT INTO applications (
@@ -198,54 +220,63 @@ def create_application(data: dict[str, Any]) -> dict[str, Any]:
             ),
         )
         new_id = cur.lastrowid
-        conn.commit()
-        conn.close()
-    return get_application(new_id)  # type: ignore
+        row = conn.execute("SELECT * FROM applications WHERE id = ?", (new_id,)).fetchone()
+    assert row is not None
+    return _row_app(row)
 
 
 def patch_application(app_id: int, data: dict[str, Any]) -> Optional[dict[str, Any]]:
-    existing = get_application(app_id)
-    if not existing:
-        return None
+    with _db_lock, _connect(transactional=True) as conn:
+        existing_row = conn.execute(
+            "SELECT * FROM applications WHERE id = ?", (app_id,)
+        ).fetchone()
+        if not existing_row:
+            return None
+        existing = _row_app(existing_row)
 
-    company = str(data["company"]) if "company" in data else existing["company"]
-    position = str(data["position"]) if "position" in data else existing["position"]
-    city = str(data["city"]) if "city" in data else existing["city"]
-    stage = data["stage"] if "stage" in data else existing["stage"]
-    if stage not in STAGE_VALUES:
-        stage = existing["stage"]
-    applied_at = data["applied_at"] if "applied_at" in data else existing.get("applied_at")
-    next_followup_at = data["next_followup_at"] if "next_followup_at" in data else existing.get("next_followup_at")
-    interviewer_info = (
-        str(data["interviewer_info"]) if "interviewer_info" in data else existing["interviewer_info"]
-    )
-    feedback = str(data["feedback"]) if "feedback" in data else existing["feedback"]
-    notes = str(data["notes"]) if "notes" in data else existing["notes"]
-    sort_order = int(data["sort_order"]) if "sort_order" in data else int(existing.get("sort_order") or 0)
-    # 跨阶段移动且未显式指定 sort_order 时，排到目标列末尾，便于看板插入后再 reorder
-    if (
-        "stage" in data
-        and "sort_order" not in data
-        and data["stage"] in STAGE_VALUES
-        and data["stage"] != existing["stage"]
-    ):
-        with _db_lock:
-            conn = _get_conn()
-            row = conn.execute(
+        company = str(data["company"]) if "company" in data else existing["company"]
+        position = str(data["position"]) if "position" in data else existing["position"]
+        city = str(data["city"]) if "city" in data else existing["city"]
+        stage = data["stage"] if "stage" in data else existing["stage"]
+        if stage not in STAGE_VALUES:
+            stage = existing["stage"]
+        applied_at = data["applied_at"] if "applied_at" in data else existing.get("applied_at")
+        next_followup_at = (
+            data["next_followup_at"]
+            if "next_followup_at" in data
+            else existing.get("next_followup_at")
+        )
+        interviewer_info = (
+            str(data["interviewer_info"])
+            if "interviewer_info" in data
+            else existing["interviewer_info"]
+        )
+        feedback = str(data["feedback"]) if "feedback" in data else existing["feedback"]
+        notes = str(data["notes"]) if "notes" in data else existing["notes"]
+        sort_order = (
+            int(data["sort_order"])
+            if "sort_order" in data
+            else int(existing.get("sort_order") or 0)
+        )
+        # 跨阶段移动且未显式指定 sort_order 时，排到目标列末尾，便于看板插入后再 reorder
+        if (
+            "stage" in data
+            and "sort_order" not in data
+            and data["stage"] in STAGE_VALUES
+            and data["stage"] != existing["stage"]
+        ):
+            max_row = conn.execute(
                 "SELECT COALESCE(MAX(sort_order), -1) FROM applications WHERE stage = ?",
                 (data["stage"],),
             ).fetchone()
-            conn.close()
-        sort_order = int(row[0]) + 1
+            sort_order = int(max_row[0]) + 1
 
-    if "todos" in data:
-        todos_json = json.dumps(data["todos"], ensure_ascii=False)
-    else:
-        todos_json = json.dumps(existing.get("todos") or [], ensure_ascii=False)
+        if "todos" in data:
+            todos_json = json.dumps(data["todos"], ensure_ascii=False)
+        else:
+            todos_json = json.dumps(existing.get("todos") or [], ensure_ascii=False)
 
-    now = _now()
-    with _db_lock:
-        conn = _get_conn()
+        now = _now()
         conn.execute(
             """
             UPDATE applications SET
@@ -271,9 +302,11 @@ def patch_application(app_id: int, data: dict[str, Any]) -> Optional[dict[str, A
                 app_id,
             ),
         )
-        conn.commit()
-        conn.close()
-    row = get_application(app_id)
+        updated_row = conn.execute(
+            "SELECT * FROM applications WHERE id = ?", (app_id,)
+        ).fetchone()
+        row = _row_app(updated_row) if updated_row else None
+
     if row and ("company" in data or "position" in data):
         try:
             from services.storage import review
@@ -281,17 +314,23 @@ def patch_application(app_id: int, data: dict[str, Any]) -> Optional[dict[str, A
             review.sync_review_metadata_from_application(app_id)
         except Exception:
             pass
-        row = get_application(app_id)
+        refreshed = get_application(app_id)
+        if refreshed is not None:
+            row = refreshed
     return row
 
 
 def delete_application(app_id: int) -> bool:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect(transactional=True) as conn:
         cur = conn.execute("DELETE FROM applications WHERE id = ?", (app_id,))
-        conn.commit()
         deleted = cur.rowcount > 0
-        conn.close()
+    if deleted:
+        try:
+            from services.storage import review
+
+            review.unlink_application(app_id)
+        except Exception as exc:
+            _log.warning("delete_application 清理 review 关联失败 app_id=%s: %s", app_id, exc)
     return deleted
 
 
@@ -302,15 +341,12 @@ def batch_update_stage(ids: list[int], stage: str) -> int:
         return 0
     now = _now()
     placeholders = ",".join("?" * len(ids))
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect(transactional=True) as conn:
         cur = conn.execute(
             f"UPDATE applications SET stage = ?, updated_at = ? WHERE id IN ({placeholders})",
             [stage, now, *ids],
         )
-        conn.commit()
         count = cur.rowcount
-        conn.close()
     return count
 
 
@@ -321,46 +357,43 @@ def reorder_stage_applications(stage: str, ordered_ids: list[int]) -> int:
     """
     if stage not in STAGE_VALUES or not ordered_ids:
         return 0
-    if len(ordered_ids) != len(set(ordered_ids)):
+    normalized_ids = [int(i) for i in ordered_ids]
+    if len(normalized_ids) != len(set(normalized_ids)):
         return 0
-    current = list_applications(stage=stage, sort_by="sort_order", sort_dir="asc")
-    cur_ids = sorted(int(r["id"]) for r in current)
-    new_ids = sorted(int(i) for i in ordered_ids)
-    if cur_ids != new_ids:
-        return 0
+    expected_ids = sorted(normalized_ids)
     now = _now()
-    with _db_lock:
-        conn = _get_conn()
-        for i, aid in enumerate(ordered_ids):
+    with _db_lock, _connect(transactional=True) as conn:
+        rows = conn.execute(
+            "SELECT id FROM applications WHERE stage = ?",
+            (stage,),
+        ).fetchall()
+        cur_ids = sorted(int(r["id"]) for r in rows)
+        if cur_ids != expected_ids:
+            return 0
+        for i, aid in enumerate(normalized_ids):
             conn.execute(
                 "UPDATE applications SET sort_order = ?, updated_at = ? WHERE id = ? AND stage = ?",
-                (i, now, int(aid), stage),
+                (i, now, aid, stage),
             )
-        conn.commit()
-        conn.close()
-    return len(ordered_ids)
+    return len(normalized_ids)
 
 
 # --- Offers ---
 
 
 def get_offer_by_application(application_id: int) -> Optional[dict[str, Any]]:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect() as conn:
         cur = conn.execute(
             "SELECT * FROM offers WHERE application_id = ?", (application_id,)
         )
         r = cur.fetchone()
-        conn.close()
     return _row_offer(r) if r else None
 
 
 def get_offer(offer_id: int) -> Optional[dict[str, Any]]:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect() as conn:
         cur = conn.execute("SELECT * FROM offers WHERE id = ?", (offer_id,))
         r = cur.fetchone()
-        conn.close()
     return _row_offer(r) if r else None
 
 
@@ -373,85 +406,71 @@ def create_or_update_offer(data: dict[str, Any]) -> dict[str, Any]:
     else:
         benefits_json = json.dumps([], ensure_ascii=False)
 
-    existing = get_offer_by_application(application_id)
-    with _db_lock:
-        conn = _get_conn()
-        if existing:
-            conn.execute(
-                """
-                UPDATE offers SET
-                    base_salary = ?, total_pkg_note = ?, bonus = ?, equity = ?,
-                    benefits_json = ?, wfh = ?, location = ?, pros = ?, cons = ?, deadline = ?
-                WHERE application_id = ?
-                """,
-                (
-                    str(data.get("base_salary") or ""),
-                    str(data.get("total_pkg_note") or ""),
-                    str(data.get("bonus") or ""),
-                    str(data.get("equity") or ""),
-                    benefits_json,
-                    str(data.get("wfh") or ""),
-                    str(data.get("location") or ""),
-                    str(data.get("pros") or ""),
-                    str(data.get("cons") or ""),
-                    data.get("deadline"),
-                    application_id,
-                ),
-            )
-            oid = int(existing["id"])
-        else:
-            cur = conn.execute(
-                """
-                INSERT INTO offers (
-                    application_id, base_salary, total_pkg_note, bonus, equity,
-                    benefits_json, wfh, location, pros, cons, deadline, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    application_id,
-                    str(data.get("base_salary") or ""),
-                    str(data.get("total_pkg_note") or ""),
-                    str(data.get("bonus") or ""),
-                    str(data.get("equity") or ""),
-                    benefits_json,
-                    str(data.get("wfh") or ""),
-                    str(data.get("location") or ""),
-                    str(data.get("pros") or ""),
-                    str(data.get("cons") or ""),
-                    data.get("deadline"),
-                    now,
-                ),
-            )
-            oid = int(cur.lastrowid)
-        conn.commit()
-        conn.close()
-    out = get_offer(oid)
-    assert out is not None
-    return out
+    with _db_lock, _connect(transactional=True) as conn:
+        conn.execute(
+            """
+            INSERT INTO offers (
+                application_id, base_salary, total_pkg_note, bonus, equity,
+                benefits_json, wfh, location, pros, cons, deadline, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(application_id) DO UPDATE SET
+                base_salary = excluded.base_salary,
+                total_pkg_note = excluded.total_pkg_note,
+                bonus = excluded.bonus,
+                equity = excluded.equity,
+                benefits_json = excluded.benefits_json,
+                wfh = excluded.wfh,
+                location = excluded.location,
+                pros = excluded.pros,
+                cons = excluded.cons,
+                deadline = excluded.deadline
+            """,
+            (
+                application_id,
+                str(data.get("base_salary") or ""),
+                str(data.get("total_pkg_note") or ""),
+                str(data.get("bonus") or ""),
+                str(data.get("equity") or ""),
+                benefits_json,
+                str(data.get("wfh") or ""),
+                str(data.get("location") or ""),
+                str(data.get("pros") or ""),
+                str(data.get("cons") or ""),
+                data.get("deadline"),
+                now,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM offers WHERE application_id = ?", (application_id,)
+        ).fetchone()
+    assert row is not None
+    return _row_offer(row)
 
 
 def patch_offer(offer_id: int, data: dict[str, Any]) -> Optional[dict[str, Any]]:
-    existing = get_offer(offer_id)
-    if not existing:
-        return None
+    with _db_lock, _connect(transactional=True) as conn:
+        existing_row = conn.execute(
+            "SELECT * FROM offers WHERE id = ?", (offer_id,)
+        ).fetchone()
+        if not existing_row:
+            return None
+        existing = _row_offer(existing_row)
 
-    def pick(key: str, default: str = "") -> str:
-        if key in data:
-            return str(data.get(key) or "")
-        return str(existing.get(key) or default)
+        def pick(key: str, default: str = "") -> str:
+            if key in data:
+                return str(data.get(key) or "")
+            return str(existing.get(key) or default)
 
-    benefits = data["benefits"] if "benefits" in data else existing.get("benefits")
-    if isinstance(benefits, list):
-        benefits_json = json.dumps(benefits, ensure_ascii=False)
-    else:
-        benefits_json = json.dumps(existing.get("benefits") or [], ensure_ascii=False)
+        benefits = data["benefits"] if "benefits" in data else existing.get("benefits")
+        if isinstance(benefits, list):
+            benefits_json = json.dumps(benefits, ensure_ascii=False)
+        else:
+            benefits_json = json.dumps(existing.get("benefits") or [], ensure_ascii=False)
 
-    deadline = existing.get("deadline")
-    if "deadline" in data:
-        deadline = data["deadline"]
+        deadline = existing.get("deadline")
+        if "deadline" in data:
+            deadline = data["deadline"]
 
-    with _db_lock:
-        conn = _get_conn()
         conn.execute(
             """
             UPDATE offers SET
@@ -473,14 +492,14 @@ def patch_offer(offer_id: int, data: dict[str, Any]) -> Optional[dict[str, Any]]
                 offer_id,
             ),
         )
-        conn.commit()
-        conn.close()
-    return get_offer(offer_id)
+        updated_row = conn.execute(
+            "SELECT * FROM offers WHERE id = ?", (offer_id,)
+        ).fetchone()
+    return _row_offer(updated_row) if updated_row else None
 
 
 def list_offers() -> list[dict[str, Any]]:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect() as conn:
         cur = conn.execute(
             """
             SELECT o.*, a.company, a.position
@@ -490,7 +509,6 @@ def list_offers() -> list[dict[str, Any]]:
             """
         )
         rows = cur.fetchall()
-        conn.close()
     out = []
     for r in rows:
         d = _row_offer(r)
@@ -501,12 +519,9 @@ def list_offers() -> list[dict[str, Any]]:
 
 
 def delete_offer(offer_id: int) -> bool:
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect(transactional=True) as conn:
         cur = conn.execute("DELETE FROM offers WHERE id = ?", (offer_id,))
-        conn.commit()
         ok = cur.rowcount > 0
-        conn.close()
     return ok
 
 
@@ -514,8 +529,7 @@ def compare_offers(offer_ids: list[int]) -> list[dict[str, Any]]:
     if not offer_ids:
         return []
     placeholders = ",".join("?" * len(offer_ids))
-    with _db_lock:
-        conn = _get_conn()
+    with _db_lock, _connect() as conn:
         cur = conn.execute(
             f"""
             SELECT o.*, a.company, a.position
@@ -526,7 +540,6 @@ def compare_offers(offer_ids: list[int]) -> list[dict[str, Any]]:
             offer_ids,
         )
         rows = cur.fetchall()
-        conn.close()
 
     by_id = {r["id"]: r for r in rows}
     result = []

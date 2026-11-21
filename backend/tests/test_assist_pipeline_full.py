@@ -469,6 +469,8 @@ def test_running_asr_worker_can_still_be_cancelled_when_interrupt_enabled(
     monkeypatch.setattr(pipeline, "broadcast", broadcasts.append)
 
     def fake_stream(*_args, **_kwargs):
+        # Simulate a newer ASR turn arriving while this worker is actively streaming.
+        assert pipeline._begin_asr_turn() == 2
         yield ("text", "旧回答不应提交")
 
     monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
@@ -483,12 +485,45 @@ def test_running_asr_worker_can_still_be_cancelled_when_interrupt_enabled(
             {"origin": "asr", "asr_turn_id": 1},
         )
     )
-    assert pipeline._begin_asr_turn() == 2
     _DeferredThread.started[0].run()
 
     event_types = [event["type"] for event in broadcasts]
     assert event_types == ["answer_start", "answer_cancelled"]
     assert get_session().qa_pairs == []
+
+
+def test_preempted_asr_worker_before_start_suppresses_ghost_answer_start(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    cfg = _cfg()
+    cfg.assist_asr_interrupt_running = True
+    cfg.max_parallel_answers = 1
+    broadcasts: list[dict] = []
+    monkeypatch.setattr(pipeline, "get_config", lambda: cfg)
+    monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
+    monkeypatch.setattr(pipeline, "broadcast", broadcasts.append)
+    monkeypatch.setattr(
+        answer_worker,
+        "chat_stream_single_model",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("preempted worker must not stream")),
+    )
+
+    pipeline._latest_asr_turn_id = 1
+    assert pipeline.submit_answer_task(
+        (
+            "已被抢占的旧 ASR 问题",
+            None,
+            False,
+            "conversation_mic",
+            {"origin": "asr", "asr_turn_id": 1},
+        )
+    )
+    assert pipeline._begin_asr_turn() == 2
+    _DeferredThread.started[0].run()
+
+    assert broadcasts == []
+    assert get_session().qa_pairs == []
+    assert pipeline._next_commit_seq == 1
 
 
 def test_running_asr_worker_is_not_cancelled_when_parallel_slots_available(
