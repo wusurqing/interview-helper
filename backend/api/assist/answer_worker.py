@@ -1482,19 +1482,27 @@ def process_question_parallel(task, seq, model_idx, sess_v, deps):
     if archive is None or not run_id:
         return _process_question_parallel(task, seq, model_idx, sess_v, deps)
     cfg = deps.config_snapshot if deps.config_snapshot is not None else get_config()
-    model = deps.model_cfg_snapshot
-    if model is None and 0 <= model_idx < len(cfg.models):
-        model = cfg.models[model_idx]
-    snapshot = {}
-    if model is not None:
+    round_id = meta.get("_archive_round_id")
+
+    def model_snapshot(model):
+        if model is None:
+            return {}
         key = getattr(model, "api_key", "")
         try:
             endpoint = urlsplit(getattr(model, "api_base_url", "")).hostname or ""
         except ValueError:
             endpoint = ""
-        snapshot = dict(name=trace._redact_text(model.name, key), model=trace._redact_text(model.model, key),
-                        protocol=getattr(model, "api_type", ""), endpoint=trace._redact_text(endpoint, key))
-    archive.start_ai(meta.get("_archive_round_id"), run_id, snapshot)
+        return dict(
+            name=trace._redact_text(model.name, key),
+            model=trace._redact_text(model.model, key),
+            protocol=getattr(model, "api_type", ""),
+            endpoint=trace._redact_text(endpoint, key),
+        )
+
+    model = deps.model_cfg_snapshot
+    if model is None and 0 <= model_idx < len(cfg.models):
+        model = cfg.models[model_idx]
+    archive.start_ai(round_id, run_id, model_snapshot(model))
 
     def broadcast(event):
         deps.broadcast(event)
@@ -1502,6 +1510,32 @@ def process_question_parallel(task, seq, model_idx, sess_v, deps):
             archive.ai_event(run_id, event)
         except Exception:
             deps.error_logger.exception("archive answer observation failed")
+
+    resolve_exam_model = deps.resolve_exam_model
+    if resolve_exam_model is not None:
+        orig_resolve_exam_model = resolve_exam_model
+
+        def resolve_exam_model(index):
+            live_model = orig_resolve_exam_model(index)
+            if live_model is not None:
+                try:
+                    archive.start_ai(round_id, run_id, model_snapshot(live_model))
+                except Exception:
+                    deps.error_logger.exception("archive answer model update failed")
+            return live_model
+
+    reserve_retry = deps.reserve_retry
+    if reserve_retry is not None:
+        orig_reserve_retry = reserve_retry
+
+        def reserve_retry(attempted, announce_retry):
+            next_index = orig_reserve_retry(attempted, announce_retry)
+            if next_index is not None and 0 <= next_index < len(cfg.models):
+                try:
+                    archive.start_ai(round_id, run_id, model_snapshot(cfg.models[next_index]))
+                except Exception:
+                    deps.error_logger.exception("archive answer retry model update failed")
+            return next_index
 
     commit_submitted = False
 
@@ -1525,7 +1559,19 @@ def process_question_parallel(task, seq, model_idx, sess_v, deps):
 
     try:
         with trace.observe(lambda event: archive.observe_attempt(run_id, event)):
-            return _process_question_parallel(task, seq, model_idx, sess_v, replace(deps, broadcast=broadcast, flush_commit=flush_commit))
+            return _process_question_parallel(
+                task,
+                seq,
+                model_idx,
+                sess_v,
+                replace(
+                    deps,
+                    broadcast=broadcast,
+                    flush_commit=flush_commit,
+                    resolve_exam_model=resolve_exam_model,
+                    reserve_retry=reserve_retry,
+                ),
+            )
     finally:
         if not commit_submitted:
             request = meta.get("mmpg_request")

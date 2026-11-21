@@ -272,8 +272,15 @@ class InterviewArchive:
                 run["answer"] += event["chunk"]
             elif kind == "answer_think_chunk":
                 run["thinking"] += event.get("chunk", "")
+            elif kind == "answer_retry":
+                run["answer"] = ""
+                run["thinking"] = ""
+                run["first_token_at"] = None
+                run["first_token_ms"] = None
             elif kind == "answer_done":
                 run["answer"] = event.get("answer", run["answer"])
+                if "think" in event and event["think"] is not None:
+                    run["thinking"] = event["think"]
                 self.finish_ai(run_id, "completed")
             elif kind in ("answer_error", "answer_cancelled"):
                 self.finish_ai(run_id, "failed" if kind == "answer_error" else "cancelled", error=event.get("message", ""))
