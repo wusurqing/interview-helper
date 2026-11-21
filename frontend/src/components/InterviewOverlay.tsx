@@ -339,15 +339,6 @@ export default function InterviewOverlay() {
     document.body.classList.add('overlay-window')
     applyStoredColorSchemeToDocument()
 
-    const fontHref = 'https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600&family=JetBrains+Mono:wght@400;500&display=swap'
-    let link = document.querySelector<HTMLLinkElement>(`link[href="${fontHref}"]`)
-    if (!link) {
-      link = document.createElement('link')
-      link.rel = 'stylesheet'
-      link.href = fontHref
-      document.head.appendChild(link)
-    }
-
     return () => {
       document.documentElement.classList.remove('overlay-window')
       document.body.classList.remove('overlay-window')

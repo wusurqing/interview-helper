@@ -1,5 +1,3 @@
-@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;600;700&display=swap');
-
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
@@ -16,7 +14,7 @@ body,
   height: 100%;
   width: 100%;
   overflow: hidden;
-  font-family: 'Plus Jakarta Sans', 'Noto Sans SC', system-ui, -apple-system, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei UI', 'Microsoft YaHei', sans-serif;
 }
 
 html.overlay-window,
@@ -31,7 +29,7 @@ html[data-overlay='1'] #root {
 }
 
 code, pre, .font-mono {
-  font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+  font-family: ui-monospace, SFMono-Regular, 'Cascadia Code', Consolas, Menlo, Monaco, monospace;
 }
 
 .app-drag-region {
@@ -647,7 +645,7 @@ code, pre, .font-mono {
 
 /* ========== Overlay HUD (重构 2026-04-20) ==========
  * 单一统一模式，有背景(磨砂玻璃) / 无背景(浮文字幕) 通过 showBg 切换。
- * 字体: JetBrains Mono + DM Sans — 通过 InterviewOverlay.tsx 动态注入 <link>。
+ * 字体: 本地系统字体栈（不依赖远程字体外链，避免弱网阻塞）。
  */
 
 .ov-root {
@@ -658,7 +656,7 @@ code, pre, .font-mono {
   align-items: stretch;
   justify-content: stretch;
   padding: 10px;
-  font-family: 'DM Sans', 'JetBrains Mono', system-ui, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', sans-serif;
 }
 
 .ov-root--prompt {
@@ -789,7 +787,7 @@ code, pre, .font-mono {
   padding: 8px 44px 8px 26px;
   border-bottom: 1px solid rgba(203, 213, 225, 0.42);
   color: rgba(45, 55, 72, 0.7);
-  font-family: 'DM Sans', 'Noto Sans SC', system-ui, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', sans-serif;
   user-select: none;
   -webkit-user-select: none;
 }
@@ -1051,7 +1049,7 @@ code, pre, .font-mono {
   overflow-x: hidden;
   padding: 20px clamp(22px, 4vw, 60px) 30px;
   line-height: 1.58;
-  font-family: 'DM Sans', 'Noto Sans SC', system-ui, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', sans-serif;
   font-weight: 600;
   white-space: pre-wrap;
   word-break: break-word;
@@ -1285,7 +1283,7 @@ code, pre, .font-mono {
   overflow-x: hidden;
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
-  font-family: 'DM Sans', sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei UI', sans-serif;
   user-select: none;
   -webkit-user-select: none;
   caret-color: transparent;

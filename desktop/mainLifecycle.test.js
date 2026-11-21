@@ -424,30 +424,20 @@ test('tray content protection toggle syncs mainWindow._contentProtection and get
   assert.equal(h.handlers.get('get-window-state')().contentProtection, true);
 });
 
-test('createWindow clearCache guards against destroyed window and cache rejection', async (t) => {
-  let resolveCache;
-  const hDestroyed = createHarness(t, {
+test('createWindow loads FRONTEND_URL directly without calling clearCache on startup', async (t) => {
+  let clearCacheCalls = 0;
+  const h = createHarness(t, {
     useMockTimers: false,
-    clearCacheImpl: () => new Promise((res) => { resolveCache = res; }),
+    clearCacheImpl: () => {
+      clearCacheCalls += 1;
+      return Promise.resolve();
+    },
   });
-  hDestroyed.context.createWindow();
-  const win1 = hDestroyed.createdWindows[0];
-  win1.destroy();
-  resolveCache();
+  h.context.createWindow();
+  const win = h.createdWindows[0];
   await Promise.resolve();
-  await Promise.resolve();
-  assert.deepEqual(win1.loadedUrls, [], 'must not call loadURL on destroyed window');
-
-  const hReject = createHarness(t, {
-    useMockTimers: false,
-    clearCacheImpl: () => Promise.reject(new Error('disk full')),
-  });
-  hReject.context.createWindow();
-  const win2 = hReject.createdWindows[0];
-  await Promise.resolve();
-  await Promise.resolve();
-  await Promise.resolve();
-  assert.equal(win2.loadedUrls.length, 1, 'should still load URL after clearCache error');
+  assert.equal(clearCacheCalls, 0, 'startup must not aggressively clear HTTP cache');
+  assert.equal(win.loadedUrls.length, 1, 'should immediately load FRONTEND_URL');
 });
 
 test('will-quit force-kills exiting hung promptWheelHelper and falls back when taskkill spawnSync errors', (t) => {

@@ -567,19 +567,13 @@ function createWindow() {
   mainWindow._contentProtection = true;
   mainWindow.setContentProtection(true);
 
-  // 每次启动清除缓存，确保加载到最新的前端构建（避免设置里识别引擎等不更新）
+  // 静态资源已由 Vite 生成内容 hash，直接加载主页面，避免每次启动暴力清空缓存。
   const win = mainWindow;
-  const loadMainWindow = () => {
-    if (!win || win.isDestroyed()) return;
+  if (win && !win.isDestroyed()) {
     Promise.resolve(win.loadURL(FRONTEND_URL)).catch((err) => {
       console.warn('loadURL failed:', err?.message || err);
     });
-  };
-  Promise.resolve(win.webContents.session.clearCache())
-    .catch((err) => {
-      console.warn('clearCache failed:', err?.message || err);
-    })
-    .then(loadMainWindow);
+  }
 
   mainWindow.webContents.on('did-finish-load', () => {
     const t = JSON.stringify(APP_DISPLAY_NAME);
