@@ -514,6 +514,112 @@ def test_stateless_http_client_isolates_threads_and_rejects_cookies():
     client.close()
 
 
+def test_stateless_http_client_releases_exited_thread_sessions():
+    import gc
+    import threading
+
+    client = protocols._StatelessHttpClient()
+
+    def worker():
+        s = client._get_session()
+        assert s is not None
+
+    for _ in range(5):
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+    gc.collect()
+    assert len(client._sessions) == 0
+
+
+def test_chat_stream_single_model_closes_aborted_stream(monkeypatch):
+    from types import SimpleNamespace
+    from services.llm import streaming
+
+    closed = {"count": 0}
+
+    class FakeStream:
+        def __init__(self):
+            self._items = [
+                SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content="part1", reasoning_content=None, reasoning=None))],
+                    usage=None,
+                ),
+                SimpleNamespace(
+                    choices=[SimpleNamespace(delta=SimpleNamespace(content="part2", reasoning_content=None, reasoning=None))],
+                    usage=None,
+                ),
+            ]
+            self._idx = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            if self._idx >= len(self._items):
+                raise StopIteration
+            item = self._items[self._idx]
+            self._idx += 1
+            return item
+
+        def close(self):
+            closed["count"] += 1
+
+    model = SimpleNamespace(
+        name="m1",
+        api_base_url="https://api.example.com/v1",
+        api_key="sk-test",
+        model="gpt-4o-mini",
+        api_type="openai",
+        supports_vision=False,
+        supports_think=False,
+    )
+    cfg = SimpleNamespace(temperature=0.3, max_tokens=128, think_mode=False, think_effort="off")
+
+    monkeypatch.setattr(streaming, "_try_stream_with_model", lambda *_a, **_kw: FakeStream())
+
+    aborted = False
+    out = []
+    for item in streaming.chat_stream_single_model(
+        model,
+        [{"role": "user", "content": "hi"}],
+        abort_check=lambda: aborted,
+        config_snapshot=cfg,
+    ):
+        out.append(item)
+        aborted = True
+
+    assert out == [("text", "part1")]
+    assert closed["count"] == 1
+
+
+def test_try_stream_with_model_forwards_custom_timeout_for_non_openai(monkeypatch):
+    from types import SimpleNamespace
+    from services.llm import streaming
+
+    captured = {}
+
+    def fake_post_chat_stream(base_url, api_type, api_key, payload, *, timeout=(10, 90)):
+        captured["timeout"] = timeout
+        return iter([])
+
+    model = SimpleNamespace(
+        name="claude",
+        api_base_url="https://api.anthropic.com",
+        api_key="sk-ant",
+        model="claude-3-7-sonnet",
+        api_type="anthropic",
+        supports_vision=False,
+        supports_think=False,
+    )
+    cfg = SimpleNamespace(temperature=0.3, max_tokens=128, think_mode=False, think_effort="off")
+    monkeypatch.setattr(streaming, "post_chat_stream", fake_post_chat_stream)
+
+    streaming._try_stream_with_model(model, [{"role": "user", "content": "hi"}], cfg, timeout=(5, 25))
+    assert captured["timeout"] == (5, 25)
+
+
 @pytest.mark.asyncio
 async def test_async_client_reused_per_loop_with_redirects_disabled():
     await protocols.aclose_async_client()

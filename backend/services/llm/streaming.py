@@ -357,7 +357,9 @@ def _vision_via_http(model_cfg, messages: list[dict]) -> str:
         stream=False,
     )
     result = post_chat_blocking(model_cfg.api_base_url, api_type, model_cfg.api_key, payload)
-    return (result.choices[0].message.content or "").strip()
+    choices = getattr(result, "choices", None) or []
+    first_msg = getattr(choices[0], "message", None) if choices else None
+    return (getattr(first_msg, "content", None) or "").strip()
 
 
 def vision_extract_text(image_base64_list: list[str]) -> str:
@@ -385,7 +387,9 @@ def vision_extract_text(image_base64_list: list[str]) -> str:
     try:
         r = chat_completion_create(model, vision_messages, temperature=0, max_tokens=4096,
                                    trace_context={"scene": "resume_vision_ocr"})
-        return (r.choices[0].message.content or "").strip()
+        choices = getattr(r, "choices", None) or []
+        first_msg = getattr(choices[0], "message", None) if choices else None
+        return (getattr(first_msg, "content", None) or "").strip()
     except TypeError as e:
         if "by_alias" not in str(e):
             raise ValueError(f"\u8bc6\u56fe\u6a21\u578b\u89e3\u6790\u5931\u8d25: {e}") from e
@@ -708,7 +712,9 @@ def _try_stream_with_model(
             stream=True,
             think_params=think_params,
         )
-        return post_chat_stream(model_cfg.api_base_url, api_type, model_cfg.api_key, payload)
+        if timeout == (10, 90):
+            return post_chat_stream(model_cfg.api_base_url, api_type, model_cfg.api_key, payload)
+        return post_chat_stream(model_cfg.api_base_url, api_type, model_cfg.api_key, payload, timeout=timeout)
     client = get_client_for_model(model_cfg)
     if isinstance(client, OpenAI) and getattr(client, "max_retries", 0) != 0:
         client = client.with_options(max_retries=0)
@@ -731,16 +737,23 @@ def _try_stream_with_model(
     except openai.NotFoundError as e:
         # 规范化补的 /v1 猜错（网关路径特殊）→ 按候选 URL 裸 HTTP 重试
         _log.warning("SDK stream 404, retry via HTTP candidates model=%s: %s", model_cfg.name, e)
-        return _stream_via_http(model_cfg, full_messages, cfg, think_params)
+        return _stream_via_http(model_cfg, full_messages, cfg, think_params, timeout=timeout)
     except TypeError as e:
         # 某些环境中 openai-sdk + pydantic 组合会在解析流式响应时抛 by_alias 异常。
         if "by_alias" not in str(e):
             raise
         _log.warning("SDK stream failed, fallback to HTTP stream model=%s err=%s", model_cfg.name, e)
-        return _stream_via_http(model_cfg, full_messages, cfg, think_params)
+        return _stream_via_http(model_cfg, full_messages, cfg, think_params, timeout=timeout)
 
 
-def _stream_via_http(model_cfg, full_messages, cfg, think_params):
+def _stream_via_http(
+    model_cfg,
+    full_messages,
+    cfg,
+    think_params,
+    *,
+    timeout: tuple[float, float] = (10, 90),
+):
     """OpenAI 兼容的裸 HTTP SSE 流式（SDK 不可用/404 时的降级路径）。"""
     payload = build_chat_payload(
         "openai",
@@ -751,7 +764,9 @@ def _stream_via_http(model_cfg, full_messages, cfg, think_params):
         stream=True,
         think_params=think_params,
     )
-    return post_chat_stream(model_cfg.api_base_url, "openai", model_cfg.api_key, payload)
+    if timeout == (10, 90):
+        return post_chat_stream(model_cfg.api_base_url, "openai", model_cfg.api_key, payload)
+    return post_chat_stream(model_cfg.api_base_url, "openai", model_cfg.api_key, payload, timeout=timeout)
 
 
 def _config_with_think_override(cfg, override_think_mode: Optional[bool]):
@@ -996,5 +1011,5 @@ def chat_stream_single_model(
     finally:
         if "response" in locals():
             close = getattr(response, "close", None)
-            if close is not None:
+            if callable(close):
                 close()

@@ -15,6 +15,7 @@ from http.cookiejar import DefaultCookiePolicy
 import json
 import re
 import threading
+import weakref
 from types import SimpleNamespace
 from typing import Any, Generator, Optional
 
@@ -42,7 +43,7 @@ class _StatelessHttpClient:
         self._pool_maxsize = pool_maxsize
         self._local = threading.local()
         self._lock = threading.Lock()
-        self._sessions: list[requests.Session] = []
+        self._sessions: weakref.WeakSet[requests.Session] = weakref.WeakSet()
 
     def _get_session(self) -> requests.Session:
         session = getattr(self._local, "session", None)
@@ -58,7 +59,7 @@ class _StatelessHttpClient:
             session.mount("http://", adapter)
             self._local.session = session
             with self._lock:
-                self._sessions.append(session)
+                self._sessions.add(session)
         else:
             session.cookies.clear()
         return session
