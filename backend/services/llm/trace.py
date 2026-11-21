@@ -51,6 +51,23 @@ _SECRET_KEYS = {
     "authorization", "proxy-authorization", "x-api-key", "api-key", "api_key", "apikey",
     "x-auth-token", "access_token", "refresh_token", "client_secret", "token", "secret", "password",
 }
+_METADATA_CONTEXT_KEYS = {
+    "scene", "qa_id", "source", "answer_attempt", "mmpg_group_id", "mmpg_revision", "mmpg_seq",
+    "session_id", "turn_id", "job_id", "record_id",
+}
+_TOKEN_COUNT_KEYS = {
+    "prompt_tokens", "input_tokens", "completion_tokens", "output_tokens", "total_tokens",
+    "cache_read_input_tokens", "cache_creation_input_tokens", "prompt_cache_hit_tokens", "prompt_cache_miss_tokens",
+}
+_TOKEN_DETAIL_KEYS = {
+    "prompt_tokens_details": "cached_tokens", "input_tokens_details": "cached_tokens",
+    "completion_tokens_details": "reasoning_tokens", "output_tokens_details": "reasoning_tokens",
+}
+_FINISH_REASONS = {
+    "stop", "length", "content_filter", "tool_calls", "function_call", "end_turn", "max_tokens",
+    "stop_sequence", "tool_use", "pause_turn", "refusal", "completed", "incomplete", "failed",
+    "response.completed", "response.incomplete", "response.failed", "model_context_window_exceeded",
+}
 _DATA_URL = re.compile(r"^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$", re.I)
 _URL_CREDENTIALS = re.compile(r"(https?://)[^/?#@\s]+@", re.I)
 _QUERY_SECRET = re.compile(r"([?&](?:" + "|".join(sorted(_SECRET_KEYS)) + r")=)[^&#\s]+", re.I)
@@ -86,15 +103,16 @@ def max_assets_bytes() -> int:
 def _enforce_assets_quota_locked(
     assets: Path,
     *,
-    max_bytes: int | None = None,
+    admission_limit: int | None = None,
     protected: set[str] | None = None,
-) -> None:
+) -> bool:
     if not assets.exists():
-        return
-    limit = max_assets_bytes() if max_bytes is None else max(0, int(max_bytes))
+        return True
+    limit = max_assets_bytes() if admission_limit is None else admission_limit
     protected_names = set(protected or ())
     entries: list[tuple[int, str, int, Path]] = []
     total = 0
+    protected_bytes = 0
     for asset in assets.iterdir():
         if not asset.is_file():
             continue
@@ -103,15 +121,19 @@ def _enforce_assets_quota_locked(
         except OSError:
             continue
         total += st.st_size
-        entries.append((st.st_mtime_ns, asset.name, st.st_size, asset))
+        if asset.name in protected_names:
+            protected_bytes += st.st_size
+        else:
+            entries.append((st.st_mtime_ns, asset.name, st.st_size, asset))
     if total <= limit:
-        return
+        return True
+    # Reject an image before eviction if even removing every eligible file cannot fit it.
+    if admission_limit is not None and protected_bytes > limit:
+        return False
     entries.sort(key=lambda item: (item[0], item[1]))
-    for _mtime, name, size, asset in entries:
+    for _mtime, _name, size, asset in entries:
         if total <= limit:
             break
-        if name in protected_names:
-            continue
         try:
             asset.unlink()
             total -= size
@@ -119,6 +141,7 @@ def _enforce_assets_quota_locked(
             total -= size
         except OSError:
             continue
+    return total <= limit
 
 
 def prune_unused_assets(log_dir=None, *, min_age_seconds: float = 0.0):
@@ -270,10 +293,12 @@ def _redact_text(text, api_key):
     return _AUTH_HEADER.sub(r"\g<1>[REDACTED]", text)
 
 
-def _safe_url(url, api_key):
+def _safe_url(url, api_key, *, origin_only=False):
     try:
         parts = urlsplit(str(url))
         authority = _redact_text(parts.netloc.rsplit("@", 1)[-1], api_key)
+        if origin_only:
+            return urlunsplit((parts.scheme, authority, "", "", ""))
         path = parts.path
         if api_key and api_key in unquote(path):
             path = quote(unquote(path).replace(api_key, _REDACTED), safe="/")
@@ -300,20 +325,20 @@ def _asset(data_url, *, _created_assets=None):
         return None
     digest = hashlib.sha256(data).hexdigest()
     limit = max_assets_bytes()
+    metadata = {"mime": mime, "bytes": len(data), "sha256": digest}
+    omitted = {"path": None, **metadata, "omitted": "asset_quota_exceeded"}
     if limit <= 0 or len(data) > limit:
-        return {
-            "path": None,
-            "mime": mime,
-            "bytes": len(data),
-            "sha256": digest,
-            "omitted": "asset_quota_exceeded",
-        }
+        return omitted
     ext = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}.get(mime, "img")
     rel = Path("llm_assets") / f"{digest}.{ext}"
     rel_posix = rel.as_posix()
     path = Path(LOG_DIR) / rel
     with _asset_lock:
         path.parent.mkdir(parents=True, exist_ok=True)
+        protected = {Path(p).name for p in _in_flight_assets} | {path.name}
+        required = 0 if path.exists() else len(data)
+        if not _enforce_assets_quota_locked(path.parent, admission_limit=limit - required, protected=protected):
+            return omitted
         try:
             with path.open("xb") as handle:
                 handle.write(data)
@@ -333,9 +358,7 @@ def _asset(data_url, *, _created_assets=None):
         if _created_assets is not None:
             _in_flight_assets[rel_posix] += 1
             _created_assets.append(rel_posix)
-        protected = {Path(p).name for p in _in_flight_assets} | {path.name}
-        _enforce_assets_quota_locked(path.parent, max_bytes=limit, protected=protected)
-    return {"path": rel_posix, "mime": mime, "bytes": len(data), "sha256": digest}
+    return {"path": rel_posix, **metadata}
 
 
 def _safe(value, api_key="", *, _created_assets=None):
@@ -348,8 +371,7 @@ def _safe(value, api_key="", *, _created_assets=None):
                 )
             except OSError:
                 asset = None
-            if asset is not None:
-                value = {**value, "data": asset}
+            value = {**value, "data": asset if asset is not None else _IMAGE_OMITTED}
         return {
             _redact_text(str(key), api_key): (
                 _REDACTED
@@ -367,6 +389,8 @@ def _safe(value, api_key="", *, _created_assets=None):
             asset = None
         if asset is not None:
             return asset
+        if value[:11].lower() == "data:image/":
+            return _IMAGE_OMITTED
         return _redact_text(value, api_key)
     return value
 
@@ -407,8 +431,8 @@ def _summarize_request_metadata(payload, api_key=""):
     summary = {"redacted": True, "image_count": _count_images(payload)}
     if not isinstance(payload, dict):
         return summary
-    if payload.get("model") is not None:
-        summary["model"] = _redact_text(str(payload.get("model")), api_key)
+    if isinstance(payload.get("model"), str):
+        summary["model"] = _safe_metadata(payload["model"], api_key)
     if "stream" in payload:
         summary["stream"] = bool(payload.get("stream"))
     for key in ("temperature", "max_tokens", "max_completion_tokens", "max_output_tokens"):
@@ -656,7 +680,10 @@ class Attempt:
         try:
             if self.mode == "metadata":
                 self.call_id = _safe_metadata(context.pop("call_id", uuid4().hex), api_key)
-                self.context = _safe_metadata(context, api_key)
+                self.context = {
+                    key: _safe_metadata(value, api_key) for key, value in context.items()
+                    if key in _METADATA_CONTEXT_KEYS and isinstance(value, (str, int))
+                }
                 safe_request = _summarize_request_metadata(payload, api_key)
             else:
                 self.call_id = _safe(context.pop("call_id", uuid4().hex), api_key, _created_assets=created_assets)
@@ -689,7 +716,7 @@ class Attempt:
                 "context": self.context,
                 "at": self.request_at,
                 "protocol": api_type,
-                "url": _safe_url(url, api_key),
+                "url": _safe_url(url, api_key, origin_only=self.mode == "metadata"),
                 "request": safe_request,
             }
             if self.mode == "metadata":
@@ -763,6 +790,14 @@ class Attempt:
             if self.usage is None:
                 self.usage = {}
             for key, value in usage.items():
+                if self.mode == "metadata":
+                    if key in _TOKEN_DETAIL_KEYS and isinstance(value, dict):
+                        detail = _TOKEN_DETAIL_KEYS[key]
+                        if type(value.get(detail)) is int:
+                            self.usage[key] = {detail: value[detail]}
+                    elif key in _TOKEN_COUNT_KEYS and type(value) is int:
+                        self.usage[key] = value
+                    continue
                 if value is not None:
                     self.usage[key] = value
 
@@ -816,7 +851,7 @@ class Attempt:
         if self._finished:
             return
         self._finished = True
-        usage = _safe_metadata(self.usage, self.api_key) if self.mode == "metadata" else _safe(self.usage, self.api_key)
+        usage = self.usage if self.mode == "metadata" else _safe(self.usage, self.api_key)
         input_raw = (usage.get("prompt_tokens", usage.get("input_tokens")) if usage else None)
         read = (usage.get("cache_read_input_tokens") if usage else None)
         if read is None and usage:
@@ -851,7 +886,8 @@ class Attempt:
                 "reasoning_text": None,
                 "output_chars": self._output_chars,
                 "reasoning_chars": self._reasoning_chars,
-                "finish_reason": _safe_metadata(self.finish_reason, self.api_key),
+                "finish_reason": (self.finish_reason if isinstance(self.finish_reason, str)
+                                  and self.finish_reason in _FINISH_REASONS else None),
                 "response": None,
                 "stream_events": None,
                 "stream_event_count": self._stream_event_count,
@@ -866,7 +902,7 @@ class Attempt:
                     "cache_hit": usage.get("prompt_cache_hit_tokens") if usage else None,
                     "cache_miss": usage.get("prompt_cache_miss_tokens") if usage else None,
                 },
-                "error": _safe_metadata(str(error), self.api_key) if error is not None else None,
+                "error": None,
             })
             return
 

@@ -493,6 +493,80 @@ def test_trace_assets_quota_evicts_oldest_and_respects_zero_cap(tmp_path, monkey
     assert saved_paths[2].exists()
 
 
+def test_trace_metadata_excludes_provider_free_text_and_file_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "metadata")
+    private = "fictional resume excerpt"
+    with trace.scope("kb_vision_caption", image_path=f"/fixture/{private}/page.png", qa_id="qa-2"):
+        attempt = trace.begin("https://example.com/personal-gateway/v1?team=fixture-team", "openai",
+                              {"messages": [{"content": private}]})
+        attempt.headers(400)
+        attempt.response({"choices": [{"finish_reason": private}], "usage": {
+            "prompt_tokens": 9, "completion_tokens": 2,
+            "prompt_tokens_details": {"cached_tokens": 3, "note": private},
+            "vendor_note": private,
+        }})
+        attempt.finish("failed", f"provider rejected {private}")
+
+    logged = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    assert private not in logged
+    request, result = map(json.loads, logged.splitlines())
+    assert request["context"] == {"scene": "kb_vision_caption", "qa_id": "qa-2"}
+    assert request["url"] == "https://example.com"
+    assert result["status"] == "failed"
+    assert result["http_status"] == 400
+    assert result["tokens"]["input"] == 9
+    assert result["tokens"]["cached_read"] == 3
+
+
+def test_trace_quota_applies_to_multiple_images_in_one_request(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+    monkeypatch.setenv("IA_LLM_TRACE_MAX_ASSETS_MB", str(5 / (1024 * 1024)))
+    first = "data:image/png;base64,aGVsbG8="
+    second = "data:image/png;base64,d29ybGQ="
+    trace.begin("https://example.com/v1", "openai", {"images": [first, second, first]}).finish()
+
+    logged = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    images = json.loads(logged.splitlines()[0])["request"]["images"]
+    assert sum(path.stat().st_size for path in (tmp_path / "llm_assets").iterdir()) <= 5
+    assert images[0] == images[2]
+    assert (tmp_path / images[0]["path"]).read_bytes() == b"hello"
+    assert images[1]["path"] is None
+    assert images[1]["omitted"] == "asset_quota_exceeded"
+
+
+def test_trace_asset_write_failure_omits_inline_images(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+    (tmp_path / "llm_assets").write_text("fixture prevents creating a directory")
+    trace.begin("https://example.com/v1", "openai", {
+        "image_url": "data:image/png;base64,aGVsbG8=",
+        "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="},
+    }).finish()
+
+    logged = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    assert len(logged.splitlines()) == 2
+    assert "aGVsbG8=" not in logged
+
+
+def test_unadmittable_image_preserves_existing_trace_assets(tmp_path, monkeypatch):
+    import base64
+
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+    monkeypatch.setenv("IA_LLM_TRACE_MAX_ASSETS_MB", str(10 / (1024 * 1024)))
+    for image_bytes in ([b"aa"], [b"bbbbbbbb", b"cccc"]):
+        images = ["data:image/png;base64," + base64.b64encode(data).decode("ascii") for data in image_bytes]
+        trace.begin("https://example.com/v1", "openai", {"images": images}).finish()
+
+    records = map(json.loads, (tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines())
+    old, new = (r["request"]["images"] for r in records if r["event"] == "request")
+    assert new[1]["omitted"] == "asset_quota_exceeded"
+    assert (tmp_path / new[0]["path"]).read_bytes() == b"bbbbbbbb"
+    assert (tmp_path / old[0]["path"]).read_bytes() == b"aa"
+
+
 def test_rollover_prunes_assets_asynchronously_without_blocking_emit(tmp_path, monkeypatch):
     import logging
     import threading
