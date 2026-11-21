@@ -17,6 +17,8 @@ from contextlib import contextmanager
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BACKEND_DIR = os.path.join(ROOT, "backend")
 FRONTEND_DIR = os.path.join(ROOT, "frontend")
+# The server belongs to this run. Local traffic must not use a system proxy.
+_loopback_client = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def log(msg: str):
@@ -38,7 +40,7 @@ def wait_for_server(url: str, process, max_wait: int = 30) -> bool:
         if not process.is_alive():
             return False
         try:
-            with urllib.request.urlopen(url, timeout=2) as r:
+            with _loopback_client.open(url, timeout=2) as r:
                 if r.status == 200:
                     r.read()
                     return True
@@ -142,7 +144,7 @@ def check_endpoints(base: str) -> int:
             req.add_header("Content-Type", "application/json")
             req.data = body.encode("utf-8")
         try:
-            with urllib.request.urlopen(req, timeout=5) as r:
+            with _loopback_client.open(req, timeout=5) as r:
                 if r.status != 200:
                     log(f"FAIL {path} -> {r.status}")
                     return 1
@@ -158,7 +160,7 @@ def check_endpoints(base: str) -> int:
     # 5. Test SPA page
     log("4. 测试前端页面...")
     try:
-        with urllib.request.urlopen(f"{base}/", timeout=5) as r:
+        with _loopback_client.open(f"{base}/", timeout=5) as r:
             if r.status != 200:
                 log(f"FAIL / -> {r.status}")
                 return 1
