@@ -353,3 +353,48 @@ def test_lifespan_shutdown_runs_stop_off_loop_awaits_ws_and_shuts_down_lanes(
     # 关闭后再提交仍可懒重建，不影响同进程后续请求/测试
     assert asyncio.run(rl.run_kb_query(lambda: 42)) == 42
     rl.shutdown_resource_lanes(wait=True)
+
+
+def test_resume_optimize_enforces_jd_max_length_and_knowledge_tags_strip_markdown_fences(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from core.config import KnowledgeAnalysisSettings, ModelConfig
+    from services import knowledge_analysis
+    from services.storage import knowledge
+    resume_router = importlib.import_module("api.resume.router")
+
+    app = FastAPI()
+    app.include_router(resume_router.router, prefix="/api")
+    with TestClient(app) as client:
+        too_long = client.post("/api/resume/optimize", json={"jd": "x" * 50_005})
+        assert too_long.status_code == 422
+
+    monkeypatch.setattr(
+        knowledge_analysis.streaming,
+        "chat_completion_create",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='```json\n["Redis", "缓存穿透", "布隆过滤器"]\n```'
+                    )
+                )
+            ]
+        ),
+    )
+    record = knowledge.AnalysisRecord(
+        id=1,
+        question="Redis 如何防穿透？",
+        answer="布隆过滤器",
+        candidate_answer="我讲了布隆过滤器和空值缓存",
+        tags=None,
+    )
+    tags = knowledge_analysis._extract_tags(
+        record,
+        ModelConfig(name="M", model="m", api_key="k"),
+        KnowledgeAnalysisSettings(),
+        "sys",
+        {},
+        "job-1",
+    )
+    assert tags == ["Redis", "缓存穿透", "布隆过滤器"]

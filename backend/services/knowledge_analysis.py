@@ -118,6 +118,25 @@ def _run_analysis(
         job.status = "completed"
 
 
+def _parse_json_tags(raw: str | None) -> object:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start != -1 and end > start:
+            return json.loads(text[start : end + 1])
+        raise
+
+
 def _extract_tags(
     record: knowledge.AnalysisRecord, model: ModelConfig, settings: KnowledgeAnalysisSettings,
     system_prompt: str, think_params: dict, job_id: str,
@@ -139,7 +158,7 @@ def _extract_tags(
         trace_context={"scene": "knowledge_tags", "job_id": job_id, "record_id": record.id},
     )
     raw = response.choices[0].message.content if response.choices else None
-    tags = json.loads(raw or "")
+    tags = _parse_json_tags(raw)
     if not isinstance(tags, list) or not 3 <= len(tags) <= 5:
         raise ValueError("expected 3–5 knowledge tags")
     if any(not isinstance(tag, str) or not tag.strip() for tag in tags):

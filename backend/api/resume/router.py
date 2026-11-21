@@ -2,7 +2,7 @@ import threading
 import uuid
 from collections.abc import Mapping
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from core.config import get_config
 from core.logger import get_logger
 from core.resource_lanes import submit_low_priority_background
@@ -18,7 +18,7 @@ _ropt_log = get_logger("resume.optimize")
 
 
 class OptimizeRequest(BaseModel):
-    jd: str
+    jd: str = Field(max_length=50_000)
 
 
 @router.post("/resume/optimize")
