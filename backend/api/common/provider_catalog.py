@@ -38,6 +38,8 @@ _VERIFICATION_LOCK = threading.Lock()
 _VERIFICATION_RESULTS: OrderedDict[bytes, tuple[object, bool]] = OrderedDict()
 _VERIFICATION_CACHE_LIMIT = 4096
 _CATALOG_PAGE_LIMIT = 100
+_CATALOG_PAGE_TIMEOUT_SEC = 15.0
+_CATALOG_TOTAL_TIMEOUT_SEC = 45.0
 _CATALOG_COMPAT_SUFFIXES = (
     "/api/claudecode", "/api/anthropic", "/apps/anthropic", "/api/coding",
     "/claudecode", "/anthropic", "/step_plan", "/coding", "/claude",
@@ -156,7 +158,7 @@ def _authorization_headers(connection: Connection) -> list[dict[str, str]]:
     return headers
 
 
-def _request(method, url: str, *, timeout: int = 12, **kwargs):
+def _request(method, url: str, *, timeout: float = 12, **kwargs):
     try:
         return method(url, allow_redirects=False, timeout=timeout, **kwargs)
     except requests.Timeout as exc:
@@ -267,10 +269,18 @@ def fetch_provider_catalog(connection: Connection) -> list[dict]:
     if connection.api_key in _NO_KEY:
         raise ProviderRequestError("未配置 API Key")
 
+    deadline = monotonic() + _CATALOG_TOTAL_TIMEOUT_SEC
+
+    def _remaining_timeout() -> float:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise ProviderRequestError("获取供应商模型目录超时，请稍后重试")
+        return min(_CATALOG_PAGE_TIMEOUT_SEC, remaining)
+
     for url in _catalog_url_candidates(connection.api_base_url, connection.api_type):
         variants = _authorization_headers(connection)
         for index, headers in enumerate(variants):
-            response = _request(requests.get, url, headers=headers, timeout=15)
+            response = _request(requests.get, url, headers=headers, timeout=_remaining_timeout())
             if response.status_code == 401 and index + 1 < len(variants):
                 continue
             break
@@ -292,7 +302,13 @@ def fetch_provider_catalog(connection: Connection) -> list[dict]:
             if not cursor or cursor in sent_cursors:
                 break
             sent_cursors.add(cursor)
-            response = _request(requests.get, url, headers=headers, timeout=15, params={"after_id": cursor})
+            response = _request(
+                requests.get,
+                url,
+                headers=headers,
+                timeout=_remaining_timeout(),
+                params={"after_id": cursor},
+            )
             if not 200 <= response.status_code < 300:
                 raise _status_error(response.status_code)
         raise ProviderRequestError("供应商模型目录分页未完成")

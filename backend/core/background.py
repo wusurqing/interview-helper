@@ -41,9 +41,11 @@ class BoundedTaskWorker:
             self._queue.put_nowait(args)
             return True
         except queue.Full:
-            self.dropped_count += 1
-            if self.dropped_count == 1 or self.dropped_count % 25 == 0:
-                self._log.warning("background queue full; dropped=%d", self.dropped_count)
+            with self._lock:
+                self.dropped_count += 1
+                dropped = self.dropped_count
+            if dropped == 1 or dropped % 25 == 0:
+                self._log.warning("background queue full; dropped=%d", dropped)
             return False
 
     def stop(self, timeout: float = 2.0) -> None:
@@ -51,6 +53,7 @@ class BoundedTaskWorker:
             thread = self._thread
             if not thread:
                 return
+            self._thread = None
             try:
                 self._queue.put_nowait(None)
             except queue.Full:
@@ -63,8 +66,8 @@ class BoundedTaskWorker:
                     self._queue.put_nowait(None)
                 except queue.Full:
                     self._log.warning("failed to enqueue shutdown sentinel")
+        if thread is not threading.current_thread():
             thread.join(timeout=timeout)
-            self._thread = None
 
     def _run(self) -> None:
         while True:

@@ -327,3 +327,35 @@ def test_malformed_provider_input_never_echoes_submitted_key(catalog, route, bad
     response = TestClient(app).post(route, json={"api_key": key, **bad_input})
     assert response.status_code == 422
     assert key not in response.text
+
+
+def test_catalog_pagination_enforces_total_timeout_budget(catalog, monkeypatch):
+    clock = [100.0]
+    seen_timeouts = []
+    page_num = [0]
+
+    def fake_monotonic():
+        return clock[0]
+
+    def fake_get(url, **kwargs):
+        seen_timeouts.append(kwargs["timeout"])
+        page_num[0] += 1
+        clock[0] += 12.0  # simulate slow upstream pages consuming budget
+        return Reply({
+            "data": [{"id": f"m-{page_num[0]}"}],
+            "last_id": f"m-{page_num[0]}",
+            "has_more": True,
+        })
+
+    monkeypatch.setattr(catalog, "monotonic", fake_monotonic)
+    monkeypatch.setattr(catalog, "_CATALOG_TOTAL_TIMEOUT_SEC", 30.0)
+    monkeypatch.setattr(catalog, "_CATALOG_PAGE_TIMEOUT_SEC", 15.0)
+    monkeypatch.setattr(catalog.requests, "get", fake_get)
+
+    conn = catalog.Connection("openai", "https://api.example.test/v1", "sk-test-key")
+    with pytest.raises(catalog.ProviderRequestError, match="超时"):
+        catalog.fetch_provider_catalog(conn)
+
+    # 1st page: min(15, 30)=15 -> clock=112; 2nd: min(15, 18)=15 -> clock=124; 3rd: min(15, 6)=6 -> clock=136 (>130) -> aborts
+    assert seen_timeouts == [15.0, 15.0, 6.0]
+    assert page_num[0] == 3
