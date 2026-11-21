@@ -15,6 +15,7 @@ function createHarness(t, {
   existsSyncImpl,
   httpMock,
   clearCacheImpl,
+  spawnSyncResult,
   useMockTimers = true,
 } = {}) {
   if (useMockTimers) {
@@ -24,6 +25,7 @@ function createHarness(t, {
   t.after(() => rmSync(userData, { recursive: true, force: true }));
 
   const handlers = new Map();
+  const appEvents = new EventEmitter();
   const spawnCalls = [];
   const spawnSyncCalls = [];
   const createdWindows = [];
@@ -85,7 +87,7 @@ function createHarness(t, {
       disableHardwareAcceleration() {},
       getPath: () => userData,
       whenReady: () => new Promise(() => {}),
-      on() {},
+      on(ev, fn) { appEvents.on(ev, fn); },
       quit() {},
     },
     BrowserWindow: MockWindow,
@@ -112,7 +114,10 @@ function createHarness(t, {
     Menu: {
       buildFromTemplate(template) {
         trayMenuTemplate = template;
-        return template;
+        const menu = Object.assign([...template], {
+          getMenuItemById: (id) => template.find((item) => item.id === id) || null,
+        });
+        return menu;
       },
     },
     nativeImage: {
@@ -145,7 +150,7 @@ function createHarness(t, {
     },
     spawnSync(cmd, args, options) {
       spawnSyncCalls.push({ cmd, args, options });
-      return { status: 0 };
+      return spawnSyncResult || { status: 0 };
     },
   };
 
@@ -180,6 +185,7 @@ function createHarness(t, {
   return {
     context,
     handlers,
+    appEvents,
     spawnCalls,
     spawnSyncCalls,
     createdWindows,
@@ -442,4 +448,73 @@ test('createWindow clearCache guards against destroyed window and cache rejectio
   await Promise.resolve();
   await Promise.resolve();
   assert.equal(win2.loadedUrls.length, 1, 'should still load URL after clearCache error');
+});
+
+test('will-quit force-kills exiting hung promptWheelHelper and falls back when taskkill spawnSync errors', (t) => {
+  const h = createHarness(t, {
+    platform: 'win32',
+    spawnSyncResult: { error: new Error('ENOENT') },
+    useMockTimers: false,
+  });
+
+  const killCalls = [];
+  const hungHelper = Object.assign(new EventEmitter(), {
+    pid: 7788,
+    exitCode: null,
+    signalCode: null,
+    ready: true,
+    stdin: { write: () => true, end: () => {} },
+    kill: (sig) => { killCalls.push(sig); },
+  });
+  runInNewContext('promptWheelHelper = __hungHelper;', Object.assign(h.context, { __hungHelper: hungHelper }));
+
+  // Stop helper (schedules 1500ms timer) then immediately fire will-quit before 1500ms elapses
+  h.context.stopPromptWheelHelper('inactive');
+  h.appEvents.emit('will-quit');
+
+  assert.equal(h.spawnSyncCalls.length, 1);
+  assert.equal(h.spawnSyncCalls[0].cmd, 'taskkill');
+  assert.deepEqual(Array.from(h.spawnSyncCalls[0].args), ['/PID', '7788', '/T', '/F']);
+  assert.deepEqual(killCalls, ['SIGKILL'], 'must fall back to proc.kill when spawnSync reports error');
+});
+
+test('toggle-content-protection syncs tray checkbox and handles already-exited backend in gracefulStopPython', async (t) => {
+  const h = createHarness(t, { useMockTimers: false });
+  h.context.createWindow();
+  h.context.createTray();
+
+  const stealthItem = h.getTrayMenu().find((item) => item.id === 'content-protection');
+  assert.ok(stealthItem);
+  assert.equal(stealthItem.checked, true);
+
+  const next = h.handlers.get('toggle-content-protection')();
+  assert.equal(next, false);
+  assert.equal(stealthItem.checked, false);
+
+  // Already-exited pythonProcess must resolve gracefulStopPython immediately without waiting
+  const exitedProc = Object.assign(new EventEmitter(), { pid: 5566, exitCode: 0, signalCode: null, kill: () => {} });
+  runInNewContext('pythonProcess = __exited;', Object.assign(h.context, { __exited: exitedProc }));
+  await h.context.gracefulStopPython(5000);
+});
+
+test('postBackend and getBackend reject when server closes connection before response completes', async (t) => {
+  const httpMock = {
+    request(_url, _opts, cb) {
+      const req = new EventEmitter();
+      req.write = () => {};
+      req.end = () => {
+        const res = new EventEmitter();
+        res.statusCode = 200;
+        res.complete = false;
+        res.setEncoding = () => {};
+        cb(res);
+        res.emit('close');
+      };
+      req.destroy = () => {};
+      return req;
+    },
+  };
+  const h = createHarness(t, { httpMock, useMockTimers: false });
+  await assert.rejects(() => h.context.postBackend('/api/test', '{}'), /连接已中断/);
+  await assert.rejects(() => h.context.getBackend('/api/config'), /连接已中断/);
 });

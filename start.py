@@ -270,9 +270,16 @@ def ensure_electron():
 
 def _extract_port(address: str) -> Optional[int]:
     """Extract numeric port from a netstat local address like 0.0.0.0:80 or [::]:18080."""
-    if ":" not in address:
-        return None
-    _, port_str = address.rsplit(":", 1)
+    if address.startswith("["):
+        host, sep, port_str = address.rpartition("]:")
+        if not sep or len(host) < 2:
+            return None
+    else:
+        if address.count(":") != 1:
+            return None
+        host, port_str = address.split(":", 1)
+        if not host:
+            return None
     if not port_str.isdigit():
         return None
     return int(port_str)
@@ -315,9 +322,12 @@ def kill_port(port: int):
             for pid in _parse_windows_listening_pids(result.stdout, port):
                 if pid == current_pid:
                     continue
-                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
-                print(f"[OK] 已终止占用端口 {port} 的进程 (PID {pid})")
-                killed = True
+                kill_res = subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+                if kill_res.returncode == 0:
+                    print(f"[OK] 已终止占用端口 {port} 的进程 (PID {pid})")
+                    killed = True
+                else:
+                    print(f"[WARN] 终止占用端口 {port} 的进程失败 (PID {pid}, code {kill_res.returncode})")
         else:
             result = subprocess.run(
                 ["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"],
@@ -331,9 +341,12 @@ def kill_port(port: int):
                 if pid <= 0 or pid == current_pid or pid in seen:
                     continue
                 seen.add(pid)
-                subprocess.run(["kill", "-9", str(pid)], capture_output=True)
-                print(f"[OK] 已终止占用端口 {port} 的进程 (PID {pid})")
-                killed = True
+                kill_res = subprocess.run(["kill", "-9", str(pid)], capture_output=True)
+                if kill_res.returncode == 0:
+                    print(f"[OK] 已终止占用端口 {port} 的进程 (PID {pid})")
+                    killed = True
+                else:
+                    print(f"[WARN] 终止占用端口 {port} 的进程失败 (PID {pid}, code {kill_res.returncode})")
     except Exception as e:
         print(f"[WARN] 清理端口 {port} 时出错: {e}")
     if killed:

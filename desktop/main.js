@@ -95,6 +95,7 @@ let mainWindowOpacity = 1;
 let mainWindowOpacitySaveTimer = null;
 let overlayWindow = null;
 let tray = null;
+let trayMenu = null;
 let pythonProcess = null;
 let isQuitting = false;
 let shortcuts = {};
@@ -109,6 +110,7 @@ let overlayToggleBlockedUntil = 0;
 let queuedOverlayToggle = false;
 const PROMPT_WHEEL_MESSAGE = 0x8000 + 0x179;
 let promptWheelHelper = null;
+const exitingPromptWheelHelpers = new Set();
 let promptWheelGeneration = 0;
 let promptWheelScrollable = false;
 let promptWheelStatus = 'inactive';
@@ -179,21 +181,30 @@ function terminateChildProcess(proc, { sync = false } = {}) {
   if (process.platform === 'win32' && proc.pid) {
     try {
       if (sync && typeof spawnSync === 'function') {
-        spawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+        const res = spawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
           windowsHide: true,
           stdio: 'ignore',
           timeout: 3000,
         });
+        if (!res?.error && (res?.status === 0 || res?.status == null)) {
+          return;
+        }
+      } else {
+        const killer = spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+        });
+        const fallbackKill = () => {
+          if (proc.exitCode == null && proc.signalCode == null) {
+            try { proc.kill(); } catch { /* ignore */ }
+          }
+        };
+        killer?.on?.('error', fallbackKill);
+        killer?.on?.('close', (code) => {
+          if (code && code !== 0) fallbackKill();
+        });
         return;
       }
-      const killer = spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
-        windowsHide: true,
-        stdio: 'ignore',
-      });
-      killer?.on?.('error', () => {
-        try { proc.kill(); } catch { /* ignore */ }
-      });
-      return;
     } catch {
       /* fallback to proc.kill */
     }
@@ -212,13 +223,17 @@ function stopPromptWheelHelper(status = 'inactive') {
     clearTimeout(helper.killTimer);
     try { helper.stdin.end(); } catch { /* process may have exited */ }
     if (helper.exitCode == null && helper.signalCode == null) {
+      exitingPromptWheelHelpers.add(helper);
       helper.killTimer = setTimeout(() => {
         helper.killTimer = null;
+        exitingPromptWheelHelpers.delete(helper);
         terminateChildProcess(helper);
       }, 1500);
+      helper.killTimer?.unref?.();
       helper.once?.('exit', () => {
         clearTimeout(helper.killTimer);
         helper.killTimer = null;
+        exitingPromptWheelHelpers.delete(helper);
       });
     }
   }
@@ -556,7 +571,9 @@ function createWindow() {
   const win = mainWindow;
   const loadMainWindow = () => {
     if (!win || win.isDestroyed()) return;
-    win.loadURL(FRONTEND_URL);
+    Promise.resolve(win.loadURL(FRONTEND_URL)).catch((err) => {
+      console.warn('loadURL failed:', err?.message || err);
+    });
   };
   Promise.resolve(win.webContents.session.clearCache())
     .catch((err) => {
@@ -845,6 +862,11 @@ function postBackend(pathname, body = '{}', timeoutMs = BACKEND_POST_TIMEOUT_MS)
         res.setEncoding('utf8');
         res.on('data', (chunk) => { raw += chunk; });
         res.on('error', (err) => settle(reject, err));
+        res.on('close', () => {
+          if (!settled && res.complete === false) {
+            settle(reject, new Error(`连接已中断 (${pathname})`));
+          }
+        });
         res.on('end', () => {
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
             if (!raw) { settle(resolve, { ok: true }); return; }
@@ -880,6 +902,11 @@ function getBackend(pathname, timeoutMs = BACKEND_GET_TIMEOUT_MS) {
       res.setEncoding('utf8');
       res.on('data', (chunk) => { raw += chunk; });
       res.on('error', (err) => settle(reject, err));
+      res.on('close', () => {
+        if (!settled && res.complete === false) {
+          settle(reject, new Error(`连接已中断 (${pathname})`));
+        }
+      });
       res.on('end', () => {
         if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
           if (!raw) { settle(resolve, {}); return; }
@@ -956,9 +983,10 @@ function createTray() {
       },
     },
     {
+      id: 'content-protection',
       label: '屏幕共享隐身',
       type: 'checkbox',
-      checked: true,
+      checked: mainWindow?._contentProtection !== false,
       click: (menuItem) => {
         if (mainWindow && !mainWindow.isDestroyed()) {
           mainWindow._contentProtection = Boolean(menuItem.checked);
@@ -970,6 +998,7 @@ function createTray() {
     { label: '退出', click: () => { isQuitting = true; app.quit(); } },
   ]);
 
+  trayMenu = contextMenu;
   tray.setContextMenu(contextMenu);
   tray.on('click', () => { mainWindow?.show(); mainWindow?.focus(); });
   // Windows 双击托盘图标也能显示
@@ -1238,12 +1267,14 @@ ipcMain.handle('toggle-always-on-top', () => {
   return next;
 });
 ipcMain.handle('toggle-content-protection', () => {
-  if (!mainWindow) return true;
-  const webContents = mainWindow.webContents;
+  if (!mainWindow || mainWindow.isDestroyed()) return true;
   const isProtected = mainWindow._contentProtection !== false;
-  mainWindow._contentProtection = !isProtected;
-  mainWindow.setContentProtection(!isProtected);
-  return !isProtected;
+  const next = !isProtected;
+  mainWindow._contentProtection = next;
+  mainWindow.setContentProtection(next);
+  const stealthItem = trayMenu?.getMenuItemById?.('content-protection');
+  if (stealthItem) stealthItem.checked = next;
+  return next;
 });
 ipcMain.handle('get-window-state', () => ({
   alwaysOnTop: mainWindow?.isAlwaysOnTop() ?? false,
@@ -1509,10 +1540,19 @@ let pythonStopPromise = null;
 function gracefulStopPython(timeoutMs = 20000) {
   if (pythonStopPromise) return pythonStopPromise;
   const proc = pythonProcess;
-  if (!proc) return Promise.resolve();
+  if (!proc || proc.exitCode != null || proc.signalCode != null) return Promise.resolve();
   pythonStopPromise = new Promise((resolve) => {
     let settled = false;
-    const finish = () => { if (settled) return; settled = true; resolve(); };
+    let escalateTimer = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (escalateTimer) {
+        clearTimeout(escalateTimer);
+        escalateTimer = null;
+      }
+      resolve();
+    };
     proc.once('exit', finish);
     const stopTimeoutMs = Math.max(1000, timeoutMs - 5000);
     requestAssistStop(stopTimeoutMs).then(() => {
@@ -1522,7 +1562,8 @@ function gracefulStopPython(timeoutMs = 20000) {
       } else {
         try { proc.kill('SIGTERM'); } catch (err) { console.warn('[py] SIGTERM failed:', err.message); }
       }
-      const escalateTimer = setTimeout(() => {
+      escalateTimer = setTimeout(() => {
+        escalateTimer = null;
         if (settled) return;
         try {
           if (proc.exitCode == null && proc.signalCode == null) {
@@ -1534,7 +1575,6 @@ function gracefulStopPython(timeoutMs = 20000) {
         }
         finish();
       }, Math.max(1000, timeoutMs - stopTimeoutMs));
-      proc.once?.('exit', () => clearTimeout(escalateTimer));
     });
   });
   return pythonStopPromise;
@@ -1615,6 +1655,19 @@ app.on('will-quit', () => {
   }
   // 兜底:before-quit 通常已经 graceful 停过 pythonProcess,
   // 这里 fallback 防止异常路径泄漏子进程。
+  if (promptWheelHelper) {
+    const activeHelper = promptWheelHelper;
+    promptWheelHelper = null;
+    clearTimeout(activeHelper.startupTimer);
+    clearTimeout(activeHelper.killTimer);
+    terminateChildProcess(activeHelper, { sync: true });
+  }
+  for (const helper of [...exitingPromptWheelHelpers]) {
+    clearTimeout(helper.killTimer);
+    helper.killTimer = null;
+    exitingPromptWheelHelpers.delete(helper);
+    terminateChildProcess(helper, { sync: true });
+  }
   if (pythonProcess) {
     terminateChildProcess(pythonProcess, { sync: true });
     pythonProcess = null;

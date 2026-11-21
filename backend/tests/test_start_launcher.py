@@ -165,6 +165,13 @@ Active Connections
     assert start._parse_windows_listening_pids(sample, 1808) == [2004]
     assert start._parse_windows_listening_pids(sample, 18080) == [2002, 2003]
     assert start._parse_windows_listening_pids(sample, 9999) == []
+    # Malformed / portless IPv6 or empty-host addresses must never match a port
+    assert start._extract_port("::1") is None
+    assert start._extract_port("[::1") is None
+    assert start._extract_port(":80") is None
+    assert start._extract_port("[]:80") is None
+    assert start._extract_port("[::]:80") == 80
+    assert start._extract_port("127.0.0.1:8080") == 8080
 
 
 def test_kill_port_windows_kills_exact_port_and_skips_prefix_and_self(monkeypatch):
@@ -265,3 +272,26 @@ def test_get_local_ip_returns_ip_and_closes_socket_on_success(monkeypatch):
 
     assert start.get_local_ip() == "192.168.1.42"
     assert closed == [True]
+
+
+def test_kill_port_does_not_sleep_or_report_ok_when_kill_fails(monkeypatch, capsys):
+    start = load_start()
+    slept = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "netstat":
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout="  TCP    0.0.0.0:18080    0.0.0.0:0    LISTENING    4321\n", stderr=""
+            )
+        return subprocess.CompletedProcess(cmd, 128, stdout="", stderr="not found")
+
+    monkeypatch.setattr(start.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(start.subprocess, "run", fake_run)
+    monkeypatch.setattr(start.time, "sleep", lambda sec: slept.append(sec))
+
+    start.kill_port(18080)
+
+    assert slept == []
+    out = capsys.readouterr().out
+    assert "[OK]" not in out
+    assert "[WARN]" in out
