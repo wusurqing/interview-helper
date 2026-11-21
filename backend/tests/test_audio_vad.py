@@ -485,3 +485,23 @@ def test_soundcard_device_cache_concurrent_read_write_is_thread_safe(monkeypatch
     assert not errors
     for idx in range(6):
         assert audio._lookup_sc_speaker_guid(audio._SC_ID_BASE + idx) is not None
+
+
+def test_loopback_device_enumeration_preserves_speaker_channels(monkeypatch):
+    from types import SimpleNamespace
+    from services import audio
+
+    speaker = SimpleNamespace(name="Test speaker", id="loopback-test-id", channels=6)
+    monkeypatch.setattr(audio, "_HAS_SC", True)
+    monkeypatch.setattr(audio, "_sc", SimpleNamespace(
+        default_speaker=lambda: speaker, all_speakers=lambda: [speaker],
+    ), raising=False)
+    monkeypatch.setattr(audio, "_SC_DEVICE_CACHE", {})
+    monkeypatch.setattr(audio, "_SC_ID_MAP", {})
+    monkeypatch.setattr(audio.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(audio.sd, "query_devices", lambda: [])
+
+    [device] = AudioCapture.list_devices()
+    assert device["is_default_output"] and device["is_loopback"]
+    assert device["channels"] == 6 and device["sample_rate"] == 16000
+    assert audio._lookup_sc_speaker_guid(device["id"]) == speaker.id

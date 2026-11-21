@@ -114,60 +114,59 @@ def _is_sc_id(device_id) -> bool:
 
 def _lookup_sc_speaker_guid(device_id: int) -> Optional[str]:
     with _SC_CACHE_LOCK:
-        guid = _SC_ID_MAP.get(device_id)
-        if guid is None:
-            guid = _SC_DEVICE_CACHE.get(device_id, {}).get("guid")
-        return guid
+        return _SC_ID_MAP.get(device_id)
 
 
 def _get_sc_loopback_devices() -> list[dict]:
     """Return soundcard-based WASAPI loopback device entries."""
+    from collections import Counter
+
     if not _HAS_SC:
         return []
     with _SC_CACHE_LOCK:
-        previous_by_guid = {
-            meta.get("guid"): int(dev_id)
-            for dev_id, meta in _SC_DEVICE_CACHE.items()
-            if meta.get("guid")
+        try:
+            speakers = [(spk.id, spk.name, getattr(spk, "channels", 2)) for spk in _sc.all_speakers()]
+            default_id = _sc.default_speaker().id if speakers else None
+        except Exception:
+            # A failed native query is not evidence that all outputs disconnected.
+            return []
+
+        live_guids = {guid for guid, _, _ in speakers}
+        live_names = Counter(name for _, name, _ in speakers)
+        previous_by_guid = {meta["guid"]: dev_id for dev_id, meta in _SC_DEVICE_CACHE.items()}
+        previous_names = Counter(meta["name"] for meta in _SC_DEVICE_CACHE.values())
+        # An unambiguous name can recover a changed GUID, but must never take
+        # the ID of an endpoint still present under a new display name.
+        replacement_ids = {
+            meta["name"]: dev_id for dev_id, meta in _SC_DEVICE_CACHE.items()
+            if meta["guid"] not in live_guids and meta["name"] and previous_names[meta["name"]] == 1
         }
-        previous_by_name = {
-            meta.get("name"): int(dev_id)
-            for dev_id, meta in _SC_DEVICE_CACHE.items()
-            if meta.get("name")
-        }
-    result = []
-    next_map: dict[int, str] = {}
-    next_cache: dict[int, dict[str, str]] = {}
-    used_ids: set[int] = set()
-    try:
-        default_id = _sc.default_speaker().id
-        speakers = _sc.all_speakers()
-        for n, spk in enumerate(speakers):
-            dev_id = previous_by_guid.get(spk.id) or previous_by_name.get(spk.name) or (_SC_ID_BASE + n)
-            while dev_id in used_ids:
-                dev_id += 1
-            used_ids.add(dev_id)
-            next_map[dev_id] = spk.id
-            next_cache[dev_id] = {"guid": spk.id, "name": spk.name}
-            is_default = (spk.id == default_id)
-            label = ("★ " if is_default else "") + spk.name + " (系统音频)"
+        next_id = max(_SC_DEVICE_CACHE, default=_SC_ID_BASE - 1) + 1
+        result = []
+        next_map: dict[int, str] = {}
+        for guid, name, channels in speakers:
+            dev_id = previous_by_guid.get(guid)
+            if dev_id is None and live_names[name] == 1:
+                dev_id = replacement_ids.get(name)
+            if dev_id is None:
+                dev_id = next_id
+                next_id += 1
+            next_map[dev_id] = guid
+            _SC_DEVICE_CACHE[dev_id] = {"guid": guid, "name": name}
+            is_default = (guid == default_id)
+            label = ("★ " if is_default else "") + name + " (系统音频)"
             result.append({
                 "id": dev_id,
                 "name": label,
-                "channels": getattr(spk, "channels", 2),
-                "sample_rate": 16000,
+                "channels": channels,
+                "sample_rate": AudioCapture.SAMPLE_RATE,
                 "is_loopback": True,
                 "category": "system_audio",
                 "host_api": "WASAPI (soundcard)",
                 "is_default_output": is_default,
             })
-    except Exception:
-        pass
-    if next_map:
-        with _SC_CACHE_LOCK:
-            _SC_ID_MAP.clear()
-            _SC_ID_MAP.update(next_map)
-            _SC_DEVICE_CACHE.update(next_cache)
+        _SC_ID_MAP.clear()
+        _SC_ID_MAP.update(next_map)
     # default output first
     result.sort(key=_audio_device_sort_key)
     return result
@@ -540,7 +539,7 @@ class AudioCapture:
                 pending_chunks: list[np.ndarray] = []
                 pending_samples = 0
                 with mic.recorder(samplerate=self.SAMPLE_RATE,
-                                  channels=1,
+                                  channels=self.CHANNELS,
                                   blocksize=self.LOOPBACK_RECORDER_BLOCK_SIZE) as rec:
                     while not stop_event.is_set() and self._running:
                         # SoundCard docs recommend using a fixed numframes that is
