@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 from core.logger import get_logger
@@ -53,8 +54,12 @@ def vision_caption(png_path: Path, *, deadline_s: float = 20.0) -> Optional[str]
         return None
 
     try:
-        from services.llm.streaming import chat_completion_create
+        from services.llm.streaming import _build_think_params, chat_completion_create
 
+        think_params = _build_think_params(
+            model_cfg,
+            SimpleNamespace(think_mode=False, think_effort="off", max_tokens=400),
+        )
         resp = chat_completion_create(
             model_cfg,
             [
@@ -71,6 +76,7 @@ def vision_caption(png_path: Path, *, deadline_s: float = 20.0) -> Optional[str]
             ],
             temperature=0.0,
             max_tokens=400,
+            think_params=think_params,
             trace_context={"scene": "kb_vision_caption", "image_path": str(png_path)},
             timeout=(10, max(5.0, deadline_s)),
         )
@@ -79,25 +85,46 @@ def vision_caption(png_path: Path, *, deadline_s: float = 20.0) -> Optional[str]
         return None
 
     try:
+        if not getattr(resp, "choices", None):
+            return None
         content = (resp.choices[0].message.content or "").strip()
     except Exception:  # pragma: no cover
         return None
     return content or None
 
 
+def _is_usable_vision_model(model) -> bool:
+    return (
+        bool(getattr(model, "supports_vision", False))
+        and bool(getattr(model, "enabled", True))
+        and bool(getattr(model, "api_key", ""))
+        and getattr(model, "api_key", "") not in ("", "sk-your-api-key-here")
+    )
+
+
 def _pick_vision_model():
-    """复用 vision_verify 的选模型逻辑：supports_vision + enabled + 有 api_key。"""
+    """优先尊重已选视觉模型（assist_screenshot_model_id / active_model_id），否则回退到首个可用 vision 模型。"""
     try:
         from core.config import get_config  # type: ignore
     except Exception:  # pragma: no cover
         return None
     cfg = get_config()
-    for m in getattr(cfg, "models", []) or []:
-        if (
-            getattr(m, "supports_vision", False)
-            and bool(getattr(m, "enabled", True))
-            and getattr(m, "api_key", "")
-            and m.api_key not in ("", "sk-your-api-key-here")
-        ):
+    models = list(getattr(cfg, "models", []) or [])
+    by_id = {getattr(m, "id", None): m for m in models if getattr(m, "id", None)}
+
+    for preferred_id in (
+        getattr(cfg, "assist_screenshot_model_id", None),
+        getattr(cfg, "active_model_id", None),
+    ):
+        if preferred_id and preferred_id in by_id and _is_usable_vision_model(by_id[preferred_id]):
+            return by_id[preferred_id]
+
+    active_idx = getattr(cfg, "active_model", None)
+    if isinstance(active_idx, int) and 0 <= active_idx < len(models):
+        if _is_usable_vision_model(models[active_idx]):
+            return models[active_idx]
+
+    for m in models:
+        if _is_usable_vision_model(m):
             return m
     return None

@@ -12,6 +12,7 @@ from services.storage.paths import backend_root
 
 from . import loaders as _loaders  # noqa: F401  触发 register 副作用
 from .chunker import chunk_doc
+from .loaders.pdf import clear_pdf_cache
 from .store import KBStore
 
 _log = get_logger(__name__)
@@ -212,6 +213,7 @@ def _reindex_locked(force: bool) -> dict[str, Any]:
     for row in store.list_docs():
         if row["path"] not in on_disk:
             store.delete_doc(row["path"])
+            clear_pdf_cache(row["path"])
 
     info = store.stats()
     info["reindexed_files"] = reindexed
@@ -230,6 +232,7 @@ def _reindex_file_locked(path: Path, norm: str, *, force: bool) -> dict[str, Any
     store = _get_store()
     if not path.exists() or not path.is_file():
         store.delete_doc(norm)
+        clear_pdf_cache(norm)
         info = store.stats()
         info["reindexed_files"] = 0
         return info
@@ -270,6 +273,7 @@ def remove_file(rel_path: str) -> None:
         except Exception as e:  # pragma: no cover
             _log.warning("kb indexer remove_file 删除磁盘文件失败 %s: %s", rel_path, e)
         _get_store().delete_doc(norm)
+        clear_pdf_cache(norm)
 
 
 __all__ = [

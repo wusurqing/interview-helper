@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+import zipfile
 
 from core.logger import get_logger
 
@@ -10,6 +11,10 @@ from ..types import RawDoc, RawSection
 from ._base import register
 
 _log = get_logger(__name__)
+
+MAX_DOCX_ZIP_ENTRIES = 1000
+MAX_DOCX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+_READ_CHUNK_BYTES = 64 * 1024
 
 try:
     from docx import Document  # python-docx
@@ -19,6 +24,39 @@ except Exception as e:  # pragma: no cover
     _DOCX_OK = False
 
 
+def _validate_docx_archive(file_path: Path) -> None:
+    """Reject ZIP-bomb DOCX archives before handing them to python-docx."""
+    try:
+        with zipfile.ZipFile(file_path) as zf:
+            infos = zf.infolist()
+            if len(infos) > MAX_DOCX_ZIP_ENTRIES:
+                raise ValueError(
+                    f"DOCX 压缩包条目数超过上限（{len(infos)} > {MAX_DOCX_ZIP_ENTRIES}）"
+                )
+            declared_total = 0
+            for info in infos:
+                if info.file_size < 0:
+                    raise ValueError("无效的 DOCX 文件")
+                declared_total += info.file_size
+                if declared_total > MAX_DOCX_UNCOMPRESSED_BYTES:
+                    raise ValueError("DOCX 解压后体积超过安全上限")
+            # Stream-verify actual decompressed bytes to defend against forged ZIP headers.
+            actual_total = 0
+            for info in infos:
+                if info.is_dir():
+                    continue
+                with zf.open(info, "r") as stream:
+                    while True:
+                        chunk = stream.read(_READ_CHUNK_BYTES)
+                        if not chunk:
+                            break
+                        actual_total += len(chunk)
+                        if actual_total > MAX_DOCX_UNCOMPRESSED_BYTES:
+                            raise ValueError("DOCX 实际解压体积超过安全上限")
+    except zipfile.BadZipFile:
+        raise ValueError("无效的 DOCX 文件") from None
+
+
 class DocxLoader:
     name = "docx"
     extensions = (".docx",)
@@ -26,6 +64,7 @@ class DocxLoader:
     def load(self, file_path: Path, *, rel_path: str) -> RawDoc:
         if not _DOCX_OK:
             raise RuntimeError("python-docx 未安装：请 `pip install python-docx`")
+        _validate_docx_archive(file_path)
         doc = Document(str(file_path))
         title: Optional[str] = None
         heading_stack: list[tuple[int, str]] = []
