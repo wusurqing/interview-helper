@@ -14,6 +14,9 @@ jobs:
   # ── Detect what changed ─────────────────────────────────────
   changes:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       backend: ${{ steps.filter.outputs.backend }}
       frontend: ${{ steps.filter.outputs.frontend }}
@@ -321,16 +324,18 @@ jobs:
         run: npm ci
 
       - name: Run end-to-end smoke
-        run: python scripts/e2e_test.py
+        run: |
+          python -m unittest discover -s scripts -p test_e2e_smoke.py
+          python scripts/e2e_test.py
+        env:
+          IA_SMOKE_LOG_DIR: ${{ runner.temp }}/ia-smoke-logs
 
       - name: Upload backend log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: e2e-smoke-logs
-          path: |
-            log/
-            backend/data/
+          path: ${{ runner.temp }}/ia-smoke-logs
           retention-days: 3
           if-no-files-found: ignore
 
@@ -339,12 +344,16 @@ jobs:
   # When this gate fails on visual diff, regenerate baselines on the
   # branch via the `update-visual-snapshots` workflow.
   ci-gate:
-    needs: [backend, frontend, desktop, e2e-playwright, e2e-smoke, e2e-visual]
+    needs: [changes, backend, frontend, desktop, e2e-playwright, e2e-smoke, e2e-visual]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: Check all required jobs succeeded or were skipped
         run: |
+          if [ "${{ needs.changes.result }}" != success ]; then
+            echo "Could not determine the checks required for this change"
+            exit 1
+          fi
           ok=true
           for r in "${{ needs.backend.result }}" \
                    "${{ needs.frontend.result }}" \
