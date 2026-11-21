@@ -156,11 +156,13 @@ def parse_log_sessions(log_path: Path, *, until: Optional[float] = None) -> list
                 pending_question = ""
                 continue
 
-            if "ANSWER_DONE" in line:
+            if "ANSWER_DONE" in line and "EXAM_PREFLIGHT_ANSWER_DONE" not in line:
                 qa_match = QA_ID_RE.search(line)
                 if not qa_match:
                     continue
                 qa_id = qa_match.group(1)
+                if qa_id in ("", "None", "null"):
+                    continue
                 turn = current.turns.get(qa_id)
                 if turn is None:
                     turn = LogTurn(qa_id=qa_id, seq=len(current.turns) + 1)
@@ -175,17 +177,27 @@ def parse_log_sessions(log_path: Path, *, until: Optional[float] = None) -> list
                 )
                 continue
 
-            if "CANDIDATE_ASR_" in line and "qa_id=" in line:
+            if (
+                "CANDIDATE_ASR_" in line
+                and "CANDIDATE_ASR_SEGMENT_START" not in line
+                and "qa_id=" in line
+            ):
                 qa_match = CANDIDATE_QA_RE.search(line)
                 seg_match = SEGMENT_RE.search(line)
                 if not qa_match:
                     continue
                 qa_id = qa_match.group(1)
+                if qa_id in ("", "None", "null"):
+                    continue
+                has_text = "text=" in line
+                chars_match = None if has_text else CHARS_RE.search(line)
+                if not has_text and chars_match is None:
+                    continue
                 turn = current.turns.get(qa_id)
                 if turn is None:
                     turn = LogTurn(qa_id=qa_id, seq=len(current.turns) + 1)
                     current.turns[qa_id] = turn
-                if "text=" in line:
+                if has_text:
                     segment_id = seg_match.group(1) if seg_match else f"{qa_id}-segment-{len(current.turns)}"
                     text = _extract_repr(line, "text")
                     if not text:
@@ -197,13 +209,11 @@ def parse_log_sessions(log_path: Path, *, until: Optional[float] = None) -> list
                             text=text,
                             is_final=is_final,
                         )
-                else:
-                    chars_match = CHARS_RE.search(line)
-                    if chars_match:
-                        turn.redacted_candidate_chars = max(
-                            turn.redacted_candidate_chars,
-                            int(chars_match.group(1)),
-                        )
+                elif chars_match is not None:
+                    turn.redacted_candidate_chars = max(
+                        turn.redacted_candidate_chars,
+                        int(chars_match.group(1)),
+                    )
 
     if current is not None:
         sessions.append(current)
@@ -226,25 +236,46 @@ def backfill_turns_from_knowledge_db(
         ).fetchone()
         if not table_exists:
             return stats
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(question_records)").fetchall()
+        }
+        if "qa_id" not in columns:
+            return stats
+        has_candidate_col = "candidate_answer" in columns
+        select_cols = "question, answer, candidate_answer" if has_candidate_col else "question, answer"
+        order_col = "created_at DESC, id DESC" if "created_at" in columns else "id DESC"
         for qa_id, turn in log_session.turns.items():
-            if not qa_id:
+            if not qa_id or qa_id in ("None", "null"):
                 continue
-            row = conn.execute(
-                """
-                SELECT question, answer, candidate_answer
+            rows = conn.execute(
+                f"""
+                SELECT {select_cols}
                 FROM question_records
                 WHERE qa_id = ?
-                ORDER BY created_at DESC, id DESC
-                LIMIT 1
+                ORDER BY {order_col}
                 """,
                 (qa_id,),
-            ).fetchone()
-            if row is None:
+            ).fetchall()
+            if not rows:
                 continue
             stats["matched_turns"] += 1
-            db_question = _clean_question(str(row["question"] or ""))
-            db_answer = str(row["answer"] or "").strip()
-            db_candidate = str(row["candidate_answer"] or "").strip()
+            db_question = next(
+                (q for row in rows if (q := _clean_question(str(row["question"] or "")))),
+                "",
+            )
+            db_answer = next(
+                (a for row in rows if (a := str(row["answer"] or "").strip())),
+                "",
+            )
+            db_candidate = (
+                next(
+                    (c for row in rows if (c := str(row["candidate_answer"] or "").strip())),
+                    "",
+                )
+                if has_candidate_col
+                else ""
+            )
             if not turn.question and db_question:
                 turn.question = db_question
             if not turn.candidate_answer and db_candidate:

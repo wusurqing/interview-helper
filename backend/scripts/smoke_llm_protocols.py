@@ -81,8 +81,11 @@ def main(argv: list[str] | None = None) -> int:
     cfg = get_config()
     targets = []
     if args.index is not None:
+        if not cfg.models:
+            print("当前配置中没有可测模型")
+            return 1
         if args.index < 0 or args.index >= len(cfg.models):
-            print(f"模型下标越界: {args.index}（可用范围 0..{max(0, len(cfg.models) - 1)}）")
+            print(f"模型下标越界: {args.index}（可用范围 0..{len(cfg.models) - 1}）")
             return 1
         targets = [cfg.models[args.index]]
     else:

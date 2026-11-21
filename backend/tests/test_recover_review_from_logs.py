@@ -108,3 +108,60 @@ def test_parse_redacted_logs_and_backfill_from_knowledge_db(tmp_path: Path, monk
     assert updated is not None
     assert updated["status"] == "recorded"
     assert len(updated["turns"]) == 1
+
+
+def test_parse_ignores_none_qa_id_segment_start_and_exam_preflight_and_handles_legacy_or_dup_kb(tmp_path: Path):
+    import sqlite3
+
+    log_path = tmp_path / "interview.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "2026-06-24 10:48:35 | INFO  | interview | INTERVIEW_START device=20000 loopback=False",
+                "2026-06-24 10:48:40 | INFO  | interview | CANDIDATE_ASR_SEGMENT_START segment=cand-0 qa_id=None",
+                "2026-06-24 10:48:42 | INFO  | interview | CANDIDATE_ASR_PUBLISH segment=cand-0 qa_id=None final=True provider=doubao chars=12",
+                "2026-06-24 10:49:01 | INFO  | interview | ANSWER_START id=qa-1 model=demo source=conversation_loopback followup=False q='讲讲 Redis'",
+                "2026-06-24 10:49:10 | INFO  | interview | CANDIDATE_ASR_PUBLISH segment=cand-1 qa_id=qa-1 final=True provider=doubao chars=20",
+                "2026-06-24 10:49:15 | INFO  | interview | ANSWER_DONE id=qa-1 model=demo answer_len=40",
+                "2026-06-24 10:49:20 | INFO  | interview | EXAM_PREFLIGHT_ANSWER_DONE id=exam-pre model=demo answer_len=10",
+                "2026-06-24 10:50:00 | INFO  | interview | INTERVIEW_STOP qa_count=1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    sessions = parse_log_sessions(log_path)
+    assert len(sessions) == 1
+    assert list(sessions[0].turns.keys()) == ["qa-1"]
+    assert sessions[0].turns["qa-1"].seq == 1
+
+    # Legacy knowledge.db lacking qa_id/candidate_answer must not crash with OperationalError
+    legacy_kb = tmp_path / "legacy_knowledge.db"
+    conn = sqlite3.connect(legacy_kb)
+    conn.execute("CREATE TABLE question_records (id INTEGER PRIMARY KEY, question TEXT, answer TEXT, created_at REAL)")
+    conn.commit()
+    conn.close()
+    assert backfill_turns_from_knowledge_db(sessions[0], knowledge_db_path=legacy_kb) == {
+        "matched_turns": 0,
+        "candidate_filled": 0,
+        "reference_filled": 0,
+    }
+
+    # Duplicate qa_id rows: newer row has empty candidate_answer, older row has real candidate_answer
+    dup_kb = tmp_path / "dup_knowledge.db"
+    conn = sqlite3.connect(dup_kb)
+    conn.execute(
+        "CREATE TABLE question_records "
+        "(id INTEGER PRIMARY KEY, qa_id TEXT, question TEXT, answer TEXT, candidate_answer TEXT, created_at REAL)"
+    )
+    conn.execute(
+        "INSERT INTO question_records VALUES (1, 'qa-1', '讲讲 Redis', '完整参考答案', '真实的候选人回答', 1000.0)"
+    )
+    conn.execute(
+        "INSERT INTO question_records VALUES (2, 'qa-1', '讲讲 Redis', '完整参考答案', '', 2000.0)"
+    )
+    conn.commit()
+    conn.close()
+    stats = backfill_turns_from_knowledge_db(sessions[0], knowledge_db_path=dup_kb)
+    assert stats == {"matched_turns": 1, "candidate_filled": 1, "reference_filled": 1}
+    assert sessions[0].turns["qa-1"].candidate_answer == "真实的候选人回答"

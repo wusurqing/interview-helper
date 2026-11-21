@@ -89,6 +89,35 @@ def test_import_review_from_logs_extracts_repr_deduplicates_and_sets_recorded(mo
     assert listed["items"][0]["source"] == "log_import"
 
 
+def test_import_review_from_logs_preserves_last_turn_of_crashed_session_before_next_start(tmp_path: Path):
+    log_path = tmp_path / "crashed.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "2026-06-25 09:00:00 | INFO | interview | INTERVIEW_START device=20000",
+                "2026-06-25 09:00:10 | INFO | interview | ASR_QUESTION turn=1 text='问题1'",
+                "2026-06-25 09:00:11 | INFO | interview | ANSWER_START id=qa-1 source=conversation_loopback",
+                "2026-06-25 09:00:15 | INFO | interview | ANSWER_DONE id=qa-1 answer_len=50",
+                "2026-06-25 09:01:00 | INFO | interview | ASR_QUESTION turn=2 text='问题2'",
+                "2026-06-25 09:01:05 | INFO | interview | ANSWER_DONE id=qa-2 answer_len=60",
+                # Crash: next INTERVIEW_START without INTERVIEW_STOP
+                "2026-06-25 10:00:00 | INFO | interview | INTERVIEW_START device=20000",
+                "2026-06-25 10:00:10 | INFO | interview | ASR_QUESTION turn=1 text='新会话问题'",
+                "2026-06-25 10:00:11 | INFO | interview | ANSWER_START id=qa-3 source=conversation_loopback",
+                "2026-06-25 10:00:20 | INFO | interview | INTERVIEW_STOP qa_count=1",
+                # Stray line after stop must not leak into the closed session
+                "2026-06-25 10:05:00 | INFO | interview | ASR_QUESTION turn=2 text='停录后噪音'",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    sessions = import_review_from_logs.parse_log_file(str(log_path))
+    assert len(sessions) == 2
+    assert [t["question"] for t in sessions[0]["turns"]] == ["问题1", "问题2"]
+    assert [t["question"] for t in sessions[1]["turns"]] == ["新会话问题"]
+
+
 def test_seed_job_tracker_demo_clears_only_demo_records_via_storage_connections(monkeypatch, tmp_path: Path):
     _isolate_dbs(monkeypatch, tmp_path)
 

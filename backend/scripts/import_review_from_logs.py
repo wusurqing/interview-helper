@@ -36,10 +36,13 @@ def parse_log_file(log_path: str) -> List[Dict[str, Any]]:
         for line in f:
             # 检测会话开始：INTERVIEW_START
             if 'INTERVIEW_START' in line:
-                # 如果有正在记录的 session，先保存
-                if current_session and current_turns and has_conversation:
-                    current_session['turns'] = current_turns
-                    sessions.append(current_session)
+                # 如果有正在记录的 session（例如前一场异常中断未打印 INTERVIEW_STOP），先完整落盘最后一个 QA
+                if current_session:
+                    if current_qa.get('question'):
+                        current_turns.append(current_qa)
+                    if current_turns and has_conversation:
+                        current_session['turns'] = current_turns
+                        sessions.append(current_session)
 
                 # 提取时间戳
                 ts_match = re.search(r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', line)
@@ -69,6 +72,12 @@ def parse_log_file(log_path: str) -> List[Dict[str, Any]]:
                 if ts_match:
                     dt = datetime.strptime(ts_match.group(1), '%Y-%m-%d %H:%M:%S')
                     current_session['ended_at'] = dt.timestamp()
+                if current_turns and has_conversation:
+                    current_session['turns'] = current_turns
+                    sessions.append(current_session)
+                current_session = None
+                current_turns = []
+                has_conversation = False
 
             # 检测真实对话：source=conversation_loopback
             elif current_session and 'source=conversation_loopback' in line:
@@ -122,16 +131,18 @@ def parse_log_file(log_path: str) -> List[Dict[str, Any]]:
 
 def _collect_existing_started_ats() -> list[float]:
     started_ats: list[float] = []
+    fetched = 0
     page = 1
     page_size = review.MAX_REVIEW_PAGE_SIZE
     while True:
         batch = review.list_sessions(page=page, page_size=page_size)
         items = batch.get('items') or []
+        fetched += len(items)
         for item in items:
             started = item.get('started_at')
             if started is not None:
                 started_ats.append(float(started))
-        if len(started_ats) >= int(batch.get('total') or 0) or not items:
+        if fetched >= int(batch.get('total') or 0) or not items:
             break
         page += 1
     return started_ats

@@ -185,3 +185,35 @@ def test_run_replay_suite_can_temporarily_select_generic_and_lite_ark(monkeypatc
     assert restored.active_model == 0
     assert restored.max_parallel_answers == 2
     assert restored.assist_stop_answer_wait_sec == 3.0
+
+
+def test_temporary_answer_runtime_rejects_disabled_model_and_prefers_enabled_match(monkeypatch):
+    import pytest
+    from core import config as config_mod
+
+    p1 = config_mod.ModelProvider(
+        id="p1",
+        name="P1",
+        api_base_url="https://api.example.com/v1",
+        api_type="openai",
+        api_key="sk-1",
+    )
+    cfg = config_mod.AppConfig(
+        model_providers=[p1],
+        models=[
+            config_mod.ModelConfig(id="m-disabled", name="lite-disabled", provider_id="p1", model="lite-disabled", enabled=False),
+            config_mod.ModelConfig(id="m-dup-off", name="dup-lite", provider_id="p1", model="dup-lite", enabled=False),
+            config_mod.ModelConfig(id="m-dup-on", name="dup-lite", provider_id="p1", model="dup-lite", enabled=True),
+        ],
+        active_model_id="m-dup-on",
+        assist_model_ids=["m-dup-on"],
+    )
+    monkeypatch.setattr(config_mod, "_config", cfg)
+
+    with pytest.raises(RuntimeError, match="未启用或未配置有效 API Key"):
+        with suite_script._temporary_answer_runtime(answer_model_name="lite-disabled"):
+            pass
+
+    # When both disabled and enabled models share a name, prefer the enabled one
+    with suite_script._temporary_answer_runtime(answer_model_name="dup-lite"):
+        assert config_mod.get_config().assist_model_ids[0] == "m-dup-on"

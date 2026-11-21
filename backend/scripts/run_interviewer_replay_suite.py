@@ -34,20 +34,33 @@ def _temporary_stt_provider(provider: str):
         yield
 
 
+def _model_is_usable(model) -> bool:
+    if getattr(model, "enabled", True) is False:
+        return False
+    api_key = (getattr(model, "api_key", "") or "").strip()
+    return bool(api_key and api_key != "sk-your-api-key-here")
+
+
 def _find_model_index_by_name(model_name: str) -> int | None:
     target = (model_name or "").strip().lower()
     if not target:
         return None
     cfg = get_config()
+    exact_matches: list[int] = []
     for idx, model in enumerate(cfg.models):
         name = (getattr(model, "name", "") or "").strip().lower()
         model_id = (getattr(model, "model", "") or "").strip().lower()
         if target == name or target == model_id:
-            return idx
+            exact_matches.append(idx)
+    if exact_matches:
+        return next((idx for idx in exact_matches if _model_is_usable(cfg.models[idx])), exact_matches[0])
+    partial_matches: list[int] = []
     for idx, model in enumerate(cfg.models):
         label = f"{getattr(model, 'name', '')} {getattr(model, 'model', '')}".lower()
         if target in label:
-            return idx
+            partial_matches.append(idx)
+    if partial_matches:
+        return next((idx for idx in partial_matches if _model_is_usable(cfg.models[idx])), partial_matches[0])
     return None
 
 
@@ -64,7 +77,10 @@ def _temporary_answer_runtime(
     if answer_model_name and model_idx is None:
         raise RuntimeError(f"找不到 answer model: {answer_model_name}")
     if model_idx is not None:
-        model_id = getattr(cfg.models[model_idx], "id", "")
+        target_model = cfg.models[model_idx]
+        if not _model_is_usable(target_model):
+            raise RuntimeError(f"answer model 未启用或未配置有效 API Key: {answer_model_name}")
+        model_id = getattr(target_model, "id", "")
         selected = getattr(cfg, "assist_model_ids", None)
         if model_id and selected is not None:
             updates["assist_model_ids"] = [model_id] + [other_id for other_id in selected if other_id != model_id]
@@ -111,7 +127,9 @@ def run_replay_suite(
         cfg = get_config()
         effective_provider = (stt_provider or getattr(get_config(), "stt_provider", "") or "").strip()
         answer_order = dispatch_model_order(cfg)
-        effective_answer_model = getattr(cfg.models[answer_order[0]], "name", "") if answer_order else ""
+        usable_order = [idx for idx in answer_order if _model_is_usable(cfg.models[idx])]
+        chosen_idx = usable_order[0] if usable_order else (answer_order[0] if answer_order else None)
+        effective_answer_model = getattr(cfg.models[chosen_idx], "name", "") if chosen_idx is not None else ""
         effective_max_parallel = int(getattr(cfg, "max_parallel_answers", 2) or 2)
         for scenario_id in selected_ids:
             wav_path = tmp_dir / f"{scenario_id}.wav"

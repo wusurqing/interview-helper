@@ -92,3 +92,10 @@ def test_smoke_main_rejects_out_of_range_index(monkeypatch):
 
     assert smoke_script.main(["--index", "5"]) == 1
     assert smoke_script.main(["--index", "-1"]) == 1
+
+    monkeypatch.setattr(
+        smoke_script,
+        "get_config",
+        lambda: SimpleNamespace(models=[]),
+    )
+    assert smoke_script.main(["--index", "0"]) == 1
