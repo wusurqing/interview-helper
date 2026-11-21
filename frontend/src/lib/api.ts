@@ -91,17 +91,8 @@ function formatDetailValue(value: unknown): string | null {
   return null
 }
 
-async function parseResponseBody(res: Response): Promise<unknown> {
-  const text = await res.text().catch(() => '')
+function parseResponseBody(text: string): unknown {
   if (!text) return null
-  const contentType = res.headers.get('content-type') ?? ''
-  if (contentType.includes('json')) {
-    try {
-      return JSON.parse(text)
-    } catch {
-      return text
-    }
-  }
   try {
     return JSON.parse(text)
   } catch {
@@ -109,14 +100,14 @@ async function parseResponseBody(res: Response): Promise<unknown> {
   }
 }
 
-async function buildResponseErrorMessage(res: Response, fallback?: string): Promise<string> {
-  const body = await parseResponseBody(res)
+function buildResponseErrorMessage(res: Response, text: string, fallback?: string): string {
+  const body = parseResponseBody(text)
   const detail = isRecord(body) ? body.detail ?? body.message ?? body.error : body
   const detailText = formatDetailValue(detail) ?? fallback ?? res.statusText ?? '请求失败'
   return `请求失败 (${res.status}): ${detailText}`
 }
 
-async function fetchBackend(input: string, init?: ApiRequestInit): Promise<Response> {
+async function fetchBackend(input: string, init?: ApiRequestInit) {
   const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal: callerSignal, ...rest } = init ?? {}
   const controller = new AbortController()
   let timedOut = false
@@ -140,7 +131,10 @@ async function fetchBackend(input: string, init?: ApiRequestInit): Promise<Respo
   }
 
   try {
-    return await fetch(input, { ...rest, signal: controller.signal })
+    const res = await fetch(input, { ...rest, signal: controller.signal })
+    // Fetch resolves at the headers. Keep cancellation active until the body finishes.
+    const text = await res.text()
+    return { res, text }
   } catch (error) {
     if (callerSignal?.aborted) throw error
     if (timedOut) throw new Error(BACKEND_TIMEOUT_MESSAGE)
@@ -180,16 +174,15 @@ export class ApiRequestError extends Error {
 }
 
 export async function request<T = unknown>(url: string, opts?: ApiRequestInit): Promise<T> {
-  const res = await fetchBackend(buildApiUrl(url), {
+  const { res, text } = await fetchBackend(buildApiUrl(url), {
     ...opts,
     headers: buildHeaders(opts?.headers),
   })
   if (!res.ok) {
-    throw new ApiRequestError(await buildResponseErrorMessage(res), res.status)
+    throw new ApiRequestError(buildResponseErrorMessage(res, text), res.status)
   }
   if (res.status === 204) return undefined as T
-  const body = await parseResponseBody(res)
-  return body as T
+  return parseResponseBody(text) as T
 }
 
 export interface ResumeHistoryItem {
@@ -313,16 +306,16 @@ export const api = {
     const token = getAuthToken()
     const headers: Record<string, string> = {}
     if (token) headers.Authorization = `Bearer ${token}`
-    const res = await fetchBackend(buildApiUrl('/api/resume'), {
+    const { res, text } = await fetchBackend(buildApiUrl('/api/resume'), {
       method: 'POST',
       body: fd,
       headers,
       timeoutMs: LONG_REQUEST_TIMEOUT_MS,
     })
     if (!res.ok) {
-      throw new Error(await buildResponseErrorMessage(res, '上传失败'))
+      throw new Error(buildResponseErrorMessage(res, text, '上传失败'))
     }
-    return res.json()
+    return JSON.parse(text)
   },
   deleteResume: () => request<{ ok: boolean }>('/api/resume', { method: 'DELETE' }),
   resumeHistory: () => request<{ items: ResumeHistoryItem[]; max: number }>('/api/resume/history'),
@@ -620,15 +613,15 @@ export const api = {
     const token = getAuthToken()
     const headers: Record<string, string> = {}
     if (token) headers.Authorization = `Bearer ${token}`
-    const res = await fetchBackend(buildApiUrl('/api/kb/upload'), {
+    const { res, text } = await fetchBackend(buildApiUrl('/api/kb/upload'), {
       method: 'POST',
       body: fd,
       headers,
       timeoutMs: LONG_REQUEST_TIMEOUT_MS,
     })
     if (!res.ok) {
-      throw new Error(await buildResponseErrorMessage(res, '上传失败'))
+      throw new Error(buildResponseErrorMessage(res, text, '上传失败'))
     }
-    return res.json()
+    return JSON.parse(text)
   },
 }

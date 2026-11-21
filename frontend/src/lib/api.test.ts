@@ -119,4 +119,36 @@ describe('api error handling', () => {
     caller.abort()
     await expect(pending).rejects.toMatchObject({ name: 'AbortError' })
   })
+
+  it.each(['timeout', 'caller'])('honors %s cancellation while reading a response body', async (source) => {
+    vi.useFakeTimers()
+    try {
+      const caller = new AbortController()
+      vi.stubGlobal('fetch', async (_input: string, init: RequestInit) => new Response(
+        new ReadableStream({
+          start(controller) {
+            const delivery = setTimeout(() => {
+              controller.enqueue(new TextEncoder().encode('"late response"'))
+              controller.close()
+            }, 1000)
+            init.signal!.addEventListener('abort', () => {
+              clearTimeout(delivery)
+              controller.error(init.signal!.reason)
+            }, { once: true })
+          },
+        }),
+      ))
+
+      const pending = request('/api/slow-body', { timeoutMs: 250, signal: caller.signal })
+      const outcome = pending.catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(10)
+      if (source === 'caller') caller.abort()
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(await outcome).toMatchObject(source === 'caller'
+        ? { name: 'AbortError' }
+        : { message: '请求超时，请检查后端服务或网络后重试' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })
