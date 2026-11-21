@@ -27,6 +27,8 @@ jobs:
           filters: |
             backend:
               - 'backend/**'
+              - 'start.py'
+              - 'tools/mmpg-probe/**'
               - '.github/workflows/ci.yml'
             frontend:
               - 'frontend/**'
@@ -74,8 +76,11 @@ jobs:
         run: python -m py_compile main.py api/assist/pipeline.py api/common/router.py
 
       - name: Run unit tests
-        run: |
-          python -m pytest tests/test_api_contracts.py tests/test_wave1_backend_concurrency.py tests/test_session_integration.py tests/test_assist_asr_interrupt.py tests/test_preflight_real_audio.py tests/test_prompt_polish.py tests/test_bench_prompt.py tests/test_router_p0.py tests/test_pipeline_p0.py tests/test_resume_optimizer.py tests/test_cloud_asr_contract.py tests/test_stt_doubao.py tests/test_stt_generic_http.py tests/test_stt_mmpg.py tests/test_mmpg_turns.py tests/test_single_mic_mmpg_integration.py -q --tb=short
+        run: python -m pytest tests -q --tb=short
+
+      - name: Run MMPG probe tests
+        working-directory: tools/mmpg-probe
+        run: python -m pytest test_probe.py -q --tb=short
 
   # ── Frontend ─────────────────────────────────────────────
   frontend:
@@ -135,13 +140,23 @@ jobs:
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python test runner
+        run: pip install pytest
+
       - name: Install dependencies
         # Tests only need the Electron package to be resolvable; skipping its
         # binary download keeps this job fast and avoids a flaky external fetch.
         run: npm ci --ignore-scripts
 
       - name: Run desktop unit tests
-        run: node --test multiScreenBatch.test.js windowOptions.test.js shortcuts.test.js preload.test.js overlayVisibility.test.js mainWindowOpacity.test.js
+        run: npm test
+
+      - name: Run desktop Python mouse-hook tests
+        run: python -m pytest test_prompt_mouse_hook.py -q --tb=short
 
   # ── Playwright E2E (mocked backend, no live API needed) ──
   e2e-playwright:

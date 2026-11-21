@@ -29,10 +29,13 @@ _DOC_FAIL_MSG = "不支持 .doc，请在 Word 里另存为 .docx 后再上传"
 
 
 def resolve_path(path_str: str) -> Path:
-    """相对路径按 backend_root 解析; 绝对路径原样返回。"""
+    """相对路径按 backend_root 解析; 设置 IA_DATA_DIR 时将 data/* 映射到隔离数据目录; 绝对路径原样返回。"""
     p = Path(path_str)
     if p.is_absolute():
         return p
+    data_override = os.environ.get("IA_DATA_DIR", "").strip()
+    if data_override and p.parts and p.parts[0] == "data":
+        return Path(os.path.abspath(data_override)).joinpath(*p.parts[1:])
     return Path(backend_root()) / p
 
 
