@@ -87,11 +87,9 @@ def _hidden_process_kwargs() -> dict:
 
 def get_local_ip() -> str:
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
     except Exception:
         return "127.0.0.1"
 
@@ -270,9 +268,43 @@ def ensure_electron():
 # Port management
 # ---------------------------------------------------------------------------
 
+def _extract_port(address: str) -> Optional[int]:
+    """Extract numeric port from a netstat local address like 0.0.0.0:80 or [::]:18080."""
+    if ":" not in address:
+        return None
+    _, port_str = address.rsplit(":", 1)
+    if not port_str.isdigit():
+        return None
+    return int(port_str)
+
+
+def _parse_windows_listening_pids(netstat_output: str, port: int) -> list[int]:
+    """Parse `netstat -ano` output and return deduplicated PIDs listening on local `port`."""
+    pids: list[int] = []
+    seen: set[int] = set()
+    for raw_line in netstat_output.splitlines():
+        parts = raw_line.split()
+        if len(parts) < 5:
+            continue
+        proto, local_addr, _foreign_addr, state, pid_str = parts[:5]
+        if proto.upper() != "TCP" or state.upper() != "LISTENING":
+            continue
+        if _extract_port(local_addr) != port:
+            continue
+        if not pid_str.isdigit():
+            continue
+        pid = int(pid_str)
+        if pid <= 0 or pid in seen:
+            continue
+        seen.add(pid)
+        pids.append(pid)
+    return pids
+
+
 def kill_port(port: int):
     """Kill any process occupying the given port."""
     system = platform.system()
+    current_pid = os.getpid()
     killed = False
     try:
         if system == "Windows":
@@ -280,23 +312,28 @@ def kill_port(port: int):
                 ["netstat", "-ano"],
                 capture_output=True, text=True, encoding="utf-8", errors="replace"
             )
-            for line in result.stdout.splitlines():
-                if f":{port}" in line and "LISTENING" in line:
-                    parts = line.split()
-                    pid = parts[-1]
-                    subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True)
-                    print(f"[OK] 已终止占用端口 {port} 的进程 (PID {pid})")
-                    killed = True
+            for pid in _parse_windows_listening_pids(result.stdout, port):
+                if pid == current_pid:
+                    continue
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+                print(f"[OK] 已终止占用端口 {port} 的进程 (PID {pid})")
+                killed = True
         else:
             result = subprocess.run(
-                ["lsof", "-ti", f":{port}"],
+                ["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"],
                 capture_output=True, text=True
             )
-            for pid in result.stdout.strip().split():
-                if pid:
-                    subprocess.run(["kill", "-9", pid], capture_output=True)
-                    print(f"[OK] 已终止占用端口 {port} 的进程 (PID {pid})")
-                    killed = True
+            seen: set[int] = set()
+            for token in result.stdout.strip().split():
+                if not token.isdigit():
+                    continue
+                pid = int(token)
+                if pid <= 0 or pid == current_pid or pid in seen:
+                    continue
+                seen.add(pid)
+                subprocess.run(["kill", "-9", str(pid)], capture_output=True)
+                print(f"[OK] 已终止占用端口 {port} 的进程 (PID {pid})")
+                killed = True
     except Exception as e:
         print(f"[WARN] 清理端口 {port} 时出错: {e}")
     if killed:
