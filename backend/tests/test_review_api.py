@@ -550,3 +550,42 @@ def test_generate_returns_done_for_completed_session_with_analysis(monkeypatch):
     assert resp.status_code == 200
     assert resp.json()["status"] == "done"
     assert started_analysis == []
+
+
+def test_generate_rejects_recording_or_draining_archive_and_claim_respects_archive_state(monkeypatch):
+    from services.storage import review_archive
+
+    started_analysis: list[int] = []
+    monkeypatch.setattr(
+        review_router.review_async_analysis,
+        "analyze_session_async",
+        lambda session_id: started_analysis.append(session_id),
+    )
+
+    session_id = review.create_session(
+        started_at=time.time(),
+        interviewer_enabled=True,
+        candidate_enabled=False,
+    )
+    review.add_turn(
+        session_id=session_id,
+        qa_id="round-1",
+        seq=1,
+        question_text="介绍一下乐观锁",
+        candidate_answer_text="通过版本号实现",
+        duration_ms=12000,
+    )
+
+    for active_archive_state in ("recording", "draining"):
+        review_archive.set_state(session_id, active_archive_state)
+        assert review.claim_session_for_analysis(session_id) is False
+        resp = client.post(f"/api/review/sessions/{session_id}/generate")
+        assert resp.status_code == 409
+        assert started_analysis == []
+
+    # 归档落盘完成（archive_status=complete, status=recorded）后应允许原子抢占并启动分析
+    review_archive.finish_session(session_id, None)
+    resp = client.post(f"/api/review/sessions/{session_id}/generate")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "started"
+    assert started_analysis == [session_id]

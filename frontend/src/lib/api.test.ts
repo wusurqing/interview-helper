@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { api, buildHeaders, getErrorMessage, request } from './api'
+import { ApiRequestError, api, buildHeaders, getErrorMessage, request } from './api'
 
 function jsonResponse(body: unknown, init: ResponseInit) {
   return new Response(JSON.stringify(body), {
@@ -144,6 +144,63 @@ describe('api error handling', () => {
       await vi.advanceTimersByTimeAsync(10)
       if (source === 'caller') caller.abort()
       await vi.advanceTimersByTimeAsync(1000)
+      expect(await outcome).toMatchObject(source === 'caller'
+        ? { name: 'AbortError' }
+        : { message: '请求超时，请检查后端服务或网络后重试' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('fetches review audio buffers and surfaces formatted ApiRequestError on non-ok responses', async () => {
+    const payload = new Uint8Array([79, 103, 103, 83]).buffer
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      new Response(payload, { status: 200, headers: { 'Content-Type': 'audio/ogg' } }),
+    ).mockResolvedValueOnce(
+      jsonResponse({ detail: '录音片段不存在' }, { status: 404, statusText: 'Not Found' }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const bytes = await api.reviewAudio(7, 9, 'abc123')
+    expect(new Uint8Array(bytes)).toEqual(new Uint8Array([79, 103, 103, 83]))
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/review/sessions/7/turns/9/audio/abc123'),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+
+    const error = await api.reviewAudio(7, 9, 'missing').catch((cause: unknown) => cause)
+    expect(error).toBeInstanceOf(ApiRequestError)
+    expect(error).toMatchObject({ status: 404, message: '请求失败 (404): 录音片段不存在' })
+  })
+
+  it.each(['timeout', 'caller'])('honors %s cancellation while reading reviewAudio arrayBuffer', async (source) => {
+    vi.useFakeTimers()
+    try {
+      const caller = new AbortController()
+      vi.stubGlobal('fetch', vi.fn(async (_input: string, init?: RequestInit) => new Response(
+        new ReadableStream({
+          start(controller) {
+            const delivery = setTimeout(() => {
+              controller.enqueue(new Uint8Array([1, 2, 3, 4]))
+              controller.close()
+            }, 60_000)
+            init?.signal?.addEventListener('abort', () => {
+              clearTimeout(delivery)
+              controller.error(init.signal!.reason)
+            }, { once: true })
+          },
+        }),
+      )))
+
+      const pending = api.reviewAudio(1, 2, 'slow-asset', caller.signal)
+      const outcome = pending.catch((error: unknown) => error)
+      await vi.advanceTimersByTimeAsync(10)
+      if (source === 'caller') {
+        caller.abort()
+      } else {
+        await vi.advanceTimersByTimeAsync(35_000)
+      }
+      await vi.advanceTimersByTimeAsync(10)
       expect(await outcome).toMatchObject(source === 'caller'
         ? { name: 'AbortError' }
         : { message: '请求超时，请检查后端服务或网络后重试' })

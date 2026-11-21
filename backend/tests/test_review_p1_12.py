@@ -30,6 +30,17 @@ def isolated_review_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         review_integration._current_review_session_id = None
         review_integration._existing_qa_ids = frozenset()
     yield
+    from core.session import get_session
+    active_archive = get_session().archive
+    if active_archive is not None:
+        get_session().archive = None
+        active_archive.stop(timeout=2)
+    with review_integration._archive_lock:
+        pending = list(review_integration._draining_archives)
+        review_integration._draining_archives.clear()
+        review_integration._archive_status = None
+    for archive in pending:
+        archive.stop(timeout=2)
     with review_integration._state_lock:
         review_integration._current_review_session_id = None
         review_integration._existing_qa_ids = frozenset()
@@ -241,3 +252,80 @@ def test_review_integration_locks_state_and_snapshots_under_conversation_lock(
 
     # 并发二次停止应幂等返回 None
     assert review_integration.on_assist_stop(session) is None
+
+
+def test_lifespan_recovers_interrupted_archives_before_legacy_recovery_and_prunes_orphans(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    import hashlib
+    import main as main_mod
+    from services.storage import review_archive
+
+    monkeypatch.setenv("IA_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(review, "DB_PATH", str(tmp_path / "review.db"))
+    review.init_db()
+
+    # 1) 中断中的 recording 归档会话 + 已提交轮次（含受引用音频与孤儿临时/未引用音频）
+    sid_rec = review.create_session(time.time() - 300, True, True)
+    asset_bytes = b"OggS-valid-referenced-audio"
+    asset_id = hashlib.sha256(asset_bytes).hexdigest()
+    tid = review_archive.save_round({
+        "session_id": sid_rec,
+        "round_id": "round-1",
+        "seq": 1,
+        "started_at": time.time() - 280,
+        "ended_at": time.time() - 260,
+        "question_text": "什么是事务隔离级别？",
+        "candidate_answer_text": "包含读未提交到串行化四种。",
+        "reference_answer_text": "参考答案",
+        "candidate_status": "recorded",
+        "ai_status": "completed",
+        "policy_version": "simple-v1",
+        "utterances": [],
+        "generations": [],
+        "media": {"interviewer": [], "candidate": []},
+        "assets": {asset_id: asset_bytes},
+    })
+    assert tid > 0
+    review_archive.set_state(sid_rec, "recording")
+
+    referenced_file = tmp_path / "review_media" / str(sid_rec) / "round-1" / f"{asset_id}.ogg"
+    orphan_tmp = tmp_path / "review_media" / str(sid_rec) / "round-uncommitted" / "temp.tmp"
+    orphan_ogg = tmp_path / "review_media" / str(sid_rec) / "round-uncommitted" / ("0" * 64 + ".ogg")
+    orphan_tmp.parent.mkdir(parents=True, exist_ok=True)
+    orphan_tmp.write_bytes(b"incomplete")
+    orphan_ogg.write_bytes(b"unreferenced")
+
+    # 2) 中断中的 draining 归档会话
+    sid_drain = review.create_session(time.time() - 250, True, False)
+    review_archive.set_state(sid_drain, "draining")
+
+    # 3) 传统非归档遗留会话（analyzing + recording）
+    sid_legacy_analyzing = review.create_session(time.time() - 200, True, True)
+    review.update_session_status(sid_legacy_analyzing, "analyzing")
+    sid_legacy_recording = review.create_session(time.time() - 150, True, True)
+
+    monkeypatch.setattr("services.storage.resume_history.restore_active_resume", lambda: False)
+
+    with TestClient(main_mod.app):
+        rec_detail = review.get_session_detail(sid_rec)
+        assert rec_detail["status"] == "partial_capture"
+        assert rec_detail["archive_status"] == "partial"
+        assert rec_detail["ended_at"] is not None
+        assert rec_detail["archive_warning"]
+
+        drain_detail = review.get_session_detail(sid_drain)
+        assert drain_detail["status"] == "partial_capture"
+        assert drain_detail["archive_status"] == "partial"
+        assert drain_detail["ended_at"] is not None
+
+        assert referenced_file.is_file()
+        assert not orphan_tmp.exists()
+        assert not orphan_ogg.exists()
+
+        assert review.get_session_detail(sid_legacy_analyzing)["status"] == "analysis_failed"
+        legacy_rec = review.get_session_detail(sid_legacy_recording)
+        assert legacy_rec["status"] == "partial_capture"
+        assert legacy_rec["ended_at"] is not None
+
+    review_async_analysis.shutdown_executor(wait=True)

@@ -603,3 +603,77 @@ def test_microphone_compatibility_ignores_broken_default_input_metadata(monkeypa
 
     attempts = AudioCapture()._sounddevice_attempts(9, True)
     assert [(item["device"], item["samplerate"]) for item in attempts] == [(9, 48000), (9, 16000)]
+
+
+def test_soundcard_discontinuity_hook_marks_archive_and_passes_other_threads_through(monkeypatch):
+    import threading
+    import warnings
+    from contextlib import contextmanager
+    from services import audio
+
+    recorded = []
+    other_thread_warnings: list[str] = []
+    captured_two = threading.Event()
+    calls = {"count": 0}
+
+    def outer_showwarning(message, category, filename, lineno, file=None, line=None):
+        other_thread_warnings.append(str(message))
+
+    def forbid_catch_warnings(*_args, **_kwargs):
+        raise AssertionError("warnings.catch_warnings must not be called on 64ms WASAPI hot path")
+
+    class _FakeRecorder:
+        def record(self, numframes: int):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                warnings.warn("data discontinuity in recording", RuntimeWarning)
+            if calls["count"] == 3:
+                captured_two.set()
+            # 超过 MIN_LOOPBACK_QUEUE_CHUNK_SAMPLES (1600)，每次调用都能独立触发一次 _push
+            return np.ones((2048, 1), dtype=np.float32) * 0.05
+
+    class _FakeMic:
+        name = "Fake Discontinuity Loopback"
+
+        @contextmanager
+        def recorder(self, **_kwargs):
+            yield _FakeRecorder()
+
+    class _FakeSC:
+        @staticmethod
+        def get_microphone(_guid, include_loopback=True):
+            return _FakeMic()
+
+    monkeypatch.setattr(audio.warnings, "catch_warnings", forbid_catch_warnings)
+    monkeypatch.setattr(warnings, "showwarning", outer_showwarning)
+    monkeypatch.setattr(audio, "_SC_PREV_SHOWWARNING", None)
+    monkeypatch.setattr(audio, "_sc", _FakeSC, raising=False)
+    monkeypatch.setitem(audio._SC_ID_MAP, 20089, "guid-89")
+
+    cap = AudioCapture()
+    cap.archive_role = "interviewer"
+    cap.archive_sink = lambda sample, role: recorded.append((sample, role))
+    cap.start(20089, owner="assist")
+    try:
+        assert captured_two.wait(timeout=2.0)
+        other_err: list[Exception] = []
+
+        def emit_other():
+            try:
+                warnings.warn("unrelated worker warning", UserWarning)
+            except Exception as exc:
+                other_err.append(exc)
+
+        t = threading.Thread(target=emit_other)
+        t.start()
+        t.join(timeout=2.0)
+        assert not other_err
+    finally:
+        cap.stop(owner="assist")
+
+    assert cap._loopback_discontinuity_count == 1
+    assert len(recorded) >= 2
+    assert recorded[0][1] == "interviewer"
+    assert recorded[0][0].discontinuity is False
+    assert recorded[1][0].discontinuity is True
+    assert any("unrelated worker warning" in w for w in other_thread_warnings)

@@ -732,3 +732,101 @@ def test_trace_metadata_mode_anthropic_responses_and_off_skips_sdk_json_parse(tm
     trace.TracingHttpxClient._request(req)
     assert isinstance(req.extensions["llm_trace"], trace._NullAttempt)
     assert calls == []
+
+
+def test_trace_observe_preserves_archive_generation_in_off_and_metadata_modes(tmp_path, monkeypatch):
+    import base64
+    from services.interview_archive.manager import InterviewArchive
+
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    img_url = "data:image/png;base64," + base64.b64encode(b"archive-trace-secret-image").decode("ascii")
+    api_key = "sk-archive-secret-9988"
+
+    # 1) IA_LLM_TRACE=0 + trace.observe + InterviewArchive：零落盘，但归档内存记录收到脱敏结果与耗时
+    monkeypatch.setenv("IA_LLM_TRACE", "0")
+    saved_off = []
+    archive_off = InterviewArchive(501, candidate_enabled=False, save=saved_off.append)
+    try:
+        rid = archive_off.transcript("interviewer", "解释 MVCC", "q-off", 1.0, True)
+        run_id = archive_off.start_ai(rid, "run-off", {"name": "ModelA", "model": "gpt-off"})
+        with trace.observe(lambda event: archive_off.observe_attempt(run_id, event)):
+            req = httpx.Request(
+                "POST",
+                "https://example.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                content=json.dumps({"model": "gpt-off", "stream": True}).encode("utf-8"),
+            )
+            trace.TracingHttpxClient._request(req)
+            attempt = req.extensions["llm_trace"]
+            assert isinstance(attempt, trace.Attempt)
+            assert attempt.write_disk is False
+            attempt.headers(200)
+            attempt.stream_event({
+                "choices": [{"delta": {"content": f"答案携带密钥 {api_key}", "reasoning_content": "内部推理"}}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 6},
+            })
+            attempt.finish("completed")
+        archive_off.finish_ai(run_id, "completed")
+        assert archive_off.stop(timeout=3)
+    finally:
+        archive_off.stop(timeout=3)
+
+    assert not (tmp_path / "llm.jsonl").exists()
+    assert not (tmp_path / "llm_assets").exists()
+    gen_off = saved_off[0]["generations"][0]
+    assert gen_off["status"] == "completed"
+    attempt_off = gen_off["attempts"][0]
+    assert "[REDACTED]" in attempt_off["output_text"] and api_key not in attempt_off["output_text"]
+    assert attempt_off["reasoning_text"] == "内部推理"
+
+    # 2) IA_LLM_TRACE=metadata + trace.observe + InterviewArchive：仅元数据落盘，归档保留脱敏结果
+    monkeypatch.setenv("IA_LLM_TRACE", "metadata")
+    saved_meta = []
+    archive_meta = InterviewArchive(502, candidate_enabled=False, save=saved_meta.append)
+    try:
+        rid = archive_meta.transcript("interviewer", "解释 B+Tree", "q-meta", 1.0, True)
+        run_id = archive_meta.start_ai(rid, "run-meta", {"name": "ModelB", "model": "gpt-meta"})
+        with trace.observe(lambda event: archive_meta.observe_attempt(run_id, event)):
+            attempt = trace.begin(
+                "https://example.com/v1/chat/completions",
+                "openai",
+                {
+                    "model": "gpt-meta",
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "METADATA_SECRET_PROMPT"},
+                        {"type": "image_url", "image_url": {"url": img_url}},
+                    ]}],
+                },
+                api_key=api_key,
+            )
+            attempt.headers(200)
+            attempt.response({
+                "choices": [{
+                    "message": {
+                        "content": f"METADATA_SECRET_REPLY {api_key}",
+                        "reasoning_content": "METADATA_SECRET_REASONING",
+                    },
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 8},
+            })
+            attempt.finish("completed")
+        archive_meta.finish_ai(run_id, "completed")
+        assert archive_meta.stop(timeout=3)
+    finally:
+        archive_meta.stop(timeout=3)
+
+    assert not (tmp_path / "llm_assets").exists()
+    disk_lines = [json.loads(line) for line in (tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()]
+    disk_raw = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    for secret in ("METADATA_SECRET_PROMPT", "METADATA_SECRET_REPLY", "METADATA_SECRET_REASONING", api_key):
+        assert secret not in disk_raw
+    result_rec = [r for r in disk_lines if r["event"] == "result"][0]
+    assert result_rec["output_text"] is None
+    assert result_rec["reasoning_text"] is None
+    assert result_rec["error"] is None
+    gen_meta = saved_meta[0]["generations"][0]
+    attempt_meta = gen_meta["attempts"][0]
+    assert "METADATA_SECRET_REPLY" in attempt_meta["output_text"]
+    assert api_key not in attempt_meta["output_text"]
+    assert attempt_meta["reasoning_text"] == "METADATA_SECRET_REASONING"
