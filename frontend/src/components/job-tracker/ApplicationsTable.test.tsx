@@ -237,4 +237,178 @@ describe('ApplicationsTable', () => {
       })
     }
   })
+
+  it('preserves unsaved core edits, saveNotice, and open panels when saving extras updates updated_at', async () => {
+    const initial = app({
+      id: 1,
+      company: 'ByteDance',
+      notes: 'old note',
+      todos: [],
+      updated_at: 1710000000,
+    })
+    const second = app({
+      id: 2,
+      company: 'Alibaba',
+      notes: 'other note',
+      updated_at: 1710000005,
+    })
+
+    let currentApps = [initial, second]
+    let rerenderFn!: (ui: React.ReactElement) => void
+    const onPatch = vi.fn(async (id: number, patch: Partial<Application>) => {
+      currentApps = currentApps.map((item) => (
+        item.id === id
+          ? { ...item, ...patch, updated_at: item.updated_at + 100 }
+          : item
+      ))
+      rerenderFn(
+        <ApplicationsTable
+          applications={currentApps}
+          offerByAppId={new Map()}
+          onPatch={onPatch}
+          onDelete={vi.fn()}
+          onOpenOffer={vi.fn()}
+          onOpenReviews={vi.fn()}
+          search=""
+          selectedId={1}
+          onSelect={vi.fn()}
+          compactDetailLayout={false}
+        />,
+      )
+      return true
+    })
+
+    const { rerender } = render(
+      <ApplicationsTable
+        applications={currentApps}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+    rerenderFn = rerender
+
+    fireEvent.click(screen.getByRole('button', { name: '编辑核心信息' }))
+    fireEvent.change(screen.getByLabelText('公司名称'), { target: { value: 'ByteDance AI' } })
+
+    fireEvent.click(screen.getByRole('button', { name: /补充信息/ }))
+    fireEvent.change(screen.getByLabelText('备注'), { target: { value: 'new extra note' } })
+    fireEvent.change(screen.getByLabelText('待办清单'), { target: { value: '准备系统设计' } })
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '保存补充信息' }))
+    })
+
+    expect(onPatch).toHaveBeenCalledTimes(1)
+    expect(screen.getByLabelText('公司名称')).toHaveValue('ByteDance AI')
+    expect(screen.getByLabelText('备注')).toHaveValue('new extra note')
+    expect(screen.getByText('已保存补充信息')).toBeInTheDocument()
+    expect(screen.getByText('核心待保存')).toBeInTheDocument()
+
+    // Switching to another application resets draft and closes edit panels
+    rerender(
+      <ApplicationsTable
+        applications={currentApps}
+        offerByAppId={new Map()}
+        onPatch={onPatch}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={2}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+    expect(screen.queryByLabelText('公司名称')).not.toBeInTheDocument()
+    expect(screen.queryByText('已保存补充信息')).not.toBeInTheDocument()
+  })
+
+  it('reacts immediately in quick progress section when draft.stage switches between ongoing and terminal', () => {
+    render(
+      <ApplicationsTable
+        applications={[app({ stage: 'interview1' })]}
+        offerByAppId={new Map()}
+        onPatch={vi.fn()}
+        onDelete={vi.fn()}
+        onOpenOffer={vi.fn()}
+        onOpenReviews={vi.fn()}
+        search=""
+        selectedId={1}
+        onSelect={vi.fn()}
+        compactDetailLayout={false}
+      />,
+    )
+
+    expect(screen.getByText('更新进度')).toBeInTheDocument()
+    expect(screen.getByLabelText('下次跟进')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('当前阶段'), { target: { value: 'interview1_rejected' } })
+    expect(screen.getByText('改结果')).toBeInTheDocument()
+    expect(screen.queryByLabelText('下次跟进')).not.toBeInTheDocument()
+    expect(screen.getByText('已结束 · 不进入待跟进')).toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText('当前阶段'), { target: { value: 'interview2' } })
+    expect(screen.getByText('更新进度')).toBeInTheDocument()
+    expect(screen.getByLabelText('下次跟进')).toBeInTheDocument()
+  })
+
+  it('uses non-blocking two-step delete confirmation with double-click lock instead of window.confirm', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const pendingDelete = deferred<boolean>()
+    const onDelete = vi.fn(() => pendingDelete.promise)
+
+    try {
+      render(
+        <ApplicationsTable
+          applications={[app()]}
+          offerByAppId={new Map()}
+          onPatch={vi.fn()}
+          onDelete={onDelete}
+          onOpenOffer={vi.fn()}
+          onOpenReviews={vi.fn()}
+          search=""
+          selectedId={1}
+          onSelect={vi.fn()}
+          compactDetailLayout={false}
+        />,
+      )
+
+      fireEvent.click(screen.getByRole('button', { name: /补充信息/ }))
+      fireEvent.click(screen.getByRole('button', { name: '删除这条记录' }))
+
+      expect(confirmSpy).not.toHaveBeenCalled()
+      expect(onDelete).not.toHaveBeenCalled()
+      expect(screen.getByText(/确认删除「ByteDance」/)).toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: '取消' }))
+      expect(screen.queryByRole('button', { name: '确认删除' })).not.toBeInTheDocument()
+
+      fireEvent.click(screen.getByRole('button', { name: '删除这条记录' }))
+      const confirmBtn = screen.getByRole('button', { name: '确认删除' })
+      act(() => {
+        confirmBtn.click()
+        confirmBtn.click()
+      })
+
+      expect(onDelete).toHaveBeenCalledTimes(1)
+      expect(onDelete).toHaveBeenCalledWith(1)
+      expect(screen.getByRole('button', { name: '删除中...' })).toBeDisabled()
+
+      await act(async () => {
+        pendingDelete.resolve(true)
+        await pendingDelete.promise
+      })
+
+      expect(screen.queryByRole('button', { name: '确认删除' })).not.toBeInTheDocument()
+    } finally {
+      confirmSpy.mockRestore()
+    }
+  })
 })

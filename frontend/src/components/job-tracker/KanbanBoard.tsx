@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState, type WheelEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   DndContext,
   DragOverlay,
@@ -159,6 +159,7 @@ function SortableKanbanCard({
   app,
   isLight,
   sortDisabled,
+  sortDisabledTitle,
   busy,
   onStageChange,
   index,
@@ -166,6 +167,7 @@ function SortableKanbanCard({
   app: Application
   isLight: boolean
   sortDisabled: boolean
+  sortDisabledTitle?: string
   busy: boolean
   onStageChange: (id: number, stage: string) => void
   index: number
@@ -234,7 +236,8 @@ function SortableKanbanCard({
             ${sortDisabled || busy ? 'cursor-not-allowed opacity-30' : ''}
             ${isLight ? 'text-gray-400 hover:bg-gray-100' : 'text-text-muted/60 hover:bg-white/[0.06]'}
           `}
-          aria-label="\u62D6\u52A8\u6392\u5E8F"
+          aria-label="拖动排序"
+          title={sortDisabled ? sortDisabledTitle : undefined}
           disabled={sortDisabled || busy}
           {...attributes}
           {...listeners}
@@ -329,6 +332,7 @@ function KanbanColumn({
   ids,
   isLight,
   sortDisabled,
+  sortDisabledTitle,
   busyId,
   onStageChange,
 }: {
@@ -337,6 +341,7 @@ function KanbanColumn({
   ids: number[]
   isLight: boolean
   sortDisabled: boolean
+  sortDisabledTitle?: string
   busyId: number | null
   onStageChange: (id: number, stage: string) => void
 }) {
@@ -405,6 +410,7 @@ function KanbanColumn({
               app={app}
               isLight={isLight}
               sortDisabled={sortDisabled}
+              sortDisabledTitle={sortDisabledTitle}
               busy={busyId === app.id}
               onStageChange={onStageChange}
               index={i}
@@ -454,6 +460,8 @@ type Props = {
   showTerminalStages: boolean
   onShowTerminalStagesChange: (show: boolean) => void
   terminalApplicationsCount: number
+  reorderDisabled?: boolean
+  disabledReorderStages?: ReadonlySet<string>
 }
 
 export default function KanbanBoard({
@@ -464,6 +472,8 @@ export default function KanbanBoard({
   showTerminalStages,
   onShowTerminalStagesChange,
   terminalApplicationsCount,
+  reorderDisabled = false,
+  disabledReorderStages,
 }: Props) {
   const colorScheme = useUiPrefsStore((s) => s.colorScheme)
   const isLight = isLightColorScheme(colorScheme)
@@ -478,18 +488,44 @@ export default function KanbanBoard({
   )
 
   const filteredApps = useMemo(() => filterApplicationsBySearch(applications, search), [applications, search])
-  const sortDisabled = search.trim().length > 0
+  const searchActive = search.trim().length > 0
+  const globalSortDisabled = searchActive || reorderDisabled
 
   const fullColumnIds = useMemo(
     () => buildColumnIds(applications, visibleStages),
     [applications, visibleStages],
   )
   const displayColumnIds = useMemo(
-    () => (sortDisabled ? buildColumnIds(filteredApps, visibleStages) : fullColumnIds),
-    [sortDisabled, filteredApps, visibleStages, fullColumnIds],
+    () => (searchActive ? buildColumnIds(filteredApps, visibleStages) : fullColumnIds),
+    [searchActive, filteredApps, visibleStages, fullColumnIds],
   )
 
   const appMap = useMemo(() => new Map(applications.map((a) => [a.id, a])), [applications])
+
+  const getStageSortRestriction = useCallback(
+    (stage: string): string | null => {
+      if (searchActive) return '搜索中暂不支持拖拽排序'
+      if (stage === 'rejected') return '该列合并多个终态阶段，暂不支持拖拽排序'
+      if (reorderDisabled || disabledReorderStages?.has(stage)) {
+        return '当前筛选仅显示部分记录，请切换“全部”后拖拽排序'
+      }
+      const ids = fullColumnIds[stage] ?? []
+      if (ids.some((id) => appMap.get(id)?.stage !== stage)) {
+        return '该列包含不同子阶段，暂不支持拖拽排序'
+      }
+      return null
+    },
+    [appMap, disabledReorderStages, fullColumnIds, reorderDisabled, searchActive],
+  )
+
+  const hasFilteredColumns = useMemo(
+    () =>
+      !globalSortDisabled &&
+      visibleStages.some(
+        (stage) => stage !== 'rejected' && Boolean(disabledReorderStages?.has(stage)),
+      ),
+    [disabledReorderStages, globalSortDisabled, visibleStages],
+  )
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -519,12 +555,12 @@ export default function KanbanBoard({
   const handleDragEnd = (e: DragEndEvent) => {
     const { active, over } = e
     setActiveId(null)
-    if (sortDisabled || !over) return
+    if (globalSortDisabled || !over) return
     const a = Number(active.id)
     const o = Number(over.id)
     if (a === o) return
     const stage = visibleStages.find((s) => fullColumnIds[s]?.includes(a))
-    if (!stage) return
+    if (!stage || getStageSortRestriction(stage) !== null) return
     const list = fullColumnIds[stage]
     if (!list.includes(o)) return
     const oldIndex = list.indexOf(a)
@@ -536,21 +572,28 @@ export default function KanbanBoard({
 
   const scrollBy = (dx: number) => scrollRef.current?.scrollBy({ left: dx, behavior: 'smooth' })
 
-  const handleBoardWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
-    if (event.shiftKey || event.ctrlKey || Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return
+  useEffect(() => {
     const board = scrollRef.current
-    if (!board || board.scrollWidth <= board.clientWidth) return
+    if (!board) return
+    const handleBoardWheel = (event: globalThis.WheelEvent) => {
+      if (event.shiftKey || event.ctrlKey || Math.abs(event.deltaY) <= Math.abs(event.deltaX)) return
+      if (board.scrollWidth <= board.clientWidth) return
 
-    const target = event.target instanceof HTMLElement ? event.target : null
-    const columnScroller = target?.closest('[data-kanban-column-scroll]') as HTMLElement | null
-    if (columnScroller && columnScroller.scrollHeight > columnScroller.clientHeight) {
-      const canScrollDown = event.deltaY > 0 && columnScroller.scrollTop + columnScroller.clientHeight < columnScroller.scrollHeight - 1
-      const canScrollUp = event.deltaY < 0 && columnScroller.scrollTop > 0
-      if (canScrollDown || canScrollUp) return
+      const target = event.target instanceof HTMLElement ? event.target : null
+      const columnScroller = target?.closest('[data-kanban-column-scroll]') as HTMLElement | null
+      if (columnScroller && columnScroller.scrollHeight > columnScroller.clientHeight) {
+        const canScrollDown = event.deltaY > 0 && columnScroller.scrollTop + columnScroller.clientHeight < columnScroller.scrollHeight - 1
+        const canScrollUp = event.deltaY < 0 && columnScroller.scrollTop > 0
+        if (canScrollDown || canScrollUp) return
+      }
+
+      event.preventDefault()
+      board.scrollLeft += event.deltaY
     }
-
-    event.preventDefault()
-    board.scrollLeft += event.deltaY
+    board.addEventListener('wheel', handleBoardWheel, { passive: false })
+    return () => {
+      board.removeEventListener('wheel', handleBoardWheel)
+    }
   }, [])
 
   const scrollToStage = (stage: string) => {
@@ -632,7 +675,14 @@ export default function KanbanBoard({
                 {'\u6C42\u804C\u7BA1\u9053'}
               </h2>
               <p className={`text-[10px] mt-0.5 ${isLight ? 'text-gray-400' : 'text-text-muted'}`}>
-                {totalApps}{' \u6761 \u00B7 '}{sortDisabled ? '\u641C\u7D22\u4E2D' : '\u53EF\u6392\u5E8F'}
+                {totalApps}{' \u6761 \u00B7 '}
+                {searchActive
+                  ? '\u641C\u7D22\u4E2D'
+                  : globalSortDisabled
+                    ? '\u7B5B\u9009\u4E2D'
+                    : hasFilteredColumns
+                      ? '\u90E8\u5206\u5217\u7B5B\u9009\u4E2D'
+                      : '\u53EF\u6392\u5E8F'}
               </p>
             </div>
           </div>
@@ -719,21 +769,24 @@ export default function KanbanBoard({
           <div
             ref={scrollRef}
             data-kanban-board-scroll
-            onWheel={handleBoardWheel}
             className="flex min-h-0 flex-1 gap-3 overflow-x-auto overflow-y-hidden pb-1 scroll-smooth snap-x snap-mandatory [scrollbar-width:thin]"
           >
-            {visibleStages.map((stage) => (
-              <KanbanColumn
-                key={stage}
-                stage={stage}
-                appMap={appMap}
-                ids={displayColumnIds[stage] ?? []}
-                isLight={isLight}
-                sortDisabled={sortDisabled}
-                busyId={busyId}
-                onStageChange={handleStageSelect}
-              />
-            ))}
+            {visibleStages.map((stage) => {
+              const restriction = getStageSortRestriction(stage)
+              return (
+                <KanbanColumn
+                  key={stage}
+                  stage={stage}
+                  appMap={appMap}
+                  ids={displayColumnIds[stage] ?? []}
+                  isLight={isLight}
+                  sortDisabled={restriction !== null}
+                  sortDisabledTitle={restriction ?? undefined}
+                  busyId={busyId}
+                  onStageChange={handleStageSelect}
+                />
+              )
+            })}
           </div>
           <DragOverlay dropAnimation={dropAnimation}>
             {activeApp ? <CardPreview app={activeApp} isLight={isLight} /> : null}

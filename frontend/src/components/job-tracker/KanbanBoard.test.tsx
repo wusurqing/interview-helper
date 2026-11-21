@@ -91,4 +91,78 @@ describe('KanbanBoard', () => {
 
     expect(screen.getByText('复盘 短样本')).toBeInTheDocument()
   })
+
+  it('registers native wheel listener with passive: false and prevents default scrolling', () => {
+    const addListenerSpy = vi.spyOn(HTMLDivElement.prototype, 'addEventListener')
+    try {
+      const { container } = render(
+        <KanbanBoard
+          applications={[app(1, 'applied'), app(2, 'written')]}
+          onStageChange={vi.fn()}
+          onReorderInStage={vi.fn()}
+          search=""
+          showTerminalStages={false}
+          onShowTerminalStagesChange={vi.fn()}
+          terminalApplicationsCount={0}
+        />,
+      )
+
+      const board = container.querySelector('[data-kanban-board-scroll]') as HTMLDivElement
+      const wheelCallIndex = addListenerSpy.mock.calls.findIndex(
+        ([type], idx) => type === 'wheel' && addListenerSpy.mock.instances[idx] === board,
+      )
+      expect(wheelCallIndex).toBeGreaterThanOrEqual(0)
+      expect(addListenerSpy.mock.calls[wheelCallIndex]?.[2]).toEqual({ passive: false })
+
+      Object.defineProperty(board, 'clientWidth', { configurable: true, value: 300 })
+      Object.defineProperty(board, 'scrollWidth', { configurable: true, value: 900 })
+      board.scrollLeft = 0
+
+      const wheelEvent = new WheelEvent('wheel', { deltaY: 120, deltaX: 0, cancelable: true })
+      board.dispatchEvent(wheelEvent)
+      expect(wheelEvent.defaultPrevented).toBe(true)
+      expect(board.scrollLeft).toBe(120)
+    } finally {
+      addListenerSpy.mockRestore()
+    }
+  })
+
+  it('disables drag handles for merged rejected column and filtered-subset columns', () => {
+    const { container } = render(
+      <KanbanBoard
+        applications={[
+          app(1, 'applied'),
+          app(2, 'applied'),
+          app(3, 'interview1'),
+          app(4, 'interview1'),
+          app(5, 'interview1_rejected'),
+          app(6, 'written_rejected'),
+        ]}
+        onStageChange={vi.fn()}
+        onReorderInStage={vi.fn()}
+        search=""
+        showTerminalStages={true}
+        onShowTerminalStagesChange={vi.fn()}
+        terminalApplicationsCount={2}
+        disabledReorderStages={new Set(['interview1'])}
+      />,
+    )
+
+    const appliedCol = container.querySelector('[data-kanban-stage="applied"]') as HTMLElement
+    const interview1Col = container.querySelector('[data-kanban-stage="interview1"]') as HTMLElement
+    const rejectedCol = container.querySelector('[data-kanban-stage="rejected"]') as HTMLElement
+
+    const appliedHandles = appliedCol.querySelectorAll('button[aria-label="拖动排序"]')
+    const interview1Handles = interview1Col.querySelectorAll('button[aria-label="拖动排序"]')
+    const rejectedHandles = rejectedCol.querySelectorAll('button[aria-label="拖动排序"]')
+
+    expect(appliedHandles).toHaveLength(2)
+    appliedHandles.forEach((btn) => expect(btn).not.toBeDisabled())
+
+    expect(interview1Handles).toHaveLength(2)
+    interview1Handles.forEach((btn) => expect(btn).toBeDisabled())
+
+    expect(rejectedHandles).toHaveLength(2)
+    rejectedHandles.forEach((btn) => expect(btn).toBeDisabled())
+  })
 })

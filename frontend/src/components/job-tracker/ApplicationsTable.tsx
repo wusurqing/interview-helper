@@ -44,7 +44,7 @@ type Props = {
   applications: Application[]
   offerByAppId: Map<number, Offer>
   onPatch: (id: number, patch: Partial<Application>) => void | Promise<boolean>
-  onDelete: (id: number) => void
+  onDelete: (id: number) => void | Promise<boolean | void>
   onOpenOffer: (app: Application) => void
   onOpenReviews: (app: Application) => void
   search: string
@@ -62,6 +62,26 @@ type Props = {
 
 const CORE_PATCH_KEYS = ['company', 'position', 'city', 'stage', 'applied_at', 'next_followup_at'] as const
 const EXTRA_PATCH_KEYS = ['notes', 'todos'] as const
+const PATCH_KEY_TO_DRAFT_KEY: Partial<Record<keyof Application, keyof EditorDraft>> = {
+  company: 'company',
+  position: 'position',
+  city: 'city',
+  stage: 'stage',
+  applied_at: 'appliedAtInput',
+  next_followup_at: 'nextFollowupInput',
+  notes: 'notes',
+  todos: 'todoText',
+}
+const DRAFT_KEYS: readonly (keyof EditorDraft)[] = [
+  'company',
+  'position',
+  'city',
+  'stage',
+  'appliedAtInput',
+  'nextFollowupInput',
+  'notes',
+  'todoText',
+]
 
 function toDateInput(unix: number | null): string {
   return unix != null ? dayjs.unix(Math.floor(unix)).format('YYYY-MM-DD') : ''
@@ -287,21 +307,62 @@ export default function ApplicationsTable({
   const [saveNotice, setSaveNotice] = useState<SaveNotice | null>(null)
   const [editCoreOpen, setEditCoreOpen] = useState(false)
   const [extrasOpen, setExtrasOpen] = useState(false)
+  const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null)
+  const [deletingId, setDeletingId] = useState<number | null>(null)
   const [mobileDetailOpen, setMobileDetailOpen] = useState(false)
   const [pendingDetailFocusId, setPendingDetailFocusId] = useState<number | null>(null)
   const detailRef = useRef<HTMLElement | null>(null)
   const savingRef = useRef(false)
+  const deletingRef = useRef(false)
+  const prevAppRef = useRef<Application | null>(null)
+  const pendingSubmitRef = useRef<{ appId: number; submittedValues: Partial<EditorDraft> } | null>(null)
   const patch = useMemo(
     () => (current && draft ? buildPatch(current, draft) : {}),
     [current, draft],
   )
 
   useEffect(() => {
-    setDraft(current ? createDraft(current) : null)
-    setSaveNotice(null)
-    setEditCoreOpen(false)
-    setExtrasOpen(false)
-  }, [current?.id, current?.updated_at])
+    const prevApp = prevAppRef.current
+    prevAppRef.current = current
+    if (!current) {
+      pendingSubmitRef.current = null
+      setDraft(null)
+      setSaveNotice(null)
+      setEditCoreOpen(false)
+      setExtrasOpen(false)
+      setConfirmDeleteId(null)
+      return
+    }
+    if (!prevApp || prevApp.id !== current.id) {
+      pendingSubmitRef.current = null
+      setDraft(createDraft(current))
+      setSaveNotice(null)
+      setEditCoreOpen(false)
+      setExtrasOpen(false)
+      setConfirmDeleteId(null)
+      return
+    }
+    const prevBase = createDraft(prevApp)
+    const nextBase = createDraft(current)
+    const pendingSubmit =
+      pendingSubmitRef.current?.appId === current.id ? pendingSubmitRef.current : null
+    pendingSubmitRef.current = null
+    setDraft((prevDraft) => {
+      if (!prevDraft) return nextBase
+      const merged: EditorDraft = { ...prevDraft }
+      for (const key of DRAFT_KEYS) {
+        const wasSubmittedAndUnchanged =
+          pendingSubmit !== null &&
+          key in pendingSubmit.submittedValues &&
+          prevDraft[key] === pendingSubmit.submittedValues[key]
+        const wasUntouched = prevDraft[key] === prevBase[key]
+        if (wasSubmittedAndUnchanged || wasUntouched) {
+          merged[key] = nextBase[key]
+        }
+      }
+      return merged
+    })
+  }, [current])
 
   useEffect(() => {
     if (!compactDetailLayout) {
@@ -376,6 +437,14 @@ export default function ApplicationsTable({
       })
       return
     }
+    const submittedValues: Partial<EditorDraft> = {}
+    for (const key of Object.keys(scopedPatch) as Array<keyof Application>) {
+      const draftKey = PATCH_KEY_TO_DRAFT_KEY[key]
+      if (draftKey) {
+        submittedValues[draftKey] = draft[draftKey]
+      }
+    }
+    pendingSubmitRef.current = { appId: current.id, submittedValues }
     savingRef.current = true
     setSaving(true)
     try {
@@ -387,15 +456,35 @@ export default function ApplicationsTable({
         })
         if (scope === 'core' || scope === 'all') setEditCoreOpen(false)
       } else {
+        pendingSubmitRef.current = null
         setSaveNotice({ message: '保存失败，请重试', tone: 'error' })
       }
     } catch (error) {
+      pendingSubmitRef.current = null
       setSaveNotice({ message: getSaveErrorMessage(error), tone: 'error' })
     } finally {
       savingRef.current = false
       setSaving(false)
     }
   }, [current, draft, onPatch, patch])
+
+  const handleConfirmDelete = useCallback(async () => {
+    if (!current || deletingRef.current) return
+    const targetId = current.id
+    deletingRef.current = true
+    setDeletingId(targetId)
+    try {
+      const result = await Promise.resolve(onDelete(targetId))
+      if (result !== false) {
+        setConfirmDeleteId(null)
+      }
+    } catch (error) {
+      setSaveNotice({ message: getSaveErrorMessage(error), tone: 'error' })
+    } finally {
+      deletingRef.current = false
+      setDeletingId(null)
+    }
+  }, [current, onDelete])
 
   const handleSelect = useCallback((id: number, focusDetail = false) => {
     if (focusDetail && compactDetailLayout) {
@@ -612,7 +701,10 @@ export default function ApplicationsTable({
   const quickProgressDirty = current != null && draft != null
     ? draft.stage !== current.stage || draft.nextFollowupInput !== toDateInput(current.next_followup_at)
     : false
-  const quickProgressTitle = currentIsTerminal ? '改结果' : '更新进度'
+  const draftIsTerminal = draft ? isTerminalStage(draft.stage) : currentIsTerminal
+  const quickProgressTitle = draftIsTerminal ? '改结果' : '更新进度'
+  const isDeletingCurrent = current != null && deletingId === current.id
+  const isConfirmingDelete = current != null && confirmDeleteId === current.id
   const headerQuickProgressShellClass = isLight
     ? 'border-bg-hover bg-bg-secondary/25'
     : 'border-white/[0.08] bg-black/12'
@@ -954,7 +1046,7 @@ export default function ApplicationsTable({
                     </button>
                   </div>
                 </div>
-                <div className={`mt-2.5 grid gap-2.5 ${currentIsTerminal ? 'md:grid-cols-1' : 'md:grid-cols-2'}`}>
+                <div className={`mt-2.5 grid gap-2.5 ${draftIsTerminal ? 'md:grid-cols-1' : 'md:grid-cols-2'}`}>
                   <label className="flex flex-col gap-1.5 text-xs text-text-secondary">
                     当前阶段
                     <select
@@ -978,7 +1070,7 @@ export default function ApplicationsTable({
                       </optgroup>
                     </select>
                   </label>
-                  {!currentIsTerminal ? (
+                  {!draftIsTerminal ? (
                     <label className="flex flex-col gap-1.5 text-xs text-text-secondary">
                       下次跟进
                       <input
@@ -1182,7 +1274,12 @@ export default function ApplicationsTable({
                 <section className="border-t border-bg-hover/80 pt-1">
                   <button
                     type="button"
-                    onClick={() => setExtrasOpen((prev) => !prev)}
+                    onClick={() =>
+                      setExtrasOpen((prev) => {
+                        if (prev) setConfirmDeleteId(null)
+                        return !prev
+                      })
+                    }
                     className="flex w-full items-center justify-between gap-3 py-2 text-left"
                   >
                     <div className="min-w-0">
@@ -1302,16 +1399,40 @@ export default function ApplicationsTable({
                             <p className="text-[11px] leading-relaxed text-text-secondary">
                               会删除关联数据。
                             </p>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (confirm(`删除「${current.company}」这条记录？`)) onDelete(current.id)
-                              }}
-                              className="inline-flex items-center justify-center gap-1.5 rounded-md border border-red-500/20 px-3 py-2 text-xs font-medium text-red-400 transition-colors hover:bg-red-500/10"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                              删除这条记录
-                            </button>
+                            {isConfirmingDelete ? (
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="text-[11px] font-medium text-red-400">
+                                  确认删除「{current.company || '未命名公司'}」？
+                                </span>
+                                <button
+                                  type="button"
+                                  disabled={isDeletingCurrent}
+                                  onClick={() => setConfirmDeleteId(null)}
+                                  className="rounded-md border border-bg-hover bg-bg-secondary px-2.5 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:text-text-primary disabled:opacity-50"
+                                >
+                                  取消
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={isDeletingCurrent}
+                                  onClick={() => void handleConfirmDelete()}
+                                  className="inline-flex items-center justify-center gap-1.5 rounded-md border border-red-500/40 bg-red-500/15 px-3 py-1.5 text-xs font-semibold text-red-400 transition-colors hover:bg-red-500/25 disabled:opacity-50"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                  {isDeletingCurrent ? '删除中...' : '确认删除'}
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                disabled={isDeletingCurrent}
+                                onClick={() => setConfirmDeleteId(current.id)}
+                                className="inline-flex items-center justify-center gap-1.5 rounded-md border border-red-500/20 px-3 py-2 text-xs font-medium text-red-400 transition-colors hover:bg-red-500/10 disabled:opacity-50"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                                删除这条记录
+                              </button>
+                            )}
                           </div>
                         </div>
                       </details>

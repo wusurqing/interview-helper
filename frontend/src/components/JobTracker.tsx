@@ -327,6 +327,7 @@ export default function JobTracker() {
   const [applications, setApplications] = useState<Application[]>([])
   const [offers, setOffers] = useState<Offer[]>([])
   const [loading, setLoading] = useState(true)
+  const [hasLoadedApplications, setHasLoadedApplications] = useState(false)
   const [view, setView] = useState<'table' | 'kanban'>('table')
   const [search, setSearch] = useState('')
   const deferredSearch = useDeferredValue(search)
@@ -339,8 +340,8 @@ export default function JobTracker() {
   const [createNotice, setCreateNotice] = useState<CreateNotice | null>(null)
   const [focusNotice, setFocusNotice] = useState<FocusNotice | null>(null)
   const [detailIntent, setDetailIntent] = useState<DetailIntent | null>(null)
-  const [offerModalApp, setOfferModalApp] = useState<Application | null>(null)
-  const [reviewModalApp, setReviewModalApp] = useState<Application | null>(null)
+  const [offerModalAppId, setOfferModalAppId] = useState<number | null>(null)
+  const [reviewModalAppId, setReviewModalAppId] = useState<number | null>(null)
   const [reviewItems, setReviewItems] = useState<ApplicationReviewItem[]>([])
   const [reviewLoading, setReviewLoading] = useState(false)
   const [reviewModalHighlightId, setReviewModalHighlightId] = useState<number | null>(null)
@@ -412,6 +413,7 @@ export default function JobTracker() {
         if (!isCurrentLoad()) return
         setApplications(nextApplications)
         setOffers(nextOffers)
+        setHasLoadedApplications(true)
       })
     } catch (e) {
       if (isCurrentLoad()) {
@@ -473,7 +475,7 @@ export default function JobTracker() {
   )
 
   const onDelete = useCallback(
-    async (id: number) => {
+    async (id: number): Promise<boolean> => {
       try {
         await api.jobTrackerDeleteApplication(id)
         applicationPatchSeqRef.current.delete(id)
@@ -482,8 +484,10 @@ export default function JobTracker() {
           setApplications((prev) => prev.filter((item) => item.id !== id))
           setOffers((prev) => prev.filter((offer) => offer.application_id !== id))
         })
+        return true
       } catch (e) {
         setToastMessage(e instanceof Error ? e.message : '删除失败')
+        return false
       }
     },
     [markListMutated, setToastMessage],
@@ -501,28 +505,77 @@ export default function JobTracker() {
 
   const onReorderInStage = useCallback(
     async (stage: string, orderedIds: number[]) => {
+      if (stage === 'rejected' || orderedIds.length === 0) return
+      const stageApps = [...applications]
+        .filter((app) => app.stage === stage)
+        .sort((a, b) => {
+          const so = (a.sort_order ?? 0) - (b.sort_order ?? 0)
+          if (so !== 0) return so
+          const fa = a.next_followup_at
+          const fb = b.next_followup_at
+          if (fa == null && fb == null) return a.id - b.id
+          if (fa == null) return 1
+          if (fb == null) return -1
+          return fa - fb
+        })
+      if (stageApps.length === 0) return
+      const stageIdSet = new Set(stageApps.map((app) => app.id))
+      const seen = new Set<number>()
+      for (const id of orderedIds) {
+        if (!stageIdSet.has(id) || seen.has(id)) return
+        seen.add(id)
+      }
+      let finalOrderedIds = orderedIds
+      if (orderedIds.length < stageApps.length) {
+        let cursor = 0
+        finalOrderedIds = stageApps.map((app) => (
+          seen.has(app.id) ? orderedIds[cursor++] : app.id
+        ))
+      }
       markListMutated()
       setApplications((prev) =>
         prev.map((app) => {
-          const index = orderedIds.indexOf(app.id)
+          const index = finalOrderedIds.indexOf(app.id)
           if (index < 0 || app.stage !== stage) return app
           return { ...app, sort_order: index }
         }),
       )
       try {
-        await api.jobTrackerReorderStage(stage, orderedIds)
+        await api.jobTrackerReorderStage(stage, finalOrderedIds)
       } catch (e) {
         setToastMessage(e instanceof Error ? e.message : '排序失败')
         load()
       }
     },
-    [load, markListMutated, setToastMessage],
+    [applications, load, markListMutated, setToastMessage],
   )
 
   const terminalApplicationsCount = useMemo(() => applications.filter((app) => isTerminalStage(app.stage)).length, [applications])
   const rejectedCount = useMemo(() => applications.filter((app) => isRejectedStage(app.stage)).length, [applications])
   const withdrawnCount = useMemo(() => applications.filter((app) => app.stage === 'withdrawn').length, [applications])
-  const dueSoonCutoff = useMemo(() => dayjs().add(3, 'day').endOf('day').unix(), [])
+  const [todayKey, setTodayKey] = useState(() => dayjs().format('YYYY-MM-DD'))
+  useEffect(() => {
+    const syncToday = () => {
+      const nextKey = dayjs().format('YYYY-MM-DD')
+      setTodayKey((prev) => (prev === nextKey ? prev : nextKey))
+    }
+    const msUntilNextMidnight = Math.max(
+      1000,
+      dayjs().add(1, 'day').startOf('day').diff(dayjs()) + 1000,
+    )
+    const timer = window.setTimeout(syncToday, msUntilNextMidnight)
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') syncToday()
+    }
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    window.addEventListener('focus', syncToday)
+    return () => {
+      window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      window.removeEventListener('focus', syncToday)
+    }
+  }, [todayKey])
+  const dueSoonCutoff = useMemo(() => dayjs(todayKey).add(3, 'day').endOf('day').unix(), [todayKey])
   const offerCount = useMemo(
     () => applications.filter((app) => app.stage === 'offer' || offerByAppId.has(app.id)).length,
     [applications, offerByAppId],
@@ -551,6 +604,24 @@ export default function JobTracker() {
     () => applications.filter((app) => matchesFocusFilter(app, focusFilter, offerByAppId, dueSoonCutoff)),
     [applications, dueSoonCutoff, focusFilter, offerByAppId],
   )
+  const disabledReorderStages = useMemo(() => {
+    const disabled = new Set<string>(['rejected'])
+    if (focusFilter === 'all') return disabled
+    const fullCounts = new Map<string, number>()
+    const visibleCounts = new Map<string, number>()
+    for (const app of applications) {
+      fullCounts.set(app.stage, (fullCounts.get(app.stage) ?? 0) + 1)
+    }
+    for (const app of filteredApplications) {
+      visibleCounts.set(app.stage, (visibleCounts.get(app.stage) ?? 0) + 1)
+    }
+    for (const [stage, count] of fullCounts.entries()) {
+      if ((visibleCounts.get(stage) ?? 0) !== count) {
+        disabled.add(stage)
+      }
+    }
+    return disabled
+  }, [applications, filteredApplications, focusFilter])
 
   const createApplication = useCallback(async () => {
     const company = createDraft.company.trim()
@@ -597,15 +668,24 @@ export default function JobTracker() {
     }
   }, [createDraft, markListMutated, setToastMessage])
 
+  const offerModalApp = useMemo(
+    () => (offerModalAppId != null ? applications.find((item) => item.id === offerModalAppId) ?? null : null),
+    [applications, offerModalAppId],
+  )
+  const reviewModalApp = useMemo(
+    () => (reviewModalAppId != null ? applications.find((item) => item.id === reviewModalAppId) ?? null : null),
+    [applications, reviewModalAppId],
+  )
+
   const openOfferModal = useCallback((app: Application) => {
-    setOfferModalApp(app)
+    setOfferModalAppId(app.id)
   }, [])
 
   const openReviewsModal = useCallback(
     async (app: Application, highlightedReviewId: number | null = null) => {
       const requestSeq = reviewRequestSeqRef.current + 1
       reviewRequestSeqRef.current = requestSeq
-      setReviewModalApp(app)
+      setReviewModalAppId(app.id)
       setReviewModalHighlightId(highlightedReviewId)
       setReviewItems([])
       setReviewLoading(true)
@@ -639,9 +719,15 @@ export default function JobTracker() {
   }, [reviewModalApp, setAppMode, setReviewDeepLinkSessionId, setToastMessage])
 
   useEffect(() => {
-    if (appMode !== 'job-tracker' || !jobTrackerDeepLink || applications.length === 0) return
+    if (appMode !== 'job-tracker' || !jobTrackerDeepLink) return
     const targetApp = applications.find((app) => app.id === jobTrackerDeepLink.applicationId)
-    if (!targetApp) return
+    if (!targetApp) {
+      if (hasLoadedApplications && !loading) {
+        clearJobTrackerDeepLink()
+        setToastMessage('未找到对应的求职记录，可能已被删除')
+      }
+      return
+    }
     setSelectedAppId(targetApp.id)
     setHighlightedAppId(targetApp.id)
     setFocusFilter(getFocusFilterForStage(targetApp.stage))
@@ -657,7 +743,7 @@ export default function JobTracker() {
     if (jobTrackerDeepLink.openReviews) {
       void openReviewsModal(targetApp, jobTrackerDeepLink.highlightReviewId ?? null)
     }
-  }, [appMode, applications, clearJobTrackerDeepLink, jobTrackerDeepLink, openReviewsModal])
+  }, [appMode, applications, clearJobTrackerDeepLink, hasLoadedApplications, jobTrackerDeepLink, loading, openReviewsModal, setToastMessage])
 
   const saveOffer = useCallback(
     async (payload: Record<string, unknown>) => {
@@ -765,7 +851,7 @@ export default function JobTracker() {
                   <button
                     type="button"
                     onClick={() => setSearch('')}
-                    className="absolute right-2 top-1/2 rounded-md p-1 text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 rounded-md p-1 text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary"
                     aria-label="清空搜索"
                   >
                     <X className="h-3.5 w-3.5" />
@@ -1028,7 +1114,8 @@ export default function JobTracker() {
                 setCreateNotice(null)
               }}
               onUndo={async () => {
-                await onDelete(createNotice.id)
+                const ok = await onDelete(createNotice.id)
+                if (!ok) return
                 if (selectedAppId === createNotice.id) {
                   setSelectedAppId(null)
                 }
@@ -1103,6 +1190,7 @@ export default function JobTracker() {
                 showTerminalStages={showTerminalStages}
                 onShowTerminalStagesChange={setShowTerminalStages}
                 terminalApplicationsCount={terminalApplicationsCount}
+                disabledReorderStages={disabledReorderStages}
               />
             </Suspense>
           </div>
@@ -1115,7 +1203,7 @@ export default function JobTracker() {
             open={offerModalApp != null}
             application={offerModalApp}
             offer={offerForModal}
-            onClose={() => setOfferModalApp(null)}
+            onClose={() => setOfferModalAppId(null)}
             onSave={saveOffer}
           />
         </Suspense>
@@ -1129,7 +1217,7 @@ export default function JobTracker() {
           highlightedReviewId={reviewModalHighlightId}
           onClose={() => {
             reviewRequestSeqRef.current += 1
-            setReviewModalApp(null)
+            setReviewModalAppId(null)
             setReviewModalHighlightId(null)
             setReviewItems([])
             setReviewLoading(false)
@@ -1486,13 +1574,33 @@ function ApplicationReviewsModal({
     ? dayjs.unix(Math.floor(latestReviewAt)).format('YYYY-MM-DD HH:mm')
     : '--'
   const latestScoreLabel = latestScore != null ? latestScore.toFixed(1) : '未出分'
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        onClose()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [onClose])
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-0 sm:p-4">
-      <div className="flex h-full w-full max-w-3xl flex-col overflow-hidden rounded-none border border-bg-hover bg-bg-secondary shadow-xl sm:h-auto sm:max-h-[82vh] sm:rounded-lg">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-0 sm:p-4"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose()
+      }}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="application-reviews-modal-title"
+        className="flex h-full w-full max-w-3xl flex-col overflow-hidden rounded-none border border-bg-hover bg-bg-secondary shadow-xl sm:h-auto sm:max-h-[82vh] sm:rounded-lg"
+      >
         <div className="flex items-start justify-between gap-3 border-b border-bg-hover px-4 py-3">
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
-              <h3 className="text-sm font-bold text-text-primary">关联复盘</h3>
+              <h3 id="application-reviews-modal-title" className="text-sm font-bold text-text-primary">关联复盘</h3>
               <StageBadge stage={app.stage} isLight={isLight} />
             </div>
             <p className="mt-1 truncate text-xs text-text-muted">
