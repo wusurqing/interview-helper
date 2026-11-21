@@ -36,6 +36,8 @@ _scope = contextvars.ContextVar("llm_trace_scope", default=None)
 _lock = threading.RLock()
 _asset_lock = threading.Lock()
 _in_flight_assets: collections.Counter[str] = collections.Counter()
+_prune_seen_assets: dict[int, set[str]] = {}
+_prune_scan_seq = 0
 _prune_lock = threading.Lock()
 _prune_pending: dict[Path, float] = {}
 _prune_thread: threading.Thread | None = None
@@ -121,6 +123,7 @@ def _enforce_assets_quota_locked(
 
 def prune_unused_assets(log_dir=None, *, min_age_seconds: float = 0.0):
     """Remove unreferenced assets and enforce the llm_assets/ disk quota."""
+    global _prune_scan_seq
     directory = Path(LOG_DIR if log_dir is None else log_dir)
     assets = directory / "llm_assets"
     if not assets.exists():
@@ -138,6 +141,11 @@ def prune_unused_assets(log_dir=None, *, min_age_seconds: float = 0.0):
             for child in value:
                 visit(child)
 
+    with _asset_lock:
+        _prune_scan_seq += 1
+        scan_id = _prune_scan_seq
+        _prune_seen_assets[scan_id] = set(_in_flight_assets.keys())
+
     try:
         for logfile in directory.glob("llm.jsonl*"):
             try:
@@ -151,7 +159,7 @@ def prune_unused_assets(log_dir=None, *, min_age_seconds: float = 0.0):
                 continue
         now = time.time()
         with _asset_lock:
-            protected_in_flight = set(_in_flight_assets.keys())
+            protected_in_flight = set(_in_flight_assets.keys()) | _prune_seen_assets.pop(scan_id, set())
             for asset in assets.iterdir():
                 if not asset.is_file():
                     continue
@@ -175,6 +183,9 @@ def prune_unused_assets(log_dir=None, *, min_age_seconds: float = 0.0):
             )
     except OSError:
         logging.getLogger("llm.trace.failure").exception("Unable to prune LLM assets")
+    finally:
+        with _asset_lock:
+            _prune_seen_assets.pop(scan_id, None)
 
 
 def _prune_worker() -> None:
@@ -228,12 +239,18 @@ def wait_for_pending_prune(timeout: float = 5.0) -> bool:
 class _TraceFileHandler(TimedRotatingFileHandler):
     def __init__(self, filename, *args, **kwargs):
         self._log_dir = Path(filename).parent
+        self._rolled_over = False
         super().__init__(filename, *args, **kwargs)
 
+    def doRollover(self):
+        super().doRollover()
+        self._rolled_over = True
+
     def emit(self, record):
-        old_rollover_at = self.rolloverAt
+        self._rolled_over = False
         super().emit(record)
-        if self.rolloverAt != old_rollover_at:
+        if self._rolled_over:
+            self._rolled_over = False
             schedule_prune_unused_assets(self._log_dir, min_age_seconds=_ROLLOVER_PRUNE_GRACE_SECONDS)
 
 
@@ -283,7 +300,7 @@ def _asset(data_url, *, _created_assets=None):
         return None
     digest = hashlib.sha256(data).hexdigest()
     limit = max_assets_bytes()
-    if len(data) > limit:
+    if limit <= 0 or len(data) > limit:
         return {
             "path": None,
             "mime": mime,
@@ -301,7 +318,18 @@ def _asset(data_url, *, _created_assets=None):
             with path.open("xb") as handle:
                 handle.write(data)
         except FileExistsError:
-            pass
+            try:
+                os.utime(path, None)
+            except OSError:
+                pass
+        except OSError:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+        for seen_set in _prune_seen_assets.values():
+            seen_set.add(rel_posix)
         if _created_assets is not None:
             _in_flight_assets[rel_posix] += 1
             _created_assets.append(rel_posix)
@@ -512,6 +540,9 @@ class TracingHttpxClient(DefaultHttpxClient):
 
     @staticmethod
     def _request(request):
+        if trace_mode() == "off":
+            request.extensions["llm_trace"] = _NullAttempt()
+            return
         try:
             payload = json.loads(request.content)
         except (ValueError, RuntimeError):
@@ -768,6 +799,8 @@ class Attempt:
         else:
             self._usage(obj.get("usage"))
             for choice in obj.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
                 delta = choice.get("delta") or {}
                 if isinstance(delta, dict):
                     out_parts.extend(_text_parts(delta.get("content")))

@@ -528,3 +528,133 @@ def test_rollover_prunes_assets_asynchronously_without_blocking_emit(tmp_path, m
         release.set()
         assert trace.wait_for_pending_prune(timeout=3.0)
         handler.close()
+
+
+def test_prune_during_concurrent_attempt_never_deletes_newly_logged_asset(tmp_path, monkeypatch):
+    import base64
+    import threading
+
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+
+    # Seed llm_assets/ with one unrelated orphan and an initial log file
+    assets_dir = tmp_path / "llm_assets"
+    assets_dir.mkdir(parents=True)
+    orphan = assets_dir / "orphan.png"
+    orphan.write_bytes(b"orphan-bytes")
+    (tmp_path / "llm.jsonl").write_text("", encoding="utf-8")
+
+    scanned = threading.Event()
+    resume_prune = threading.Event()
+    orig_glob = Path.glob
+
+    def paused_glob(self, pattern):
+        items = list(orig_glob(self, pattern))
+        if self == tmp_path and pattern == "llm.jsonl*":
+            scanned.set()
+            resume_prune.wait(timeout=3.0)
+        return iter(items)
+
+    monkeypatch.setattr(Path, "glob", paused_glob)
+
+    prune_thread = threading.Thread(target=trace.prune_unused_assets, kwargs={"log_dir": tmp_path, "min_age_seconds": 0.0})
+    prune_thread.start()
+    assert scanned.wait(timeout=2.0)
+
+    # While pruner has already collected the pre-write log snapshot and is about to unlink,
+    # a concurrent Attempt writes a brand-new asset, logs it, and exits __init__ (clearing _in_flight_assets).
+    live_url = "data:image/png;base64," + base64.b64encode(b"live-concurrent-image").decode("ascii")
+    attempt = trace.begin("https://example.com/v1", "openai", {"image": live_url})
+    attempt.finish()
+    req = json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    live_asset = tmp_path / req["request"]["image"]["path"]
+    assert live_asset.exists()
+
+    resume_prune.set()
+    prune_thread.join(timeout=3.0)
+    assert not prune_thread.is_alive()
+
+    assert live_asset.exists(), "asset logged during active prune scan must never be deleted"
+    assert not orphan.exists(), "unrelated orphan asset should still be pruned"
+
+
+def test_trace_asset_reuse_refreshes_mtime_for_lru_quota_eviction(tmp_path, monkeypatch):
+    import base64
+    import os
+
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "full")
+    monkeypatch.setenv("IA_LLM_TRACE_MAX_ASSETS_MB", str(25 / (1024 * 1024)))
+
+    img_a = "data:image/png;base64," + base64.b64encode(b"aaaaaaaaaaaa").decode("ascii")
+    img_b = "data:image/png;base64," + base64.b64encode(b"bbbbbbbbbbbb").decode("ascii")
+    img_c = "data:image/png;base64," + base64.b64encode(b"cccccccccccc").decode("ascii")
+
+    a1 = trace.begin("https://example.com/v1", "openai", {"image": img_a})
+    a1.finish()
+    path_a = tmp_path / json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[-2])["request"]["image"]["path"]
+    os.utime(path_a, (1_700_000_000, 1_700_000_000))
+
+    b1 = trace.begin("https://example.com/v1", "openai", {"image": img_b})
+    b1.finish()
+    path_b = tmp_path / json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[-2])["request"]["image"]["path"]
+    os.utime(path_b, (1_700_000_100, 1_700_000_100))
+
+    # Reuse A -> should refresh A's mtime so B becomes the oldest asset
+    a2 = trace.begin("https://example.com/v1", "openai", {"image": img_a})
+    a2.finish()
+
+    c1 = trace.begin("https://example.com/v1", "openai", {"image": img_c})
+    c1.finish()
+    path_c = tmp_path / json.loads((tmp_path / "llm.jsonl").read_text(encoding="utf-8").splitlines()[-2])["request"]["image"]["path"]
+
+    assert path_a.exists()
+    assert not path_b.exists()
+    assert path_c.exists()
+
+
+def test_trace_metadata_mode_anthropic_responses_and_off_skips_sdk_json_parse(tmp_path, monkeypatch):
+    monkeypatch.setattr(trace, "LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("IA_LLM_TRACE", "metadata")
+
+    anth = trace.begin("https://example.com/v1/messages", "anthropic", {
+        "model": "claude-sonnet",
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "TOP_SECRET_ANTHROPIC_PROMPT"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}},
+        ]}],
+    })
+    anth.headers(200)
+    anth.response({
+        "content": [
+            {"type": "thinking", "thinking": "SECRET_CLAUDE_THINK"},
+            {"type": "text", "text": "SECRET_CLAUDE_REPLY"},
+        ],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    })
+    anth.finish()
+
+    resp_api = trace.begin("https://example.com/v1/responses", "responses", {
+        "model": "gpt-5",
+        "input": [{"role": "user", "content": "TOP_SECRET_RESPONSES_PROMPT"}],
+    })
+    resp_api.headers(200)
+    resp_api.stream_event({"type": "response.output_text.delta", "delta": "SECRET_RESP_DELTA"})
+    resp_api.stream_event({"type": "response.completed", "response": {"status": "completed", "usage": {"input_tokens": 7, "output_tokens": 3}}})
+    resp_api.finish()
+
+    raw = (tmp_path / "llm.jsonl").read_text(encoding="utf-8")
+    for secret in ("TOP_SECRET_ANTHROPIC_PROMPT", "SECRET_CLAUDE_THINK", "SECRET_CLAUDE_REPLY",
+                   "TOP_SECRET_RESPONSES_PROMPT", "SECRET_RESP_DELTA", "aGVsbG8="):
+        assert secret not in raw
+    assert not (tmp_path / "llm_assets").exists()
+
+    # IA_LLM_TRACE=0 short-circuits TracingHttpxClient._request without calling json.loads
+    monkeypatch.setenv("IA_LLM_TRACE", "0")
+    calls = []
+    monkeypatch.setattr(trace.json, "loads", lambda *a, **k: calls.append(True))
+    req = httpx.Request("POST", "https://example.com/v1/chat/completions", content=b'{"model":"m"}')
+    trace.TracingHttpxClient._request(req)
+    assert isinstance(req.extensions["llm_trace"], trace._NullAttempt)
+    assert calls == []
