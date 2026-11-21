@@ -4,6 +4,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -87,7 +88,7 @@ async def lifespan(app: FastAPI):
     assist.init_background_workers()
     try:
         from services.storage.review import recover_stale_sessions_on_startup
-        recovered = recover_stale_sessions_on_startup()
+        recovered = await run_in_threadpool(recover_stale_sessions_on_startup)
         if recovered["analyzing_recovered"] or recovered["recording_recovered"]:
             _log.warning(
                 "Recovered stale review sessions on startup: analyzing->analysis_failed=%d recording->partial_capture=%d",
@@ -98,22 +99,32 @@ async def lifespan(app: FastAPI):
         _log.warning("Review startup recovery skipped: %s", e)
     try:
         from services.storage.resume_history import restore_active_resume
-        if restore_active_resume():
+        if await run_in_threadpool(restore_active_resume):
             _log.info("Resume auto-restored from history (id=%s)", cfg.resume_active_history_id)
     except Exception as e:
         _log.debug("Resume auto-restore skipped: %s", e)
     yield
     _log.info("SHUTDOWN cleaning up")
-    await asyncio.gather(mmpg_integration.manager.stop("shutdown"), candidate_mmpg.stop("shutdown", drain=True))
-    assist.stop_interview_loop()
-    assist.shutdown_background_workers()
+    await asyncio.gather(
+        mmpg_integration.manager.stop("shutdown"),
+        candidate_mmpg.stop("shutdown", drain=True),
+        return_exceptions=True,
+    )
+    await run_in_threadpool(assist.stop_interview_loop)
+    await run_in_threadpool(assist.shutdown_background_workers)
     try:
         from services.review_async_analysis import shutdown_executor as shutdown_review_analysis_executor
-        shutdown_review_analysis_executor(wait=False)
+        await run_in_threadpool(shutdown_review_analysis_executor, wait=False)
     except Exception as e:
         _log.debug("Review analysis executor shutdown skipped: %s", e)
+    try:
+        from core.resource_lanes import shutdown_resource_lanes
+        await run_in_threadpool(shutdown_resource_lanes, wait=False)
+    except Exception as e:
+        _log.debug("Resource lanes shutdown skipped: %s", e)
     dispatch_task.cancel()
     heartbeat_task.cancel()
+    await asyncio.gather(dispatch_task, heartbeat_task, return_exceptions=True)
 
 
 app = FastAPI(title="学习助手", lifespan=lifespan)

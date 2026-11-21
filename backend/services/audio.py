@@ -283,7 +283,7 @@ class AudioCapture:
         return result
 
     @staticmethod
-    def get_platform_info() -> dict:
+    def get_platform_info(devices: Optional[list[dict]] = None) -> dict:
         system = platform.system()
         info = {
             "platform": system,
@@ -292,8 +292,8 @@ class AudioCapture:
             "has_loopback": False,
         }
         if system == "Darwin":
-            devices = AudioCapture.list_devices()
-            has_loopback = any(d["is_loopback"] for d in devices)
+            dev_list = devices if devices is not None else AudioCapture.list_devices()
+            has_loopback = any(d["is_loopback"] for d in dev_list)
             info["has_loopback"] = has_loopback
             if not has_loopback:
                 info["needs_virtual_device"] = True
@@ -304,8 +304,8 @@ class AudioCapture:
                     "然后在「音频 MIDI 设置」中创建多输出设备。"
                 )
         elif system == "Windows":
-            devices = AudioCapture.list_devices()
-            has_loopback = any(d["is_loopback"] for d in devices)
+            dev_list = devices if devices is not None else AudioCapture.list_devices()
+            has_loopback = any(d["is_loopback"] for d in dev_list)
             info["has_loopback"] = has_loopback
             if not has_loopback:
                 info["needs_virtual_device"] = True

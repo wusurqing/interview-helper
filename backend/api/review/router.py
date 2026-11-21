@@ -2,7 +2,8 @@ import re
 import time
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from fastapi.concurrency import run_in_threadpool
+from pydantic import BaseModel, Field
 
 from core.logger import get_logger
 from services.storage import review
@@ -14,23 +15,23 @@ router = APIRouter()
 
 
 class UpdateSessionRequest(BaseModel):
-    title: str | None = None
-    company: str | None = None
-    role: str | None = None
+    title: str | None = Field(default=None, max_length=200)
+    company: str | None = Field(default=None, max_length=120)
+    role: str | None = Field(default=None, max_length=120)
     application_id: int | None = None
 
 
 class ManualReviewRequest(BaseModel):
-    transcript: str
-    title: str | None = None
-    company: str | None = None
-    role: str | None = None
+    transcript: str = Field(max_length=200_000)
+    title: str | None = Field(default=None, max_length=200)
+    company: str | None = Field(default=None, max_length=120)
+    role: str | None = Field(default=None, max_length=120)
     analyze: bool = True
 
 
 class AsrCorrectionTestRequest(BaseModel):
-    question: str | None = None
-    answer: str | None = None
+    question: str | None = Field(default=None, max_length=4000)
+    answer: str | None = Field(default=None, max_length=20_000)
 
 
 _QUESTION_PREFIX = re.compile(r"^\s*(?:Q(?:uestion)?\s*\d*|问题\s*\d*|问|面试官|Interviewer|HR)\s*[:：]\s*(.*)$", re.I)
@@ -86,23 +87,7 @@ def _has_generated_analysis(detail: dict) -> bool:
     return False
 
 
-@router.get("/review/sessions")
-async def list_sessions(page: int = 1, page_size: int = 20):
-    """列表页"""
-    return review.list_sessions(page, page_size)
-
-
-@router.post("/review/sessions/manual")
-async def create_manual_review(req: ManualReviewRequest):
-    """从粘贴的逐字稿/问答文本创建手动复盘。"""
-    transcript = (req.transcript or "").strip()
-    if len(transcript) < 12:
-        raise HTTPException(400, "复盘文本太短，请粘贴至少一组问答")
-
-    turns = _parse_manual_turns(transcript)
-    if not turns:
-        raise HTTPException(400, "未识别到问答结构，请使用“面试官: ... / 候选人: ...”或“Q: ... / A: ...”格式")
-
+def _create_manual_review_sync(req: ManualReviewRequest, turns: list[dict[str, str]]) -> dict:
     session_id = review.create_session(
         started_at=time.time(),
         interviewer_enabled=True,
@@ -137,80 +122,32 @@ async def create_manual_review(req: ManualReviewRequest):
     return {"session_id": session_id, "turn_count": len(turns), "status": "started" if req.analyze else "created"}
 
 
-@router.get("/review/sessions/{session_id}")
-async def get_session(session_id: int):
-    """详情页"""
-    detail = review.get_session_detail(session_id)
-    if not detail:
+def _update_session_sync(session_id: int, req: UpdateSessionRequest) -> dict:
+    if not review.get_session_detail(session_id):
         raise HTTPException(404, "Session not found")
-    return detail
-
-
-@router.patch("/review/sessions/{session_id}")
-async def update_session(session_id: int, req: UpdateSessionRequest):
-    """更新会话信息（标题、公司、岗位）"""
-    try:
-        if not review.get_session_detail(session_id):
-            raise HTTPException(404, "Session not found")
-        updates = req.model_dump(exclude_unset=True)
-        if "application_id" in updates and updates["application_id"] is not None:
-            if not job_tracker.get_application(int(updates["application_id"])):
-                raise HTTPException(404, "Application not found")
-        update_kwargs = {
-            "session_id": session_id,
-            "title": updates.get("title"),
-            "company": updates.get("company"),
-            "role": updates.get("role"),
-        }
-        if "application_id" in updates:
-            update_kwargs["application_id"] = updates["application_id"]
-        review.update_session_info(**update_kwargs)
-        detail = review.get_session_detail(session_id)
-        auto_sync_eligible = review.is_auto_sync_eligible_session(detail)
-        return {
-            "success": True,
-            "synced_todos": bool(detail and detail.get("application_id") and auto_sync_eligible),
-            "auto_sync_eligible": auto_sync_eligible,
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-
-@router.post("/review/asr-correction-test")
-async def test_asr_correction(req: AsrCorrectionTestRequest):
-    """测试当前复盘模型是否可用于 ASR 纠错。"""
-    return review_analysis.run_asr_correction_check(
-        question=req.question or "请介绍一下你做过的缓存优化。",
-        candidate_answer=req.answer or "",
-    )
-
-
-@router.get("/review/current")
-async def get_current_session():
-    """当前进行中的 session"""
-    current = review.get_current_session()
-    return {"session": current}
-
-
-@router.get("/review/profile")
-async def get_profile():
-    """长期画像（首版返回空）"""
+    updates = req.model_dump(exclude_unset=True)
+    if "application_id" in updates and updates["application_id"] is not None:
+        if not job_tracker.get_application(int(updates["application_id"])):
+            raise HTTPException(404, "Application not found")
+    update_kwargs = {
+        "session_id": session_id,
+        "title": updates.get("title"),
+        "company": updates.get("company"),
+        "role": updates.get("role"),
+    }
+    if "application_id" in updates:
+        update_kwargs["application_id"] = updates["application_id"]
+    review.update_session_info(**update_kwargs)
+    detail = review.get_session_detail(session_id)
+    auto_sync_eligible = review.is_auto_sync_eligible_session(detail)
     return {
-        "session_count": 0,
-        "summary": None,
-        "strengths": [],
-        "weaknesses": [],
-        "behavior_traits": [],
-        "domain_mastery": {},
-        "trend": [],
+        "success": True,
+        "synced_todos": bool(detail and detail.get("application_id") and auto_sync_eligible),
+        "auto_sync_eligible": auto_sync_eligible,
     }
 
 
-@router.post("/review/sessions/{session_id}/generate")
-async def trigger_review_analysis(session_id: int):
-    """手动触发复盘分析（用于一开始未开启但已落库的 session）"""
+def _trigger_review_analysis_sync(session_id: int) -> dict:
     detail = review.get_session_detail(session_id)
     if not detail:
         raise HTTPException(404, "Session not found")
@@ -253,3 +190,81 @@ async def trigger_review_analysis(session_id: int):
         except Exception:
             pass
         raise HTTPException(500, "复盘分析启动失败，请稍后重试")
+
+
+@router.get("/review/sessions")
+async def list_sessions(page: int = 1, page_size: int = 20):
+    """列表页（分页上下界由 review.list_sessions 统一钳制至 [1, MAX_REVIEW_PAGE_SIZE]）"""
+    return await run_in_threadpool(review.list_sessions, page, page_size)
+
+
+@router.post("/review/sessions/manual")
+async def create_manual_review(req: ManualReviewRequest):
+    """从粘贴的逐字稿/问答文本创建手动复盘。"""
+    transcript = (req.transcript or "").strip()
+    if len(transcript) < 12:
+        raise HTTPException(400, "复盘文本太短，请粘贴至少一组问答")
+
+    turns = _parse_manual_turns(transcript)
+    if not turns:
+        raise HTTPException(400, "未识别到问答结构，请使用“面试官: ... / 候选人: ...”或“Q: ... / A: ...”格式")
+
+    return await run_in_threadpool(_create_manual_review_sync, req, turns)
+
+
+@router.get("/review/sessions/{session_id}")
+async def get_session(session_id: int):
+    """详情页"""
+    detail = await run_in_threadpool(review.get_session_detail, session_id)
+    if not detail:
+        raise HTTPException(404, "Session not found")
+    return detail
+
+
+@router.patch("/review/sessions/{session_id}")
+async def update_session(session_id: int, req: UpdateSessionRequest):
+    """更新会话信息（标题、公司、岗位）"""
+    try:
+        return await run_in_threadpool(_update_session_sync, session_id, req)
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to update review session session_id=%d", session_id)
+        raise HTTPException(500, "更新复盘会话失败，请稍后重试")
+
+
+@router.post("/review/asr-correction-test")
+async def test_asr_correction(req: AsrCorrectionTestRequest):
+    """测试当前复盘模型是否可用于 ASR 纠错（离事件循环执行，避免同步 LLM HTTP 阻塞全站）。"""
+    return await run_in_threadpool(
+        review_analysis.run_asr_correction_check,
+        question=req.question or "请介绍一下你做过的缓存优化。",
+        candidate_answer=req.answer or "",
+    )
+
+
+@router.get("/review/current")
+async def get_current_session():
+    """当前进行中的 session"""
+    current = await run_in_threadpool(review.get_current_session)
+    return {"session": current}
+
+
+@router.get("/review/profile")
+async def get_profile():
+    """长期画像（首版返回空）"""
+    return {
+        "session_count": 0,
+        "summary": None,
+        "strengths": [],
+        "weaknesses": [],
+        "behavior_traits": [],
+        "domain_mastery": {},
+        "trend": [],
+    }
+
+
+@router.post("/review/sessions/{session_id}/generate")
+async def trigger_review_analysis(session_id: int):
+    """手动触发复盘分析（用于一开始未开启但已落库的 session）"""
+    return await run_in_threadpool(_trigger_review_analysis_sync, session_id)

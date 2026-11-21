@@ -305,10 +305,10 @@ async def api_clear():
             single_mic.pause()
         mmpg.clear_turns()
         candidate_mmpg.manager.discard_turns()
-        cancel_answer_work(invalidate_capture=True)
+        await run_in_threadpool(cancel_answer_work, invalidate_capture=True)
         await asyncio.gather(mmpg.manager.stop("stopped"), candidate_mmpg.stop("stopped"))
         await run_in_threadpool(stop_interview_loop)
-        cancel_answer_work(reset_session_data=True)
+        await run_in_threadpool(cancel_answer_work, reset_session_data=True)
         broadcast({"type": "session_cleared"})
     return {"ok": True}
 
@@ -317,7 +317,7 @@ async def api_clear():
 async def api_ask_cancel():
     mmpg.clear_turns()
     _bump_generation()
-    cancel_answer_work(reset_session_data=False)
+    await run_in_threadpool(cancel_answer_work, reset_session_data=False)
     return {"ok": True}
 
 
@@ -355,7 +355,7 @@ async def api_ask_from_server_screen(body: Optional[ServerScreenQuestion] = None
     if pick_model_index(("", "screen", True, "server_screen_left", {}), set(), config_snapshot=cfg) is None:
         raise HTTPException(400, model_error)
     try:
-        data_url = capture_primary_left_half_data_url()
+        data_url = await run_in_threadpool(capture_primary_left_half_data_url)
     except ScreenCaptureError as e:
         raise HTTPException(503, str(e))
     region = getattr(cfg, "screen_capture_region", "left_half") or "left_half"
@@ -366,7 +366,7 @@ async def api_ask_from_server_screen(body: Optional[ServerScreenQuestion] = None
     # Written exam: keep in-flight answers so multi-shot screenshots can run in parallel.
     # Non-exam interview: cancel previous generation (screenshot replaces the live answer).
     if not written_exam:
-        cancel_answer_work(reset_session_data=False)
+        await run_in_threadpool(cancel_answer_work, reset_session_data=False)
     queued = submit_answer_task((text, data_url, True, "server_screen_left", meta), config_snapshot=cfg)
     if not queued:
         raise HTTPException(503, model_error)
@@ -379,7 +379,8 @@ async def api_capture_server_screen():
 
     written_exam = bool(getattr(get_config(), "written_exam_mode", False))
     try:
-        return {"ok": True, "image": capture_primary_left_half_data_url(), "written_exam_mode": written_exam}
+        image = await run_in_threadpool(capture_primary_left_half_data_url)
+        return {"ok": True, "image": image, "written_exam_mode": written_exam}
     except ScreenCaptureError as e:
         raise HTTPException(503, str(e))
 
@@ -405,7 +406,7 @@ async def api_ask_from_server_screens(body: MultiServerScreenQuestion):
     if pick_model_index(task, set(), config_snapshot=cfg) is None:
         raise HTTPException(400, model_error)
     if not written_exam:
-        cancel_answer_work(reset_session_data=False)
+        await run_in_threadpool(cancel_answer_work, reset_session_data=False)
     queued = submit_answer_task(task, config_snapshot=cfg)
     if not queued:
         raise HTTPException(503, model_error)

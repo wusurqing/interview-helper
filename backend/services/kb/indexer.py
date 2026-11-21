@@ -97,7 +97,78 @@ def stats() -> dict[str, Any]:
     return _get_store().stats()
 
 
-def reindex() -> dict[str, Any]:
+def _index_single_file(
+    path: Path,
+    rel: str,
+    *,
+    cfg: Any,
+    store: KBStore,
+    allowed: set[str],
+    force: bool = False,
+) -> bool:
+    """索引单个文件；实际重建了 chunk 返回 True，跳过或失败返回 False。"""
+    ext = path.suffix.lower()
+    if ext in _FAILED_DOC_EXTENSIONS:
+        try:
+            st = path.stat()
+            store.upsert_doc(rel, st.st_mtime, st.st_size, "unsupported", None)
+            store.set_status(rel, "failed", _DOC_FAIL_MSG)
+        except Exception as e:  # pragma: no cover
+            _log.warning("kb indexer 记录 .doc 失败 %s: %s", rel, e)
+        return False
+
+    if ext not in allowed:
+        return False
+
+    loader = _loaders.dispatch_loader(path)
+    if loader is None:
+        return False
+
+    try:
+        stat = path.stat()
+    except OSError as e:
+        _log.warning("kb indexer stat 失败 %s: %s", rel, e)
+        return False
+
+    if not force:
+        existing = store.get_doc(rel)
+        if (
+            existing
+            and existing["mtime"] == stat.st_mtime
+            and existing["size"] == stat.st_size
+            and existing["status"] == "ok"
+        ):
+            return False
+
+    try:
+        raw = loader.load(path, rel_path=rel)
+        doc_id = store.upsert_doc(
+            path=rel,
+            mtime=stat.st_mtime,
+            size=stat.st_size,
+            loader=getattr(loader, "name", "unknown"),
+            title=raw.title,
+        )
+        chunks = chunk_doc(raw, max_chars=cfg.kb_chunk_max_chars)
+        store.replace_chunks(doc_id, chunks)
+        return True
+    except Exception as e:
+        _log.warning("kb indexer 加载 %s 失败：%s", rel, e)
+        try:
+            store.upsert_doc(
+                rel,
+                stat.st_mtime,
+                stat.st_size,
+                getattr(loader, "name", "unknown"),
+                None,
+            )
+            store.set_status(rel, "failed", str(e)[:500])
+        except Exception as inner:  # pragma: no cover
+            _log.warning("kb indexer 记录失败状态时再次失败 %s: %s", rel, inner)
+        return False
+
+
+def reindex(force: bool = False) -> dict[str, Any]:
     cfg = get_config()
     kb_dir = resolve_path(cfg.kb_dir)
     kb_dir.mkdir(parents=True, exist_ok=True)
@@ -113,65 +184,17 @@ def reindex() -> dict[str, Any]:
             rel = str(path.relative_to(kb_dir)).replace(os.sep, "/")
         except ValueError:
             continue
-        ext = path.suffix.lower()
         on_disk.add(rel)
 
-        if ext in _FAILED_DOC_EXTENSIONS:
-            try:
-                st = path.stat()
-                store.upsert_doc(rel, st.st_mtime, st.st_size, "unsupported", None)
-                store.set_status(rel, "failed", _DOC_FAIL_MSG)
-            except Exception as e:  # pragma: no cover
-                _log.warning("kb indexer 记录 .doc 失败 %s: %s", rel, e)
-            continue
-
-        if ext not in allowed:
-            continue
-
-        loader = _loaders.dispatch_loader(path)
-        if loader is None:
-            continue
-
-        try:
-            stat = path.stat()
-        except OSError as e:
-            _log.warning("kb indexer stat 失败 %s: %s", rel, e)
-            continue
-
-        existing = store.get_doc(rel)
-        if (
-            existing
-            and existing["mtime"] == stat.st_mtime
-            and existing["size"] == stat.st_size
-            and existing["status"] == "ok"
+        if _index_single_file(
+            path,
+            rel,
+            cfg=cfg,
+            store=store,
+            allowed=allowed,
+            force=force,
         ):
-            continue
-
-        try:
-            raw = loader.load(path, rel_path=rel)
-            doc_id = store.upsert_doc(
-                path=rel,
-                mtime=stat.st_mtime,
-                size=stat.st_size,
-                loader=getattr(loader, "name", "unknown"),
-                title=raw.title,
-            )
-            chunks = chunk_doc(raw, max_chars=cfg.kb_chunk_max_chars)
-            store.replace_chunks(doc_id, chunks)
             reindexed += 1
-        except Exception as e:
-            _log.warning("kb indexer 加载 %s 失败：%s", rel, e)
-            try:
-                store.upsert_doc(
-                    rel,
-                    stat.st_mtime,
-                    stat.st_size,
-                    getattr(loader, "name", "unknown"),
-                    None,
-                )
-                store.set_status(rel, "failed", str(e)[:500])
-            except Exception as inner:  # pragma: no cover
-                _log.warning("kb indexer 记录失败状态时再次失败 %s: %s", rel, inner)
 
     for row in store.list_docs():
         if row["path"] not in on_disk:
@@ -182,14 +205,34 @@ def reindex() -> dict[str, Any]:
     return info
 
 
-def reindex_file(rel_path: str) -> dict[str, Any]:
-    """按相对路径重建单文件索引；文件不存在时删除记录。"""
-    path = resolve_kb_file(rel_path)
+def reindex_file(rel_path: str, *, force: bool = True) -> dict[str, Any]:
+    """按相对路径增量重建单文件索引（不再触发全库 rglob 扫描）；文件不存在时删除记录。"""
+    norm = validate_rel_path(rel_path)
+    path = resolve_kb_file(norm)
     store = _get_store()
-    if not path.exists():
-        store.delete_doc(validate_rel_path(rel_path))
-        return store.stats()
-    return reindex()
+    if not path.exists() or not path.is_file():
+        store.delete_doc(norm)
+        info = store.stats()
+        info["reindexed_files"] = 0
+        return info
+
+    cfg = get_config()
+    allowed = {ext.lower() for ext in cfg.kb_file_extensions}
+    reindexed = (
+        1
+        if _index_single_file(
+            path,
+            norm,
+            cfg=cfg,
+            store=store,
+            allowed=allowed,
+            force=force,
+        )
+        else 0
+    )
+    info = store.stats()
+    info["reindexed_files"] = reindexed
+    return info
 
 
 def remove_file(rel_path: str) -> None:

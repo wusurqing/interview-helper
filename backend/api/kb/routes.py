@@ -14,16 +14,19 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 
 from core.config import get_config
-from core.resource_lanes import ResourceLaneBusyError, run_low_priority
+from core.logger import get_logger
+from core.resource_lanes import ResourceLaneBusyError, run_kb_index, run_kb_query
 from services.kb import indexer, retriever
 from services.kb.recent_hits import global_recent_hits
 
+_log = get_logger(__name__)
 router = APIRouter()
 
 
@@ -35,15 +38,22 @@ def _dep_ok(mod: str) -> bool:
         return False
 
 
-async def _run_kb_low_priority(fn, *args):
+async def _run_kb_query_lane(fn, *args, **kwargs):
     try:
-        return await run_low_priority(fn, *args)
+        return await run_kb_query(fn, *args, **kwargs)
     except ResourceLaneBusyError as e:
-        raise HTTPException(status_code=429, detail="后台低优先级队列繁忙，请稍后重试") from e
+        raise HTTPException(status_code=429, detail="知识库查询队列繁忙，请稍后重试") from e
+
+
+async def _run_kb_index_lane(fn, *args, **kwargs):
+    try:
+        return await run_kb_index(fn, *args, **kwargs)
+    except ResourceLaneBusyError as e:
+        raise HTTPException(status_code=429, detail="知识库索引队列繁忙，请稍后重试") from e
 
 
 class SearchReq(BaseModel):
-    query: str
+    query: str = Field(max_length=2000)
     k: int = Field(default=4, ge=1, le=20)
     min_score: float = Field(default=0.0, ge=0.0)
     deadline_ms: Optional[int] = Field(default=None, ge=10, le=5000)
@@ -52,7 +62,7 @@ class SearchReq(BaseModel):
 @router.get("/kb/status")
 async def kb_status() -> dict:
     cfg = get_config()
-    s = await _run_kb_low_priority(indexer.stats)
+    s = await _run_kb_query_lane(indexer.stats)
     deps = {
         "docx": _dep_ok("docx"),
         "pdf": _dep_ok("pypdf"),
@@ -71,8 +81,8 @@ async def kb_status() -> dict:
 
 
 @router.get("/kb/docs")
-async def kb_docs(limit: Optional[int] = None) -> dict:
-    items = await _run_kb_low_priority(indexer.list_docs, limit)
+async def kb_docs(limit: Annotated[Optional[int], Query(ge=1, le=1000)] = None) -> dict:
+    items = await _run_kb_query_lane(indexer.list_docs, limit)
     return {"items": items}
 
 
@@ -80,7 +90,7 @@ async def kb_docs(limit: Optional[int] = None) -> dict:
 async def kb_search(req: SearchReq) -> dict:
     cfg = get_config()
     deadline = req.deadline_ms or int(getattr(cfg, "kb_deadline_ms", 150) or 150)
-    hits = await _run_kb_low_priority(
+    hits = await _run_kb_query_lane(
         lambda: retriever.retrieve(
             req.query,
             req.k,
@@ -108,8 +118,14 @@ async def kb_search(req: SearchReq) -> dict:
 
 
 @router.get("/kb/hits/recent")
-async def kb_hits_recent(limit: int = 50) -> dict:
+async def kb_hits_recent(limit: Annotated[int, Query(ge=1, le=200)] = 50) -> dict:
     return {"items": global_recent_hits().list(limit=limit)}
+
+
+def _write_upload_bytes(rel_str: str, content: bytes) -> None:
+    dest = indexer.resolve_kb_file(rel_str)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(content)
 
 
 def _safe_rel_path(subdir: str, filename: str, allowed_exts: set[str]) -> Path:
@@ -156,13 +172,14 @@ async def kb_upload(
 
     rel_str = rel.as_posix()
     try:
-        dest = indexer.resolve_kb_file(rel_str)
+        await run_in_threadpool(_write_upload_bytes, rel_str, content)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"invalid path: {e}") from e
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(content)
+    except OSError:
+        _log.exception("kb upload write failed path=%s", rel_str)
+        raise HTTPException(status_code=500, detail="保存知识库文件失败，请检查磁盘权限") from None
 
-    info = await _run_kb_low_priority(indexer.reindex_file, rel_str)
+    info = await _run_kb_index_lane(indexer.reindex_file, rel_str)
     return {
         "path": rel_str,
         "size": len(content),
@@ -176,7 +193,8 @@ class ReindexReq(BaseModel):
 
 @router.post("/kb/reindex")
 async def kb_reindex(req: Optional[ReindexReq] = None) -> dict:
-    info = await _run_kb_low_priority(indexer.reindex)
+    force = bool(req.force) if req is not None else False
+    info = await _run_kb_index_lane(indexer.reindex, force=force)
     return info
 
 
@@ -187,8 +205,8 @@ async def kb_delete_doc(path: str) -> dict:
         raise HTTPException(status_code=400, detail="path required")
     try:
         rel = indexer.validate_rel_path(p)
-        indexer.resolve_kb_file(rel)
+        await run_in_threadpool(indexer.resolve_kb_file, rel)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"invalid path: {e}") from e
-    await _run_kb_low_priority(indexer.remove_file, rel)
+    await _run_kb_query_lane(indexer.remove_file, rel)
     return {"ok": True, "path": rel}

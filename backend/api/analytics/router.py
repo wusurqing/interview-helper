@@ -1,4 +1,7 @@
-from fastapi import APIRouter, HTTPException, Response
+from typing import Annotated
+
+from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi.concurrency import run_in_threadpool
 
 from core.config import (
     ConfigCorruptError, KnowledgeAnalysisSettings, ModelListChanged, get_config, get_provider_layout,
@@ -82,15 +85,18 @@ def api_start_knowledge_analysis(response: Response):
 
 @router.get("/knowledge/summary")
 async def api_knowledge_summary():
-    return {"tags": get_summary(ABILITY_SESSION_TYPES)}
+    return {"tags": await run_in_threadpool(get_summary, ABILITY_SESSION_TYPES)}
 
 
 @router.get("/knowledge/history")
-async def api_knowledge_history(page: int = 1, page_size: int = 20):
-    return get_history(page, page_size, ABILITY_SESSION_TYPES)
+async def api_knowledge_history(
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=200)] = 20,
+):
+    return await run_in_threadpool(get_history, page, page_size, ABILITY_SESSION_TYPES)
 
 
 @router.delete("/knowledge/reset")
 async def api_knowledge_reset():
-    reset_all()
+    await run_in_threadpool(reset_all)
     return {"ok": True}

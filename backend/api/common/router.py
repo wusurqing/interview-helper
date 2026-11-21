@@ -19,6 +19,7 @@ from core.config import (
     normalize_llm_max_tokens, normalize_llm_temperature,
 )
 from core.env import env_int
+from core.logger import get_logger
 from core.prompt_settings import PROMPT_SCENES
 from services.audio import AudioCapture
 from services.stt import STTError, get_stt_engine, stt_configuration_error
@@ -47,6 +48,7 @@ from services.storage.resume_history import (
     update_entry_summary,
 )
 
+_log = get_logger("common.router")
 router = APIRouter()
 router.include_router(catalog_router)
 router.include_router(provider_settings_router)
@@ -153,7 +155,7 @@ def _list_remote_models(api_base_url: str, api_key: str, api_type: str = "openai
 
 @router.get("/config")
 async def api_get_config():
-    return build_config_payload(get_config())
+    return await run_in_threadpool(build_config_payload, get_config())
 
 
 @router.get("/prompts")
@@ -459,7 +461,16 @@ async def api_update_config(body: ConfigUpdate, request: Request = None):
     except (TypeError, ValueError) as e:
         raise HTTPException(400, str(e)) from e
     # 返回更新后的完整配置，而不是简单的 {ok: True}
-    return build_config_payload(get_config())
+    return await run_in_threadpool(build_config_payload, get_config())
+
+
+def _detect_lan_ip() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return "127.0.0.1"
 
 
 @router.get("/network-info")
@@ -470,15 +481,8 @@ async def api_network_info(request: Request):
     可自动写入 sessionStorage 并附在后续请求里。LAN 客户端拿到的是不带
     token 的 URL,自身就拒绝访问,从而避免凭证泄露。
     """
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-    except Exception:
-        ip = "127.0.0.1"
+    ip = await run_in_threadpool(_detect_lan_ip)
     # Read PORT from env (set by start.py), fallback to 18080
-    import os
     port = env_int("PORT", 18080, minimum=1)
     base = f"http://{ip}:{port}"
     client_host = request.client.host if request.client else None
@@ -512,14 +516,27 @@ async def api_options():
     }
 
 
+def _collect_audio_devices_and_platform() -> dict:
+    devices = AudioCapture.list_devices()
+    platform_info = AudioCapture.get_platform_info(devices=devices)
+    return {"devices": devices, "platform": platform_info}
+
+
 @router.get("/devices")
 async def api_devices():
     try:
-        devices = AudioCapture.list_devices()
-        platform_info = AudioCapture.get_platform_info()
-        return {"devices": devices, "platform": platform_info}
-    except Exception as e:
-        return {"devices": [], "platform": {"platform": "unknown", "needs_virtual_device": False, "instructions": "", "error": str(e)}}
+        return await run_in_threadpool(_collect_audio_devices_and_platform)
+    except Exception:
+        _log.exception("Failed to enumerate audio devices")
+        return {
+            "devices": [],
+            "platform": {
+                "platform": "unknown",
+                "needs_virtual_device": False,
+                "instructions": "",
+                "error": "获取音频设备失败，请检查系统音频驱动后重试",
+            },
+        }
 
 
 @router.post("/resume")
@@ -558,8 +575,9 @@ async def api_upload_resume(request: Request, file: UploadFile = File(...)):
         return await run_in_threadpool(add_upload, content, file.filename)
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
-    except Exception as e:
-        raise HTTPException(500, str(e)) from e
+    except Exception:
+        _log.exception("Failed to upload resume filename=%s", file.filename)
+        raise HTTPException(500, "简历上传失败，请稍后重试") from None
 
 
 @router.delete("/resume")
@@ -572,7 +590,8 @@ async def api_delete_resume():
 
 @router.get("/resume/history")
 async def api_resume_history():
-    return {"items": list_entries(), "max": 10}
+    items = await run_in_threadpool(list_entries)
+    return {"items": items, "max": 10}
 
 
 class ResumeHistoryUpdateBody(BaseModel):
@@ -582,7 +601,7 @@ class ResumeHistoryUpdateBody(BaseModel):
 @router.get("/resume/history/{entry_id}")
 async def api_resume_history_detail(entry_id: int):
     try:
-        return get_entry_detail(entry_id)
+        return await run_in_threadpool(get_entry_detail, entry_id)
     except FileNotFoundError:
         raise HTTPException(404, "记录不存在")
 
@@ -590,7 +609,7 @@ async def api_resume_history_detail(entry_id: int):
 @router.put("/resume/history/{entry_id}")
 async def api_resume_history_update(entry_id: int, body: ResumeHistoryUpdateBody):
     try:
-        return update_entry_summary(entry_id, body.summary)
+        return await run_in_threadpool(update_entry_summary, entry_id, body.summary)
     except FileNotFoundError:
         raise HTTPException(404, "记录不存在")
     except ValueError as e:
@@ -610,7 +629,7 @@ async def api_resume_history_apply(entry_id: int):
 
 @router.delete("/resume/history/{entry_id}")
 async def api_resume_history_delete(entry_id: int):
-    delete_entry(entry_id)
+    await run_in_threadpool(delete_entry, entry_id)
     return {"ok": True}
 
 
@@ -847,8 +866,12 @@ async def api_models_layout(body: dict):
             updates["active_model"] = 0
     try:
         await run_in_threadpool(update_config, updates, model_origins=origins, model_snapshot=cfg.models)
+    except ConfigCorruptError as e:
+        raise HTTPException(409, str(e)) from e
     except ModelListChanged as e:
         raise HTTPException(409, str(e)) from e
     except InvalidAssistModelSelection as e:
         raise HTTPException(422, str(e)) from e
+    except OSError:
+        raise HTTPException(500, "无法保存设置，请检查配置文件目录的写入权限") from None
     return {"ok": True}
