@@ -1,5 +1,5 @@
 const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, ipcMain, screen, shell } = require('electron');
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
@@ -160,6 +160,47 @@ function updatePromptWheelState(active = Boolean(promptWheelActive())) {
   }
 }
 
+function resolvePythonExecutable() {
+  const envPython = typeof process.env.IA_DESKTOP_PYTHON === 'string'
+    ? process.env.IA_DESKTOP_PYTHON.trim()
+    : '';
+  if (envPython) return envPython;
+  const venvPython = process.platform === 'win32'
+    ? path.join(ROOT, '.venv', 'Scripts', 'python.exe')
+    : path.join(ROOT, '.venv', 'bin', 'python');
+  if (fs.existsSync(venvPython)) return venvPython;
+  return process.platform === 'win32' ? 'python' : 'python3';
+}
+
+function terminateChildProcess(proc, { sync = false } = {}) {
+  if (!proc) return;
+  if (proc.exitCode !== null && proc.exitCode !== undefined) return;
+  if (proc.signalCode !== null && proc.signalCode !== undefined) return;
+  if (process.platform === 'win32' && proc.pid) {
+    try {
+      if (sync && typeof spawnSync === 'function') {
+        spawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+          timeout: 3000,
+        });
+        return;
+      }
+      const killer = spawn('taskkill', ['/PID', String(proc.pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      killer?.on?.('error', () => {
+        try { proc.kill(); } catch { /* ignore */ }
+      });
+      return;
+    } catch {
+      /* fallback to proc.kill */
+    }
+  }
+  try { proc.kill('SIGKILL'); } catch { /* ignore */ }
+}
+
 function stopPromptWheelHelper(status = 'inactive') {
   const helper = promptWheelHelper;
   if (helper) {
@@ -168,15 +209,25 @@ function stopPromptWheelHelper(status = 'inactive') {
     promptWheelHelper = null;
     promptWheelGeneration += 1;
     clearTimeout(helper.startupTimer);
+    clearTimeout(helper.killTimer);
     try { helper.stdin.end(); } catch { /* process may have exited */ }
+    if (helper.exitCode == null && helper.signalCode == null) {
+      helper.killTimer = setTimeout(() => {
+        helper.killTimer = null;
+        terminateChildProcess(helper);
+      }, 1500);
+      helper.once?.('exit', () => {
+        clearTimeout(helper.killTimer);
+        helper.killTimer = null;
+      });
+    }
   }
   sendPromptWheelStatus(status);
 }
 
 function startPromptWheelHelper() {
   if (!promptWheelActive() || promptWheelHelper) return;
-  const python = process.env.IA_DESKTOP_PYTHON || (fs.existsSync(path.join(ROOT, '.venv', 'Scripts', 'python.exe'))
-    ? path.join(ROOT, '.venv', 'Scripts', 'python.exe') : 'python');
+  const python = resolvePythonExecutable();
   let helper;
   try {
     helper = spawn(python, ['-u', path.join(__dirname, 'prompt_mouse_hook.py'), '--parent-pid', String(process.pid)], {
@@ -392,24 +443,59 @@ function createTrayIcon() {
 function waitForServer(timeout = 40000) {
   const start = Date.now();
   return new Promise((resolve, reject) => {
-    const check = () => {
-      const req = http.get(`${SERVER_URL}/api/options`, { timeout: 1000 }, (res) => {
-        if (res.statusCode === 200) return resolve();
-        retry();
-      });
-      req.on('error', retry);
-      req.on('timeout', () => { req.destroy(); retry(); });
+    let done = false;
+    let retryTimer = null;
+    const finish = (err) => {
+      if (done) return;
+      done = true;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+      if (err) reject(err);
+      else resolve();
     };
-    const retry = () => {
-      if (Date.now() - start > timeout) return reject(new Error('Server start timeout'));
-      setTimeout(check, 300);
+    const scheduleRetry = () => {
+      if (done || retryTimer) return;
+      if (Date.now() - start > timeout) {
+        finish(new Error('Server start timeout'));
+        return;
+      }
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        check();
+      }, 300);
+    };
+    const check = () => {
+      if (done) return;
+      let attemptSettled = false;
+      const onAttemptFailed = () => {
+        if (attemptSettled || done) return;
+        attemptSettled = true;
+        scheduleRetry();
+      };
+      const req = http.get(`${SERVER_URL}/api/options`, { timeout: 1000 }, (res) => {
+        res.resume?.();
+        if (attemptSettled || done) return;
+        attemptSettled = true;
+        if (res.statusCode === 200) {
+          finish();
+          return;
+        }
+        scheduleRetry();
+      });
+      req.on('error', onAttemptFailed);
+      req.on('timeout', () => {
+        try { req.destroy(); } catch { /* ignore */ }
+        onAttemptFailed();
+      });
     };
     check();
   });
 }
 
 function startPythonBackend() {
-  const python = process.platform === 'win32' ? 'python' : 'python3';
+  const python = resolvePythonExecutable();
   pythonProcess = spawn(python, [
     path.join(ROOT, 'start.py'),
     '--mode', 'network',
@@ -463,12 +549,20 @@ function createWindow() {
     openExternal: (url) => shell?.openExternal?.(url),
   });
 
+  mainWindow._contentProtection = true;
   mainWindow.setContentProtection(true);
 
   // 每次启动清除缓存，确保加载到最新的前端构建（避免设置里识别引擎等不更新）
-  mainWindow.webContents.session.clearCache().then(() => {
-    mainWindow.loadURL(FRONTEND_URL);
-  });
+  const win = mainWindow;
+  const loadMainWindow = () => {
+    if (!win || win.isDestroyed()) return;
+    win.loadURL(FRONTEND_URL);
+  };
+  Promise.resolve(win.webContents.session.clearCache())
+    .catch((err) => {
+      console.warn('clearCache failed:', err?.message || err);
+    })
+    .then(loadMainWindow);
 
   mainWindow.webContents.on('did-finish-load', () => {
     const t = JSON.stringify(APP_DISPLAY_NAME);
@@ -725,12 +819,22 @@ function notifyConfigUpdated(config) {
   }
 }
 
-function postBackend(pathname, body = '{}') {
+const BACKEND_GET_TIMEOUT_MS = 15000;
+const BACKEND_POST_TIMEOUT_MS = 30000;
+
+function postBackend(pathname, body = '{}', timeoutMs = BACKEND_POST_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
     const req = http.request(
       `${SERVER_URL}${pathname}`,
       {
         method: 'POST',
+        timeout: timeoutMs,
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(body),
@@ -740,40 +844,56 @@ function postBackend(pathname, body = '{}') {
         let raw = '';
         res.setEncoding('utf8');
         res.on('data', (chunk) => { raw += chunk; });
+        res.on('error', (err) => settle(reject, err));
         res.on('end', () => {
           if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-            if (!raw) { resolve({ ok: true }); return; }
-            try { resolve(JSON.parse(raw)); } catch { resolve({ ok: true }); }
+            if (!raw) { settle(resolve, { ok: true }); return; }
+            try { settle(resolve, JSON.parse(raw)); } catch { settle(resolve, { ok: true }); }
             return;
           }
           let detail;
           try { detail = JSON.parse(raw).detail; } catch { /* Some errors are plain text. */ }
-          reject(new Error((typeof detail === 'string' && detail) || raw || res.statusMessage || `HTTP ${res.statusCode}`));
+          settle(reject, new Error((typeof detail === 'string' && detail) || raw || res.statusMessage || `HTTP ${res.statusCode}`));
         });
       }
     );
-    req.on('error', reject);
+    req.on('timeout', () => {
+      settle(reject, new Error(`请求超时 (${pathname})`));
+      try { req.destroy(); } catch { /* ignore */ }
+    });
+    req.on('error', (err) => settle(reject, err));
     req.write(body);
     req.end();
   });
 }
 
-function getBackend(pathname) {
+function getBackend(pathname, timeoutMs = BACKEND_GET_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    const req = http.request(`${SERVER_URL}${pathname}`, { method: 'GET' }, (res) => {
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
+    const req = http.request(`${SERVER_URL}${pathname}`, { method: 'GET', timeout: timeoutMs }, (res) => {
       let raw = '';
       res.setEncoding('utf8');
       res.on('data', (chunk) => { raw += chunk; });
+      res.on('error', (err) => settle(reject, err));
       res.on('end', () => {
         if (res.statusCode && res.statusCode >= 200 && res.statusCode < 300) {
-          if (!raw) { resolve({}); return; }
-          try { resolve(JSON.parse(raw)); } catch { resolve({}); }
+          if (!raw) { settle(resolve, {}); return; }
+          try { settle(resolve, JSON.parse(raw)); } catch { settle(resolve, {}); }
           return;
         }
-        reject(new Error(raw || res.statusMessage || `HTTP ${res.statusCode}`));
+        settle(reject, new Error(raw || res.statusMessage || `HTTP ${res.statusCode}`));
       });
     });
-    req.on('error', reject);
+    req.on('timeout', () => {
+      settle(reject, new Error(`请求超时 (${pathname})`));
+      try { req.destroy(); } catch { /* ignore */ }
+    });
+    req.on('error', (err) => settle(reject, err));
     req.end();
   });
 }
@@ -840,7 +960,10 @@ function createTray() {
       type: 'checkbox',
       checked: true,
       click: (menuItem) => {
-        mainWindow?.setContentProtection(menuItem.checked);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow._contentProtection = Boolean(menuItem.checked);
+          mainWindow.setContentProtection(mainWindow._contentProtection);
+        }
       },
     },
     { type: 'separator' },
@@ -1148,7 +1271,10 @@ ipcMain.handle('set-window-opacity', (_event, requestedOpacity) => {
   }, 250);
   return mainWindow.getOpacity();
 });
-ipcMain.handle('sync-overlay-window', (_event, payload = {}) => {
+ipcMain.handle('sync-overlay-window', (_event, rawPayload) => {
+  const payload = rawPayload && typeof rawPayload === 'object' && !Array.isArray(rawPayload)
+    ? rawPayload
+    : {};
   const style = {};
   if ('opacity' in payload) {
     const opacity = Number(payload.opacity);
@@ -1304,10 +1430,16 @@ ipcMain.handle('destroy-overlay', () => {
   }
   return { ok: true };
 });
-ipcMain.handle('move-overlay-window', (_event, dx, dy) => {
-  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+ipcMain.handle('move-overlay-window', (event, dx, dy) => {
+  if (!overlayWindow || overlayWindow.isDestroyed() || event?.sender !== overlayWindow.webContents) {
+    return { ok: false };
+  }
+  if (typeof dx !== 'number' || typeof dy !== 'number' || !Number.isFinite(dx) || !Number.isFinite(dy)) {
+    return { ok: false };
+  }
   const [x, y] = overlayWindow.getPosition();
   overlayWindow.setPosition(x + Math.round(dx), y + Math.round(dy));
+  return { ok: true };
 });
 ipcMain.on('overlay-drag-start', (event) => {
   _overlayDragging = true;
@@ -1385,19 +1517,24 @@ function gracefulStopPython(timeoutMs = 20000) {
     const stopTimeoutMs = Math.max(1000, timeoutMs - 5000);
     requestAssistStop(stopTimeoutMs).then(() => {
       if (settled) return;
-      try { proc.kill('SIGTERM'); } catch (err) { console.warn('[py] SIGTERM failed:', err.message); }
-      setTimeout(() => {
+      if (process.platform === 'win32') {
+        terminateChildProcess(proc);
+      } else {
+        try { proc.kill('SIGTERM'); } catch (err) { console.warn('[py] SIGTERM failed:', err.message); }
+      }
+      const escalateTimer = setTimeout(() => {
         if (settled) return;
         try {
-          if (proc.exitCode === null && proc.signalCode === null) {
+          if (proc.exitCode == null && proc.signalCode == null) {
             console.warn('[py] graceful timeout, escalating to SIGKILL');
-            proc.kill('SIGKILL');
+            terminateChildProcess(proc);
           }
         } catch (err) {
           console.warn('[py] SIGKILL failed:', err.message);
         }
         finish();
       }, Math.max(1000, timeoutMs - stopTimeoutMs));
+      proc.once?.('exit', () => clearTimeout(escalateTimer));
     });
   });
   return pythonStopPromise;
@@ -1479,7 +1616,7 @@ app.on('will-quit', () => {
   // 兜底:before-quit 通常已经 graceful 停过 pythonProcess,
   // 这里 fallback 防止异常路径泄漏子进程。
   if (pythonProcess) {
-    try { pythonProcess.kill('SIGKILL'); } catch (_) { /* ignore */ }
+    terminateChildProcess(pythonProcess, { sync: true });
     pythonProcess = null;
   }
 });
