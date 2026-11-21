@@ -1292,6 +1292,8 @@ def process_question_parallel(
             return
         session = get_session()
         if exam_preflight_id:
+            if deps.abort_check():
+                return
             stats = get_token_stats()
             deps.logger.info(
                 "EXAM_PREFLIGHT_ANSWER_DONE id=%s model=%s first_token=%.0fms total=%.0fms answer_len=%d",

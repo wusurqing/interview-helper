@@ -683,3 +683,140 @@ def test_mmpg_turns_seen_traces_is_bounded():
     # Recent traces remain deduplicated; oldest evicted trace is no longer in _seen.
     assert "trace-9" in turns._seen
     assert "trace-0" not in turns._seen
+
+
+def test_commit_queue_continues_draining_subsequent_seqs_after_apply_exception():
+    _reset_pipeline_state()
+    with pipeline._commit_lock:
+        base_seq = pipeline._next_commit_seq
+
+    entered = threading.Event()
+    release = threading.Event()
+    seq1_ran: list[str] = []
+
+    def fail_commit0():
+        entered.set()
+        release.wait(timeout=2.0)
+        raise RuntimeError("unexpected commit failure")
+
+    t0 = threading.Thread(target=pipeline._flush_commit, args=(base_seq, fail_commit0), daemon=True)
+    t0.start()
+    assert entered.wait(timeout=2.0)
+
+    # Enqueue seq1 while seq0 holds _commit_draining; this call returns immediately.
+    pipeline._flush_commit(base_seq + 1, lambda: seq1_ran.append("seq1-drained"))
+    release.set()
+    t0.join(timeout=2.0)
+
+    assert seq1_ran == ["seq1-drained"]
+    assert pipeline._answer_work_idle() is True
+
+
+def test_candidate_worker_pause_race_stays_alive_instead_of_exiting(monkeypatch: pytest.MonkeyPatch):
+    _reset_pipeline_state()
+    session = reset_session()
+    session.is_recording = True
+    cfg = AppConfig(candidate_asr_enabled=True, candidate_stt_provider="doubao", doubao_stt_api_key="test-key")
+    monkeypatch.setattr(pipeline, "get_capture_config", lambda: cfg)
+    broadcasts: list[dict] = []
+    monkeypatch.setattr(pipeline, "broadcast", broadcasts.append)
+
+    class _PauseRacingCapture:
+        is_running = True
+
+        def drain_audio_chunks(self, timeout=0.1, max_chunks=None):
+            return []
+
+        def stop(self, owner=None, *, clear_queue=True):
+            self.is_running = False
+
+    cap = _PauseRacingCapture()
+    monkeypatch.setattr(pipeline, "_candidate_audio_capture", cap)
+
+    entered_pause = threading.Event()
+
+    class _PauseRaceEvent:
+        def __init__(self):
+            self.checks = 0
+            self.paused = False
+
+        def is_set(self):
+            self.checks += 1
+            if self.checks == 1:
+                # Pause hits right after top-of-loop check and stops candidate capture.
+                self.paused = True
+                cap.is_running = False
+                return False
+            if self.paused:
+                entered_pause.set()
+            return self.paused
+
+        def clear(self):
+            self.paused = False
+
+        def set(self):
+            self.paused = True
+
+    monkeypatch.setattr(pipeline, "_pause_event", _PauseRaceEvent())
+
+    worker = threading.Thread(
+        target=pipeline._candidate_worker,
+        args=(session.transcript_epoch, None, cfg),
+        daemon=True,
+    )
+    worker.start()
+    try:
+        assert entered_pause.wait(timeout=2.0)
+        time.sleep(0.05)
+        assert worker.is_alive()
+        assert not any(msg.get("type") == "stt_error" for msg in broadcasts)
+    finally:
+        pipeline._stop_event.set()
+        worker.join(timeout=2.0)
+
+
+def test_append_late_asr_constraint_tail_groups_all_merged_fragment_anchors(monkeypatch: pytest.MonkeyPatch):
+    _reset_pipeline_state()
+    session = reset_session()
+    session.begin_transcript_capture()
+    cfg = AppConfig(
+        auto_detect=True,
+        assist_transcription_merge_gap_sec=0.0,
+        assist_asr_late_constraint_grace_sec=2.0,
+        models=[ModelConfig(id="m1", name="M1", api_key="sk-test", enabled=True)],
+        assist_model_ids=["m1"],
+    )
+    monkeypatch.setattr(pipeline, "get_config", lambda: cfg)
+    monkeypatch.setattr(pipeline, "get_model_health", lambda _idx: "ok")
+    monkeypatch.setattr(pipeline, "broadcast", lambda _msg: None)
+    monkeypatch.setattr(pipeline, "_try_dispatch", lambda: None)
+
+    now = time.monotonic()
+    a1 = session.record_transcript("interviewer", "Redis 分布式锁怎么实现？", started_at=now, question_group="q1")
+    a2 = session.record_transcript("interviewer", "补充一下条件", started_at=now + 0.4)
+    a3 = session.record_transcript("interviewer", "不要结合项目", started_at=now + 0.6)
+    assert a1 and a2 and a3
+
+    state = AssistAsrStateMachine(
+        broadcast=lambda _m: None,
+        submit_answer_task=lambda task: pipeline.submit_answer_task(task, config_snapshot=cfg),
+        begin_asr_turn=lambda: 1,
+        append_late_constraint_tail=pipeline._append_late_asr_constraint_tail,
+        clock=lambda: now + 0.2,
+        logger=Mock(),
+    )
+    state.handle_auto_detect_asr_text(
+        cfg, session, "Redis 分布式锁怎么实现？", "conversation_loopback", now,
+        transcript_anchor=a1, transcript_anchors=(a1,),
+    )
+    state.flush_question_group_now(cfg, session)
+
+    # Merged two-fragment late constraint tail arrives with both anchors (a2, a3).
+    state.handle_auto_detect_asr_text(
+        cfg, session, "不要结合项目", "conversation_loopback", now + 0.7,
+        transcript_anchor=a3, transcript_anchors=(a2, a3),
+    )
+
+    rounds = session.transcript_snapshot(a3)
+    assert len(rounds) == 1
+    assert [u.id for u in rounds[0]] == [a1, a2, a3]

@@ -1195,3 +1195,148 @@ def test_old_worker_finally_only_joins_its_own_runtime_threads_not_new_session(m
     finally:
         new_runtime.flush_stop_event.set()
         new_runtime_flush.join(timeout=1.0)
+
+
+def test_interview_worker_pause_race_does_not_trigger_unexpected_stop(monkeypatch):
+    audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    _wire_common_fakes(monkeypatch, audio, session)
+    broadcast_log: list[dict] = []
+    monkeypatch.setattr(pipeline, "broadcast", broadcast_log.append)
+    review_stopped: list[object] = []
+    monkeypatch.setattr(pipeline.review_integration, "on_assist_stop", review_stopped.append)
+
+    class _PauseRaceEvent:
+        def __init__(self):
+            self.checks = 0
+            self.paused = False
+
+        def is_set(self):
+            self.checks += 1
+            if self.checks == 1:
+                # Simulate pause_interview() running right after the top-of-loop pause check
+                # and stopping audio_capture before `if not audio_capture.is_running:`.
+                self.paused = True
+                audio._is_running = False
+                return False
+            if self.checks >= 4:
+                pipeline._stop_event.set()
+            return self.paused
+
+        def clear(self):
+            self.paused = False
+
+        def set(self):
+            self.paused = True
+
+    monkeypatch.setattr(pipeline, "_pause_event", _PauseRaceEvent())
+    pipeline._interview_worker()
+
+    assert session.is_recording is True
+    assert review_stopped == []
+    assert not any(
+        msg.get("type") == "error" and "音频采集异常中断" in msg.get("message", "")
+        for msg in broadcast_log
+    )
+    assert not any(msg.get("type") == "recording" and msg.get("value") is False for msg in broadcast_log)
+
+
+def test_single_mic_worker_crash_stops_audio_capture_and_retains_thread_until_teardown_done(monkeypatch):
+    from api.assist.single_mic import SingleMicSession
+
+    audio = _RecordingAudioCapture()
+    candidate_audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    single_mic = SingleMicSession("sm-crash", device_id=3)
+    session.single_mic = single_mic
+    _wire_common_fakes(monkeypatch, audio, session)
+    monkeypatch.setattr(pipeline, "_candidate_audio_capture", candidate_audio)
+    monkeypatch.setattr(pipeline, "broadcast", lambda _msg: None)
+    monkeypatch.setattr(pipeline.review_integration, "on_assist_stop", lambda _s: None)
+    monkeypatch.setattr(
+        pipeline,
+        "get_config",
+        lambda: AppConfig(stt_provider="doubao", doubao_stt_api_key="test-asr", assist_stop_answer_wait_sec=1.0),
+    )
+
+    thread_ref_during_wait: list[object] = []
+
+    def observe_wait(_timeout: float) -> bool:
+        thread_ref_during_wait.append(pipeline._interview_thread)
+        return True
+
+    monkeypatch.setattr(pipeline, "_wait_for_answer_work_idle", observe_wait)
+    monkeypatch.setattr(
+        single_mic.interviewer_input,
+        "drain_audio_chunks",
+        lambda **_kw: (_ for _ in ()).throw(RuntimeError("decoder fault")),
+    )
+
+    worker = threading.Thread(
+        target=pipeline._interview_worker,
+        kwargs={"single_mic": single_mic},
+        daemon=True,
+    )
+    pipeline._interview_thread = worker
+    worker.start()
+    worker.join(timeout=3.0)
+
+    assert not worker.is_alive()
+    assert "assist" in audio.stop_calls
+    assert session.is_recording is False
+    assert session.single_mic is None
+    # _interview_thread must remain set through teardown so concurrent stop_interview_loop joins it.
+    assert thread_ref_during_wait == [worker]
+    assert pipeline._interview_thread is None
+
+
+def test_stop_interview_loop_releases_already_queued_late_constraint_grace(monkeypatch):
+    from core.config import ModelConfig
+
+    audio = _RecordingAudioCapture()
+    session = _FakeSession()
+    _wire_common_fakes(monkeypatch, audio, session)
+    monkeypatch.setattr(pipeline.review_integration, "on_assist_stop", lambda _s: None)
+    cfg = AppConfig(
+        stt_provider="doubao",
+        doubao_stt_api_key="test-asr",
+        assist_stop_answer_wait_sec=0,
+        models=[ModelConfig(id="m1", name="M1", api_key="sk-test", enabled=True)],
+        assist_model_ids=["m1"],
+    )
+    monkeypatch.setattr(pipeline, "get_config", lambda: cfg)
+    monkeypatch.setattr(pipeline, "get_model_health", lambda _idx: "ok")
+    dispatched: list[float] = []
+    monkeypatch.setattr(
+        pipeline,
+        "_try_dispatch",
+        lambda: dispatched.extend(
+            float(task[4].get("dispatch_after_mono", -1.0))
+            for task, _seq, _tv in pipeline._pending
+        ),
+    )
+
+    pipeline.cancel_answer_work(reset_session_data=False)
+    future_grace = time.monotonic() + 1.2
+    with pipeline._dispatch_lock:
+        pipeline._pending.append(
+            (
+                (
+                    "已入队问题？",
+                    None,
+                    False,
+                    "conversation_loopback",
+                    {
+                        "origin": "asr",
+                        "asr_turn_id": 1,
+                        "dispatch_after_mono": future_grace,
+                        "asr_tail_grace_until_mono": future_grace,
+                    },
+                ),
+                0,
+                pipeline._task_session_version,
+            )
+        )
+
+    pipeline.stop_interview_loop()
+    assert dispatched == [0.0]

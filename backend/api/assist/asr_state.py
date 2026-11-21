@@ -186,9 +186,17 @@ class AssistAsrStateMachine:
             self.pending_group is None
             and kind == "candidate"
             and is_asr_question_constraint_tail(cleaned)
-            and self.append_late_constraint_tail(cleaned, source, now_mono, transcript_anchor)
         ):
-            return
+            try:
+                merged_tail = self.append_late_constraint_tail(
+                    cleaned, source, now_mono, transcript_anchor, transcript_anchors,
+                )
+            except TypeError:
+                merged_tail = self.append_late_constraint_tail(
+                    cleaned, source, now_mono, transcript_anchor,
+                )
+            if merged_tail:
+                return
         if (
             self.pending_group is not None
             and kind == "candidate"

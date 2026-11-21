@@ -414,3 +414,43 @@ def test_exam_preflight_timeout_cancels_inflight_task_and_unblocks_commit_buffer
         assert committed == ["other-committed"]
     finally:
         pipeline.cancel_answer_work(reset_session_data=False)
+
+
+def test_cancelled_exam_preflight_commit_does_not_broadcast_ghost_answer_done(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from api.assist import answer_worker
+    from core.config import AppConfig, ModelConfig
+
+    cfg = AppConfig(
+        models=[ModelConfig(id="v1", name="Vision", api_key="sk-test", enabled=True, supports_vision=True)],
+        written_exam_mode=True,
+        written_exam_model_ids=["v1"],
+    )
+    aborted_flag = {"cancelled": False}
+    broadcasts: list[dict] = []
+    deferred_commits: list = []
+
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", lambda *_a, **_kw: iter([("text", "题解")]))
+    monkeypatch.setattr(answer_worker, "get_token_stats", lambda: {"prompt": 1, "completion": 1, "total": 2, "by_model": {}})
+
+    deps = answer_worker.AnswerWorkerDeps(
+        abort_check=lambda: aborted_flag["cancelled"],
+        is_session_current=lambda _v: True,
+        flush_commit=lambda _seq, fn: deferred_commits.append(fn),
+        mark_seq_skipped=lambda _seq: None,
+        submit_knowledge_record=lambda *_a: True,
+        broadcast=broadcasts.append,
+        logger=SimpleNamespace(info=lambda *_a, **_kw: None),
+        error_logger=SimpleNamespace(warning=lambda *_a, **_kw: None, error=lambda *_a, **_kw: None),
+        config_snapshot=cfg,
+    )
+
+    task = exam_test._exam_preflight_task("data:image/png;base64,fake", "exam-preflight-late-cancel")
+    answer_worker.process_question_parallel(task, seq=0, model_idx=0, sess_v=0, deps=deps)
+    assert len(deferred_commits) == 1
+
+    # Simulate timeout cancelling the preflight after _commit was scheduled.
+    aborted_flag["cancelled"] = True
+    deferred_commits[0]()
+    assert not any(event.get("type") == "answer_done" for event in broadcasts)

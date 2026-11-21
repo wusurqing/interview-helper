@@ -710,7 +710,10 @@ def _drain_commit_queue() -> None:
                 if apply_fn is None:
                     _commit_draining = False
                     return
-            apply_fn()
+            try:
+                apply_fn()
+            except Exception:
+                _elog.exception("Commit apply_fn failed; continuing commit queue drain")
     except BaseException:
         with _commit_lock:
             _commit_draining = False
@@ -890,13 +893,20 @@ def _handle_auto_detect_asr_text(cfg, session, pub: str, source: str, now_mono: 
 
 
 def _append_late_asr_constraint_tail(
-    text: str, source: str, now_mono: float, transcript_anchor: str | None = None,
+    text: str,
+    source: str,
+    now_mono: float,
+    transcript_anchor: str | None = None,
+    transcript_anchors: tuple[str, ...] = (),
 ) -> bool:
     cleaned = (text or "").strip()
     if not cleaned:
         return False
     anchors_to_group: list[str] = []
     merged = False
+    incoming_anchors: list[str] = [str(a) for a in transcript_anchors if a]
+    if transcript_anchor and transcript_anchor not in incoming_anchors:
+        incoming_anchors.append(transcript_anchor)
     with _dispatch_lock:
         for idx in range(len(_pending) - 1, -1, -1):
             task, seq, session_version = _pending[idx]
@@ -914,7 +924,7 @@ def _append_late_asr_constraint_tail(
             utterances.append(cleaned)
             updated_question = build_asr_question_group_text(utterances) or f"{question}\n{cleaned}".strip()
             updated_meta = {**meta, "utterances": utterances, "late_constraint_tail": True}
-            if transcript_anchor:
+            if incoming_anchors:
                 anchors = [
                     str(a) for a in (meta.get("transcript_anchors") or ())
                     if a
@@ -922,9 +932,10 @@ def _append_late_asr_constraint_tail(
                 prev_anchor = meta.get("transcript_anchor")
                 if not anchors and prev_anchor:
                     anchors.append(str(prev_anchor))
-                if transcript_anchor not in anchors:
-                    anchors.append(transcript_anchor)
-                updated_meta["transcript_anchor"] = transcript_anchor
+                for anchor in incoming_anchors:
+                    if anchor not in anchors:
+                        anchors.append(anchor)
+                updated_meta["transcript_anchor"] = transcript_anchor or incoming_anchors[-1]
                 updated_meta["transcript_anchors"] = tuple(anchors)
                 anchors_to_group = anchors
             _pending[idx] = (
@@ -943,6 +954,24 @@ def _append_late_asr_constraint_tail(
     if merged and anchors_to_group:
         get_session().group_transcript_question(anchors_to_group)
     return merged
+
+
+def _dispatch_delayed_pending_now() -> None:
+    """Release any ASR late-constraint grace hold on queued tasks once recording stops or role switches."""
+    released = False
+    with _dispatch_lock:
+        for idx, (task, seq, tv) in enumerate(_pending):
+            meta = task_meta(task)
+            if float(meta.get("dispatch_after_mono", 0.0) or 0.0) > 0.0:
+                updated_meta = {
+                    **meta,
+                    "dispatch_after_mono": 0.0,
+                    "asr_tail_grace_until_mono": 0.0,
+                }
+                _pending[idx] = ((task[0], task[1], task[2], task[3], updated_meta), seq, tv)
+                released = True
+    if released:
+        _try_dispatch()
 
 
 # ---------------------------------------------------------------------------
@@ -1314,6 +1343,7 @@ def drain_single_mic_worker(single_mic: SingleMicSession, operation: RoleSwitch,
                 failures = runtime.segment_failures + runtime.segment_dropped
                 success = failures == runtime.reported_role_failures
                 runtime.reported_role_failures = failures
+            _dispatch_delayed_pending_now()
             return success
         if _stop_event.wait(0.02):
             break
@@ -1581,6 +1611,7 @@ def stop_interview_loop():
             _try_flush_asr_question_group(cfg, session, now, True)
         except Exception:
             _elog.debug("final ASR flush during stop skipped", exc_info=True)
+    _dispatch_delayed_pending_now()
     _interviewer_streaming = False
     _interviewer_config = None
     with _asr_state_lock, conversation_lock:
@@ -1626,82 +1657,95 @@ def _finalize_unexpected_interview_stop(
 ) -> None:
     """Unified teardown when _interview_worker exits abnormally (device lost or crash)."""
     global _candidate_thread, _interview_thread, _interviewer_streaming, _interviewer_config
-    with conversation_lock:
-        if session.transcript_epoch != transcript_epoch:
-            return
-    _stop_event.set()
-    _pause_event.clear()
-    _candidate_flush_event.set()
-    if single_mic is not None:
-        single_mic.close()
-    try:
-        _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=False)
-    except Exception:
-        _elog.warning("candidate capture stop during unexpected exit failed", exc_info=True)
     current_thread = threading.current_thread()
-    candidate_thread = _candidate_thread
-    if candidate_thread and candidate_thread.is_alive() and candidate_thread is not current_thread:
-        candidate_thread.join(timeout=3.0)
-    if _candidate_thread is candidate_thread:
-        _candidate_thread = None
-    if _interview_thread is current_thread:
-        _interview_thread = None
-
-    if not _interviewer_streaming:
-        try:
-            cfg = get_capture_config()
-            now = time.monotonic()
-            _try_flush_asr_merge_buffer(cfg, session, now, True)
-            _try_flush_asr_question_group(cfg, session, now, True)
-        except Exception:
-            _elog.debug("final ASR flush during unexpected stop skipped", exc_info=True)
-    _interviewer_streaming = False
-    _interviewer_config = None
-    with _asr_state_lock, conversation_lock:
-        if session.transcript_epoch != transcript_epoch:
-            return
-        session.stop_transcript_capture()
-
-    wait_sec = float(getattr(get_config(), "assist_stop_answer_wait_sec", 3.0))
-    if wait_sec > 0 and not _wait_for_answer_work_idle(min(wait_sec, 20.0)):
-        _elog.warning("ANSWER_STOP_WAIT_TIMEOUT pending/inflight work will be cancelled")
-    cancel_answer_work(reset_session_data=False)
-
     try:
-        review_integration.on_assist_stop(session)
-    except Exception:
-        _elog.error("review_integration.on_assist_stop failed during unexpected stop", exc_info=True)
+        with conversation_lock:
+            if session.transcript_epoch != transcript_epoch:
+                return
+        _stop_event.set()
+        _pause_event.clear()
+        _candidate_flush_event.set()
+        if single_mic is not None:
+            single_mic.close()
+            try:
+                _stop_capture_compat(audio_capture, owner="assist", clear_queue=False)
+            except Exception:
+                _elog.warning("interviewer capture stop during unexpected exit failed", exc_info=True)
+        try:
+            _stop_capture_compat(_candidate_audio_capture, owner="assist-candidate", clear_queue=False)
+        except Exception:
+            _elog.warning("candidate capture stop during unexpected exit failed", exc_info=True)
+        candidate_thread = _candidate_thread
+        if candidate_thread and candidate_thread.is_alive() and candidate_thread is not current_thread:
+            candidate_thread.join(timeout=3.0)
+        if _candidate_thread is candidate_thread:
+            _candidate_thread = None
 
-    with conversation_lock:
-        session.is_recording = False
-        session.is_paused = False
-        session.single_mic = None
-        if hasattr(session, "close_candidate_answer_window"):
-            session.close_candidate_answer_window()
-        if len(session.transcription_history) > 30:
-            session.transcription_history = session.transcription_history[-30:]
-        if hasattr(session, "candidate_transcription_history") and len(session.candidate_transcription_history) > 30:
-            session.candidate_transcription_history = session.candidate_transcription_history[-30:]
+        if not _interviewer_streaming:
+            try:
+                cfg = get_capture_config()
+                now = time.monotonic()
+                _try_flush_asr_merge_buffer(cfg, session, now, True)
+                _try_flush_asr_question_group(cfg, session, now, True)
+            except Exception:
+                _elog.debug("final ASR flush during unexpected stop skipped", exc_info=True)
+        _dispatch_delayed_pending_now()
+        _interviewer_streaming = False
+        _interviewer_config = None
+        with _asr_state_lock, conversation_lock:
+            if session.transcript_epoch != transcript_epoch:
+                return
+            session.stop_transcript_capture()
+            stopped_epoch = session.transcript_epoch
 
-    if runtime is not None:
-        remaining = _interviewer_segment_backlog(runtime)
-        _set_last_interviewer_runtime_snapshot(
-            _snapshot_interviewer_runtime(
-                runtime,
-                live=False,
-                drained=remaining == 0,
-                remaining_after_drain=remaining,
+        wait_sec = float(getattr(get_config(), "assist_stop_answer_wait_sec", 3.0))
+        if wait_sec > 0 and not _wait_for_answer_work_idle(min(wait_sec, 20.0)):
+            _elog.warning("ANSWER_STOP_WAIT_TIMEOUT pending/inflight work will be cancelled")
+        with conversation_lock:
+            if session.transcript_epoch != stopped_epoch:
+                return
+        cancel_answer_work(reset_session_data=False)
+
+        try:
+            review_integration.on_assist_stop(session)
+        except Exception:
+            _elog.error("review_integration.on_assist_stop failed during unexpected stop", exc_info=True)
+
+        with conversation_lock:
+            if session.transcript_epoch != stopped_epoch:
+                return
+            session.is_recording = False
+            session.is_paused = False
+            session.single_mic = None
+            if hasattr(session, "close_candidate_answer_window"):
+                session.close_candidate_answer_window()
+            if len(session.transcription_history) > 30:
+                session.transcription_history = session.transcription_history[-30:]
+            if hasattr(session, "candidate_transcription_history") and len(session.candidate_transcription_history) > 30:
+                session.candidate_transcription_history = session.candidate_transcription_history[-30:]
+
+        if runtime is not None:
+            remaining = _interviewer_segment_backlog(runtime)
+            _set_last_interviewer_runtime_snapshot(
+                _snapshot_interviewer_runtime(
+                    runtime,
+                    live=False,
+                    drained=remaining == 0,
+                    remaining_after_drain=remaining,
+                )
             )
-        )
-        if _interviewer_runtime is runtime:
-            _set_interviewer_runtime(None)
-    _candidate_flush_event.clear()
+            if _interviewer_runtime is runtime:
+                _set_interviewer_runtime(None)
+        _candidate_flush_event.clear()
 
-    broadcast({"type": "error", "message": error_message})
-    broadcast({"type": "recording", "value": False, "candidate_capture_provider": ""})
-    broadcast({"type": "paused", "value": False})
-    if single_mic is not None:
-        broadcast_single_mic(None)
+        broadcast({"type": "error", "message": error_message})
+        broadcast({"type": "recording", "value": False, "candidate_capture_provider": ""})
+        broadcast({"type": "paused", "value": False})
+        if single_mic is not None:
+            broadcast_single_mic(None)
+    finally:
+        if _interview_thread is current_thread:
+            _interview_thread = None
 
 
 def pause_interview():
@@ -2043,7 +2087,6 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
 
     # H4: 启动独立 flush 线程（封装在 per-session runtime 内，防止跨会话泄漏或误 join）
     global _flush_thread, _interviewer_asr_thread
-    runtime.flush_stop_event.clear()
     runtime.flush_thread = threading.Thread(
         target=_flush_worker, args=(runtime,), daemon=True, name="assist-flush"
     )
@@ -2090,6 +2133,8 @@ def _interview_worker(config_snapshot=None, transcript_epoch=None, single_mic=No
                 if _pause_event.is_set() or _stop_event.is_set():
                     continue
             if not audio_capture.is_running:
+                if _pause_event.is_set() or _stop_event.is_set():
+                    continue
                 _elog.error("Interview worker: audio capture stopped unexpectedly, exiting loop")
                 unexpected_error = "音频采集异常中断，面试录音已停止"
                 break
@@ -2403,10 +2448,13 @@ def _candidate_worker(transcript_epoch=None, single_mic=None, config_snapshot=No
                         candidate_final_failed = False
                         operation.complete(success)
             elif getattr(audio_input, "is_running", True) is False:
-                if not _stop_event.is_set() and not _pause_event.is_set():
-                    _elog.warning("Candidate worker: audio capture stopped unexpectedly, exiting loop")
-                    if is_current():
-                        report_stt_error(provider, "candidate", "候选人麦克风采集异常中断，已停止记录我的回答")
+                if _pause_event.is_set():
+                    continue
+                if _stop_event.is_set():
+                    break
+                _elog.warning("Candidate worker: audio capture stopped unexpectedly, exiting loop")
+                if is_current():
+                    report_stt_error(provider, "candidate", "候选人麦克风采集异常中断，已停止记录我的回答")
                 break
             chunks = audio_input.drain_audio_chunks(timeout=0.1, max_chunks=6)
             if not chunks:
