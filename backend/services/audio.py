@@ -66,9 +66,17 @@ try:
 except Exception:
     _HAS_SC = False
 
+# 一次性注册静态 warning 过滤，避免在 64ms WASAPI 热路径中调用非线程安全的 warnings.catch_warnings()
+warnings.filterwarnings(
+    "ignore",
+    message=r".*fromstring is deprecated.*",
+    category=DeprecationWarning,
+)
+
 # Stable mapping: integer device_id (20000+N) -> soundcard speaker GUID
 # Populated by list_devices(); used by start() to find the right device.
 _SC_ID_BASE = 20000
+_SC_CACHE_LOCK = threading.Lock()
 _SC_ID_MAP: dict[int, str] = {}   # id -> speaker.id (GUID)
 _SC_DEVICE_CACHE: dict[int, dict[str, str]] = {}   # id -> stable device metadata
 
@@ -99,20 +107,29 @@ def _is_sc_id(device_id) -> bool:
         return False
 
 
+def _lookup_sc_speaker_guid(device_id: int) -> Optional[str]:
+    with _SC_CACHE_LOCK:
+        guid = _SC_ID_MAP.get(device_id)
+        if guid is None:
+            guid = _SC_DEVICE_CACHE.get(device_id, {}).get("guid")
+        return guid
+
+
 def _get_sc_loopback_devices() -> list[dict]:
     """Return soundcard-based WASAPI loopback device entries."""
     if not _HAS_SC:
         return []
-    previous_by_guid = {
-        meta.get("guid"): int(dev_id)
-        for dev_id, meta in _SC_DEVICE_CACHE.items()
-        if meta.get("guid")
-    }
-    previous_by_name = {
-        meta.get("name"): int(dev_id)
-        for dev_id, meta in _SC_DEVICE_CACHE.items()
-        if meta.get("name")
-    }
+    with _SC_CACHE_LOCK:
+        previous_by_guid = {
+            meta.get("guid"): int(dev_id)
+            for dev_id, meta in _SC_DEVICE_CACHE.items()
+            if meta.get("guid")
+        }
+        previous_by_name = {
+            meta.get("name"): int(dev_id)
+            for dev_id, meta in _SC_DEVICE_CACHE.items()
+            if meta.get("name")
+        }
     result = []
     next_map: dict[int, str] = {}
     next_cache: dict[int, dict[str, str]] = {}
@@ -142,9 +159,10 @@ def _get_sc_loopback_devices() -> list[dict]:
     except Exception:
         pass
     if next_map:
-        _SC_ID_MAP.clear()
-        _SC_ID_MAP.update(next_map)
-        _SC_DEVICE_CACHE.update(next_cache)
+        with _SC_CACHE_LOCK:
+            _SC_ID_MAP.clear()
+            _SC_ID_MAP.update(next_map)
+            _SC_DEVICE_CACHE.update(next_cache)
     # default output first
     result.sort(key=_audio_device_sort_key)
     return result
@@ -484,13 +502,11 @@ class AudioCapture:
     # soundcard path -------------------------------------------------------
 
     def _start_soundcard(self, device_id: int):
-        speaker_guid = _SC_ID_MAP.get(device_id)
-        if speaker_guid is None:
-            speaker_guid = _SC_DEVICE_CACHE.get(device_id, {}).get("guid")
+        speaker_guid = _lookup_sc_speaker_guid(device_id)
         if speaker_guid is None:
             # Map may have been rebuilt; try refreshing
             _get_sc_loopback_devices()
-            speaker_guid = _SC_ID_MAP.get(device_id)
+            speaker_guid = _lookup_sc_speaker_guid(device_id)
         if speaker_guid is None:
             self._running = False
             raise RuntimeError(f"找不到系统音频设备 ID={device_id}，请刷新页面重新选择设备")
@@ -511,7 +527,7 @@ class AudioCapture:
                     mic = _sc.get_microphone(active_guid, include_loopback=True)
                 except IndexError:
                     _get_sc_loopback_devices()
-                    active_guid = _SC_ID_MAP.get(device_id) or _SC_DEVICE_CACHE.get(device_id, {}).get("guid")
+                    active_guid = _lookup_sc_speaker_guid(device_id)
                     if active_guid is None:
                         raise RuntimeError(f"系统音频设备已失效 ID={device_id}，请刷新页面重新选择设备")
                     mic = _sc.get_microphone(active_guid, include_loopback=True)
@@ -522,30 +538,14 @@ class AudioCapture:
                                   channels=1,
                                   blocksize=self.LOOPBACK_RECORDER_BLOCK_SIZE) as rec:
                     while not stop_event.is_set() and self._running:
-                        with warnings.catch_warnings(record=True) as caught:
-                            warnings.simplefilter("always")
-                            # SoundCard docs recommend using a fixed numframes that is
-                            # noticeably smaller than blocksize on WASAPI to reduce
-                            # latency spikes and backend-sized chunk jitter.
-                            data = rec.record(numframes=self.LOOPBACK_RECORD_NUMFRAMES)
+                        # SoundCard docs recommend using a fixed numframes that is
+                        # noticeably smaller than blocksize on WASAPI to reduce
+                        # latency spikes and backend-sized chunk jitter.
+                        data = rec.record(numframes=self.LOOPBACK_RECORD_NUMFRAMES)
                         if self._sc_stop is not stop_event:
                             return
                         if stop_event.is_set() and not self._queue_audio:
                             return
-                        if caught:
-                            for warning in caught:
-                                warning_text = str(getattr(warning, "message", "") or "")
-                                if "data discontinuity in recording" in warning_text.lower():
-                                    self._loopback_discontinuity_count += 1
-                                    _alog.warning(
-                                        "soundcard_loopback_discontinuity count=%d",
-                                        self._loopback_discontinuity_count,
-                                    )
-                                elif "fromstring is deprecated" in warning_text.lower():
-                                    continue
-                                elif warning_text not in self._seen_soundcard_warning_messages:
-                                    self._seen_soundcard_warning_messages.add(warning_text)
-                                    _alog.warning("soundcard warning: %s", warning_text)
                         if data is None or len(data) <= 0:
                             continue
                         mono = data[:, 0].copy()

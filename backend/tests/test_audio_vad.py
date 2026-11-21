@@ -381,3 +381,107 @@ def test_concurrent_input_level_monitor_start_serializes_and_never_orphans_devic
     assert AudioCapture.is_device_busy(41) is False
     assert AudioCapture.is_device_busy(42) is False
     assert sound_test.get_input_level_status()["running"] is False
+
+
+def test_soundcard_hot_path_never_calls_catch_warnings(monkeypatch):
+    import threading
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from services import audio
+
+    recorded_chunks: list[np.ndarray] = []
+    enough = threading.Event()
+    calls = {"count": 0}
+
+    def forbid_catch_warnings(*_args, **_kwargs):
+        raise AssertionError("warnings.catch_warnings must not be called on 64ms WASAPI hot path")
+
+    class _FakeRecorder:
+        def record(self, numframes: int):
+            calls["count"] += 1
+            if calls["count"] >= 4:
+                enough.set()
+            return np.ones((numframes, 1), dtype=np.float32) * 0.05
+
+    class _FakeMic:
+        name = "Fake Loopback"
+
+        @contextmanager
+        def recorder(self, **_kwargs):
+            yield _FakeRecorder()
+
+    class _FakeSC:
+        @staticmethod
+        def get_microphone(_guid, include_loopback=True):
+            return _FakeMic()
+
+    monkeypatch.setattr(audio.warnings, "catch_warnings", forbid_catch_warnings)
+    monkeypatch.setattr(audio, "_sc", _FakeSC, raising=False)
+    monkeypatch.setitem(audio._SC_ID_MAP, 20088, "guid-88")
+
+    cap = AudioCapture()
+    cap.start(20088, on_audio=recorded_chunks.append, owner="assist")
+    try:
+        assert enough.wait(timeout=2.0)
+    finally:
+        cap.stop(owner="assist")
+
+    assert calls["count"] >= 4
+    assert len(recorded_chunks) >= 1
+
+
+def test_soundcard_device_cache_concurrent_read_write_is_thread_safe(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from services import audio
+
+    speakers = [
+        SimpleNamespace(id=f"guid-{i}", name=f"Speaker {i}", channels=2)
+        for i in range(6)
+    ]
+
+    class _FakeSC:
+        @staticmethod
+        def default_speaker():
+            return speakers[0]
+
+        @staticmethod
+        def all_speakers():
+            return list(speakers)
+
+    monkeypatch.setattr(audio, "_HAS_SC", True)
+    monkeypatch.setattr(audio, "_sc", _FakeSC, raising=False)
+
+    errors: list[Exception] = []
+    barrier = threading.Barrier(6)
+
+    def writer():
+        try:
+            barrier.wait(timeout=5.0)
+            for _ in range(40):
+                devs = audio._get_sc_loopback_devices()
+                assert len(devs) == 6
+        except Exception as exc:
+            errors.append(exc)
+
+    def reader():
+        try:
+            barrier.wait(timeout=5.0)
+            for _ in range(80):
+                for idx in range(6):
+                    guid = audio._lookup_sc_speaker_guid(audio._SC_ID_BASE + idx)
+                    assert guid is None or guid.startswith("guid-")
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=writer) for _ in range(3)] + [
+        threading.Thread(target=reader) for _ in range(3)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+
+    assert not errors
+    for idx in range(6):
+        assert audio._lookup_sc_speaker_guid(audio._SC_ID_BASE + idx) is not None
