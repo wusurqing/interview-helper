@@ -1088,7 +1088,11 @@ def process_question_parallel(
     else:
         think_override = None
 
+    flush_failed_attempt: Optional[Callable[[], None]] = None
+
     def _generate_attempt() -> GeneratedAnswer | None:
+        nonlocal flush_failed_attempt
+        flush_failed_attempt = None
         sanitizer = create_answer_stream_sanitizer(
             prompt_mode, preserve_format=customized_prompt, plain_text=plain_text,
         )
@@ -1178,8 +1182,11 @@ def process_question_parallel(
                         flush_chunks()
         except Exception:
             if not deps.abort_check():
-                flush_chunks()
-                emit_tail()
+                def _flush_residual() -> None:
+                    flush_chunks()
+                    emit_tail()
+
+                flush_failed_attempt = _flush_residual
             raise
         finally:
             close = getattr(stream, "close", None)
@@ -1239,12 +1246,16 @@ def process_question_parallel(
             if deps.abort_check():
                 break
             if next_index is None:
+                if flush_failed_attempt is not None:
+                    flush_failed_attempt()
+                    flush_failed_attempt = None
                 _broadcast({
                     "type": "answer_error", "id": qa_id, "stage": "generation",
                     "message": exc.user_msg if isinstance(exc, LLMError) else "生成答案失败，请稍后重试。",
                 })
                 deps.mark_seq_skipped(seq)
                 return
+            flush_failed_attempt = None
             model_idx = next_index
             model_cfg = cfg.models[next_index]
             retry_model_name = model_cfg.name

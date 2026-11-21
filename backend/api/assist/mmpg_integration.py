@@ -26,7 +26,32 @@ _capture_epoch: int | None = None
 _lifecycle_epoch: int = 0
 _prepared_lifecycle_epoch: int | None = None
 _speech_starts: dict[str, tuple[float, str | None]] = {}
+_background_tasks: set[asyncio.Task] = set()
 _log = get_logger("mmpg.diagnostics")
+
+
+def _spawn_background_task(coro, *, name: str) -> asyncio.Task:
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def _done(finished: asyncio.Task) -> None:
+        _background_tasks.discard(finished)
+        if finished.cancelled():
+            return
+        try:
+            exc = finished.exception()
+        except asyncio.CancelledError:
+            return
+        if exc is not None:
+            _log.warning(
+                "mmpg background task %s failed: %s",
+                name,
+                exc,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+
+    task.add_done_callback(_done)
+    return task
 
 
 def current_lifecycle_epoch() -> int:
@@ -105,7 +130,13 @@ def _new_turns():
             return False
         request.loop = loop
         request.on_started = lambda at: turns.request_started(request, at)
-        request.on_finished = lambda: loop.call_soon_threadsafe(turns.request_finished, request)
+        def _notify_finished():
+            if loop.is_closed():
+                return
+            with suppress(RuntimeError):
+                loop.call_soon_threadsafe(turns.request_finished, request)
+
+        request.on_finished = _notify_finished
         return pipeline.submit_mmpg_question(request, transcript_epoch=_capture_epoch)
 
     def log_event(event, **fields):
@@ -315,7 +346,7 @@ def sync_single_mic_transport(role: Role, transport: MmpgManager, state: dict) -
     else:
         detach_single_mic_stream(session_id, role)
     if state["state"] == "error" or state.get("reason") in ("owner_disconnected", "settings_changed"):
-        asyncio.create_task(_pause_after_loss(single_mic))
+        _spawn_background_task(_pause_after_loss(single_mic), name="mmpg-single-mic-loss-pause")
     return True
 
 
@@ -387,7 +418,7 @@ def watch_single_mic(single_mic: SingleMicSession | None) -> None:
             elif time.monotonic() - not_ready_since > 30:
                 await _pause_after_loss(single_mic, message="语音识别连接超时，请检查配置后继续单人测试")
 
-    asyncio.create_task(watch())
+    _spawn_background_task(watch(), name=f"mmpg-watch-single-mic-{single_mic.id}")
 
 
 async def finish_single_mic_role(single_mic, operation, timeout: float) -> bool:
@@ -410,7 +441,10 @@ def _broadcast_state(status):
         if sync_single_mic_transport("interviewer", manager, status):
             return
         if status["state"] == "error" and pipeline.is_streaming_interview() and candidate_mmpg.manager.active:
-            asyncio.create_task(candidate_mmpg.stop("interviewer_disconnected"))
+            _spawn_background_task(
+                candidate_mmpg.stop("interviewer_disconnected"),
+                name="mmpg-stop-candidate-on-error",
+            )
 
 
 def stt_status(status=None):

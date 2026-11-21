@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
+from core.session import conversation_lock
 from services.stt import (
     build_asr_question_group_text,
     classify_asr_question_candidate,
@@ -78,7 +79,8 @@ class AssistAsrStateMachine:
         text = text.strip()
         if not text:
             return "empty"
-        session.add_transcription(text)
+        with conversation_lock:
+            session.add_transcription(text)
         self.broadcast({"type": "transcription", "text": text})
         return self.submit_final_question(cfg, session, text, mmpg_trace)
 
@@ -137,6 +139,7 @@ class AssistAsrStateMachine:
                     "dispatch_after_mono": 0.0 if immediate else now_mono + grace_sec,
                     "asr_tail_grace_until_mono": 0.0 if immediate else now_mono + grace_sec,
                     **({"transcript_anchor": group.transcript_anchor} if group.transcript_anchor else {}),
+                    **({"transcript_anchors": tuple(group.transcript_anchors)} if group.transcript_anchors else {}),
                 },
             )
         )
@@ -231,7 +234,8 @@ class AssistAsrStateMachine:
         pub = transcription_for_publish(merged_raw, min_sig)
         if not pub:
             return
-        session.add_transcription(pub)
+        with conversation_lock:
+            session.add_transcription(pub)
         self.broadcast({"type": "transcription", "text": pub})
         if self._automatic_answers_enabled(cfg):
             source = (
@@ -283,7 +287,8 @@ class AssistAsrStateMachine:
             return
         gap = float(getattr(cfg, "assist_transcription_merge_gap_sec", 2.0) or 0.0)
         if gap <= 0:
-            session.add_transcription(pub)
+            with conversation_lock:
+                session.add_transcription(pub)
             self.broadcast({"type": "transcription", "text": pub})
             if self._automatic_answers_enabled(cfg):
                 source = (
