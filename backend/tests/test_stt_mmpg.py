@@ -1289,6 +1289,52 @@ def test_drain_dual_input_enforces_timeout_floor_and_preserves_reconnecting_tail
                 logger.removeHandler(caplog.handler)
         assert "ASR tail incomplete role=interviewer reason=drain_timeout" in caplog.text
         archive.stt_timeout.assert_called_once_with("interviewer")
+
+        # Non-listening transport that recovers to "listening" mid-gather must still log its
+        # initial non-listening state rather than misleadingly logging drain_timeout.
+        caplog.clear()
+        archive.reset_mock()
+        cand_state = {"state": "reconnecting"}
+
+        async def slow_interviewer_drain(*, timeout=None):
+            cand_state["state"] = "listening"
+            return True
+
+        async def fast_candidate_fail(*, timeout=None):
+            return False
+
+        monkeypatch.setattr(
+            mmpg_integration,
+            "manager",
+            SimpleNamespace(
+                active=True,
+                single_mic_id=None,
+                status=lambda: {"state": "listening", "mode": "start"},
+                recommended_drain_timeout=lambda: 6.0,
+                drain_transcripts=slow_interviewer_drain,
+            ),
+        )
+        monkeypatch.setattr(
+            candidate_mmpg,
+            "manager",
+            SimpleNamespace(
+                active=True,
+                single_mic_id=None,
+                status=lambda: {"state": cand_state["state"], "mode": "start"},
+                recommended_drain_timeout=lambda: 6.0,
+                drain_transcripts=fast_candidate_fail,
+            ),
+        )
+        if attach_handler:
+            logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level("WARNING", logger="mmpg.diagnostics"):
+                await mmpg_integration.drain_dual_input("stopped")
+        finally:
+            if attach_handler:
+                logger.removeHandler(caplog.handler)
+        assert "ASR tail incomplete role=candidate reason=state=reconnecting" in caplog.text
+        archive.stt_timeout.assert_called_once_with("candidate")
         reset_session()
 
     asyncio.run(check())
@@ -1417,5 +1463,178 @@ def test_api_pause_drains_dual_channels_concurrently_without_sealing_archive_and
         assert pipeline.is_paused() is True
         reset_session()
         pipeline._pause_event.clear()
+
+    asyncio.run(check())
+
+
+def test_api_pause_dual_channel_real_managers_and_archive_resume_then_stop(monkeypatch):
+    from api.assist import candidate_mmpg, mmpg_integration, pipeline, routes
+    from core import config
+    from core.session import reset_session
+    from services.interview_archive.audio import CapturedAudio
+    from services.interview_archive.manager import InterviewArchive
+    from services.stt import mmpg
+    from services.stt.mmpg import MmpgManager
+
+    monkeypatch.setattr(mmpg, "ROLE_DRAIN_PLAYBACK_GRACE_SECONDS", 0.05)
+    cfg = config.AppConfig(
+        stt_provider="doubao_mmpg",
+        candidate_stt_provider="doubao_mmpg",
+        candidate_asr_enabled=True,
+        mmpg=config.Mmpg(**{**CONFIG, "silence_ms": 500}),
+        auto_detect=False,
+        assist_stop_answer_wait_sec=0,
+    )
+    monkeypatch.setattr(config, "_config", cfg)
+    monkeypatch.setattr(mmpg_integration, "get_config", lambda: cfg)
+    monkeypatch.setattr(mmpg_integration, "_session_config", cfg)
+    monkeypatch.setattr(mmpg_integration, "_session_settings", cfg.mmpg)
+    monkeypatch.setattr(mmpg_integration, "_test_settings", None)
+    monkeypatch.setattr(pipeline, "_interviewer_config", cfg)
+    monkeypatch.setattr(pipeline, "_interviewer_streaming", True)
+    monkeypatch.setattr(pipeline, "_device_is_loopback", lambda _dev: False)
+    monkeypatch.setattr(pipeline, "broadcast", lambda *_a, **_kw: None)
+    monkeypatch.setattr(candidate_mmpg, "broadcast", lambda *_a, **_kw: None)
+    monkeypatch.setattr(mmpg_integration, "broadcast", lambda *_a, **_kw: None)
+
+    class _FakeCapture:
+        def __init__(self):
+            self.running = False
+            self.callback = None
+
+        def start(self, _dev, *, on_audio=None, owner=None, **_kw):
+            self.running = True
+            self.callback = on_audio
+
+        def stop(self, *, owner=None, clear_queue=True):
+            self.running = False
+            self.callback = None
+
+    ic = _FakeCapture()
+    cc = _FakeCapture()
+    monkeypatch.setattr(pipeline, "audio_capture", ic)
+    monkeypatch.setattr(pipeline, "_candidate_audio_capture", cc)
+    monkeypatch.setattr(mmpg_integration, "audio_capture", ic)
+
+    async def check():
+        monkeypatch.setattr(mmpg_integration, "http_lifecycle_lock", asyncio.Lock())
+        saved: list[dict] = []
+        session = reset_session()
+        archive = InterviewArchive(99, candidate_enabled=True, save=saved.append)
+        try:
+            session.archive = archive
+            session.begin_transcript_capture()
+            session.is_recording = True
+            session.is_paused = False
+            session.last_device_id = 10
+            session.last_candidate_mic_device_id = 20
+            pipeline._pause_event.clear()
+            monkeypatch.setattr(mmpg_integration, "_capture_epoch", session.transcript_epoch)
+            monkeypatch.setattr(candidate_mmpg, "_capture_epoch", session.transcript_epoch)
+            monkeypatch.setattr(candidate_mmpg, "_pending", {})
+
+            ic_cloud, cc_cloud = CloudSocket(), CloudSocket()
+
+            async def iconn(_):
+                ic_cloud.push("session.created")
+                return ic_cloud
+
+            async def cconn(_):
+                cc_cloud.push("session.created")
+                return cc_cloud
+
+            imgr = MmpgManager(
+                mmpg_integration._settings,
+                mmpg_integration._final_transcript,
+                on_turn=mmpg_integration._turn_event,
+                on_capture_stop=mmpg_integration.stop_capture,
+                connector=iconn,
+            )
+            cmgr = MmpgManager(
+                lambda: cfg.mmpg,
+                candidate_mmpg._on_transcript,
+                on_turn=candidate_mmpg._on_turn,
+                on_capture_stop=candidate_mmpg._stop_capture,
+                connector=cconn,
+            )
+            monkeypatch.setattr(mmpg_integration, "manager", imgr)
+            monkeypatch.setattr(candidate_mmpg, "manager", cmgr)
+            monkeypatch.setattr(mmpg_integration, "_turns", mmpg_integration._new_turns())
+
+            im_ctrl, cm_ctrl = [], []
+            im_done_pushed = [False]
+            cm_done_pushed = [False]
+
+            async def isend(payload):
+                if isinstance(payload, bytes):
+                    if not ic.running and not any(payload) and not im_done_pushed[0]:
+                        im_done_pushed[0] = True
+                        ic_cloud.push("user.audio.transcription.done", conv_id="q1", transcript="暂停前问题？")
+                else:
+                    im_ctrl.append(payload)
+
+            async def csend(payload):
+                if isinstance(payload, bytes):
+                    if not cc.running and not any(payload) and not cm_done_pushed[0]:
+                        cm_done_pushed[0] = True
+                        cc_cloud.push("user.audio.transcription.done", conv_id="a1", transcript="暂停前回答")
+                else:
+                    cm_ctrl.append(payload)
+
+            o1, o2 = object(), object()
+            imgr.attach(o1, isend)
+            cmgr.attach(o2, csend)
+            imgr.start(o1, "start", [10], 20)
+            cmgr.start(o2, "start", [20])
+            await wait_until(
+                lambda: any(m["type"] == "rtc_join" for m in im_ctrl)
+                and any(m["type"] == "rtc_join" for m in cm_ctrl)
+            )
+            await imgr.rtc_event(o1, {"type": "rtc_ready", "generation": imgr.status()["generation"]})
+            await cmgr.rtc_event(o2, {"type": "rtc_ready", "generation": cmgr.status()["generation"]})
+            await wait_until(
+                lambda: imgr.status()["state"] == "listening" and cmgr.status()["state"] == "listening"
+            )
+
+            ic.running = True
+            cc.running = True
+            anchor = time.monotonic() - 1.0
+            archive.capture(CapturedAudio(np.full(8000, 0.05, dtype=np.float32), "loop1", 0, anchor), "interviewer")
+            archive.capture(CapturedAudio(np.full(8000, 0.05, dtype=np.float32), "mic1", 0, anchor), "candidate")
+            assert imgr.offer_audio(np.full(640, 0.05, dtype=np.float32))
+            assert cmgr.offer_audio(np.full(640, 0.05, dtype=np.float32))
+            ic_cloud.push("user.conversation.created", conv_id="q1")
+            cc_cloud.push("user.conversation.created", conv_id="a1")
+            await wait_until(
+                lambda: "q1" in imgr._current.open_conversations and "a1" in cmgr._current.open_conversations
+            )
+
+            # Dual-channel pause must drain both real cloud tails without sealing the real archive.
+            assert await routes.api_pause() == {"ok": True}
+            assert session.is_paused is True
+            assert archive.audio._sealed is False
+            assert not archive._stt_timeouts
+            assert "暂停前问题？" in session.transcription_history
+            assert "暂停前回答" in session.candidate_transcription_history
+
+            # Resume into the same unsealed archive and capture another round cleanly.
+            await mmpg_integration.prepare("resume", [10], 20)
+            await mmpg_integration.start_capture("resume", [10], 20)
+            assert session.is_paused is False
+            assert ic.running is True
+            anchor2 = time.monotonic()
+            archive.capture(CapturedAudio(np.full(8000, 0.05, dtype=np.float32), "loop2", 0, anchor2), "interviewer")
+            archive.transcript("interviewer", "恢复后问题？", "q2", anchor2, audio_end=anchor2 + 0.5)
+            assert archive.stop()
+
+            assert len(saved) == 2
+            assert saved[0]["question_text"] == "暂停前问题？"
+            assert saved[0]["candidate_answer_text"] == "暂停前回答"
+            assert saved[1]["question_text"] == "恢复后问题？"
+            assert saved[1]["audio_status"]["interviewer"]["state"] == "ready"
+        finally:
+            archive.stop()
+            reset_session()
+            pipeline._pause_event.clear()
 
     asyncio.run(check())

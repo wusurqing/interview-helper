@@ -419,7 +419,11 @@ async def drain_dual_input(reason: str = "stopped"):
             if result is not False:
                 fail_reason = type(result).__name__
             else:
-                state = transport.status().get("state") or initial_state
+                state = (
+                    initial_state
+                    if initial_state and initial_state != "listening"
+                    else transport.status().get("state")
+                )
                 fail_reason = f"state={state}" if state and state != "listening" else "drain_timeout"
             _log.warning("ASR tail incomplete role=%s reason=%s", role, fail_reason)
             if archive:
