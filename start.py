@@ -2,6 +2,7 @@
 """Unified launcher for the interview assistant."""
 
 import argparse
+import importlib.util
 import os
 import platform
 import shutil
@@ -131,6 +132,10 @@ def ensure_python_deps():
                       "volcenginesdkcore.signv4", "websockets.asyncio.client", "multipart.multipart"]
     missing = []
     for pkg in probe_packages:
+        if pkg == "sounddevice":
+            if importlib.util.find_spec("sounddevice") is None:
+                missing.append(pkg)
+            continue
         try:
             __import__(pkg)
         except ImportError:
@@ -151,6 +156,10 @@ def ensure_python_deps():
     # Re-check
     still_missing = []
     for pkg in probe_packages:
+        if pkg == "sounddevice":
+            if importlib.util.find_spec("sounddevice") is None:
+                still_missing.append(pkg)
+            continue
         try:
             __import__(pkg.replace("-", "_"))
         except ImportError:

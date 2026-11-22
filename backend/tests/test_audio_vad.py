@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import importlib.util
+import os
 from pathlib import Path
+import subprocess
 import sys
 import threading
 from types import SimpleNamespace
+import wave
 
 import numpy as np
+import pytest
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 if str(BACKEND_DIR) not in sys.path:
@@ -721,3 +726,200 @@ def test_sc_showwarning_handles_nested_outer_wrapper_without_recursion(monkeypat
     assert any("nested warning" in msg for msg in outer_seen)
     assert any("nested warning" in msg for msg in orig_seen)
     assert getattr(audio._SC_WARNING_LOCAL, "dispatching", False) is False
+
+
+def test_headless_portaudio_import_failure_degrades_gracefully(tmp_path):
+    fake_site = tmp_path / "fake_site"
+    fake_site.mkdir()
+    (fake_site / "sounddevice.py").write_text(
+        "class PortAudioError(Exception):\n"
+        "    pass\n\n"
+        "raise PortAudioError(\n"
+        "    'Error initializing PortAudio: Unanticipated host error [PaErrorCode -9999]: '\n"
+        "    \"'PulseAudio_Initialize: Can't connect to server'\"\n"
+        ")\n",
+        encoding="utf-8",
+    )
+
+    wav_path = tmp_path / "probe.wav"
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00\x00" * 160)
+
+    log_dir = tmp_path / "logs"
+    data_dir = tmp_path / "data"
+    config_path = tmp_path / "config.json"
+    log_dir.mkdir()
+    data_dir.mkdir()
+
+    script = f"""
+import sys
+from types import SimpleNamespace
+import pytest
+
+sys.path.insert(0, {str(BACKEND_DIR)!r})
+sys.path.insert(0, {str(fake_site)!r})
+
+import core.logger as _logger
+import core.config as _config
+_logger.LOG_DIR = {str(log_dir)!r}
+_config.CONFIG_FILE = {str(config_path)!r}
+
+import services.audio as audio
+import main
+
+assert main.app is not None
+assert audio._SOUNDDEVICE_IMPORT_ERROR is not None
+assert type(audio._SOUNDDEVICE_IMPORT_ERROR).__name__ == "PortAudioError"
+assert "PulseAudio_Initialize: Can't connect to server" in str(audio._SOUNDDEVICE_IMPORT_ERROR)
+assert audio.sd.default.device == (-1, -1)
+assert audio.sd.query_devices() == []
+
+for call in (
+    lambda: audio.sd.query_devices(0),
+    lambda: audio.sd.query_devices(kind="input"),
+    lambda: audio.sd.query_hostapis(0),
+    lambda: audio.sd.InputStream(),
+    lambda: audio.sd.WasapiSettings(),
+    lambda: audio.sd.play(b"", 16000),
+    lambda: audio.sd.wait(),
+):
+    with pytest.raises(RuntimeError):
+        call()
+
+audio._HAS_SC = False
+assert audio.AudioCapture.list_devices() == []
+
+with pytest.raises(RuntimeError):
+    audio.AudioCapture().start(0)
+
+with pytest.raises(RuntimeError):
+    audio.play_audio_file({str(wav_path)!r})
+
+# Verify audio.sd remains a monkeypatchable proxy across all expected attributes.
+with pytest.MonkeyPatch.context() as mp:
+    mp.setattr(audio.sd, "query_devices", lambda *args, **kwargs: (
+        {{"index": 0, "name": "Fake Mic", "max_input_channels": 1, "default_samplerate": 16000, "hostapi": 0}}
+        if args or kwargs else
+        [{{"name": "Fake Mic", "max_input_channels": 1, "default_samplerate": 16000, "hostapi": 0}}]
+    ))
+    mp.setattr(audio.sd, "query_hostapis", lambda *_: {{"name": "ALSA"}})
+    mp.setattr(audio.sd, "InputStream", lambda **_: SimpleNamespace(start=lambda: None, stop=lambda: None, close=lambda: None))
+    mp.setattr(audio.sd, "WasapiSettings", lambda **_: SimpleNamespace())
+    played = []
+    waited = []
+    mp.setattr(audio.sd, "play", lambda a, sr: played.append((len(a), sr)))
+    mp.setattr(audio.sd, "wait", lambda: waited.append(True))
+    mp.setattr(audio.sd, "default", SimpleNamespace(device=(0, 0)))
+
+    assert audio.AudioCapture.list_devices()[0]["name"] == "Fake Mic"
+    cap = audio.AudioCapture()
+    cap.start(0, owner="headless-monkeypatch-test")
+    cap.stop(owner="headless-monkeypatch-test")
+    audio.play_audio_file({str(wav_path)!r})
+    assert played == [(160, 16000)]
+    assert waited == [True]
+    assert audio.sd.default.device == (0, 0)
+
+# After MonkeyPatch restores audio.sd, fallback behavior returns intact.
+with pytest.raises(RuntimeError):
+    audio.AudioCapture().start(0)
+"""
+
+    env = os.environ.copy()
+    env["IA_CONFIG_PATH"] = str(config_path)
+    env["IA_DATA_DIR"] = str(data_dir)
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=str(BACKEND_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+
+
+def test_list_devices_handles_sounddevice_query_error(monkeypatch):
+    from types import SimpleNamespace
+    from services import audio
+
+    def broken_query(*_args, **_kwargs):
+        raise RuntimeError("PulseAudio_Initialize: Can't connect to server")
+
+    monkeypatch.setattr(audio.sd, "query_devices", broken_query)
+    monkeypatch.setattr(audio.platform, "system", lambda: "Linux")
+    assert AudioCapture.list_devices() == []
+
+    speaker = SimpleNamespace(name="Fallback Speaker", id="loopback-fallback-id", channels=2)
+    monkeypatch.setattr(audio.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(audio, "_HAS_SC", True)
+    monkeypatch.setattr(
+        audio,
+        "_sc",
+        SimpleNamespace(default_speaker=lambda: speaker, all_speakers=lambda: [speaker]),
+        raising=False,
+    )
+    monkeypatch.setattr(audio, "_SC_DEVICE_CACHE", {})
+    monkeypatch.setattr(audio, "_SC_ID_MAP", {})
+
+    devices = AudioCapture.list_devices()
+    assert len(devices) == 1
+    assert devices[0]["is_loopback"] is True
+    assert "Fallback Speaker" in devices[0]["name"]
+
+
+def test_start_ensure_python_deps_checks_sounddevice_without_importing(monkeypatch):
+    start_path = BACKEND_DIR.parent / "start.py"
+    spec = importlib.util.spec_from_file_location("start_headless_check", start_path)
+    start_mod = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(start_mod)
+
+    orig_find_spec = importlib.util.find_spec
+    find_spec_calls: list[str] = []
+    import_calls: list[str] = []
+    sounddevice_installed = True
+
+    def fake_find_spec(name: str, package=None):
+        find_spec_calls.append(name)
+        if name == "sounddevice":
+            return object() if sounddevice_installed else None
+        return orig_find_spec(name, package)
+
+    def fake_import(name: str, *args, **kwargs):
+        import_calls.append(name)
+        if name == "sounddevice":
+            raise RuntimeError(
+                "PortAudioError: Error initializing PortAudio: PulseAudio_Initialize: Can't connect to server"
+            )
+        return object()
+
+    pip_calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        nonlocal sounddevice_installed
+        pip_calls.append(cmd)
+        sounddevice_installed = True
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(start_mod.importlib.util, "find_spec", fake_find_spec)
+    monkeypatch.setattr(start_mod, "__import__", fake_import, raising=False)
+    monkeypatch.setattr(start_mod.subprocess, "run", fake_run)
+
+    # Case 1: sounddevice is installed; ensure_python_deps uses find_spec and never imports sounddevice.
+    start_mod.ensure_python_deps()
+    assert "sounddevice" in find_spec_calls
+    assert "sounddevice" not in import_calls
+    assert pip_calls == []
+
+    # Case 2: sounddevice is initially missing, triggers pip install, then passes re-check via find_spec.
+    find_spec_calls.clear()
+    import_calls.clear()
+    sounddevice_installed = False
+    start_mod.ensure_python_deps()
+    assert find_spec_calls.count("sounddevice") == 2
+    assert "sounddevice" not in import_calls
+    assert len(pip_calls) == 1
+    assert pip_calls[0][:6] == [sys.executable, "-m", "pip", "install", "-r", str(BACKEND_DIR / "requirements.txt")]
