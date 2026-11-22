@@ -631,7 +631,7 @@ def test_soundcard_discontinuity_hook_marks_archive_and_passes_other_threads_thr
         def record(self, numframes: int):
             calls["count"] += 1
             if calls["count"] == 2:
-                warnings.warn("data discontinuity in recording", RuntimeWarning)
+                warnings.warn("data discontinuity in recording", RuntimeWarning, stacklevel=2)
             if calls["count"] == 3:
                 captured_two.set()
             # 超过 MIN_LOOPBACK_QUEUE_CHUNK_SAMPLES (1600)，每次调用都能独立触发一次 _push
@@ -665,7 +665,7 @@ def test_soundcard_discontinuity_hook_marks_archive_and_passes_other_threads_thr
 
         def emit_other():
             try:
-                warnings.warn("unrelated worker warning", UserWarning)
+                warnings.warn("unrelated worker warning", UserWarning, stacklevel=2)
             except Exception as exc:
                 other_err.append(exc)
 
@@ -714,7 +714,7 @@ def test_sc_showwarning_handles_nested_outer_wrapper_without_recursion(monkeypat
 
     def run_in_other_thread():
         try:
-            warnings.warn("nested warning", UserWarning)
+            warnings.warn("nested warning", UserWarning, stacklevel=2)
         except Exception as exc:
             errors.append(exc)
 
