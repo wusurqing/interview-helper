@@ -34,6 +34,7 @@ code, pre, .font-mono {
 
 .app-drag-region {
   -webkit-app-region: drag;
+  app-region: drag;
 }
 
 .app-drag-region button,
@@ -44,11 +45,19 @@ code, pre, .font-mono {
 .app-drag-region [role='button'],
 .app-drag-region [role='tab'] {
   -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .app-no-drag,
-.app-no-drag * {
+.app-no-drag *,
+[role='dialog'],
+[role='dialog'] *,
+[aria-modal='true'],
+[aria-modal='true'] *,
+[role='menu'],
+[role='menu'] * {
   -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 /* ========== 主题变量（与 tailwind.config 中 rgb(var(--c-*) / <alpha>) 对应）========== */

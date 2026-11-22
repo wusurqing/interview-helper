@@ -1100,7 +1100,7 @@ export default function ControlBar() {
       </div>
 
       {inputMeterOpen && (
-        <div className="fixed inset-0 z-[100] flex items-end justify-center bg-black/45 px-3 py-4 sm:items-center">
+        <div className="app-no-drag fixed inset-0 z-[100] flex items-end justify-center bg-black/45 px-3 py-4 sm:items-center">
           <div
             role="dialog"
             aria-modal="true"
