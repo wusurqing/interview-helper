@@ -607,21 +607,118 @@ test('before-quit offers native force-quit dialog after failed /api/stop (cancel
   assert.equal(h.quitCalls, 0);
   assert.equal(mainWin.sentMessages.filter((m) => m.channel === 'desktop-toast').length, 2);
 
-  // 4) Fourth before-quit -> choose Force Quit (response 1) -> stops helper, taskkills backend, quits.
+  // 4) Fourth before-quit -> choose Force Quit (response 1) -> stops helper, sync-taskkills backend, quits.
   h.appEvents.emit('before-quit', { preventDefault() { prevented += 1; } });
   assert.equal(dialogCalls.length, 3);
   dialogResolvers.shift()({ response: 1 });
   await flushMicrotasks();
 
   assert.equal(helperStdinEnded, true, 'force quit must call stopPromptWheelHelper()');
-  const backendKill = h.spawnCalls.find(
+  const backendKill = h.spawnSyncCalls.find(
     (c) => c.cmd === 'taskkill' && c.args.includes(String(backendChild.pid)),
   );
-  assert.ok(backendKill, 'force quit must terminate backend process tree via taskkill');
+  assert.ok(backendKill, 'force quit must synchronously terminate backend process tree via taskkill');
   assert.deepEqual(Array.from(backendKill.args), ['/PID', String(backendChild.pid), '/T', '/F']);
   assert.equal(runInNewContext('pythonProcess', h.context), null);
   assert.equal(runInNewContext('readyToQuit', h.context), true);
   assert.equal(h.quitCalls, 1);
+});
+
+test('force-quit via quit-app/tray keeps isQuitting false while dialog is open, binds dialog this, handles sync throw, and falls back to SIGKILL on taskkill ENOENT', async (t) => {
+  const failingHttp = {
+    request(_url, _opts, cb) {
+      const req = new EventEmitter();
+      req.end = () => {
+        const res = new EventEmitter();
+        res.statusCode = 500;
+        res.resume = () => {};
+        cb(res);
+        res.emit('end');
+      };
+      req.destroy = () => {};
+      return req;
+    },
+  };
+
+  let throwFirst = true;
+  let dialogCalls = [];
+  let pendingResolve = null;
+  const dialogMock = {
+    tag: 'electron-dialog',
+    showMessageBox(...args) {
+      assert.equal(this.tag, 'electron-dialog', 'dialog.showMessageBox must preserve receiver binding');
+      if (throwFirst) {
+        throwFirst = false;
+        throw new Error('native dialog unavailable');
+      }
+      const options = args.length === 2 ? args[1] : args[0];
+      dialogCalls.push({ parent: args.length === 2 ? args[0] : null, options });
+      return new Promise((resolve) => { pendingResolve = resolve; });
+    },
+  };
+
+  const h = createHarness(t, {
+    platform: 'win32',
+    httpMock: failingHttp,
+    dialogMock,
+    spawnSyncResult: { error: new Error('ENOENT') },
+    useMockTimers: false,
+  });
+  h.context.createWindow();
+  h.context.createTray();
+  const mainWin = h.createdWindows[0];
+  // Main window hidden in tray -> parent should be null for native dialog.
+  mainWin.hide();
+  h.context.startPythonBackend();
+  const backendChild = h.spawnCalls[0].child;
+
+  const flushMicrotasks = async () => {
+    for (let i = 0; i < 6; i += 1) await Promise.resolve();
+  };
+
+  // Wire simulated quit triggers through before-quit just like Electron.
+  const triggerQuitVia = (invoke) => {
+    const prevQuitCalls = h.quitCalls;
+    invoke();
+    assert.equal(h.quitCalls, prevQuitCalls + 1);
+    let prevented = false;
+    h.appEvents.emit('before-quit', { preventDefault() { prevented = true; } });
+    return prevented;
+  };
+
+  // First quit via frameless Close button (quit-app IPC) fails /api/stop.
+  assert.equal(triggerQuitVia(() => h.handlers.get('quit-app')()), true);
+  await flushMicrotasks();
+  assert.equal(runInNewContext('isQuitting', h.context), false);
+
+  // Second quit triggers synchronous dialog throw -> must not crash and must keep stopAckFailed=true & isQuitting=false.
+  assert.doesNotThrow(() => {
+    assert.equal(triggerQuitVia(() => h.handlers.get('quit-app')()), true);
+  });
+  assert.equal(runInNewContext('isQuitting', h.context), false);
+  assert.equal(runInNewContext('stopAckFailed', h.context), true);
+
+  // Third quit via Tray '退出' while mainWindow is hidden -> opens dialog without parent, keeping isQuitting=false!
+  const trayExit = h.getTrayMenu().find((item) => item.label === '退出');
+  assert.ok(trayExit);
+  assert.equal(triggerQuitVia(() => trayExit.click()), true);
+  assert.equal(dialogCalls.length, 1);
+  assert.equal(dialogCalls[0].parent, null, 'hidden mainWindow must not be passed as dialog parent');
+  assert.equal(runInNewContext('isQuitting', h.context), false, 'tray exit must not flip isQuitting while dialog is open');
+
+  // Duplicate quit-app click while dialog is open must also leave isQuitting=false.
+  assert.equal(triggerQuitVia(() => h.handlers.get('quit-app')()), true);
+  assert.equal(dialogCalls.length, 1);
+  assert.equal(runInNewContext('isQuitting', h.context), false);
+
+  // Confirm Force Quit (response 1) -> taskkill spawnSync errors with ENOENT -> must fall back synchronously to SIGKILL.
+  pendingResolve({ response: 1 });
+  await flushMicrotasks();
+  assert.equal(h.spawnSyncCalls.length, 1);
+  assert.equal(h.spawnSyncCalls[0].cmd, 'taskkill');
+  assert.deepEqual(backendChild.killCalls, ['SIGKILL']);
+  assert.equal(runInNewContext('pythonProcess', h.context), null);
+  assert.equal(runInNewContext('readyToQuit', h.context), true);
 });
 
 test('before-quit dialog retry-and-succeed exits cleanly and missing dialog falls back safely', async (t) => {

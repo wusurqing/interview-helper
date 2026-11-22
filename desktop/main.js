@@ -995,7 +995,7 @@ function createTray() {
       },
     },
     { type: 'separator' },
-    { label: '退出', click: () => { isQuitting = true; app.quit(); } },
+    { label: '退出', click: () => { app.quit(); } },
   ]);
 
   trayMenu = contextMenu;
@@ -1239,7 +1239,7 @@ function sendOverlayQuestionCommand(direction) {
 
 ipcMain.handle('hide-window', () => mainWindow?.hide());
 ipcMain.handle('minimize-window', () => mainWindow?.minimize());
-ipcMain.handle('quit-app', () => { isQuitting = true; app.quit(); });
+ipcMain.handle('quit-app', () => { app.quit(); });
 ipcMain.handle('show-window', () => { mainWindow?.show(); mainWindow?.focus(); });
 ipcMain.handle('get-shortcuts', () => shortcuts);
 ipcMain.handle('update-shortcuts', (_event, updates) => {
@@ -1496,7 +1496,7 @@ function createAppMenu() {
         { role: 'hide', label: '隐藏应用' },
         { role: 'unhide', label: '显示应用' },
         { type: 'separator' },
-        { label: '退出', accelerator: 'CommandOrControl+Q', click: () => { isQuitting = true; app.quit(); } },
+        { label: '退出', accelerator: 'CommandOrControl+Q', click: () => { app.quit(); } },
       ],
     },
     {
@@ -1614,7 +1614,7 @@ function forceDesktopQuit() {
   isQuitting = true;
   stopPromptWheelHelper();
   if (pythonProcess) {
-    terminateChildProcess(pythonProcess);
+    terminateChildProcess(pythonProcess, { sync: true });
     pythonProcess = null;
   }
   readyToQuit = true;
@@ -1623,8 +1623,7 @@ function forceDesktopQuit() {
 
 function promptForceQuitAfterStopFailure() {
   if (forceQuitDialogPromise) return forceQuitDialogPromise;
-  const showMessageBox = dialog?.showMessageBox;
-  if (typeof showMessageBox !== 'function') {
+  if (typeof dialog?.showMessageBox !== 'function') {
     return startNormalDesktopQuit();
   }
   const options = {
@@ -1640,9 +1639,17 @@ function promptForceQuitAfterStopFailure() {
   const parentWin = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible?.()
     ? mainWindow
     : null;
-  const boxPromise = parentWin
-    ? showMessageBox(parentWin, options)
-    : showMessageBox(options);
+  let boxPromise;
+  try {
+    boxPromise = parentWin
+      ? dialog.showMessageBox(parentWin, options)
+      : dialog.showMessageBox(options);
+  } catch (err) {
+    console.warn('force quit confirmation dialog failed:', err?.message || err);
+    stopAckFailed = true;
+    isQuitting = false;
+    return Promise.resolve();
+  }
   forceQuitDialogPromise = Promise.resolve(boxPromise).then((result) => {
     forceQuitDialogPromise = null;
     const response = result?.response;
