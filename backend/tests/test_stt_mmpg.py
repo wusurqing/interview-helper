@@ -692,7 +692,19 @@ def test_candidate_mmpg_routes_final_transcripts_to_qa_and_drains_on_pause(monke
             candidate_cloud.push("user.audio.transcription.done", conv_id="cleared", transcript="旧记录")
             candidate_cloud.push("user.audio.transcription.started", conv_id="tail")
             await wait_until(lambda: session.has_candidate_asr_pending_for_qa("qa-2"))
-            await candidate_mmpg.stop("paused", drain=True)
+
+            async def keep_interviewer_alive():
+                chunk = np.zeros(160, dtype=np.float32)
+                while True:
+                    interviewer.offer_audio(chunk)
+                    await asyncio.sleep(0.2)
+
+            keepalive = asyncio.create_task(keep_interviewer_alive())
+            try:
+                await candidate_mmpg.stop("paused", drain=True)
+            finally:
+                keepalive.cancel()
+                await asyncio.gather(keepalive, return_exceptions=True)
             assert candidate_cloud.closed and mic.stopped
             assert interviewer.status()["state"] == "listening" and not primary_cloud.closed
             assert saved == [("qa-1", "我的真实回答"), ("qa-2", "最后一句")]
@@ -1012,3 +1024,398 @@ def test_mmpg_schedule_timeout_test_skips_when_stopping_and_handles_concurrent_s
             await mgr2.detach(owner)
 
     asyncio.run(check_race())
+
+
+def test_mmpg_drain_input_monotonic_pacing_bounded_catchup_and_queue_limit(monkeypatch):
+    from services.stt import mmpg
+    from services.stt.mmpg import MAX_AUDIO_BYTES, MmpgManager
+
+    async def check_jitter_and_stall():
+        loop = asyncio.get_running_loop()
+        fake_now = [100.0]
+        monkeypatch.setattr(loop, "time", lambda: fake_now[0])
+
+        # Case 1: alternating early/late timer wakes (Windows 15.625ms-style jitter) must
+        # maintain ~40ms/chunk average without early-fire runaway or slow drift.
+        mgr = MmpgManager(lambda: CONFIG, str)
+        sent_times: list[float] = []
+        wait_timeouts: list[float] = []
+        done = asyncio.Event()
+
+        def fake_offer(samples):
+            assert len(samples) == 640 * 4
+            sent_times.append(fake_now[0])
+            if len(sent_times) >= 25:
+                done.set()
+            return True
+
+        monkeypatch.setattr(mgr, "offer_audio", fake_offer)
+
+        real_wait = asyncio.wait
+        jitter_pattern = [-0.00875, 0.006875, -0.005, 0.009]
+        wait_idx = [0]
+
+        async def fake_wait(aws, *, timeout=None):
+            assert timeout is not None and timeout > 0
+            wait_timeouts.append(timeout)
+            jitter = jitter_pattern[wait_idx[0] % len(jitter_pattern)]
+            wait_idx[0] += 1
+            fake_now[0] += max(0.015625, timeout + jitter)
+            return await real_wait(aws, timeout=0)
+
+        monkeypatch.setattr(mmpg.asyncio, "wait", fake_wait)
+
+        async def finishing():
+            await done.wait()
+            return True
+
+        assert await mgr._drain_input(finishing()) is True
+        elapsed = sent_times[-1] - sent_times[0]
+        expected = 24 * 0.04
+        assert abs(elapsed - expected) < 0.025, f"drifted: elapsed={elapsed:.4f} expected={expected:.4f}"
+        assert all(t > 0 for t in wait_timeouts)
+
+        # Case 2: a sudden 2.0s stall must clamp catch-up so chunks cannot burst-overflow
+        # the browser's 1s PcmQueue (25 chunks).
+        mgr2 = MmpgManager(lambda: CONFIG, str)
+        sent_at_stall: list[float] = []
+        done2 = asyncio.Event()
+        stalled = [False]
+
+        def fake_offer2(_samples):
+            sent_at_stall.append(fake_now[0])
+            if len(sent_at_stall) >= 8:
+                done2.set()
+            return True
+
+        monkeypatch.setattr(mgr2, "offer_audio", fake_offer2)
+
+        async def stall_wait(aws, *, timeout=None):
+            if not stalled[0]:
+                stalled[0] = True
+                fake_now[0] += 2.0  # 2-second event-loop stall
+            else:
+                fake_now[0] += timeout
+            return await real_wait(aws, timeout=0)
+
+        monkeypatch.setattr(mmpg.asyncio, "wait", stall_wait)
+
+        async def finishing2():
+            await done2.wait()
+            return True
+
+        assert await mgr2._drain_input(finishing2()) is True
+        stall_timestamp = sent_at_stall[1]
+        burst_at_stall = sum(1 for ts in sent_at_stall[1:] if ts == stall_timestamp)
+        assert 1 <= burst_at_stall <= 4, f"unbounded burst after stall: {burst_at_stall} chunks"
+
+        # Case 3: queue at MAX_AUDIO_BYTES skips offer_audio without failing until space frees up.
+        mgr3 = MmpgManager(lambda: CONFIG, str)
+        mgr3._queued_bytes = MAX_AUDIO_BYTES
+        offered3: list[int] = []
+        done3 = asyncio.Event()
+        ticks = [0]
+
+        def fake_offer3(samples):
+            offered3.append(len(samples))
+            if len(offered3) >= 2:
+                done3.set()
+            return True
+
+        monkeypatch.setattr(mgr3, "offer_audio", fake_offer3)
+
+        async def backpressure_wait(aws, *, timeout=None):
+            ticks[0] += 1
+            fake_now[0] += timeout
+            if ticks[0] == 2:
+                mgr3._queued_bytes = 0
+            return await real_wait(aws, timeout=0)
+
+        monkeypatch.setattr(mmpg.asyncio, "wait", backpressure_wait)
+
+        async def finishing3():
+            await done3.wait()
+            return True
+
+        assert await mgr3._drain_input(finishing3()) is True
+        assert ticks[0] >= 3
+        assert len(offered3) == 2
+        assert mgr3._audio_failed is False
+
+    asyncio.run(check_jitter_and_stall())
+
+
+def test_mmpg_drain_transcripts_uses_dynamic_timeout_for_high_silence_ms():
+    from core.config import Mmpg
+    from services.stt import mmpg
+    from services.stt.mmpg import MmpgManager
+
+    # Verify recommended_drain_timeout() across config shapes and fallback paths.
+    default_mgr = MmpgManager(lambda: None, str)
+    assert default_mgr.recommended_drain_timeout() == 6.0
+
+    high_model_mgr = MmpgManager(lambda: Mmpg(**{**CONFIG, "silence_ms": 2999}), str)
+    expected_2999 = 2.999 + mmpg.ROLE_DRAIN_PLAYBACK_GRACE_SECONDS + 2.0
+    assert high_model_mgr.recommended_drain_timeout() == pytest.approx(expected_2999)
+    assert high_model_mgr.recommended_drain_timeout() > 6.0
+
+    high_cfg = {**CONFIG, "silence_ms": 2500}
+
+    async def check_high_silence_drain():
+        cloud = CloudSocket()
+        controls: list[dict] = []
+        finals: list[str] = []
+        sent_bytes = [0]
+        done_pushed = [False]
+        queued_pcm = np.ones(16_000 // 2, dtype=np.float32).tobytes()  # 0.5s spoken PCM
+        required_bytes = len(queued_pcm) + 2500 * (mmpg.PCM_BYTES_PER_SECOND // 1000)
+
+        async def connector(_):
+            cloud.push("session.created")
+            return cloud
+
+        async def send(payload):
+            if isinstance(payload, bytes):
+                sent_bytes[0] += len(payload)
+                if not done_pushed[0] and sent_bytes[0] >= required_bytes:
+                    done_pushed[0] = True
+                    cloud.push("user.audio.transcription.done", conv_id="slow-turn", transcript="长静音末尾补全")
+            else:
+                controls.append(payload)
+
+        mgr = MmpgManager(lambda: high_cfg, lambda text, _: finals.append(text), connector=connector)
+        owner = object()
+        assert mgr.attach(owner, send)
+        mgr.start(owner, "start", [1])
+        try:
+            await wait_until(lambda: any(msg["type"] == "rtc_join" for msg in controls))
+            gen = mgr.status()["generation"]
+            await mgr.rtc_event(owner, {"type": "rtc_ready", "generation": gen})
+            await wait_until(lambda: mgr.status()["state"] == "listening")
+
+            assert mgr.recommended_drain_timeout() == max(
+                6.0, 2.5 + mmpg.ROLE_DRAIN_PLAYBACK_GRACE_SECONDS + 2.0,
+            )
+            assert mgr.offer_audio(queued_pcm)
+            cloud.push("user.conversation.created", conv_id="slow-turn")
+            await wait_until(lambda: "slow-turn" in mgr._current.open_conversations)
+
+            started = time.monotonic()
+            # Default timeout=None must use recommended_drain_timeout() (>=6.0s) instead of old 3.0s.
+            assert await mgr.drain_transcripts() is True
+            elapsed = time.monotonic() - started
+            assert elapsed > 3.0, f"expected real >3s drain with silence_ms=2500, got {elapsed:.2f}s"
+            assert finals == ["长静音末尾补全"]
+        finally:
+            await mgr.detach(owner)
+
+    asyncio.run(check_high_silence_drain())
+
+
+def test_drain_dual_input_enforces_timeout_floor_and_preserves_reconnecting_tail_on_stop(
+    monkeypatch, caplog,
+):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from api.assist import candidate_mmpg, mmpg_integration, pipeline
+    from core import config
+    from core.session import get_session, reset_session
+
+    low_cfg = config.AppConfig(assist_interviewer_asr_drain_timeout_sec=1.0)
+    monkeypatch.setattr(mmpg_integration, "get_config", lambda: low_cfg)
+    monkeypatch.setattr(pipeline, "freeze_interview_inputs", Mock())
+    monkeypatch.setattr(candidate_mmpg, "freeze_input", lambda: asyncio.sleep(0))
+
+    async def check():
+        session = reset_session()
+        archive = Mock()
+        session.archive = archive
+        session.is_recording = True
+        session.is_paused = False
+
+        seen_timeouts: dict[str, float] = {}
+
+        def fake_transport(role, state, drain_ok, recommended):
+            async def drain_transcripts(*, timeout=None):
+                seen_timeouts[role] = timeout
+                return drain_ok
+
+            return SimpleNamespace(
+                active=True,
+                single_mic_id=None,
+                status=lambda: {"state": state, "mode": "start"},
+                recommended_drain_timeout=lambda: recommended,
+                drain_transcripts=drain_transcripts,
+            )
+
+        interviewer = fake_transport("interviewer", "listening", True, 6.24)
+        candidate = fake_transport("candidate", "reconnecting", False, 6.0)
+        monkeypatch.setattr(mmpg_integration, "manager", interviewer)
+        monkeypatch.setattr(candidate_mmpg, "manager", candidate)
+        monkeypatch.setattr(mmpg_integration, "_turns", Mock())
+
+        logger = logging.getLogger("mmpg.diagnostics")
+        attach_handler = not logger.propagate
+        if attach_handler:
+            logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level("WARNING", logger="mmpg.diagnostics"):
+                await mmpg_integration.drain_dual_input("stopped")
+        finally:
+            if attach_handler:
+                logger.removeHandler(caplog.handler)
+
+        assert seen_timeouts["interviewer"] == pytest.approx(6.24)
+        assert seen_timeouts["candidate"] == pytest.approx(6.0)
+        archive.seal_capture.assert_called_once()
+        archive.stt_timeout.assert_called_once_with("candidate")
+        mmpg_integration._turns.finish_role.assert_called_once()
+        assert "ASR tail incomplete role=candidate reason=state=reconnecting" in caplog.text
+
+        # Listening transport timing out logs reason=drain_timeout (distinct from non-listening state).
+        caplog.clear()
+        archive.reset_mock()
+        interviewer_timeout = fake_transport("interviewer", "listening", False, 6.0)
+        monkeypatch.setattr(mmpg_integration, "manager", interviewer_timeout)
+        monkeypatch.setattr(candidate_mmpg, "manager", SimpleNamespace(active=False, status=lambda: {"state": "idle"}))
+        if attach_handler:
+            logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level("WARNING", logger="mmpg.diagnostics"):
+                await mmpg_integration.drain_dual_input("stopped")
+        finally:
+            if attach_handler:
+                logger.removeHandler(caplog.handler)
+        assert "ASR tail incomplete role=interviewer reason=drain_timeout" in caplog.text
+        archive.stt_timeout.assert_called_once_with("interviewer")
+        reset_session()
+
+    asyncio.run(check())
+
+
+def test_api_pause_drains_dual_channels_concurrently_without_sealing_archive_and_allows_resume(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from api.assist import candidate_mmpg, mmpg_integration, pipeline, routes
+    from core import config
+    from core.session import get_session, reset_session
+
+    cfg = config.AppConfig(
+        stt_provider="doubao_mmpg",
+        candidate_stt_provider="doubao_mmpg",
+        candidate_asr_enabled=True,
+        mmpg=config.Mmpg(**CONFIG),
+        assist_interviewer_asr_drain_timeout_sec=1.0,
+    )
+    monkeypatch.setattr(config, "_config", cfg)
+    monkeypatch.setattr(mmpg_integration, "get_config", lambda: cfg)
+    monkeypatch.setattr(mmpg_integration, "_session_config", cfg)
+    monkeypatch.setattr(mmpg_integration, "_session_settings", cfg.mmpg)
+    monkeypatch.setattr(mmpg_integration, "_test_settings", None)
+    monkeypatch.setattr(pipeline, "_interviewer_config", cfg)
+    monkeypatch.setattr(pipeline, "_interviewer_streaming", True)
+    monkeypatch.setattr(pipeline, "_device_is_loopback", lambda _dev: False)
+    monkeypatch.setattr(pipeline, "_start_candidate_capture", Mock())
+    monkeypatch.setattr(pipeline, "broadcast", Mock())
+
+    capture_events: list[tuple[str, str]] = []
+    fake_main_capture = SimpleNamespace(
+        is_running=True,
+        start=lambda dev, **kw: capture_events.append(("start-main", f"{dev}:{kw.get('owner')}")),
+        stop=lambda **kw: capture_events.append(("stop-main", str(kw.get("owner")))),
+    )
+    fake_cand_capture = SimpleNamespace(
+        is_running=True,
+        start=lambda dev, **kw: capture_events.append(("start-cand", f"{dev}:{kw.get('owner')}")),
+        stop=lambda **kw: capture_events.append(("stop-cand", str(kw.get("owner")))),
+    )
+    monkeypatch.setattr(pipeline, "audio_capture", fake_main_capture)
+    monkeypatch.setattr(pipeline, "_candidate_audio_capture", fake_cand_capture)
+    monkeypatch.setattr(mmpg_integration, "audio_capture", fake_main_capture)
+
+    async def check():
+        monkeypatch.setattr(mmpg_integration, "http_lifecycle_lock", asyncio.Lock())
+        session = reset_session()
+        archive = Mock()
+        session.archive = archive
+        session.is_recording = True
+        session.is_paused = False
+        session.last_device_id = 10
+        session.last_candidate_mic_device_id = 20
+        pipeline._pause_event.clear()
+
+        both_draining = asyncio.Event()
+        draining: set[str] = set()
+        stopped: list[str] = []
+        turns_mock = Mock()
+        monkeypatch.setattr(mmpg_integration, "_turns", turns_mock)
+
+        def make_transport(role, drain_ok):
+            obj = SimpleNamespace(
+                active=True,
+                single_mic_id=None,
+                status=lambda: {"state": "listening", "mode": "start"},
+                recommended_drain_timeout=lambda: 6.0,
+                offer_audio=Mock(),
+            )
+
+            async def drain_transcripts(*, timeout=None):
+                assert timeout >= 6.0
+                # Both physical inputs must be frozen before draining starts.
+                assert ("stop-main", "assist") in capture_events
+                assert ("stop-cand", "assist-candidate-mmpg") in capture_events
+                assert not stopped
+                draining.add(role)
+                if len(draining) == 2:
+                    both_draining.set()
+                await asyncio.wait_for(both_draining.wait(), timeout=1.0)
+                return drain_ok
+
+            async def stop(reason):
+                assert reason == "paused"
+                # _turns.finish_role() must have already run during drain before stop("paused").
+                assert turns_mock.finish_role.call_count == 1
+                stopped.append(role)
+                obj.active = False
+
+            obj.drain_transcripts = drain_transcripts
+            obj.stop = stop
+            return obj
+
+        interviewer = make_transport("interviewer", True)
+        candidate = make_transport("candidate", False)
+        monkeypatch.setattr(mmpg_integration, "manager", interviewer)
+        monkeypatch.setattr(candidate_mmpg, "manager", candidate)
+
+        assert await routes.api_pause() == {"ok": True}
+        assert draining == {"interviewer", "candidate"}
+        assert set(stopped) == {"interviewer", "candidate"}
+        turns_mock.finish_role.assert_called_once()
+        # CRITICAL: pausing must NEVER seal archive or mark stt_timeout.
+        archive.seal_capture.assert_not_called()
+        archive.stt_timeout.assert_not_called()
+        # Even though freeze_interview_inputs() already set _pause_event, api_pause must
+        # transition session.is_paused=True so resume is accepted afterward.
+        assert session.is_paused is True
+        assert pipeline.is_paused() is True
+
+        # Verify resume succeeds cleanly after dual-channel pause drain.
+        await mmpg_integration.prepare("resume", [10], 20)
+        await mmpg_integration.start_capture("resume", [10], 20)
+        assert session.is_paused is False
+        assert pipeline.is_paused() is False
+        assert ("start-main", "10:assist") in capture_events
+
+        # Edge case: is_streaming_interview() is True while mmpg.manager.active is False
+        # must still pause cleanly.
+        interviewer.active = False
+        candidate.active = False
+        assert await routes.api_pause() == {"ok": True}
+        assert session.is_paused is True
+        assert pipeline.is_paused() is True
+        reset_session()
+        pipeline._pause_event.clear()
+
+    asyncio.run(check())

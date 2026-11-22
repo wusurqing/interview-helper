@@ -9,6 +9,7 @@ import copy
 import hmac
 import json
 import logging
+import math
 import re
 import secrets
 import struct
@@ -598,9 +599,30 @@ class MmpgManager:
             if last_audio is not None and time.monotonic() - last_audio >= AUDIO_STALL_TIMEOUT:
                 raise MmpgError("audio_stalled")
 
-    async def drain_transcripts(self, *, timeout=3.0) -> bool:
+    def recommended_drain_timeout(self) -> float:
+        """Compute a safe drain timeout covering configured silence and playback grace."""
+        silence_ms = _DEFAULTS["silence_ms"]
+        current = self._current
+        if current is not None and isinstance(current.config, dict):
+            raw = current.config.get("silence_ms", silence_ms)
+        else:
+            raw = silence_ms
+            try:
+                cfg = self._get_config()
+            except Exception:
+                cfg = None
+            if isinstance(cfg, dict):
+                raw = cfg.get("silence_ms", silence_ms)
+            elif cfg is not None:
+                raw = getattr(cfg, "silence_ms", silence_ms)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw) and raw > 0:
+            silence_ms = float(raw)
+        return max(6.0, silence_ms / 1000.0 + ROLE_DRAIN_PLAYBACK_GRACE_SECONDS + 2.0)
+
+    async def drain_transcripts(self, *, timeout: float | None = None) -> bool:
         """After dual-device capture stops, wait for sent PCM and the tail final."""
-        return await self._drain_input(self._finish_input(timeout=timeout))
+        effective_timeout = self.recommended_drain_timeout() if timeout is None else timeout
+        return await self._drain_input(self._finish_input(timeout=effective_timeout))
 
     async def drain_single_mic_input(self, session_id: str, *, timeout: float) -> bool:
         """Feed silence while a paused physical source has a final turn to finish."""
@@ -611,15 +633,28 @@ class MmpgManager:
     async def _drain_input(self, finishing) -> bool:
         drain = asyncio.create_task(finishing)
         silence = bytes(640 * 4)  # 40 ms of 16 kHz float32 PCM.
+        step = 0.04
+        max_catchup = step * 2  # Bound catch-up so stalls cannot burst-overflow the 1s browser PcmQueue.
+        loop = asyncio.get_running_loop()
         try:
             # Let the waiter capture the end of real PCM before adding silence.
             await asyncio.sleep(0)
+            next_send = loop.time()
             while not drain.done():
                 with self._audio_lock:
                     room = self._queued_bytes + self._inflight_bytes + len(silence) <= MAX_AUDIO_BYTES
                 if room and not self.offer_audio(silence):
                     return False
-                await asyncio.wait({drain}, timeout=0.04)
+                now = loop.time()
+                if room:
+                    next_send = max(next_send, now - max_catchup) + step
+                else:
+                    next_send = now + step
+                delay = next_send - now
+                if delay <= 0:
+                    await asyncio.sleep(0)
+                else:
+                    await asyncio.wait({drain}, timeout=delay)
             return drain.result()
         finally:
             if not drain.done():

@@ -168,15 +168,12 @@ async def _finish_interview(reason):
                     if session.single_mic is not None:
                         await mmpg.drain_single_mic_transports(session.single_mic, reason)
                     else:
-                        await mmpg.drain_dual_input()
+                        await mmpg.drain_dual_input(reason)
             finally:
                 try:
                     await asyncio.gather(
                         mmpg.manager.stop(reason),
-                        candidate_mmpg.stop(
-                            reason,
-                            drain=bool(reason == "shutdown" and not is_active and session.single_mic is None),
-                        ),
+                        candidate_mmpg.stop(reason, drain=False),
                         return_exceptions=(reason == "shutdown"),
                     )
                 finally:
@@ -208,7 +205,14 @@ async def api_pause(body: dict | None = None):
             return {"ok": True}
         if is_streaming_interview() or mmpg.manager.active:
             mmpg.bump_lifecycle_epoch()
-            await asyncio.gather(mmpg.manager.stop("paused"), candidate_mmpg.stop("paused", drain=True))
+            try:
+                await mmpg.drain_dual_input(reason="paused")
+            finally:
+                try:
+                    await asyncio.gather(mmpg.manager.stop("paused"), candidate_mmpg.stop("paused"))
+                finally:
+                    if is_streaming_interview() and not get_session().is_paused:
+                        await run_in_threadpool(pause_interview)
             return {"ok": True}
         session = get_session()
         if not session.is_recording:
