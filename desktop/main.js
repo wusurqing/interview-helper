@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, ipcMain, screen, shell } = require('electron');
+const { app, BrowserWindow, dialog, globalShortcut, Tray, Menu, nativeImage, ipcMain, screen, shell } = require('electron');
 const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const http = require('http');
@@ -100,6 +100,8 @@ let pythonProcess = null;
 let isQuitting = false;
 let readyToQuit = false;
 let desktopStopPromise = null;
+let stopAckFailed = false;
+let forceQuitDialogPromise = null;
 let shortcuts = {};
 let _overlayDragging = false;
 let _blurTimer = null;
@@ -1584,25 +1586,92 @@ function gracefulStopPython(timeoutMs = 20000) {
   return pythonStopPromise;
 }
 
-app.on('before-quit', (event) => {
-  if (readyToQuit || (!mainWindow && !pythonProcess)) return;
-  event.preventDefault();
-  if (desktopStopPromise) return;
+function startNormalDesktopQuit() {
+  if (desktopStopPromise) return desktopStopPromise;
+  stopAckFailed = false;
   isQuitting = true;
   // Keep the renderer's RTC publisher alive until the API has saved the tail.
   desktopStopPromise = (mainWindow ? requestAssistStop() : Promise.resolve(true)).then(async (acknowledged) => {
     if (!acknowledged && (pythonProcess || DEV_FRONTEND_PORT)) {
+      stopAckFailed = true;
       desktopStopPromise = null;
       isQuitting = false;
-      notifyDesktopToast('未能确认面试记录已保存，请重试退出', 'error');
+      notifyDesktopToast('未能确认面试记录已保存，请再次关闭选择强制退出或重试', 'error');
       return;
     }
+    stopAckFailed = false;
     stopPromptWheelHelper();
     if (pythonProcess) await stopPythonProcess(pythonProcess);
     pythonProcess = null;
     readyToQuit = true;
     app.quit();
   });
+  return desktopStopPromise;
+}
+
+function forceDesktopQuit() {
+  stopAckFailed = false;
+  isQuitting = true;
+  stopPromptWheelHelper();
+  if (pythonProcess) {
+    terminateChildProcess(pythonProcess);
+    pythonProcess = null;
+  }
+  readyToQuit = true;
+  app.quit();
+}
+
+function promptForceQuitAfterStopFailure() {
+  if (forceQuitDialogPromise) return forceQuitDialogPromise;
+  const showMessageBox = dialog?.showMessageBox;
+  if (typeof showMessageBox !== 'function') {
+    return startNormalDesktopQuit();
+  }
+  const options = {
+    type: 'warning',
+    title: '确认退出',
+    message: '未能确认面试记录已保存',
+    detail: '强行退出可能会丢失当前轮次末尾录音或转写。你可以重试保存，或强制退出。',
+    buttons: ['重试保存并退出', '强制退出', '取消'],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+  };
+  const parentWin = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible?.()
+    ? mainWindow
+    : null;
+  const boxPromise = parentWin
+    ? showMessageBox(parentWin, options)
+    : showMessageBox(options);
+  forceQuitDialogPromise = Promise.resolve(boxPromise).then((result) => {
+    forceQuitDialogPromise = null;
+    const response = result?.response;
+    if (response === 1) {
+      forceDesktopQuit();
+    } else if (response === 0) {
+      startNormalDesktopQuit();
+    } else {
+      stopAckFailed = true;
+      isQuitting = false;
+    }
+  }).catch((err) => {
+    forceQuitDialogPromise = null;
+    console.warn('force quit confirmation dialog failed:', err?.message || err);
+    stopAckFailed = true;
+    isQuitting = false;
+  });
+  return forceQuitDialogPromise;
+}
+
+app.on('before-quit', (event) => {
+  if (readyToQuit || (!mainWindow && !pythonProcess)) return;
+  event.preventDefault();
+  if (desktopStopPromise || forceQuitDialogPromise) return;
+  if (stopAckFailed && (pythonProcess || DEV_FRONTEND_PORT)) {
+    promptForceQuitAfterStopFailure();
+    return;
+  }
+  startNormalDesktopQuit();
 });
 
 app.whenReady().then(async () => {

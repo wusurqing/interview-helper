@@ -14,6 +14,7 @@ function createHarness(t, {
   env = {},
   existsSyncImpl,
   httpMock,
+  dialogMock,
   clearCacheImpl,
   spawnSyncResult,
   useMockTimers = true,
@@ -30,6 +31,7 @@ function createHarness(t, {
   const spawnSyncCalls = [];
   const createdWindows = [];
   let trayMenuTemplate = null;
+  let quitCalls = 0;
 
   class MockWindow extends EventEmitter {
     constructor(opts = {}) {
@@ -40,8 +42,9 @@ function createHarness(t, {
       this.visible = false;
       this.loadedUrls = [];
       this.contentProtectionCalls = [];
+      this.sentMessages = [];
       this.webContents = Object.assign(new EventEmitter(), {
-        send() {},
+        send: (channel, payload) => { this.sentMessages.push({ channel, payload }); },
         setWindowOpenHandler() {},
         executeJavaScript: () => Promise.resolve(),
         session: {
@@ -88,8 +91,9 @@ function createHarness(t, {
       getPath: () => userData,
       whenReady: () => new Promise(() => {}),
       on(ev, fn) { appEvents.on(ev, fn); },
-      quit() {},
+      quit() { quitCalls += 1; },
     },
+    ...(dialogMock !== undefined ? { dialog: dialogMock } : {}),
     BrowserWindow: MockWindow,
     screen: Object.assign(new EventEmitter(), {
       getPrimaryDisplay: () => primary,
@@ -189,6 +193,7 @@ function createHarness(t, {
     spawnCalls,
     spawnSyncCalls,
     createdWindows,
+    get quitCalls() { return quitCalls; },
     getTrayMenu: () => trayMenuTemplate,
     tick: (ms) => t.mock.timers.tick(ms),
   };
@@ -507,4 +512,202 @@ test('postBackend and getBackend reject when server closes connection before res
   const h = createHarness(t, { httpMock, useMockTimers: false });
   await assert.rejects(() => h.context.postBackend('/api/test', '{}'), /连接已中断/);
   await assert.rejects(() => h.context.getBackend('/api/config'), /连接已中断/);
+});
+
+test('before-quit offers native force-quit dialog after failed /api/stop (cancel, retry, force quit)', async (t) => {
+  const stopResponses = [500, 503];
+  let stopRequests = 0;
+  const httpMock = {
+    request(url, _opts, cb) {
+      assert.ok(String(url).endsWith('/api/stop'));
+      const statusCode = stopResponses[stopRequests++] ?? 500;
+      const req = new EventEmitter();
+      req.end = () => {
+        const res = new EventEmitter();
+        res.statusCode = statusCode;
+        res.resume = () => {};
+        cb(res);
+        res.emit('end');
+      };
+      req.destroy = () => {};
+      return req;
+    },
+  };
+
+  const dialogCalls = [];
+  const dialogResolvers = [];
+  const dialogMock = {
+    showMessageBox(...args) {
+      const options = args.length === 2 ? args[1] : args[0];
+      dialogCalls.push({ parent: args.length === 2 ? args[0] : null, options });
+      return new Promise((resolve) => { dialogResolvers.push(resolve); });
+    },
+  };
+
+  const h = createHarness(t, { platform: 'win32', httpMock, dialogMock, useMockTimers: false });
+  h.context.createWindow();
+  const mainWin = h.createdWindows[0];
+  mainWin.show();
+  h.context.startPythonBackend();
+  const backendChild = h.spawnCalls[0].child;
+
+  let helperStdinEnded = false;
+  const activeHelper = Object.assign(new EventEmitter(), {
+    pid: 8899,
+    exitCode: null,
+    signalCode: null,
+    ready: true,
+    stdin: { write: () => true, end: () => { helperStdinEnded = true; } },
+    kill: () => {},
+  });
+  runInNewContext('promptWheelHelper = __helper;', Object.assign(h.context, { __helper: activeHelper }));
+
+  const flushMicrotasks = async () => {
+    for (let i = 0; i < 6; i += 1) await Promise.resolve();
+  };
+
+  // 1) First before-quit fails /api/stop -> toast shown, stays alive, no dialog yet.
+  let prevented = 0;
+  h.appEvents.emit('before-quit', { preventDefault() { prevented += 1; } });
+  await flushMicrotasks();
+
+  assert.equal(prevented, 1);
+  assert.equal(stopRequests, 1);
+  assert.equal(dialogCalls.length, 0);
+  assert.equal(h.quitCalls, 0);
+  const toasts = mainWin.sentMessages.filter((m) => m.channel === 'desktop-toast');
+  assert.equal(toasts.length, 1);
+  assert.equal(toasts[0].payload.level, 'error');
+  assert.match(toasts[0].payload.message, /强制退出或重试/);
+  assert.equal(h.spawnCalls.filter((c) => c.cmd === 'taskkill').length, 0);
+
+  // 2) Second before-quit opens native confirmation dialog; duplicate while open is ignored.
+  h.appEvents.emit('before-quit', { preventDefault() { prevented += 1; } });
+  h.appEvents.emit('before-quit', { preventDefault() { prevented += 1; } });
+  assert.equal(prevented, 3);
+  assert.equal(dialogCalls.length, 1);
+  assert.equal(dialogCalls[0].parent, mainWin);
+  assert.deepEqual(Array.from(dialogCalls[0].options.buttons), ['重试保存并退出', '强制退出', '取消']);
+  assert.equal(dialogCalls[0].options.defaultId, 0);
+  assert.equal(dialogCalls[0].options.cancelId, 2);
+
+  // Cancel (response 2) keeps app open and preserves stopAckFailed so next quit prompts again.
+  dialogResolvers.shift()({ response: 2 });
+  await flushMicrotasks();
+  assert.equal(h.quitCalls, 0);
+  assert.equal(stopRequests, 1);
+  assert.equal(runInNewContext('isQuitting', h.context), false);
+
+  // 3) Third before-quit -> choose Retry (response 0), which fails again (503) -> stays open & toasts.
+  h.appEvents.emit('before-quit', { preventDefault() { prevented += 1; } });
+  assert.equal(dialogCalls.length, 2);
+  dialogResolvers.shift()({ response: 0 });
+  await flushMicrotasks();
+  assert.equal(stopRequests, 2);
+  assert.equal(h.quitCalls, 0);
+  assert.equal(mainWin.sentMessages.filter((m) => m.channel === 'desktop-toast').length, 2);
+
+  // 4) Fourth before-quit -> choose Force Quit (response 1) -> stops helper, taskkills backend, quits.
+  h.appEvents.emit('before-quit', { preventDefault() { prevented += 1; } });
+  assert.equal(dialogCalls.length, 3);
+  dialogResolvers.shift()({ response: 1 });
+  await flushMicrotasks();
+
+  assert.equal(helperStdinEnded, true, 'force quit must call stopPromptWheelHelper()');
+  const backendKill = h.spawnCalls.find(
+    (c) => c.cmd === 'taskkill' && c.args.includes(String(backendChild.pid)),
+  );
+  assert.ok(backendKill, 'force quit must terminate backend process tree via taskkill');
+  assert.deepEqual(Array.from(backendKill.args), ['/PID', String(backendChild.pid), '/T', '/F']);
+  assert.equal(runInNewContext('pythonProcess', h.context), null);
+  assert.equal(runInNewContext('readyToQuit', h.context), true);
+  assert.equal(h.quitCalls, 1);
+});
+
+test('before-quit dialog retry-and-succeed exits cleanly and missing dialog falls back safely', async (t) => {
+  // Part A: Retry from dialog succeeds on second /api/stop call.
+  let stopRequests = 0;
+  const httpMock = {
+    request(_url, _opts, cb) {
+      stopRequests += 1;
+      const req = new EventEmitter();
+      req.end = () => {
+        if (stopRequests === 1) {
+          req.emit('error', new Error('ECONNREFUSED'));
+          return;
+        }
+        const res = new EventEmitter();
+        res.statusCode = 200;
+        res.resume = () => {};
+        cb(res);
+        res.emit('end');
+      };
+      req.destroy = () => {};
+      return req;
+    },
+  };
+  let dialogCount = 0;
+  const dialogMock = {
+    showMessageBox: () => {
+      dialogCount += 1;
+      return Promise.resolve({ response: 0 });
+    },
+  };
+
+  const h = createHarness(t, { platform: 'win32', httpMock, dialogMock, useMockTimers: false });
+  h.context.createWindow();
+  h.context.startPythonBackend();
+  const backendChild = h.spawnCalls[0].child;
+
+  const flushMicrotasks = async () => {
+    for (let i = 0; i < 8; i += 1) await Promise.resolve();
+  };
+
+  h.appEvents.emit('before-quit', { preventDefault() {} });
+  await flushMicrotasks();
+  assert.equal(stopRequests, 1);
+  assert.equal(h.quitCalls, 0);
+
+  // Trigger second quit -> dialog resolves Retry (0) -> /api/stop returns 200 -> stopPythonProcess waits for exit.
+  h.appEvents.emit('before-quit', { preventDefault() {} });
+  await flushMicrotasks();
+  assert.equal(dialogCount, 1);
+  assert.equal(stopRequests, 2);
+  backendChild.exitCode = 0;
+  backendChild.emit('exit', 0);
+  await flushMicrotasks();
+  assert.equal(h.quitCalls, 1);
+
+  // Part B: Minimal stub without dialog.showMessageBox falls back to retrying normal stop without throwing.
+  let fallbackRequests = 0;
+  const fallbackHttp = {
+    request(_url, _opts, cb) {
+      fallbackRequests += 1;
+      const req = new EventEmitter();
+      req.end = () => {
+        const res = new EventEmitter();
+        res.statusCode = fallbackRequests === 1 ? 500 : 200;
+        res.resume = () => {};
+        cb(res);
+        res.emit('end');
+      };
+      req.destroy = () => {};
+      return req;
+    },
+  };
+  const hFallback = createHarness(t, { platform: 'linux', httpMock: fallbackHttp, dialogMock: null, useMockTimers: false });
+  hFallback.context.createWindow();
+  hFallback.context.startPythonBackend();
+  const linuxBackend = hFallback.spawnCalls[0].child;
+  linuxBackend.kill = () => { linuxBackend.exitCode = 0; linuxBackend.emit('exit', 0); };
+
+  hFallback.appEvents.emit('before-quit', { preventDefault() {} });
+  await flushMicrotasks();
+  assert.equal(fallbackRequests, 1);
+  assert.equal(hFallback.quitCalls, 0);
+
+  assert.doesNotThrow(() => hFallback.appEvents.emit('before-quit', { preventDefault() {} }));
+  await flushMicrotasks();
+  assert.equal(fallbackRequests, 2);
+  assert.equal(hFallback.quitCalls, 1);
 });
