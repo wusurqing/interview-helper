@@ -18,13 +18,47 @@ import warnings
 import wave
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Optional
-
-import sounddevice as sd
+from types import SimpleNamespace
+from typing import Any, Callable, Optional
 
 from core.logger import get_logger
 
 _alog = get_logger("audio")
+
+_SOUNDDEVICE_IMPORT_ERROR: Optional[Exception] = None
+
+
+class _UnavailableSoundDevice:
+    """Fallback proxy when PortAudio / sounddevice fails to initialize at import time."""
+
+    def __init__(self, error: Exception):
+        self._error = error
+        self.default = SimpleNamespace(device=(-1, -1))
+
+    def _raise(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(f"PortAudio / sounddevice 不可用: {self._error}") from self._error
+
+    def query_devices(self, *args: Any, **kwargs: Any) -> Any:
+        if not args and not kwargs:
+            return []
+        return self._raise(*args, **kwargs)
+
+    query_hostapis = _raise
+    InputStream = _raise
+    WasapiSettings = _raise
+    play = _raise
+    wait = _raise
+
+
+try:
+    import sounddevice as sd
+except Exception as _sd_exc:
+    _SOUNDDEVICE_IMPORT_ERROR = _sd_exc
+    sd = _UnavailableSoundDevice(_sd_exc)
+    _alog.warning(
+        "sounddevice unavailable at import time; microphone capture disabled: %s",
+        _sd_exc,
+    )
 
 @contextmanager
 def _microphone_com():
@@ -244,7 +278,7 @@ class AudioCapture:
     AGC_RELEASE    = 0.995
 
     def __init__(self):
-        self._stream: Optional[sd.InputStream] = None
+        self._stream: Any = None
         self._running = False
         self._audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=940)
         self._callback: Optional[Callable[[np.ndarray], None]] = None
@@ -273,7 +307,11 @@ class AudioCapture:
 
     @staticmethod
     def list_devices() -> list[dict]:
-        devices = sd.query_devices()
+        try:
+            devices = sd.query_devices()
+        except Exception as exc:
+            _alog.warning("sounddevice query_devices failed: %s", exc)
+            devices = []
         result = []
         system = platform.system()
 
