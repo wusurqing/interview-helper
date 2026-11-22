@@ -30,3 +30,6 @@ ignore = [
 "tests/*" = ["F811", "B011", "F841"]
 "scripts/*" = ["E402"]
 "__init__.py" = ["F401", "F403"]
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
