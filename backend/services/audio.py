@@ -98,6 +98,7 @@ class AudioBusyError(RuntimeError):
 # ---------------------------------------------------------------------------
 # soundcard (Windows WASAPI loopback) – optional
 # ---------------------------------------------------------------------------
+_sc: Any = None
 try:
     import soundcard as _sc
     if platform.system() == "Windows":
@@ -107,6 +108,7 @@ try:
         configure_property_buffers(mediafoundation)
     _HAS_SC = True
 except Exception:
+    _sc = None
     _HAS_SC = False
 
 # 一次性注册静态 warning 过滤，避免在 64ms WASAPI 热路径中调用非线程安全的 warnings.catch_warnings()
@@ -391,16 +393,15 @@ class AudioCapture:
     @staticmethod
     def get_platform_info(devices: Optional[list[dict]] = None) -> dict:
         system = platform.system()
+        dev_list = devices if devices is not None else AudioCapture.list_devices()
+        has_loopback = any(bool(d.get("is_loopback")) for d in dev_list)
         info = {
             "platform": system,
             "needs_virtual_device": False,
             "instructions": "",
-            "has_loopback": False,
+            "has_loopback": has_loopback,
         }
         if system == "Darwin":
-            dev_list = devices if devices is not None else AudioCapture.list_devices()
-            has_loopback = any(d["is_loopback"] for d in dev_list)
-            info["has_loopback"] = has_loopback
             if not has_loopback:
                 info["needs_virtual_device"] = True
                 info["instructions"] = (
@@ -410,9 +411,6 @@ class AudioCapture:
                     "然后在「音频 MIDI 设置」中创建多输出设备。"
                 )
         elif system == "Windows":
-            dev_list = devices if devices is not None else AudioCapture.list_devices()
-            has_loopback = any(d["is_loopback"] for d in dev_list)
-            info["has_loopback"] = has_loopback
             if not has_loopback:
                 info["needs_virtual_device"] = True
                 info["instructions"] = (
@@ -611,6 +609,9 @@ class AudioCapture:
     # soundcard path -------------------------------------------------------
 
     def _start_soundcard(self, device_id: int):
+        if _sc is None:
+            self._running = False
+            raise RuntimeError("系统音频捕获组件 soundcard 不可用")
         speaker_guid = _lookup_sc_speaker_guid(device_id)
         if speaker_guid is None:
             # Map may have been rebuilt; try refreshing

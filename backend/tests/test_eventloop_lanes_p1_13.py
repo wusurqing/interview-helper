@@ -123,6 +123,17 @@ def test_common_devices_enumerates_once_off_loop_and_sanitizes_errors(monkeypatc
     assert res["devices"] == fake_devs
     assert res["platform"]["has_loopback"] is True
 
+    audio_mod = importlib.import_module("services.audio")
+    with monkeypatch.context() as mp:
+        mp.setattr(audio_mod.platform, "system", lambda: "Linux")
+        linux_info = common_router.AudioCapture.get_platform_info(devices=fake_devs)
+        assert linux_info["platform"] == "Linux"
+        assert linux_info["has_loopback"] is True
+        assert common_router.AudioCapture.get_platform_info(devices=[])["has_loopback"] is False
+        linux_res = asyncio.run(common_router.api_devices())
+        assert linux_res["platform"]["has_loopback"] is True
+        assert calls["list_devices"] == 2
+
     # 错误脱敏：不透出原始异常文本
     def broken_devices():
         raise RuntimeError("secret-driver-internal-pointer-0xdeadbeef")

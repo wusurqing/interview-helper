@@ -923,3 +923,14 @@ def test_start_ensure_python_deps_checks_sounddevice_without_importing(monkeypat
     assert "sounddevice" not in import_calls
     assert len(pip_calls) == 1
     assert pip_calls[0][:6] == [sys.executable, "-m", "pip", "install", "-r", str(BACKEND_DIR / "requirements.txt")]
+
+
+def test_audio_module_exposes_sc_attribute_and_guards_unavailable_soundcard(monkeypatch):
+    from services import audio
+
+    assert hasattr(audio, "_sc")
+    capture = AudioCapture()
+    monkeypatch.setattr(audio, "_sc", None)
+    with pytest.raises(RuntimeError, match="soundcard"):
+        capture._start_soundcard(20001)
+    assert capture._running is False

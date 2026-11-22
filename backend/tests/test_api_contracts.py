@@ -402,6 +402,18 @@ def test_api_preflight_replay_hides_filesystem_paths_in_response_and_errors(monk
     result = asyncio.run(assist_routes.api_preflight_replay({"device_id": 7}))
     assert result["audio_path"] == "preflight_phrase.wav"
 
+    monkeypatch.setattr(
+        "api.assist.sound_test.replay_preflight_capture_stt",
+        lambda device_id, **kwargs: {
+            "device_id": device_id,
+            "audio_path": "/var/secret/server/assets/preflight_phrase.wav",
+            "success_count": 1,
+            "failure_count": 0,
+        },
+    )
+    posix_result = asyncio.run(assist_routes.api_preflight_replay({"device_id": 7}))
+    assert posix_result["audio_path"] == "preflight_phrase.wav"
+
     def fail_with_path(*_args, **_kwargs):
         raise RuntimeError("测试音频不存在: E:\\secret\\server\\assets\\preflight_phrase.wav")
 

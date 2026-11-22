@@ -1,7 +1,7 @@
 """Interview assist HTTP routes."""
 
 import asyncio
-from pathlib import Path
+from pathlib import PureWindowsPath
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -562,7 +562,7 @@ async def api_preflight_replay(body: dict):
             expected_phrase=expected_phrase,
         )
         if isinstance(result, dict) and "audio_path" in result:
-            result = {**result, "audio_path": Path(str(result["audio_path"])).name}
+            result = {**result, "audio_path": PureWindowsPath(str(result["audio_path"])).name}
         return result
     except AudioBusyError as e:
         raise HTTPException(409, str(e))
