@@ -175,6 +175,27 @@ def init_db() -> None:
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_review_turns_qa_id ON review_turns(qa_id)")
                 _ensure_column(conn, "review_turns", "original_candidate_answer_text", "TEXT")
                 _ensure_column(conn, "review_sessions", "application_id", "INTEGER")
+                _ensure_column(conn, "review_sessions", "archive_status", "TEXT")
+                _ensure_column(conn, "review_sessions", "archive_warning", "TEXT")
+                _ensure_column(conn, "review_sessions", "archive_version", "INTEGER NOT NULL DEFAULT 0")
+                for name, definition in {
+                    "round_id": "TEXT",
+                    "archive_version": "INTEGER NOT NULL DEFAULT 0",
+                    "candidate_status": "TEXT",
+                    "ai_status": "TEXT",
+                    "started_at": "REAL",
+                    "ended_at": "REAL",
+                    "media_json": "TEXT",
+                    "model_summary_json": "TEXT",
+                    "audio_status_json": "TEXT",
+                }.items():
+                    _ensure_column(conn, "review_turns", name, definition)
+                conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_review_round ON review_turns(session_id, round_id)")
+                conn.execute("""CREATE TABLE IF NOT EXISTS review_archive_payloads (
+                    turn_id INTEGER PRIMARY KEY, details_json TEXT NOT NULL)""")
+                conn.execute("""CREATE TABLE IF NOT EXISTS review_audio_assets (
+                    session_id INTEGER NOT NULL, turn_id INTEGER NOT NULL, asset_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL, PRIMARY KEY(turn_id, asset_id))""")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_review_sessions_application_id ON review_sessions(application_id)")
             except Exception:
                 pass
@@ -398,6 +419,11 @@ def get_session_detail(session_id: int) -> Optional[dict[str, Any]]:
     turns = []
     for row in turn_rows:
         turn = dict(row)
+        for key in ("media", "model_summary", "audio_status"):
+            try:
+                turn[key] = json.loads(turn.pop(key + "_json", None) or "null")
+            except (ValueError, TypeError):
+                turn[key] = None
         for field in ["strengths", "risks", "evidence", "behavior_signals", "tags", "scorecard"]:
             json_field = f"{field}_json"
             if json_field in turn and turn[json_field]:
@@ -433,6 +459,7 @@ def claim_session_for_analysis(session_id: int) -> bool:
             UPDATE review_sessions
             SET status = 'analyzing', updated_at = ?
             WHERE id = ?
+              AND COALESCE(archive_status, '') NOT IN ('recording', 'draining')
               AND (
                 status IN ('recorded', 'recording', 'partial_capture', 'analysis_failed')
                 OR (

@@ -107,7 +107,11 @@ function buildResponseErrorMessage(res: Response, text: string, fallback?: strin
   return `请求失败 (${res.status}): ${detailText}`
 }
 
-async function fetchBackend(input: string, init?: ApiRequestInit) {
+async function fetchWithCancellation<T>(
+  input: string,
+  init: ApiRequestInit | undefined,
+  readBody: (res: Response) => Promise<T>,
+): Promise<T> {
   const { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal: callerSignal, ...rest } = init ?? {}
   const controller = new AbortController()
   let timedOut = false
@@ -133,11 +137,11 @@ async function fetchBackend(input: string, init?: ApiRequestInit) {
   try {
     const res = await fetch(input, { ...rest, signal: controller.signal })
     // Fetch resolves at the headers. Keep cancellation active until the body finishes.
-    const text = await res.text()
-    return { res, text }
+    return await readBody(res)
   } catch (error) {
     if (callerSignal?.aborted) throw error
     if (timedOut) throw new Error(BACKEND_TIMEOUT_MESSAGE)
+    if (error instanceof ApiRequestError) throw error
     throw new Error(BACKEND_UNREACHABLE_MESSAGE)
   } finally {
     if (timer !== undefined) clearTimeout(timer)
@@ -145,6 +149,23 @@ async function fetchBackend(input: string, init?: ApiRequestInit) {
       callerSignal.removeEventListener('abort', onCallerAbort)
     }
   }
+}
+
+async function fetchBackend(input: string, init?: ApiRequestInit) {
+  return fetchWithCancellation(input, init, async (res) => ({
+    res,
+    text: await res.text(),
+  }))
+}
+
+async function fetchBackendArrayBuffer(input: string, init?: ApiRequestInit): Promise<ArrayBuffer> {
+  return fetchWithCancellation(input, init, async (res) => {
+    if (!res.ok) {
+      const text = await res.text()
+      throw new ApiRequestError(buildResponseErrorMessage(res, text), res.status)
+    }
+    return await res.arrayBuffer()
+  })
 }
 
 export function getErrorMessage(error: unknown, fallback = '操作失败'): string {
@@ -507,6 +528,13 @@ export const api = {
     request<Record<string, unknown>>(`/api/review/sessions?page=${page}&page_size=${pageSize}`),
   reviewSessionDetail: (sessionId: number) =>
     request<Record<string, unknown>>(`/api/review/sessions/${sessionId}`),
+  reviewTurnArchive: (sessionId: number, turnId: number, signal?: AbortSignal) =>
+    request<import('@/components/review/types').ArchiveDetails>(`/api/review/sessions/${sessionId}/turns/${turnId}/archive`, { signal }),
+  reviewAudio: (sessionId: number, turnId: number, assetId: string, signal?: AbortSignal) =>
+    fetchBackendArrayBuffer(
+      buildApiUrl(`/api/review/sessions/${sessionId}/turns/${turnId}/audio/${encodeURIComponent(assetId)}`),
+      { signal, headers: buildHeaders() },
+    ),
   reviewUpdateSession: (sessionId: number, data: { title?: string; company?: string; role?: string; application_id?: number | null }) =>
     request<Record<string, unknown>>(`/api/review/sessions/${sessionId}`, { method: 'PATCH', body: JSON.stringify(data) }),
   reviewTriggerAnalysis: (sessionId: number) =>

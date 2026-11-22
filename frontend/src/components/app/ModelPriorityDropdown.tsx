@@ -124,7 +124,7 @@ export function ModelPriorityDropdown({
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full mt-1.5 glass border border-bg-hover/50 rounded-xl shadow-xl shadow-black/20 z-50 min-w-[200px] py-1.5 animate-fade-up">
+        <div className="app-no-drag absolute right-0 top-full mt-1.5 glass border border-bg-hover/50 rounded-xl shadow-xl shadow-black/20 z-50 min-w-[200px] py-1.5 animate-fade-up">
           {entries.map(({ model, index }) => {
             const disabled = !isConfiguredModel(model)
             const statusLabel = disabled ? '不可用' : index === activeIndex ? '优先' : null

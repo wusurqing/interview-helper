@@ -20,12 +20,13 @@ import ReactMarkdown from 'react-markdown'
 import { SAFE_MARKDOWN_COMPONENTS } from '@/components/MarkdownLink'
 import { api, getErrorMessage } from '../../lib/api'
 import type { ReviewSessionDetail, ReviewTurn } from './types'
-import { parseReviewSessionDetail } from './types'
+import { ARCHIVE_SPEAKERS, archiveAudioIssue, parseReviewSessionDetail } from './types'
 import { getReviewSourceMeta, isWrittenExamReview, type ReviewSourceMeta } from './sourceMeta'
 import type { Application } from '../job-tracker/types'
 import { parseApplication } from '../job-tracker/types'
 import { STAGE_LABELS, isTerminalStage } from '../job-tracker/stageConfig'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
+import { ArchiveTurnContent } from './ArchiveTurnContent'
 import { isLightColorScheme } from '@/lib/colorScheme'
 
 interface Props {
@@ -154,7 +155,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
   }, [])
 
   useEffect(() => {
-    if (detail?.status !== 'analyzing') return undefined
+    if (detail?.status !== 'analyzing' && detail?.archive_status !== 'recording' && detail?.archive_status !== 'draining') return undefined
 
     let cancelled = false
     let inFlight = false
@@ -186,7 +187,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
         const data = parseReviewSessionDetail(await api.reviewSessionDetail(targetSessionId) as Record<string, unknown>)
         if (cancelled || !isActiveSession(targetSessionId)) return
         setDetail(data)
-        stillAnalyzing = data.status === 'analyzing'
+        stillAnalyzing = data.status === 'analyzing' || data.archive_status === 'recording' || data.archive_status === 'draining'
         if (data.status === 'completed') {
           if (data.application_id != null) {
             void refreshApplications(false)
@@ -222,7 +223,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
       clearTimer()
       document.removeEventListener('visibilitychange', onVisibilityChange)
     }
-  }, [detail?.status, refreshApplications, sessionId])
+  }, [detail?.status, detail?.archive_status, refreshApplications, sessionId])
 
   useEffect(() => {
     void refreshApplications(true)
@@ -384,7 +385,7 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
   const followUpDrills = buildFollowUpDrills(detail)
   const hasTakeaways = (detail.strong_points?.length ?? 0) > 0 || (detail.weak_points?.length ?? 0) > 0
   const summaryMissing = !detail.summary_markdown
-  const autoExpandTurns = summaryMissing && detail.turns.length > 0 && detail.turns.length <= 3
+  const autoExpandTurns = !!detail.archive_version || (summaryMissing && detail.turns.length > 0 && detail.turns.length <= 3)
   const applicationQuery = applicationSearch.trim().toLowerCase()
   const linkedApplicationSummary = detail.application
     ? applications.find((app) => app.id === detail.application?.id) ?? null
@@ -619,10 +620,11 @@ export default function ReviewSessionDetail({ sessionId, onBack }: Props) {
               </SectionPanel>
             ) : null}
 
+            {detail.archive_warning && <p role="status" className="text-xs text-yellow-600">{detail.archive_warning}</p>}
             {detail.turns.length > 0 ? (
               <CollapsibleSection
-                title={`逐题分析 · ${detail.turns.length} 题`}
-                subtitle={autoExpandTurns ? '短记录，已展开。' : undefined}
+                title={`${detail.archive_version ? '面试记录' : '逐题分析'} · ${detail.turns.length} 题`}
+                subtitle={!detail.archive_version && autoExpandTurns ? '短记录，已展开。' : undefined}
                 defaultOpen={autoExpandTurns}
                 resetKey={detail.id}
               >
@@ -954,46 +956,51 @@ function TurnCard({
     : 'text-text-muted'
 
   return (
-    <div className="border-t border-bg-hover/70">
+    <article className="overflow-hidden rounded-xl border border-bg-hover bg-bg-secondary">
       <button
         type="button"
+        aria-expanded={expanded}
         onClick={onToggle}
-        className="flex w-full items-start gap-3 py-3 text-left transition-colors hover:bg-bg-tertiary/15"
+        className="flex w-full items-start gap-2 px-3 py-3 text-left transition-colors hover:bg-bg-tertiary focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent-blue sm:px-4"
       >
-        <div className="mt-1 flex-shrink-0">
+        <span className="mt-1 shrink-0" aria-hidden="true">
           {expanded ? (
             <ChevronDown className="h-4 w-4 text-text-muted" />
           ) : (
             <ChevronRight className="h-4 w-4 text-text-muted" />
           )}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="mb-1.5 flex items-center gap-2">
-            <span className="text-xs font-semibold text-text-muted">第 {turn.seq} 题</span>
-            {turn.is_partial && (
-              <span className="text-[10px] font-medium text-yellow-500">
-                部分录制
+        </span>
+        <span className="min-w-0 flex-1 text-sm leading-6 text-text-primary [overflow-wrap:anywhere]">
+          <span className="inline-block whitespace-nowrap rounded-md bg-bg-hover px-2 text-xs font-semibold leading-5 text-text-primary">
+            第 {turn.seq} 题
+          </span>{' '}
+          <span>{turn.question_text || (turn.archive_version ? '面试官未取得转写' : '')}</span>
+          {ARCHIVE_SPEAKERS.map(([speaker, label]) => {
+            const issue = archiveAudioIssue(turn.audio_status?.[speaker]?.state)
+            return issue && (
+              <span key={speaker} className="ml-2 inline-block rounded-md bg-accent-amber/10 px-1.5 text-xs leading-5 text-accent-amber">
+                {label}{issue}
               </span>
-            )}
-            {visionVerify?.verdict === 'FAIL' && (
-              <span className="rounded-full border border-yellow-500/30 bg-yellow-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-yellow-500">
-                截图自检风险
-              </span>
-            )}
-          </div>
-          <div className="text-sm text-text-primary leading-relaxed">{turn.question_text}</div>
-        </div>
+            )
+          })}
+          {turn.is_partial && !turn.audio_status && (
+            <span className="ml-2 text-[10px] font-medium text-yellow-500">部分录制</span>
+          )}
+          {visionVerify?.verdict === 'FAIL' && (
+            <span className="ml-2 inline-block rounded-full border border-yellow-500/30 bg-yellow-500/10 px-1.5 text-[10px] font-semibold leading-5 text-yellow-500">
+              截图自检风险
+            </span>
+          )}
+        </span>
         {avgScore !== null && (
-          <div className="flex-shrink-0 text-right">
-            <span className={`text-xs font-semibold ${scoreColor}`}>{avgScore.toFixed(1)}</span>
-          </div>
+          <span className={`mt-1 shrink-0 text-right text-xs font-semibold ${scoreColor}`}>{avgScore.toFixed(1)}</span>
         )}
       </button>
 
       {expanded && (
-        <div className="space-y-3 border-t border-bg-hover/40 py-3">
+        <div className="space-y-3 border-t border-bg-hover px-3 py-3 sm:px-4">
           {visionVerify && <TurnVisionVerifyNotice verify={visionVerify} />}
-          <div>
+          {turn.archive_version ? <ArchiveTurnContent turn={turn} /> : <div>
             <h4 className="mb-2 text-xs font-semibold text-text-muted">{sourceMeta.answerHeading}</h4>
             {hasAsrCorrection && (
               <details className="mb-2 rounded-md border border-accent-blue/20 bg-accent-blue/5 px-3 py-2 text-xs">
@@ -1008,7 +1015,7 @@ function TurnCard({
             <div className="whitespace-pre-wrap text-sm leading-relaxed text-text-primary">
               {answerText || sourceMeta.emptyAnswer}
             </div>
-          </div>
+          </div>}
 
           {turn.code_text && (
             <div>
@@ -1110,7 +1117,7 @@ function TurnCard({
           )}
         </div>
       )}
-    </div>
+    </article>
   )
 }
 

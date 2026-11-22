@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { useInterviewStore } from '@/stores/configStore'
 import { useKbStore } from '@/stores/kbStore'
+import { receiveArchiveStatus } from '@/stores/archiveStatusStore'
 import { buildWsUrl } from '@/lib/backendUrl'
 import { emitExamPreflight, emitSoundPreflight } from '@/lib/preflightWsBus'
 import { subscribeLeader } from '@/lib/wsLeader'
@@ -143,6 +144,10 @@ export function useInterviewWS(active = true) {
     switch (msg.type) {
       case 'init':
         s.setInitData(msg as Parameters<typeof s.setInitData>[0])
+        receiveArchiveStatus(msg.archive, true)
+        break
+      case 'review_archive_status':
+        receiveArchiveStatus(msg)
         break
       case 'recording':
         s.setRecording(

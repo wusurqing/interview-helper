@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut, Tray, Menu, nativeImage, ipcMain, screen, shell } = require('electron');
+const { app, BrowserWindow, dialog, globalShortcut, Tray, Menu, nativeImage, ipcMain, screen, shell } = require('electron');
 const { spawn, spawnSync } = require('child_process');
 const path = require('path');
 const http = require('http');
@@ -98,6 +98,10 @@ let tray = null;
 let trayMenu = null;
 let pythonProcess = null;
 let isQuitting = false;
+let readyToQuit = false;
+let desktopStopPromise = null;
+let stopAckFailed = false;
+let forceQuitDialogPromise = null;
 let shortcuts = {};
 let _overlayDragging = false;
 let _blurTimer = null;
@@ -594,8 +598,10 @@ function createWindow() {
   });
 
   // 关闭按钮 = 真正退出
-  mainWindow.on('close', () => {
-    isQuitting = true;
+  mainWindow.on('close', (event) => {
+    if (readyToQuit) return;
+    event.preventDefault();
+    app.quit();
   });
 }
 
@@ -989,7 +995,7 @@ function createTray() {
       },
     },
     { type: 'separator' },
-    { label: '退出', click: () => { isQuitting = true; app.quit(); } },
+    { label: '退出', click: () => { app.quit(); } },
   ]);
 
   trayMenu = contextMenu;
@@ -1233,7 +1239,7 @@ function sendOverlayQuestionCommand(direction) {
 
 ipcMain.handle('hide-window', () => mainWindow?.hide());
 ipcMain.handle('minimize-window', () => mainWindow?.minimize());
-ipcMain.handle('quit-app', () => { isQuitting = true; app.quit(); });
+ipcMain.handle('quit-app', () => { app.quit(); });
 ipcMain.handle('show-window', () => { mainWindow?.show(); mainWindow?.focus(); });
 ipcMain.handle('get-shortcuts', () => shortcuts);
 ipcMain.handle('update-shortcuts', (_event, updates) => {
@@ -1490,7 +1496,7 @@ function createAppMenu() {
         { role: 'hide', label: '隐藏应用' },
         { role: 'unhide', label: '显示应用' },
         { type: 'separator' },
-        { label: '退出', accelerator: 'CommandOrControl+Q', click: () => { isQuitting = true; app.quit(); } },
+        { label: '退出', accelerator: 'CommandOrControl+Q', click: () => { app.quit(); } },
       ],
     },
     {
@@ -1504,28 +1510,67 @@ function createAppMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
-function requestAssistStop(timeoutMs = 12000) {
+function requestAssistStop(timeoutMs) {
   return new Promise((resolve) => {
     let settled = false;
+    const done = (acknowledged) => {
+      if (settled) return;
+      settled = true;
+      resolve(acknowledged);
+    };
+    const options = timeoutMs === undefined ? { method: 'POST' } : { method: 'POST', timeout: timeoutMs };
+    const req = http.request(`${SERVER_URL}/api/stop`, options, (res) => {
+      res.once('end', () => done(res.statusCode >= 200 && res.statusCode < 300));
+      res.once('close', () => done(false));
+      res.once('error', () => done(false));
+      res.resume();
+    });
+    if (timeoutMs !== undefined && typeof req.on === 'function') {
+      req.once('timeout', () => {
+        try { req.destroy?.(); } catch { /* ignore */ }
+        done(false);
+      });
+    }
+    req.once('error', () => done(false));
+    req.end();
+  });
+}
+
+function stopPythonProcess(proc, timeoutMs = 5000) {
+  if (!proc || proc.exitCode != null || proc.signalCode != null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    let forceTimer;
     const finish = () => {
       if (settled) return;
       settled = true;
+      clearTimeout(forceTimer);
       resolve();
     };
-    const req = http.request(`${SERVER_URL}/api/stop`, {
-      method: 'POST',
-      timeout: timeoutMs,
-    }, (res) => {
-      res.resume();
-      res.on('end', finish);
-      res.on('close', finish);
-    });
-    req.on('error', finish);
-    req.on('timeout', () => {
-      try { req.destroy(); } catch (_) { /* ignore */ }
+    proc.once('exit', finish);
+    if (process.platform === 'win32' && proc.pid) {
+      terminateChildProcess(proc);
+    } else {
+      try { proc.kill('SIGTERM'); } catch (err) { console.warn('[py] SIGTERM failed:', err.message); }
+    }
+    if (settled) return;
+    forceTimer = setTimeout(() => {
+      try {
+        if (proc.exitCode == null && proc.signalCode == null) {
+          console.warn('[py] graceful timeout, escalating to SIGKILL');
+          if (process.platform === 'win32' && proc.pid) {
+            terminateChildProcess(proc);
+          } else {
+            proc.kill('SIGKILL');
+          }
+        }
+      } catch (err) {
+        console.warn('[py] SIGKILL failed:', err.message);
+      }
       finish();
-    });
-    req.end();
+    }, timeoutMs);
   });
 }
 
@@ -1535,55 +1580,105 @@ function gracefulStopPython(timeoutMs = 20000) {
   if (pythonStopPromise) return pythonStopPromise;
   const proc = pythonProcess;
   if (!proc || proc.exitCode != null || proc.signalCode != null) return Promise.resolve();
-  pythonStopPromise = new Promise((resolve) => {
-    let settled = false;
-    let escalateTimer = null;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      if (escalateTimer) {
-        clearTimeout(escalateTimer);
-        escalateTimer = null;
-      }
-      resolve();
-    };
-    proc.once('exit', finish);
-    const stopTimeoutMs = Math.max(1000, timeoutMs - 5000);
-    requestAssistStop(stopTimeoutMs).then(() => {
-      if (settled) return;
-      if (process.platform === 'win32') {
-        terminateChildProcess(proc);
-      } else {
-        try { proc.kill('SIGTERM'); } catch (err) { console.warn('[py] SIGTERM failed:', err.message); }
-      }
-      escalateTimer = setTimeout(() => {
-        escalateTimer = null;
-        if (settled) return;
-        try {
-          if (proc.exitCode == null && proc.signalCode == null) {
-            console.warn('[py] graceful timeout, escalating to SIGKILL');
-            terminateChildProcess(proc);
-          }
-        } catch (err) {
-          console.warn('[py] SIGKILL failed:', err.message);
-        }
-        finish();
-      }, Math.max(1000, timeoutMs - stopTimeoutMs));
-    });
-  });
+  const stopTimeoutMs = Math.max(1000, timeoutMs - 5000);
+  const killTimeoutMs = Math.max(1000, timeoutMs - stopTimeoutMs);
+  pythonStopPromise = requestAssistStop(stopTimeoutMs).then(() => stopPythonProcess(proc, killTimeoutMs));
   return pythonStopPromise;
 }
 
-app.on('before-quit', (event) => {
+function startNormalDesktopQuit() {
+  if (desktopStopPromise) return desktopStopPromise;
+  stopAckFailed = false;
   isQuitting = true;
-  stopPromptWheelHelper();
-  if (!pythonProcess) return;
-  event.preventDefault();
-  if (pythonStopPromise) return;
-  gracefulStopPython().then(() => {
+  // Keep the renderer's RTC publisher alive until the API has saved the tail.
+  desktopStopPromise = (mainWindow ? requestAssistStop() : Promise.resolve(true)).then(async (acknowledged) => {
+    if (!acknowledged && (pythonProcess || DEV_FRONTEND_PORT)) {
+      stopAckFailed = true;
+      desktopStopPromise = null;
+      isQuitting = false;
+      notifyDesktopToast('未能确认面试记录已保存，请再次关闭选择强制退出或重试', 'error');
+      return;
+    }
+    stopAckFailed = false;
+    stopPromptWheelHelper();
+    if (pythonProcess) await stopPythonProcess(pythonProcess);
     pythonProcess = null;
+    readyToQuit = true;
     app.quit();
   });
+  return desktopStopPromise;
+}
+
+function forceDesktopQuit() {
+  stopAckFailed = false;
+  isQuitting = true;
+  stopPromptWheelHelper();
+  if (pythonProcess) {
+    terminateChildProcess(pythonProcess, { sync: true });
+    pythonProcess = null;
+  }
+  readyToQuit = true;
+  app.quit();
+}
+
+function promptForceQuitAfterStopFailure() {
+  if (forceQuitDialogPromise) return forceQuitDialogPromise;
+  if (typeof dialog?.showMessageBox !== 'function') {
+    return startNormalDesktopQuit();
+  }
+  const options = {
+    type: 'warning',
+    title: '确认退出',
+    message: '未能确认面试记录已保存',
+    detail: '强行退出可能会丢失当前轮次末尾录音或转写。你可以重试保存，或强制退出。',
+    buttons: ['重试保存并退出', '强制退出', '取消'],
+    defaultId: 0,
+    cancelId: 2,
+    noLink: true,
+  };
+  const parentWin = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible?.()
+    ? mainWindow
+    : null;
+  let boxPromise;
+  try {
+    boxPromise = parentWin
+      ? dialog.showMessageBox(parentWin, options)
+      : dialog.showMessageBox(options);
+  } catch (err) {
+    console.warn('force quit confirmation dialog failed:', err?.message || err);
+    stopAckFailed = true;
+    isQuitting = false;
+    return Promise.resolve();
+  }
+  forceQuitDialogPromise = Promise.resolve(boxPromise).then((result) => {
+    forceQuitDialogPromise = null;
+    const response = result?.response;
+    if (response === 1) {
+      forceDesktopQuit();
+    } else if (response === 0) {
+      startNormalDesktopQuit();
+    } else {
+      stopAckFailed = true;
+      isQuitting = false;
+    }
+  }).catch((err) => {
+    forceQuitDialogPromise = null;
+    console.warn('force quit confirmation dialog failed:', err?.message || err);
+    stopAckFailed = true;
+    isQuitting = false;
+  });
+  return forceQuitDialogPromise;
+}
+
+app.on('before-quit', (event) => {
+  if (readyToQuit || (!mainWindow && !pythonProcess)) return;
+  event.preventDefault();
+  if (desktopStopPromise || forceQuitDialogPromise) return;
+  if (stopAckFailed && (pythonProcess || DEV_FRONTEND_PORT)) {
+    promptForceQuitAfterStopFailure();
+    return;
+  }
+  startNormalDesktopQuit();
 });
 
 app.whenReady().then(async () => {

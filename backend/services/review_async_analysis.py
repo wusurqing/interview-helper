@@ -127,6 +127,7 @@ def _analyze_session_worker(session_id: int, system_prompts: Mapping[str, str] |
                         code_text=turn.get("code_text", ""),
                         review_source=review_source,
                         system_prompts=system_prompts,
+                        **({"apply_asr_correction": False} if turn.get("archive_version") else {}),
                     )
 
                 # 更新 turn（包括纠正后的候选人回答）

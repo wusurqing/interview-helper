@@ -33,6 +33,7 @@ LOG_DIR = _DEFAULT_LOG_DIR
 DEFAULT_MAX_ASSETS_MB = 256.0
 _ROLLOVER_PRUNE_GRACE_SECONDS = 60.0
 _scope = contextvars.ContextVar("llm_trace_scope", default=None)
+_observer = contextvars.ContextVar("llm_archive_observer", default=None)
 _lock = threading.RLock()
 _asset_lock = threading.Lock()
 _in_flight_assets: collections.Counter[str] = collections.Counter()
@@ -515,6 +516,15 @@ def current_context():
     return dict(_scope.get() or {})
 
 
+@contextlib.contextmanager
+def observe(callback):
+    token = _observer.set(callback)
+    try:
+        yield
+    finally:
+        _observer.reset(token)
+
+
 def traced(scene):
     """Scope a complete logical call, including generators consumed later."""
     def decorate(func):
@@ -538,10 +548,13 @@ def traced(scene):
 
 def begin(url, api_type, payload, *, api_key="", context=None):
     mode = trace_mode()
-    if mode == "off":
+    has_observer = _observer.get() is not None
+    if mode == "off" and not has_observer:
         return _NullAttempt()
     try:
-        return Attempt(url, api_type, payload, api_key=api_key, context=context, mode=mode)
+        return Attempt(
+            url, api_type, payload, api_key=api_key, context=context, mode=mode, write_disk=(mode != "off")
+        )
     except Exception:
         logging.getLogger("llm.trace.failure").exception("Unable to begin LLM trace")
         return _NullAttempt()
@@ -564,7 +577,7 @@ class TracingHttpxClient(DefaultHttpxClient):
 
     @staticmethod
     def _request(request):
-        if trace_mode() == "off":
+        if trace_mode() == "off" and _observer.get() is None:
             request.extensions["llm_trace"] = _NullAttempt()
             return
         try:
@@ -672,13 +685,20 @@ class TracingHttpxClient(DefaultHttpxClient):
 
 
 class Attempt:
-    def __init__(self, url, api_type, payload, *, api_key="", context=None, mode="full"):
+    def __init__(self, url, api_type, payload, *, api_key="", context=None, mode="full", write_disk=True):
         self.mode = mode
+        self.write_disk = write_disk
         self.api_key = api_key
+        self._observer = _observer.get()
         context = dict(context if context is not None else current_context())
         created_assets: list[str] = []
         try:
-            if self.mode == "metadata":
+            self.model_id = _redact_text(str(payload.get("model", "")), api_key) if isinstance(payload, dict) else ""
+            if not self.write_disk:
+                self.call_id = _safe_metadata(context.pop("call_id", uuid4().hex), api_key)
+                self.context = _safe_metadata(context, api_key)
+                safe_request = None
+            elif self.mode == "metadata":
                 self.call_id = _safe_metadata(context.pop("call_id", uuid4().hex), api_key)
                 self.context = {
                     key: _safe_metadata(value, api_key) for key, value in context.items()
@@ -708,20 +728,26 @@ class Attempt:
             self._stream_event_count = 0
             self.finish_reason = None
             self._finished = False
-            record = {
-                "schema_version": 1,
-                "event": "request",
-                "call_id": self.call_id,
-                "attempt_id": self.attempt_id,
-                "context": self.context,
-                "at": self.request_at,
-                "protocol": api_type,
-                "url": _safe_url(url, api_key, origin_only=self.mode == "metadata"),
-                "request": safe_request,
-            }
-            if self.mode == "metadata":
-                record["trace_mode"] = "metadata"
-            _write(record)
+            if self._observer:
+                try:
+                    self._observer({"event": "request", "attempt_id": self.attempt_id, "request_at": self.request_at})
+                except Exception:
+                    logging.getLogger("llm.trace.failure").exception("Archive observer failed")
+            if self.write_disk:
+                record = {
+                    "schema_version": 1,
+                    "event": "request",
+                    "call_id": self.call_id,
+                    "attempt_id": self.attempt_id,
+                    "context": self.context,
+                    "at": self.request_at,
+                    "protocol": api_type,
+                    "url": _safe_url(url, api_key, origin_only=self.mode == "metadata"),
+                    "request": safe_request,
+                }
+                if self.mode == "metadata":
+                    record["trace_mode"] = "metadata"
+                _write(record)
         finally:
             if created_assets:
                 with _asset_lock:
@@ -739,7 +765,7 @@ class Attempt:
         if self.mode == "metadata":
             self._output_chars += sum(len(p) for p in out_parts)
             self._reasoning_chars += sum(len(p) for p in reason_parts)
-        else:
+        if self.mode != "metadata" or self._observer is not None:
             self.output_text.extend(out_parts)
             self.reasoning.extend(reason_parts)
 
@@ -749,7 +775,7 @@ class Attempt:
         return any(self.output_text) or any(self.reasoning)
 
     def response(self, body):
-        if self.mode != "metadata":
+        if self.mode == "full" and self.write_disk:
             self.body = _safe(body, self.api_key)
         if isinstance(body, dict):
             self._usage(body.get("usage"))
@@ -778,7 +804,7 @@ class Attempt:
             if self.mode == "metadata":
                 self._output_chars = sum(len(p) for p in out_parts)
                 self._reasoning_chars = sum(len(p) for p in reason_parts)
-            else:
+            if self.mode != "metadata" or self._observer is not None:
                 self.output_text = out_parts
                 self.reasoning = reason_parts
         if self._has_output() and self.first_output_at is None:
@@ -803,7 +829,7 @@ class Attempt:
 
     def stream_event(self, obj):
         self._stream_event_count += 1
-        if self.mode != "metadata":
+        if self.mode == "full" and self.write_disk:
             self.events.append({"at": _now(), "data": _safe(obj, self.api_key)})
         if not isinstance(obj, dict):
             return
@@ -851,7 +877,10 @@ class Attempt:
         if self._finished:
             return
         self._finished = True
-        usage = self.usage if self.mode == "metadata" else _safe(self.usage, self.api_key)
+        usage = (
+            self.usage if self.mode == "metadata"
+            else (_safe(self.usage, self.api_key) if self.write_disk else _safe_metadata(self.usage, self.api_key))
+        )
         input_raw = (usage.get("prompt_tokens", usage.get("input_tokens")) if usage else None)
         read = (usage.get("cache_read_input_tokens") if usage else None)
         if read is None and usage:
@@ -864,7 +893,55 @@ class Attempt:
         reasoning = None
         if usage:
             reasoning = (usage.get("completion_tokens_details") or usage.get("output_tokens_details") or {}).get("reasoning_tokens")
-        if self.mode == "metadata":
+        finished_at = _now()
+        duration_ms = round((time.monotonic() - self.t0) * 1000, 1)
+        tokens_dict = {
+            "input": input_total,
+            "output": output,
+            "total": usage.get("total_tokens") if usage else None,
+            "reasoning": reasoning,
+            "cached_read": read,
+            "cached_write": created,
+            "cache_hit": usage.get("prompt_cache_hit_tokens") if usage else None,
+            "cache_miss": usage.get("prompt_cache_miss_tokens") if usage else None,
+        }
+        output_text = None
+        reasoning_text = None
+        safe_finish_reason = None
+        safe_error = None
+        if self.mode == "full" and self.write_disk:
+            output_text, split_output_secret = _redact_joined_text(self.output_text, self.api_key)
+            reasoning_text, split_reasoning_secret = _redact_joined_text(self.reasoning, self.api_key)
+            # Individually safe fragments can still expose a joined credential.
+            keep_raw_output = not (split_output_secret or split_reasoning_secret)
+            safe_finish_reason = _safe(self.finish_reason, self.api_key)
+            safe_error = _safe(str(error), self.api_key) if error is not None else None
+            _write({
+                "schema_version": 1,
+                "event": "result",
+                "call_id": self.call_id,
+                "attempt_id": self.attempt_id,
+                "context": self.context,
+                "protocol": self.api_type,
+                "status": status,
+                "http_status": self.status_code,
+                "request_at": self.request_at,
+                "response_headers_at": self.response_headers_at,
+                "first_output_at": self.first_output_at,
+                "headers_latency_ms": self.headers_latency_ms,
+                "first_output_latency_ms": self.first_output_latency_ms,
+                "finished_at": finished_at,
+                "duration_ms": duration_ms,
+                "output_text": output_text,
+                "reasoning_text": reasoning_text,
+                "finish_reason": safe_finish_reason,
+                "response": self.body if keep_raw_output else None,
+                "stream_events": self.events or None if keep_raw_output else None,
+                "usage_raw": usage,
+                "tokens": tokens_dict,
+                "error": safe_error,
+            })
+        elif self.write_disk:
             _write({
                 "schema_version": 1,
                 "event": "result",
@@ -880,8 +957,8 @@ class Attempt:
                 "first_output_at": self.first_output_at,
                 "headers_latency_ms": self.headers_latency_ms,
                 "first_output_latency_ms": self.first_output_latency_ms,
-                "finished_at": _now(),
-                "duration_ms": round((time.monotonic() - self.t0) * 1000, 1),
+                "finished_at": finished_at,
+                "duration_ms": duration_ms,
                 "output_text": None,
                 "reasoning_text": None,
                 "output_chars": self._output_chars,
@@ -892,40 +969,38 @@ class Attempt:
                 "stream_events": None,
                 "stream_event_count": self._stream_event_count,
                 "usage_raw": usage,
-                "tokens": {
-                    "input": input_total,
-                    "output": output,
-                    "total": usage.get("total_tokens") if usage else None,
-                    "reasoning": reasoning,
-                    "cached_read": read,
-                    "cached_write": created,
-                    "cache_hit": usage.get("prompt_cache_hit_tokens") if usage else None,
-                    "cache_miss": usage.get("prompt_cache_miss_tokens") if usage else None,
-                },
+                "tokens": tokens_dict,
                 "error": None,
             })
-            return
-
-        output_text, split_output_secret = _redact_joined_text(self.output_text, self.api_key)
-        reasoning_text, split_reasoning_secret = _redact_joined_text(self.reasoning, self.api_key)
-        # Individually safe fragments can still expose a joined credential.
-        keep_raw_output = not (split_output_secret or split_reasoning_secret)
-        _write({"schema_version": 1, "event": "result", "call_id": self.call_id,
-                "attempt_id": self.attempt_id, "context": self.context, "protocol": self.api_type,
-                "status": status, "http_status": self.status_code, "request_at": self.request_at,
-                "response_headers_at": self.response_headers_at, "first_output_at": self.first_output_at,
-                "headers_latency_ms": self.headers_latency_ms,
-                "first_output_latency_ms": self.first_output_latency_ms,
-                "finished_at": _now(), "duration_ms": round((time.monotonic() - self.t0) * 1000, 1),
-                "output_text": output_text, "reasoning_text": reasoning_text,
-                "finish_reason": _safe(self.finish_reason, self.api_key),
-                "response": self.body if keep_raw_output else None,
-                "stream_events": self.events or None if keep_raw_output else None,
-                "usage_raw": usage,
-                "tokens": {"input": input_total, "output": output,
-                           "total": usage.get("total_tokens") if usage else None,
-                           "reasoning": reasoning, "cached_read": read,
-                           "cached_write": created,
-                           "cache_hit": usage.get("prompt_cache_hit_tokens") if usage else None,
-                           "cache_miss": usage.get("prompt_cache_miss_tokens") if usage else None},
-                "error": _safe(str(error), self.api_key) if error is not None else None})
+        if self._observer:
+            if output_text is None and (self.mode != "full" or not self.write_disk):
+                output_text, _ = _redact_joined_text(self.output_text, self.api_key)
+                reasoning_text, _ = _redact_joined_text(self.reasoning, self.api_key)
+                safe_finish_reason = _safe_metadata(self.finish_reason, self.api_key)
+                safe_error = _safe_metadata(str(error), self.api_key) if error is not None else None
+            try:
+                self._observer({
+                    "schema_version": 1,
+                    "event": "result",
+                    "call_id": self.call_id,
+                    "attempt_id": self.attempt_id,
+                    "protocol": self.api_type,
+                    "status": status,
+                    "http_status": self.status_code,
+                    "request_at": self.request_at,
+                    "response_headers_at": self.response_headers_at,
+                    "first_output_at": self.first_output_at,
+                    "headers_latency_ms": self.headers_latency_ms,
+                    "first_output_latency_ms": self.first_output_latency_ms,
+                    "finished_at": finished_at,
+                    "duration_ms": duration_ms,
+                    "output_text": output_text,
+                    "reasoning_text": reasoning_text,
+                    "finish_reason": safe_finish_reason,
+                    "usage_raw": usage,
+                    "tokens": tokens_dict,
+                    "error": safe_error,
+                    "model": self.model_id,
+                })
+            except Exception:
+                logging.getLogger("llm.trace.failure").exception("Archive observer failed")

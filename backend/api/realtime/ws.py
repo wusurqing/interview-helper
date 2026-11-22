@@ -301,6 +301,7 @@ async def websocket_endpoint(ws: WebSocket):
             detail = stt_configuration_error(cfg, provider)
             current_stt = {"loaded": not detail, "loading": False, "provider": provider, "detail": detail}
         snapshot = snapshot_session()
+        from services.review_integration import get_archive_status
         written_exam_mode = get_config().written_exam_mode
         initial_frames: list[dict] = [
             {
@@ -317,6 +318,7 @@ async def websocket_endpoint(ws: WebSocket):
                 "candidate_transcriptions": snapshot.get("candidate_transcriptions", []),
                 "candidate_answer_segments": snapshot.get("candidate_answer_segments", []),
                 "qa_pairs": snapshot["qa_pairs"],
+                "archive": get_archive_status(),
             },
             {"type": "stt_status", **current_stt},
         ]

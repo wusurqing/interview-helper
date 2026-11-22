@@ -3,15 +3,33 @@ import time
 
 from fastapi import APIRouter, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from core.logger import get_logger
 from services.storage import review
 from services.storage import job_tracker
+from services.storage import review_archive
 from services import review_analysis, review_async_analysis
 
 logger = get_logger(__name__)
 router = APIRouter()
+
+
+@router.get("/review/sessions/{session_id}/turns/{turn_id}/archive")
+async def get_turn_archive(session_id: int, turn_id: int):
+    detail = await run_in_threadpool(review_archive.get_archive, session_id, turn_id)
+    if detail is None:
+        raise HTTPException(404, "此记录未保存归档详情")
+    return detail
+
+
+@router.get("/review/sessions/{session_id}/turns/{turn_id}/audio/{asset_id}")
+async def get_turn_audio(session_id: int, turn_id: int, asset_id: str):
+    path = await run_in_threadpool(review_archive.asset_path, session_id, turn_id, asset_id)
+    if path is None:
+        raise HTTPException(404, "录音片段不存在")
+    return FileResponse(path, media_type="audio/ogg", headers={"Cache-Control": "private, max-age=3600"})
 
 
 class UpdateSessionRequest(BaseModel):
@@ -152,6 +170,9 @@ def _trigger_review_analysis_sync(session_id: int) -> dict:
     if not detail:
         raise HTTPException(404, "Session not found")
 
+    if detail.get("archive_status") in ("recording", "draining"):
+        raise HTTPException(409, "面试记录仍在收集或保存，请保存完成后再生成复盘")
+
     status = detail.get("status", "")
 
     # 如果正在分析，返回 pending
@@ -172,6 +193,8 @@ def _trigger_review_analysis_sync(session_id: int) -> dict:
         latest = review.get_session_detail(session_id)
         if not latest:
             raise HTTPException(404, "Session not found")
+        if latest.get("archive_status") in ("recording", "draining"):
+            raise HTTPException(409, "面试记录仍在收集或保存，请保存完成后再生成复盘")
         latest_status = latest.get("status", "")
         if latest_status == "analyzing":
             return {"status": "pending", "message": "分析正在进行中"}
@@ -246,8 +269,11 @@ async def test_asr_correction(req: AsrCorrectionTestRequest):
 @router.get("/review/current")
 async def get_current_session():
     """当前进行中的 session"""
+    from services.review_integration import get_archive_status
+
     current = await run_in_threadpool(review.get_current_session)
-    return {"session": current}
+    archive = await run_in_threadpool(get_archive_status)
+    return {"session": current, "archive": archive}
 
 
 @router.get("/review/profile")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Optional
 
 from core.config import get_config
@@ -661,7 +661,7 @@ def prompt_mode_for_task(
     return PROMPT_MODE_ASR_REALTIME
 
 
-def process_question_parallel(
+def _process_question_parallel(
     task: TaskPayload,
     seq: int,
     model_idx: int,
@@ -1470,3 +1470,109 @@ def process_question_parallel(
 
     apply_commit = _commit_current_request if mmpg_request else _commit
     deps.flush_commit(seq, AnswerCommit(apply_commit, _cancel_visible_answer) if plain_text else apply_commit)
+
+
+def process_question_parallel(task, seq, model_idx, sess_v, deps):
+    """Observe all exits without changing answer generation/commit scheduling."""
+    from services.llm import trace
+    from urllib.parse import urlsplit
+
+    meta = task[4]
+    archive, run_id = meta.get("_archive_owner"), meta.get("_archive_run_id")
+    if archive is None or not run_id:
+        return _process_question_parallel(task, seq, model_idx, sess_v, deps)
+    cfg = deps.config_snapshot if deps.config_snapshot is not None else get_config()
+    round_id = meta.get("_archive_round_id")
+
+    def model_snapshot(model):
+        if model is None:
+            return {}
+        key = getattr(model, "api_key", "")
+        try:
+            endpoint = urlsplit(getattr(model, "api_base_url", "")).hostname or ""
+        except ValueError:
+            endpoint = ""
+        return dict(
+            name=trace._redact_text(model.name, key),
+            model=trace._redact_text(model.model, key),
+            protocol=getattr(model, "api_type", ""),
+            endpoint=trace._redact_text(endpoint, key),
+        )
+
+    model = deps.model_cfg_snapshot
+    if model is None and 0 <= model_idx < len(cfg.models):
+        model = cfg.models[model_idx]
+    archive.start_ai(round_id, run_id, model_snapshot(model))
+
+    def broadcast(event):
+        deps.broadcast(event)
+        try:
+            archive.ai_event(run_id, event)
+        except Exception:
+            deps.error_logger.exception("archive answer observation failed")
+
+    resolve_exam_model = deps.resolve_exam_model
+    if resolve_exam_model is not None:
+        orig_resolve_exam_model = resolve_exam_model
+
+        def resolve_exam_model(index):
+            live_model = orig_resolve_exam_model(index)
+            if live_model is not None:
+                try:
+                    archive.start_ai(round_id, run_id, model_snapshot(live_model))
+                except Exception:
+                    deps.error_logger.exception("archive answer model update failed")
+            return live_model
+
+    reserve_retry = deps.reserve_retry
+    if reserve_retry is not None:
+        orig_reserve_retry = reserve_retry
+
+        def reserve_retry(attempted, announce_retry):
+            next_index = orig_reserve_retry(attempted, announce_retry)
+            if next_index is not None and 0 <= next_index < len(cfg.models):
+                try:
+                    archive.start_ai(round_id, run_id, model_snapshot(cfg.models[next_index]))
+                except Exception:
+                    deps.error_logger.exception("archive answer retry model update failed")
+            return next_index
+
+    commit_submitted = False
+
+    def flush_commit(index, commit):
+        nonlocal commit_submitted
+        commit_submitted = True
+        archive.mark_generation_ended(run_id)
+
+        def apply():
+            try:
+                commit()
+            finally:
+                archive.settle_unreported_ai(run_id, deps.abort_check())
+
+        def cancel():
+            if isinstance(commit, AnswerCommit):
+                commit.cancel()
+            archive.settle_unreported_ai(run_id, cancelled=True)
+
+        deps.flush_commit(index, AnswerCommit(apply, cancel))
+
+    try:
+        with trace.observe(lambda event: archive.observe_attempt(run_id, event)):
+            return _process_question_parallel(
+                task,
+                seq,
+                model_idx,
+                sess_v,
+                replace(
+                    deps,
+                    broadcast=broadcast,
+                    flush_commit=flush_commit,
+                    resolve_exam_model=resolve_exam_model,
+                    reserve_retry=reserve_retry,
+                ),
+            )
+    finally:
+        if not commit_submitted:
+            request = meta.get("mmpg_request")
+            archive.settle_unreported_ai(run_id, deps.abort_check() or bool(request and request.cancelled))

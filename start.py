@@ -128,7 +128,7 @@ def ensure_python_deps():
        using *sys.executable* (same Python that is running this script).
     3. After installing, re-check; exit with helpful message if still missing.
     """
-    probe_packages = ["fastapi", "uvicorn", "openai", "numpy", "sounddevice",
+    probe_packages = ["fastapi", "uvicorn", "openai", "numpy", "sounddevice", "av",
                       "volcenginesdkcore.signv4", "websockets.asyncio.client", "multipart.multipart"]
     missing = []
     for pkg in probe_packages:

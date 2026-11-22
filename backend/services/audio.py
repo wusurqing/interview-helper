@@ -98,6 +98,7 @@ class AudioBusyError(RuntimeError):
 # ---------------------------------------------------------------------------
 # soundcard (Windows WASAPI loopback) – optional
 # ---------------------------------------------------------------------------
+_sc: Any = None
 try:
     import soundcard as _sc
     if platform.system() == "Windows":
@@ -107,6 +108,7 @@ try:
         configure_property_buffers(mediafoundation)
     _HAS_SC = True
 except Exception:
+    _sc = None
     _HAS_SC = False
 
 # 一次性注册静态 warning 过滤，避免在 64ms WASAPI 热路径中调用非线程安全的 warnings.catch_warnings()
@@ -115,6 +117,40 @@ warnings.filterwarnings(
     message=r".*fromstring is deprecated.*",
     category=DeprecationWarning,
 )
+
+# 进程级线程隔离 warnings.showwarning hook：在 64ms WASAPI _reader() 热路径捕获
+# SoundCard 的 "data discontinuity in recording" 而不修改全局 warnings 状态，非采集线程原样透传。
+_SC_WARNING_HOOK_LOCK = threading.Lock()
+_SC_WARNING_LOCAL = threading.local()
+_SC_PREV_SHOWWARNING = None
+
+
+def _sc_showwarning(message, category, filename, lineno, file=None, line=None):
+    sink = getattr(_SC_WARNING_LOCAL, "sink", None)
+    if sink is not None:
+        sink.append(str(message))
+        return
+    if getattr(_SC_WARNING_LOCAL, "dispatching", False):
+        warnings._showwarning_orig(message, category, filename, lineno, file=file, line=line)
+        return
+    prev = _SC_PREV_SHOWWARNING
+    if prev is not None and prev is not _sc_showwarning:
+        _SC_WARNING_LOCAL.dispatching = True
+        try:
+            prev(message, category, filename, lineno, file=file, line=line)
+        finally:
+            _SC_WARNING_LOCAL.dispatching = False
+        return
+    warnings._showwarning_orig(message, category, filename, lineno, file=file, line=line)
+
+
+def _ensure_soundcard_warning_hook() -> None:
+    global _SC_PREV_SHOWWARNING
+    with _SC_WARNING_HOOK_LOCK:
+        if warnings.showwarning is not _sc_showwarning:
+            _SC_PREV_SHOWWARNING = warnings.showwarning
+            warnings.showwarning = _sc_showwarning
+            warnings.filterwarnings("always", message=r".*data discontinuity in recording.*")
 
 # Stable mapping: integer device_id (20000+N) -> soundcard speaker GUID
 # Populated by list_devices(); used by start() to find the right device.
@@ -297,6 +333,7 @@ class AudioCapture:
         self._claimed_device_ids: set[int] = set()
         self._dropped_chunks_count = 0
         self._loopback_discontinuity_count = 0
+        self._keep_tail_on_stop = False
         self._max_queue_chunk_samples = 0
         self._last_queue_chunk_samples = 0
         self._seen_soundcard_warning_messages: set[str] = set()
@@ -356,16 +393,15 @@ class AudioCapture:
     @staticmethod
     def get_platform_info(devices: Optional[list[dict]] = None) -> dict:
         system = platform.system()
+        dev_list = devices if devices is not None else AudioCapture.list_devices()
+        has_loopback = any(bool(d.get("is_loopback")) for d in dev_list)
         info = {
             "platform": system,
             "needs_virtual_device": False,
             "instructions": "",
-            "has_loopback": False,
+            "has_loopback": has_loopback,
         }
         if system == "Darwin":
-            dev_list = devices if devices is not None else AudioCapture.list_devices()
-            has_loopback = any(d["is_loopback"] for d in dev_list)
-            info["has_loopback"] = has_loopback
             if not has_loopback:
                 info["needs_virtual_device"] = True
                 info["instructions"] = (
@@ -375,9 +411,6 @@ class AudioCapture:
                     "然后在「音频 MIDI 设置」中创建多输出设备。"
                 )
         elif system == "Windows":
-            dev_list = devices if devices is not None else AudioCapture.list_devices()
-            has_loopback = any(d["is_loopback"] for d in dev_list)
-            info["has_loopback"] = has_loopback
             if not has_loopback:
                 info["needs_virtual_device"] = True
                 info["instructions"] = (
@@ -493,6 +526,8 @@ class AudioCapture:
             self._running = True
             self._owner = owner
             self._audio_queue = queue.Queue(maxsize=940)
+            self._archive_capture_id = None
+            self._keep_tail_on_stop = False
             self._resample_state = [None]
             self._agc_peak = 0.0
             self._dropped_chunks_count = 0
@@ -538,7 +573,7 @@ class AudioCapture:
                 _alog.warning("audio_queue_full_dropped chunk_samples=%d", len(dropped))
         self._audio_queue.put_nowait(audio)
 
-    def _push(self, audio: np.ndarray):
+    def _push(self, audio: np.ndarray, *, discontinuity: bool = False):
         """Common path: optionally AGC → queue → callback."""
         if len(audio) <= 0:
             return
@@ -546,6 +581,25 @@ class AudioCapture:
             audio = audio.astype(np.float32)
         if self._use_agc:
             audio = self._apply_agc(audio)
+        sink = getattr(self, "archive_sink", None)
+        role = getattr(self, "archive_role", None)
+        if sink:
+            from services.interview_archive.audio import CapturedAudio
+            if not getattr(self, "_archive_capture_id", None):
+                from uuid import uuid4
+                self._archive_capture_id = uuid4().hex
+                self._archive_sample = 0
+                self._archive_anchor = time.monotonic() - len(audio) / self.SAMPLE_RATE
+            audio = CapturedAudio(
+                audio, self._archive_capture_id, self._archive_sample, self._archive_anchor,
+                discontinuity=discontinuity and self._archive_sample > 0,
+            )
+            self._archive_sample += len(audio)
+        if sink and role:
+            try:
+                sink(audio, role)
+            except Exception:
+                _alog.exception("archive capture observer failed")
         if self._queue_audio:
             for chunk in self._iter_queueable_chunks(audio):
                 self._enqueue_chunk(chunk)
@@ -555,6 +609,9 @@ class AudioCapture:
     # soundcard path -------------------------------------------------------
 
     def _start_soundcard(self, device_id: int):
+        if _sc is None:
+            self._running = False
+            raise RuntimeError("系统音频捕获组件 soundcard 不可用")
         speaker_guid = _lookup_sc_speaker_guid(device_id)
         if speaker_guid is None:
             # Map may have been rebuilt; try refreshing
@@ -564,9 +621,12 @@ class AudioCapture:
             self._running = False
             raise RuntimeError(f"找不到系统音频设备 ID={device_id}，请刷新页面重新选择设备")
 
+        _ensure_soundcard_warning_hook()
         stop_event = self._sc_stop
 
         def _reader():
+            sc_warnings: list[str] = []
+            _SC_WARNING_LOCAL.sink = sc_warnings
             try:
                 # soundcard uses COM on Windows; must init COM in each new thread
                 import ctypes
@@ -587,6 +647,7 @@ class AudioCapture:
                 _alog.info("soundcard loopback opened: %s", mic.name)
                 pending_chunks: list[np.ndarray] = []
                 pending_samples = 0
+                pending_discontinuity = False
                 with mic.recorder(samplerate=self.SAMPLE_RATE,
                                   channels=self.CHANNELS,
                                   blocksize=self.LOOPBACK_RECORDER_BLOCK_SIZE) as rec:
@@ -597,8 +658,24 @@ class AudioCapture:
                         data = rec.record(numframes=self.LOOPBACK_RECORD_NUMFRAMES)
                         if self._sc_stop is not stop_event:
                             return
-                        if stop_event.is_set() and not self._queue_audio:
+                        if stop_event.is_set() and not (self._queue_audio or self._keep_tail_on_stop):
                             return
+                        if sc_warnings:
+                            for warning_text in sc_warnings:
+                                if "data discontinuity in recording" in warning_text.lower():
+                                    self._loopback_discontinuity_count += 1
+                                    if getattr(self, "archive_sink", None):
+                                        pending_discontinuity = True
+                                    _alog.warning(
+                                        "soundcard_loopback_discontinuity count=%d",
+                                        self._loopback_discontinuity_count,
+                                    )
+                                elif "fromstring is deprecated" in warning_text.lower():
+                                    continue
+                                elif warning_text not in self._seen_soundcard_warning_messages:
+                                    self._seen_soundcard_warning_messages.add(warning_text)
+                                    _alog.warning("soundcard warning: %s", warning_text)
+                            sc_warnings.clear()
                         if data is None or len(data) <= 0:
                             continue
                         mono = data[:, 0].copy()
@@ -606,11 +683,12 @@ class AudioCapture:
                         pending_samples += len(mono)
                         if pending_samples < self.MIN_LOOPBACK_QUEUE_CHUNK_SAMPLES:
                             continue
-                        self._push(np.concatenate(pending_chunks))
+                        self._push(np.concatenate(pending_chunks), discontinuity=pending_discontinuity)
                         pending_chunks = []
                         pending_samples = 0
-                if pending_chunks and self._sc_stop is stop_event and self._queue_audio:
-                    self._push(np.concatenate(pending_chunks))
+                        pending_discontinuity = False
+                if pending_chunks and self._sc_stop is stop_event and (self._queue_audio or self._keep_tail_on_stop):
+                    self._push(np.concatenate(pending_chunks), discontinuity=pending_discontinuity)
             except Exception as e:
                 _alog.error("soundcard error: %s", e, exc_info=True)
                 with _ACTIVE_DEVICES_LOCK:
@@ -622,6 +700,7 @@ class AudioCapture:
                         self._owner = None
                         self._running = False
             finally:
+                _SC_WARNING_LOCAL.sink = None
                 try:
                     ctypes.windll.ole32.CoUninitialize()
                 except Exception:
@@ -700,12 +779,12 @@ class AudioCapture:
         stop_event = self._sc_stop
 
         def audio_cb(indata, frames, time_info, status):
-            if self._sc_stop is not stop_event or stop_event.is_set():
+            if self._sc_stop is not stop_event or (stop_event.is_set() and not self._keep_tail_on_stop):
                 return
             audio = indata[:, 0].copy() if indata.ndim > 1 else indata.copy().flatten()
             native_sr = getattr(self, '_native_sr', self.SAMPLE_RATE)
             audio = _resample_chunk(audio, native_sr, self.SAMPLE_RATE, self._resample_state)
-            self._push(audio)
+            self._push(audio, discontinuity=bool(getattr(status, "input_overflow", False)))
 
         last_error: Optional[Exception] = None
         try:
@@ -773,6 +852,7 @@ class AudioCapture:
                 and owner != self._owner
             ):
                 return
+            self._keep_tail_on_stop = not clear_queue
             self._running = False
             self._sc_stop.set()
             if self._stream:
@@ -856,6 +936,15 @@ class AudioCapture:
 # ---------------------------------------------------------------------------
 
 class VADBuffer:
+    def _joined_audio(self):
+        result = np.concatenate(self._buffer)
+        first, last = self._buffer[0], self._buffer[-1]
+        if getattr(first, "capture_id", ""):
+            from services.interview_archive.audio import CapturedAudio
+            result = CapturedAudio(result, first.capture_id, first.sample_start, first.capture_anchor)
+            result.source_end_mono = getattr(last, "started_mono", first.started_mono) + len(last) / self.sample_rate
+        return result
+
     """Voice Activity Detection: accumulate speech, trigger after silence."""
 
     def __init__(self, sample_rate: int = 16000, silence_threshold: float = 0.01,
@@ -956,7 +1045,7 @@ class VADBuffer:
                 self.max_speech_duration is not None
                 and self._speech_audio_samples / self.sample_rate >= self.max_speech_duration
             ):
-                result = np.concatenate(self._buffer)
+                result = self._joined_audio()
                 self._last_flush_reason = "max_speech"
                 self._last_segment_ended_at = now
                 self._seed_next_segment_from_rollover()
@@ -982,7 +1071,7 @@ class VADBuffer:
             if should_flush:
                 speech_duration = self._speech_audio_samples / self.sample_rate
                 if speech_duration >= self.min_speech_duration and self._buffer:
-                    result = np.concatenate(self._buffer)
+                    result = self._joined_audio()
                     self._last_flush_reason = "silence"
                     self._last_segment_ended_at = now
                     self._reset()
@@ -997,7 +1086,7 @@ class VADBuffer:
 
     def flush(self) -> Optional[np.ndarray]:
         if self._buffer:
-            result = np.concatenate(self._buffer)
+            result = self._joined_audio()
             self._last_flush_reason = "stop_flush"
             self._last_segment_ended_at = time.time()
             self._reset()

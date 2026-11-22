@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
+from types import SimpleNamespace
 import wave
 
 import numpy as np
@@ -145,6 +147,42 @@ def test_audio_capture_loopback_min_chunk_samples_is_smaller_than_max():
     capture = AudioCapture()
 
     assert capture.MIN_LOOPBACK_QUEUE_CHUNK_SAMPLES < capture.MAX_QUEUE_CHUNK_SAMPLES
+
+
+def test_streaming_loopback_delivers_in_flight_tail_during_graceful_stop(monkeypatch):
+    from services import audio
+
+    capture = AudioCapture()
+    reading = threading.Event()
+    frame = np.full((320, 1), 0.1, dtype=np.float32)
+
+    class Recorder:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return None
+
+        def record(self, **_):
+            reading.set()
+            assert capture._sc_stop.wait(2)
+            return frame
+
+    device = SimpleNamespace(name="test loopback", recorder=lambda **_: Recorder())
+    monkeypatch.setattr(audio, "_sc", SimpleNamespace(get_microphone=lambda *_, **__: device))
+    monkeypatch.setitem(audio._SC_ID_MAP, 20001, "test-loopback")
+    captured, sent = [], []
+    capture.archive_sink = lambda samples, role: captured.append((samples, role))
+    capture.archive_role = "interviewer"
+    try:
+        capture.start(20001, on_audio=sent.append, owner="assist", queue_audio=False)
+        assert reading.wait(2)
+    finally:
+        capture.stop(owner="assist", clear_queue=False)
+    assert len(captured) == len(sent) == 1
+    assert captured[0][0] is sent[0]
+    assert captured[0][1] == "interviewer"
+    assert len(sent[0]) == len(frame)
 
 
 def test_audio_device_sort_keeps_default_loopback_first():
@@ -572,6 +610,124 @@ def test_microphone_compatibility_ignores_broken_default_input_metadata(monkeypa
     assert [(item["device"], item["samplerate"]) for item in attempts] == [(9, 48000), (9, 16000)]
 
 
+def test_soundcard_discontinuity_hook_marks_archive_and_passes_other_threads_through(monkeypatch):
+    import threading
+    import warnings
+    from contextlib import contextmanager
+    from services import audio
+
+    recorded = []
+    other_thread_warnings: list[str] = []
+    captured_two = threading.Event()
+    calls = {"count": 0}
+
+    def outer_showwarning(message, category, filename, lineno, file=None, line=None):
+        other_thread_warnings.append(str(message))
+
+    def forbid_catch_warnings(*_args, **_kwargs):
+        raise AssertionError("warnings.catch_warnings must not be called on 64ms WASAPI hot path")
+
+    class _FakeRecorder:
+        def record(self, numframes: int):
+            calls["count"] += 1
+            if calls["count"] == 2:
+                warnings.warn("data discontinuity in recording", RuntimeWarning, stacklevel=2)
+            if calls["count"] == 3:
+                captured_two.set()
+            # 超过 MIN_LOOPBACK_QUEUE_CHUNK_SAMPLES (1600)，每次调用都能独立触发一次 _push
+            return np.ones((2048, 1), dtype=np.float32) * 0.05
+
+    class _FakeMic:
+        name = "Fake Discontinuity Loopback"
+
+        @contextmanager
+        def recorder(self, **_kwargs):
+            yield _FakeRecorder()
+
+    class _FakeSC:
+        @staticmethod
+        def get_microphone(_guid, include_loopback=True):
+            return _FakeMic()
+
+    monkeypatch.setattr(audio.warnings, "catch_warnings", forbid_catch_warnings)
+    monkeypatch.setattr(warnings, "showwarning", outer_showwarning)
+    monkeypatch.setattr(audio, "_SC_PREV_SHOWWARNING", None)
+    monkeypatch.setattr(audio, "_sc", _FakeSC, raising=False)
+    monkeypatch.setitem(audio._SC_ID_MAP, 20089, "guid-89")
+
+    cap = AudioCapture()
+    cap.archive_role = "interviewer"
+    cap.archive_sink = lambda sample, role: recorded.append((sample, role))
+    cap.start(20089, owner="assist")
+    try:
+        assert captured_two.wait(timeout=2.0)
+        other_err: list[Exception] = []
+
+        def emit_other():
+            try:
+                warnings.warn("unrelated worker warning", UserWarning, stacklevel=2)
+            except Exception as exc:
+                other_err.append(exc)
+
+        t = threading.Thread(target=emit_other)
+        t.start()
+        t.join(timeout=2.0)
+        assert not other_err
+    finally:
+        cap.stop(owner="assist")
+
+    assert cap._loopback_discontinuity_count == 1
+    assert len(recorded) >= 2
+    assert recorded[0][1] == "interviewer"
+    assert recorded[0][0].discontinuity is False
+    assert recorded[1][0].discontinuity is True
+    assert any("unrelated worker warning" in w for w in other_thread_warnings)
+
+
+def test_sc_showwarning_handles_nested_outer_wrapper_without_recursion(monkeypatch):
+    import threading
+    import warnings
+    from services import audio
+
+    orig_seen: list[str] = []
+    outer_seen: list[str] = []
+
+    def fake_orig_showwarning(message, category, filename, lineno, file=None, line=None):
+        orig_seen.append(str(message))
+
+    monkeypatch.setattr(warnings, "_showwarning_orig", fake_orig_showwarning)
+    monkeypatch.setattr(audio, "_SC_PREV_SHOWWARNING", None)
+    monkeypatch.setattr(warnings, "showwarning", fake_orig_showwarning)
+
+    audio._ensure_soundcard_warning_hook()
+    first_hook = warnings.showwarning
+    assert first_hook is audio._sc_showwarning
+
+    def outer_wrapper(message, category, filename, lineno, file=None, line=None):
+        outer_seen.append(str(message))
+        first_hook(message, category, filename, lineno, file=file, line=line)
+
+    monkeypatch.setattr(warnings, "showwarning", outer_wrapper)
+    audio._ensure_soundcard_warning_hook()
+
+    errors: list[Exception] = []
+
+    def run_in_other_thread():
+        try:
+            warnings.warn("nested warning", UserWarning, stacklevel=2)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run_in_other_thread)
+    thread.start()
+    thread.join(timeout=2.0)
+
+    assert not errors
+    assert any("nested warning" in msg for msg in outer_seen)
+    assert any("nested warning" in msg for msg in orig_seen)
+    assert getattr(audio._SC_WARNING_LOCAL, "dispatching", False) is False
+
+
 def test_headless_portaudio_import_failure_degrades_gracefully(tmp_path):
     fake_site = tmp_path / "fake_site"
     fake_site.mkdir()
@@ -767,3 +923,14 @@ def test_start_ensure_python_deps_checks_sounddevice_without_importing(monkeypat
     assert "sounddevice" not in import_calls
     assert len(pip_calls) == 1
     assert pip_calls[0][:6] == [sys.executable, "-m", "pip", "install", "-r", str(BACKEND_DIR / "requirements.txt")]
+
+
+def test_audio_module_exposes_sc_attribute_and_guards_unavailable_soundcard(monkeypatch):
+    from services import audio
+
+    assert hasattr(audio, "_sc")
+    capture = AudioCapture()
+    monkeypatch.setattr(audio, "_sc", None)
+    with pytest.raises(RuntimeError, match="soundcard"):
+        capture._start_soundcard(20001)
+    assert capture._running is False

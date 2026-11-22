@@ -63,6 +63,7 @@ class Session:
     system_summary: str = ""
     _compaction_running: bool = False
     _live_transcript: LiveTranscript = field(default_factory=LiveTranscript, repr=False, compare=False)
+    archive: object | None = field(default=None, repr=False, compare=False)
 
     MAX_HISTORY = 20
     MAX_TRANSCRIPTION_HISTORY = 200
@@ -85,6 +86,8 @@ class Session:
         self._live_transcript.reset()
 
     def stop_transcript_capture(self) -> None:
+        if self.archive:
+            self.archive.settle_transcriptions()
         self._live_transcript.stop()
 
     def record_transcript(
@@ -97,13 +100,28 @@ class Session:
         is_final: bool = True,
         epoch: int | None = None,
         question_group: str | None = None,
+        raw_text: str | None = None,
+        audio_end: float | None = None,
+        cloud: bool = False,
+        source_capture_id: str | None = None,
     ) -> str | None:
-        return self._live_transcript.record(
+        anchor = self._live_transcript.record(
             speaker, text, started_at=started_at, utterance_key=utterance_key,
             is_final=is_final, epoch=epoch, question_group=question_group,
         )
+        if anchor and self.archive:
+            try:
+                self.archive.transcript(speaker, text if raw_text is None else raw_text, anchor,
+                                        started_at, is_final, question_group, audio_end=audio_end, cloud=cloud,
+                                        source_capture_id=source_capture_id)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("archive transcript observation failed")
+        return anchor
 
     def discard_unfinished_transcript(self, utterance_id: str | None) -> None:
+        if self.archive and utterance_id:
+            self.archive.discard(utterance_id)
         self._live_transcript.discard_unfinished(utterance_id)
 
     def group_transcript_question(self, anchors: Iterable[str | None], *, split_after_reply: bool = False) -> None:
@@ -388,6 +406,8 @@ class Session:
 
     def clear(self):
         with conversation_lock:
+            if self.archive:
+                self.archive.settle_transcriptions()
             self._live_transcript.reset()
             self.transcription_history.clear()
             self.candidate_transcription_history.clear()

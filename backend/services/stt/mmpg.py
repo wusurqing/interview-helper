@@ -9,6 +9,7 @@ import copy
 import hmac
 import json
 import logging
+import math
 import re
 import secrets
 import struct
@@ -598,34 +599,63 @@ class MmpgManager:
             if last_audio is not None and time.monotonic() - last_audio >= AUDIO_STALL_TIMEOUT:
                 raise MmpgError("audio_stalled")
 
-    async def drain_transcripts(self):
-        """Send silence after capture stops so the provider can finish the current turn."""
-        generation = self._current
-        if generation is None or self._state != "listening":
-            return
+    def recommended_drain_timeout(self) -> float:
+        """Compute a safe drain timeout covering configured silence and playback grace."""
+        silence_ms = _DEFAULTS["silence_ms"]
+        current = self._current
+        if current is not None and isinstance(current.config, dict):
+            raw = current.config.get("silence_ms", silence_ms)
+        else:
+            raw = silence_ms
+            try:
+                cfg = self._get_config()
+            except Exception:
+                cfg = None
+            if isinstance(cfg, dict):
+                raw = cfg.get("silence_ms", silence_ms)
+            elif cfg is not None:
+                raw = getattr(cfg, "silence_ms", silence_ms)
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and math.isfinite(raw) and raw > 0:
+            silence_ms = float(raw)
+        return max(6.0, silence_ms / 1000.0 + ROLE_DRAIN_PLAYBACK_GRACE_SECONDS + 2.0)
 
-        started = self._loop.time()
-        deadline = started + 3
-        grace = started + 0.24
-        silence = bytes(640 * 4)  # 40 ms of 16 kHz float32 PCM.
-        while self._current is generation and self._state == "listening":
-            now = self._loop.time()
-            if now >= deadline or (not generation.open_conversations and now >= grace):
-                break
-            if not self.offer_audio(silence):
-                break
-            await asyncio.sleep(0.04)
+    async def drain_transcripts(self, *, timeout: float | None = None) -> bool:
+        """After dual-device capture stops, wait for sent PCM and the tail final."""
+        effective_timeout = self.recommended_drain_timeout() if timeout is None else timeout
+        return await self._drain_input(self._finish_input(timeout=effective_timeout))
 
     async def drain_single_mic_input(self, session_id: str, *, timeout: float) -> bool:
         """Feed silence while a paused physical source has a final turn to finish."""
         if self.single_mic_id != session_id or self._state != "listening":
             return False
-        drain = asyncio.create_task(self.finish_role_input(session_id, timeout=timeout))
+        return await self._drain_input(self.finish_role_input(session_id, timeout=timeout))
+
+    async def _drain_input(self, finishing) -> bool:
+        drain = asyncio.create_task(finishing)
         silence = bytes(640 * 4)  # 40 ms of 16 kHz float32 PCM.
+        step = 0.04
+        max_catchup = step * 2  # Bound catch-up so stalls cannot burst-overflow the 1s browser PcmQueue.
+        loop = asyncio.get_running_loop()
         try:
-            while not drain.done() and self.offer_audio(silence):
-                await asyncio.wait({drain}, timeout=0.04)
-            return drain.done() and drain.result()
+            # Let the waiter capture the end of real PCM before adding silence.
+            await asyncio.sleep(0)
+            next_send = loop.time()
+            while not drain.done():
+                with self._audio_lock:
+                    room = self._queued_bytes + self._inflight_bytes + len(silence) <= MAX_AUDIO_BYTES
+                if room and not self.offer_audio(silence):
+                    return False
+                now = loop.time()
+                if room:
+                    next_send = max(next_send, now - max_catchup) + step
+                else:
+                    next_send = now + step
+                delay = next_send - now
+                if delay <= 0:
+                    await asyncio.sleep(0)
+                else:
+                    await asyncio.wait({drain}, timeout=delay)
+            return drain.result()
         finally:
             if not drain.done():
                 drain.cancel()
@@ -633,8 +663,13 @@ class MmpgManager:
 
     async def finish_role_input(self, single_mic_id: str, *, timeout: float) -> bool:
         """Wait for routed silence and final ASR events without closing RTC."""
+        if not single_mic_id or self.single_mic_id != single_mic_id:
+            return False
+        return await self._finish_input(timeout=timeout)
+
+    async def _finish_input(self, *, timeout: float) -> bool:
         run, generation = self._run, self._current
-        if not single_mic_id or run is None or run.single_mic_id != single_mic_id or generation is None:
+        if run is None or generation is None or self._state != "listening":
             return False
         with self._audio_lock:
             if self._audio_generation != generation.number:

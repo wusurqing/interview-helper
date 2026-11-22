@@ -147,6 +147,7 @@ class SingleMicSession:
         self._closed = False
         self._last_audio_at = time.monotonic()
         self._revision = 0
+        self.archive_end_capture: Callable[[Role], None] | None = None
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -175,6 +176,8 @@ class SingleMicSession:
             if self._closed:
                 return False
             if self._streams[role] != callback:
+                if self._streams_ready() and self.archive_end_capture:
+                    self.archive_end_capture(self._role)
                 self._cancel_switch()
                 self._streams[role] = callback
             return True
@@ -188,6 +191,9 @@ class SingleMicSession:
                 return
             self._last_audio_at = time.monotonic()
             active_role = self._role if self._switch is None and self._streams_ready() else None
+            sink = getattr(self, "archive_sink", None)
+            if active_role and sink:
+                sink(samples, active_role)
             silence = None
             for role, stream in self._streams.items():
                 if stream is None:
@@ -212,6 +218,8 @@ class SingleMicSession:
                 raise SingleMicConflict("正在切换角色")
             if self._role == target:
                 return None
+            if self.archive_end_capture:
+                self.archive_end_capture(self._role)
             operation = RoleSwitch(self._role, target, streaming=self._streams[self._role] is not None)
             self._switch = operation
             self._revision += 1
@@ -251,6 +259,8 @@ class SingleMicSession:
             self._pause()
 
     def _pause(self) -> None:
+        if not self._paused and self.archive_end_capture:
+            self.archive_end_capture(self._role)
         self._paused = True
         self._cancel_switch()
         for role_input in self._inputs.values():

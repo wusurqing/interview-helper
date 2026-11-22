@@ -71,6 +71,11 @@ async def lifespan(app: FastAPI):
         )
 
     cfg = get_config()
+    from services.storage.review_archive import recover_interrupted
+    try:
+        await run_in_threadpool(recover_interrupted)
+    except Exception:
+        _log.exception("Could not reconcile interrupted interview archives")
     models_summary = ", ".join(
         f"{m.name}({'on' if m.enabled else 'off'})" for m in cfg.models
     )
@@ -105,12 +110,10 @@ async def lifespan(app: FastAPI):
         _log.debug("Resume auto-restore skipped: %s", e)
     yield
     _log.info("SHUTDOWN cleaning up")
-    await asyncio.gather(
-        mmpg_integration.manager.stop("shutdown"),
-        candidate_mmpg.stop("shutdown", drain=True),
-        return_exceptions=True,
-    )
-    await run_in_threadpool(assist.stop_interview_loop)
+    try:
+        await assist.finish_interview("shutdown")
+    except Exception as e:
+        _log.warning("Assist shutdown cleanup failed: %s", e)
     await run_in_threadpool(assist.shutdown_background_workers)
     try:
         from services.review_async_analysis import shutdown_executor as shutdown_review_analysis_executor

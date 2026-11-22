@@ -12,9 +12,11 @@ const mainSource = readFileSync(mainFile, 'utf8');
 const primary = { id: 1, label: 'Primary', workArea: { x: 0, y: 0, width: 1280, height: 800 } };
 const secondary = { id: 2, label: 'Secondary', workArea: { x: -1000, y: -100, width: 1000, height: 900 } };
 
-function startDesktop(t, { http, savedLayout, connected = true, main = false } = {}) {
+function startDesktop(t, { http, savedLayout, connected = true, main = false, backend } = {}) {
   t.mock.timers.enable({ apis: ['Date', 'setInterval', 'setTimeout'], now: 1000 });
   const handlers = new Map();
+  const appEvents = new Map();
+  let quitCalls = 0;
   const shortcuts = new Map();
   const userData = mkdtempSync(path.join(tmpdir(), 'interview-overlay-test-'));
   t.after(() => rmSync(userData, { recursive: true, force: true }));
@@ -89,7 +91,8 @@ function startDesktop(t, { http, savedLayout, connected = true, main = false } =
       commandLine: { appendSwitch() {} },
       getPath: () => userData,
       whenReady: () => new Promise(() => {}),
-      on() {},
+      on(event, handler) { appEvents.set(event, handler); },
+      quit() { quitCalls++; },
     },
     BrowserWindow: OverlayWindow,
     screen,
@@ -121,6 +124,7 @@ function startDesktop(t, { http, savedLayout, connected = true, main = false } =
       return require(name);
     },
     process: { platform: 'win32', env: {} },
+    testBackend: backend,
     Date,
     setInterval,
     clearInterval,
@@ -129,6 +133,7 @@ function startDesktop(t, { http, savedLayout, connected = true, main = false } =
     Buffer,
   };
   runInNewContext(mainSource, context, { filename: mainFile });
+  if (backend) runInNewContext('pythonProcess = testBackend', context);
   if (main) {
     runInNewContext(`mainWindow = {
       isDestroyed: () => false, isVisible: () => false,
@@ -141,6 +146,8 @@ function startDesktop(t, { http, savedLayout, connected = true, main = false } =
   invoke('set-shortcuts-suspended', false);
   return {
     requestAssistStop: context.requestAssistStop,
+    beforeQuit: (event) => appEvents.get('before-quit')(event),
+    get quitCalls() { return quitCalls; },
     invoke,
     toggle: () => shortcuts.get('CommandOrControl+O')(),
     moveToMouse: () => shortcuts.get('CommandOrControl+M')(),
@@ -372,19 +379,52 @@ test('desktop quit posts the session stop and waits for its response', async (t)
   };
   const desktop = startDesktop(t, { http });
   let settled = false;
-  const stopping = desktop.requestAssistStop(15000).then(() => { settled = true; });
+  const stopping = desktop.requestAssistStop().then((acknowledged) => { settled = true; return acknowledged; });
   assert.equal(new URL(requested.url).pathname, '/api/stop');
   assert.equal(requested.options.method, 'POST');
-  assert.equal(requested.options.timeout, 15000);
+  assert.equal(requested.options.timeout, undefined);
 
   const response = new EventEmitter();
   response.resume = () => {};
+  response.statusCode = 200;
   sendResponse(response);
   await Promise.resolve();
   assert.equal(settled, false);
   response.emit('end');
-  await stopping;
+  assert.equal(await stopping, true);
   assert.equal(settled, true);
+});
+
+test('desktop keeps the backend alive while archive acknowledgement takes over 15 seconds', async (t) => {
+  let sendResponse;
+  let requests = 0;
+  const signals = [];
+  const backend = new EventEmitter();
+  backend.kill = (signal) => { signals.push(signal); backend.emit('exit'); };
+  const desktop = startDesktop(t, {
+    main: true, backend, http: { request(_url, _options, callback) {
+      requests++;
+      sendResponse = callback;
+      return Object.assign(new EventEmitter(), { end() {} });
+    } },
+  });
+
+  let prevented = 0;
+  const event = { preventDefault() { prevented++; } };
+  desktop.beforeQuit(event);
+  desktop.beforeQuit(event);
+  desktop.tick(20000);
+  assert.equal(prevented, 2);
+  assert.equal(requests, 1);
+  assert.deepEqual(signals, []);
+
+  const response = Object.assign(new EventEmitter(), { resume() {}, statusCode: 200 });
+  sendResponse(response);
+  response.emit('end');
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(signals, ['SIGTERM']);
+  assert.equal(desktop.quitCalls, 1);
 });
 
 for (const [entry, hide] of [

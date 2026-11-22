@@ -70,6 +70,38 @@ def _reset_default_config_state() -> None:
         pass
 
 
+def _stop_active_archives() -> None:
+    session_mod = sys.modules.get("core.session")
+    if session_mod is not None:
+        get_session_fn = getattr(session_mod, "get_session", None)
+        if callable(get_session_fn):
+            session = get_session_fn()
+            archive = getattr(session, "archive", None)
+            if archive is not None:
+                session.archive = None
+                try:
+                    archive.stop(timeout=2)
+                except Exception:
+                    pass
+
+    review_int_mod = sys.modules.get("services.review_integration")
+    if review_int_mod is not None:
+        archive_lock = getattr(review_int_mod, "_archive_lock", None)
+        draining = getattr(review_int_mod, "_draining_archives", None)
+        if archive_lock is not None and draining is not None:
+            with archive_lock:
+                pending = list(draining)
+                draining.clear()
+                review_int_mod._archive_status = None
+            for archive in pending:
+                try:
+                    archive.stop(timeout=2)
+                except Exception:
+                    pass
+        else:
+            review_int_mod._archive_status = None
+
+
 @pytest.fixture(autouse=True)
 def _isolate_default_config(monkeypatch):
     # Each test starts with the application defaults in the isolated log directory.
@@ -77,4 +109,5 @@ def _isolate_default_config(monkeypatch):
     monkeypatch.delenv("IA_LLM_TRACE_MAX_ASSETS_MB", raising=False)
     _reset_default_config_state()
     yield
+    _stop_active_archives()
     _reset_default_config_state()

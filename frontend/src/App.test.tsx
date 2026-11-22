@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import App from './App'
 import { useInterviewStore } from '@/stores/configStore'
+import { useKbStore } from '@/stores/kbStore'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
 
 
@@ -69,6 +70,7 @@ describe('App bootstrap', () => {
       wsConnected: true,
     } as any)
     useUiPrefsStore.setState({ appMode: 'assist' })
+    useKbStore.setState({ drawerOpen: false })
     apiMock.getConfig.mockResolvedValue({
       models: [{ name: 'demo', supports_vision: false }],
       active_model: 0,
@@ -429,6 +431,7 @@ describe('Window control buttons', () => {
       wsConnected: true,
     } as any)
     useUiPrefsStore.setState({ appMode: 'assist' })
+    useKbStore.setState({ drawerOpen: false })
     apiMock.getConfig.mockResolvedValue({
       models: [{ name: 'demo', supports_vision: false }],
       active_model: 0,
@@ -511,5 +514,34 @@ describe('Window control buttons', () => {
 
     expect(quitSpy).toHaveBeenCalledTimes(1)
     expect(minimizeSpy).not.toHaveBeenCalled()
+  })
+
+  it('suspends header app-drag-region while SettingsDrawer or KnowledgeDrawer is open', async () => {
+    const { container } = render(<App />)
+
+    await screen.findByRole('tab', { name: '面试辅助' })
+    const header = container.querySelector('header')
+    expect(header).not.toBeNull()
+    expect(header).toHaveClass('app-drag-region')
+
+    act(() => {
+      useInterviewStore.setState({ settingsOpen: true })
+    })
+    expect(header).not.toHaveClass('app-drag-region')
+
+    act(() => {
+      useInterviewStore.setState({ settingsOpen: false })
+    })
+    expect(header).toHaveClass('app-drag-region')
+
+    act(() => {
+      useKbStore.setState({ drawerOpen: true })
+    })
+    expect(header).not.toHaveClass('app-drag-region')
+
+    act(() => {
+      useKbStore.setState({ drawerOpen: false })
+    })
+    expect(header).toHaveClass('app-drag-region')
   })
 })

@@ -284,12 +284,16 @@ class AssistAsrStateMachine:
         transcript_key: str = "",
         transcript_epoch: int | None = None,
         publish: bool = True,
+        raw_text: str | None = None,
+        audio_end: float | None = None,
+        source_capture_id: str | None = None,
     ) -> None:
         transcript_key = transcript_key or uuid4().hex
         transcript_anchor = session.record_transcript(
             "interviewer", pub, started_at=now_mono if started_at is None else started_at,
             utterance_key=transcript_key, epoch=transcript_epoch,
             question_group=transcript_key if is_transcript_question(cfg, pub) else None,
+            raw_text=raw_text, audio_end=audio_end, source_capture_id=source_capture_id,
         )
         if transcript_anchor is None or not publish:
             return

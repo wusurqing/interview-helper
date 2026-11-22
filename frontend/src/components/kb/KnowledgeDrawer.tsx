@@ -84,13 +84,13 @@ export default function KnowledgeDrawer() {
 
   return (
     <>
-      <div className="fixed inset-0 bg-black/50 z-40" onClick={() => setOpen(false)} />
+      <div className="app-no-drag fixed inset-0 bg-black/50 z-40" onClick={() => setOpen(false)} />
       <div
         ref={drawerRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="kb-drawer-title"
-        className="fixed right-0 top-0 bottom-0 w-full sm:w-[480px] bg-bg-secondary z-50 shadow-2xl flex flex-col border-l border-bg-tertiary"
+        className="app-no-drag fixed right-0 top-0 bottom-0 w-full sm:w-[480px] bg-bg-secondary z-50 shadow-2xl flex flex-col border-l border-bg-tertiary"
       >
         <div className="flex-shrink-0 border-b border-bg-tertiary px-3 pt-3 pb-0">
           <div className="flex items-center justify-between mb-3 px-1">

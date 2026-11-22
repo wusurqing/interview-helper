@@ -216,14 +216,14 @@ export default function SettingsDrawer() {
 
   return (
     <>
-      <div className="fixed inset-0 bg-black/55 backdrop-blur-[2px] z-40" onClick={closeSettings} />
+      <div className="app-no-drag fixed inset-0 bg-black/55 backdrop-blur-[2px] z-40" onClick={closeSettings} />
       <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 md:p-6 pointer-events-none">
         <div
           ref={drawerRef}
           role="dialog"
           aria-modal="true"
           aria-labelledby="settings-title settings-title-mobile"
-          className="pointer-events-auto relative flex w-full max-w-5xl h-full max-h-[94vh] bg-bg-secondary rounded-2xl border border-bg-tertiary shadow-2xl overflow-hidden flex-col md:flex-row"
+          className="app-no-drag pointer-events-auto relative flex w-full max-w-5xl h-full max-h-[94vh] bg-bg-secondary rounded-2xl border border-bg-tertiary shadow-2xl overflow-hidden flex-col md:flex-row"
         >
           {/* ── 左侧导航栏（md 及以上）── */}
           <nav className="hidden md:flex w-52 flex-shrink-0 flex-col overflow-y-auto bg-bg-primary/50 border-r border-bg-tertiary/70 py-4" aria-label="设置分区">
@@ -309,7 +309,7 @@ export default function SettingsDrawer() {
                     </button>
                   )}
                 </div>
-                <button type="button" onClick={closeSettings} aria-disabled={saving || undefined} className="ml-auto p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary flex-shrink-0 aria-disabled:opacity-50" aria-label="关闭">
+                <button type="button" onClick={closeSettings} aria-disabled={saving || undefined} className="ml-auto inline-flex items-center justify-center p-1.5 rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-tertiary flex-shrink-0 aria-disabled:opacity-50" aria-label="关闭">
                   <X className="w-5 h-5" />
                 </button>
               </div>

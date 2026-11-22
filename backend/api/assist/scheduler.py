@@ -33,6 +33,7 @@ class DispatchClaim:
 class DispatchStep:
     claim: DispatchClaim | None = None
     skipped_seq: int | None = None
+    skipped_task: TaskPayload | None = None
     unavailable_task: TaskPayload | None = None
 
 
@@ -269,7 +270,7 @@ def claim_next_dispatch(
             continue
         if interrupt_stale_asr and is_asr_task(task) and int(meta.get("asr_turn_id", 0)) < latest_asr_turn_id:
             pending.pop(idx)
-            return DispatchStep(skipped_seq=seq)
+            return DispatchStep(skipped_seq=seq, skipped_task=task)
         avoid_models = physical_busy if is_asr_task(task) else None
         model_idx = pick_model_index(task, busy_models, avoid_models)
         if model_idx is not None:

@@ -1984,3 +1984,197 @@ def test_commit_post_answer_done_side_effect_failure_does_not_rollback_or_emit_e
     event_types = [event["type"] for event in broadcasts]
     assert "answer_done" in event_types
     assert "answer_error" not in event_types
+
+
+def test_archive_tracks_retry_model_and_clears_stale_thinking_on_fallback(monkeypatch: pytest.MonkeyPatch):
+    from services.interview_archive.manager import InterviewArchive
+    from services.llm import LLMError
+
+    saved = []
+    archive = InterviewArchive(88, candidate_enabled=False, save=saved.append)
+    cfg = SimpleNamespace(
+        models=[
+            SimpleNamespace(
+                name="primary-A",
+                api_key="secret-a",
+                api_base_url="https://a.example.com/v1",
+                api_type="openai",
+                model="fake-a",
+                enabled=True,
+                supports_vision=False,
+            ),
+            SimpleNamespace(
+                name="backup-B",
+                api_key="secret-b",
+                api_base_url="https://b.example.com/v1",
+                api_type="anthropic",
+                model="fake-b",
+                enabled=True,
+                supports_vision=False,
+            ),
+        ],
+        written_exam_mode=False,
+        written_exam_think=False,
+        screen_capture_region="left_half",
+        kb_enabled=False,
+        kb_trigger_modes=[],
+        assist_realtime_max_tokens=720,
+        assist_realtime_high_churn_max_tokens=320,
+    )
+    monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
+
+    calls = {"count": 0}
+
+    def fake_stream(model_cfg, _messages, **_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            assert model_cfg.name == "primary-A"
+            yield ("think", "stale-think-A ")
+            yield ("text", "stale-partial-A ")
+            raise LLMError("primary failed")
+        assert model_cfg.name == "backup-B-live"
+        yield ("think", "fresh-think-B")
+        yield ("text", "final-answer-B")
+
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
+
+    def reserve_retry(attempted, announce_retry):
+        if 1 in attempted:
+            return None
+        announce_retry(model_name="backup-B")
+        return 1
+
+    def resolve_exam_model(index):
+        base = cfg.models[index]
+        if index == 1:
+            return SimpleNamespace(**{**base.__dict__, "name": "backup-B-live"})
+        return base
+
+    round_id = archive.transcript("interviewer", "重试切换模型测试？", "q1", 0.0, audio_end=0.2)
+    broadcasts: list[dict] = []
+    base_deps = _deps(broadcasts=broadcasts)
+    deps = replace(
+        base_deps,
+        config_snapshot=cfg,
+        reserve_retry=reserve_retry,
+        resolve_exam_model=resolve_exam_model,
+    )
+
+    try:
+        answer_worker.process_question_parallel(
+            (
+                "重试切换模型测试？",
+                None,
+                False,
+                "conversation_loopback",
+                {
+                    "origin": "asr",
+                    "asr_turn_id": 1,
+                    "_archive_owner": archive,
+                    "_archive_round_id": round_id,
+                    "_archive_run_id": "run-retry-1",
+                },
+            ),
+            seq=0,
+            model_idx=0,
+            sess_v=0,
+            deps=deps,
+        )
+        assert archive.stop()
+        turn, = saved
+        assert turn["model_summary"]["name"] == "backup-B-live"
+        assert turn["model_summary"]["model"] == "fake-b"
+        assert turn["model_summary"]["protocol"] == "anthropic"
+        gen, = turn["generations"]
+        assert gen["model"]["name"] == "backup-B-live"
+        assert gen["thinking"] == "fresh-think-B"
+        assert gen["answer"] == "final-answer-B"
+    finally:
+        archive.stop()
+
+
+def test_archive_retry_then_cancel_does_not_keep_failed_attempt_partial_output(monkeypatch: pytest.MonkeyPatch):
+    from services.interview_archive.manager import InterviewArchive
+    from services.llm import LLMError
+
+    saved = []
+    archive = InterviewArchive(89, candidate_enabled=False, save=saved.append)
+    cfg = SimpleNamespace(
+        models=[
+            SimpleNamespace(
+                name="primary-A",
+                api_key="secret-a",
+                api_base_url="https://a.example.com/v1",
+                api_type="openai",
+                model="fake-a",
+                enabled=True,
+                supports_vision=False,
+            ),
+            SimpleNamespace(
+                name="backup-B",
+                api_key="secret-b",
+                api_base_url="https://b.example.com/v1",
+                api_type="anthropic",
+                model="fake-b",
+                enabled=True,
+                supports_vision=False,
+            ),
+        ],
+        written_exam_mode=False,
+        written_exam_think=False,
+        screen_capture_region="left_half",
+        kb_enabled=False,
+        kb_trigger_modes=[],
+        assist_realtime_max_tokens=720,
+        assist_realtime_high_churn_max_tokens=320,
+    )
+    monkeypatch.setattr(answer_worker, "get_config", lambda: cfg)
+
+    aborted = {"flag": False}
+
+    def fake_stream(_model_cfg, _messages, **_kwargs):
+        yield ("think", "stale-think")
+        yield ("text", "stale-partial")
+        raise LLMError("primary failed")
+
+    monkeypatch.setattr(answer_worker, "chat_stream_single_model", fake_stream)
+
+    def reserve_retry(_attempted, announce_retry):
+        announce_retry(model_name="")
+        aborted["flag"] = True
+        return None
+
+    round_id = archive.transcript("interviewer", "重试取消清理测试？", "q1", 0.0, audio_end=0.2)
+    broadcasts: list[dict] = []
+    base_deps = _deps(broadcasts=broadcasts, abort_check=lambda: aborted["flag"])
+    deps = replace(base_deps, config_snapshot=cfg, reserve_retry=reserve_retry)
+
+    try:
+        answer_worker.process_question_parallel(
+            (
+                "重试取消清理测试？",
+                None,
+                False,
+                "conversation_loopback",
+                {
+                    "origin": "asr",
+                    "asr_turn_id": 1,
+                    "_archive_owner": archive,
+                    "_archive_round_id": round_id,
+                    "_archive_run_id": "run-retry-cancel",
+                },
+            ),
+            seq=0,
+            model_idx=0,
+            sess_v=0,
+            deps=deps,
+        )
+        assert archive.stop()
+        turn, = saved
+        assert turn["ai_status"] == "cancelled"
+        gen, = turn["generations"]
+        assert gen["answer"] == ""
+        assert gen["thinking"] == ""
+        assert gen["first_token_ms"] is None
+    finally:
+        archive.stop()

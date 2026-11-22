@@ -11,12 +11,32 @@ from core.session import Session, conversation_lock
 from core.config import get_config
 from services.storage import review
 from services import review_async_analysis
+from services.interview_archive.manager import InterviewArchive
 
 logger = get_logger(__name__)
 
 _state_lock = threading.Lock()
 _current_review_session_id: Optional[int] = None
 _existing_qa_ids: frozenset[str] = frozenset()
+_archive_status = None
+_draining_archives: set[InterviewArchive] = set()
+_archive_lock = threading.Lock()
+
+
+def get_archive_status():
+    from core.session import get_session
+    archive = get_session().archive
+    if archive is not None:
+        return archive.snapshot()
+    with _archive_lock:
+        return dict(_archive_status) if isinstance(_archive_status, dict) else _archive_status
+
+
+def wait_for_archive_saves():
+    with _archive_lock:
+        pending = tuple(_draining_archives)
+    for archive in pending:
+        archive.wait_finalized()
 
 
 def should_create_review_session(
@@ -27,33 +47,8 @@ def should_create_review_session(
     *,
     single_mic: bool = False,
 ) -> bool:
-    """
-    判断是否应该创建 review session。
-
-    落盘与 LLM 分析解耦: review_enabled 不再阻止创建 session —— 只要录音设备
-    配齐就创建并落盘 QA turns, 后续是否自动跑 LLM 复盘由 on_assist_stop 按
-    review_enabled 决定 (关闭时置 recorded 状态, 可手动触发)。
-
-    普通语音面试仅当以下条件全部满足才创建:
-    1. interviewer 音频设备有效
-    2. candidate mic 有效
-    3. candidate ASR 开启
-    4. 普通面试使用不同设备，单人测试由同一设备按角色分流
-
-    笔试模式没有 interviewer 音频设备, 但仍会产生截图题目和答案, 也需要落入
-    面试复盘, 因此 written_exam_mode=True 时允许创建无音频采集的 session。
-    """
-    if written_exam_mode:
-        return True
-    if interviewer_device_id is None:
-        return False
-    if candidate_device_id is None:
-        return False
-    if not candidate_asr_enabled:
-        return False
-    if not single_mic and interviewer_device_id == candidate_device_id:
-        return False
-    return True
+    """Speech archive requires interviewer capture only; written exams need neither input."""
+    return written_exam_mode or interviewer_device_id is not None
 
 
 def on_assist_start(
@@ -81,6 +76,7 @@ def on_assist_start(
         logger.info("Review session not created: conditions not met")
         return None
 
+    created_archive = None
     try:
         session_id = review.create_session(
             started_at=time.time(),
@@ -95,11 +91,86 @@ def on_assist_start(
         with _state_lock:
             _current_review_session_id = session_id
             _existing_qa_ids = existing_qa_ids
+        if not written_exam_mode:
+            from api.realtime.ws import broadcast
+            from services.storage import review_archive
+
+            def archive_event(event):
+                global _archive_status
+                with _archive_lock:
+                    if _archive_status is None or _archive_status["session_id"] <= session_id:
+                        _archive_status = {k: v for k, v in event.items() if k != "type"}
+                broadcast(event)
+
+            def completed():
+                try:
+                    state = archive.snapshot()
+                    review_archive.finish_session(session_id, state["warning"])
+                    if _should_auto_analyze(
+                        review_enabled=bool(get_config().review_enabled),
+                        turn_count=state["persisted_turn_count"],
+                    ):
+                        if review.claim_session_for_analysis(session_id):
+                            try:
+                                review_async_analysis.analyze_session_async(session_id)
+                            except Exception:
+                                logger.exception(
+                                    "Failed to enqueue background analysis for archived session %d",
+                                    session_id,
+                                )
+                                try:
+                                    review.update_session_status(session_id, "analysis_failed")
+                                except Exception:
+                                    pass
+                finally:
+                    with _archive_lock:
+                        _draining_archives.discard(archive)
+
+            archive = InterviewArchive(
+                session_id,
+                candidate_enabled=bool(
+                    candidate_device_id is not None
+                    and candidate_asr_enabled
+                    and (single_mic or candidate_device_id != interviewer_device_id)
+                ),
+                broadcast=archive_event,
+                on_complete=completed,
+            )
+            created_archive = archive
+            review_archive.set_state(session_id, "recording")
+            from core.session import get_session
+            get_session().archive = archive
         logger.info("Review session created: session_id=%d", session_id)
         return session_id
     except Exception as e:
+        with _state_lock:
+            _current_review_session_id = None
+            _existing_qa_ids = frozenset()
+        if created_archive is not None:
+            try:
+                from core.session import get_session
+                session = get_session()
+                if getattr(session, "archive", None) is created_archive:
+                    session.archive = None
+            except Exception:
+                pass
+            try:
+                created_archive.stop(timeout=2)
+            except Exception:
+                pass
         logger.error("Failed to create review session: %s", e, exc_info=True)
         return None
+
+
+def update_candidate_capture(archive, *, enabled, available):
+    archive.candidate_enabled = available
+    archive.candidate_unavailable = enabled and not available
+    try:
+        from services.storage import review_archive
+        review_archive.set_candidate_capture(archive.session_id, available)
+    except Exception:
+        archive.warning("候选人采集状态保存失败")
+        logger.exception("Unable to update archive candidate capture flags")
 
 
 def on_assist_stop(session: Session) -> Optional[int]:
@@ -116,6 +187,18 @@ def on_assist_stop(session: Session) -> Optional[int]:
         existing_qa_ids = _existing_qa_ids
         _current_review_session_id = None
         _existing_qa_ids = frozenset()
+
+    if session.archive is not None:
+        from services.storage import review_archive
+        archive, session.archive = session.archive, None
+        with _archive_lock:
+            _draining_archives.add(archive)
+        try:
+            review_archive.set_state(session_id, "draining")
+        except Exception:
+            logger.exception("Unable to update draining archive state")
+        archive.stop(timeout=3)
+        return session_id
 
     with conversation_lock:
         qa_snapshots = [

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, useRef, lazy, Suspense } from 'react'
 import { Settings, SlidersHorizontal, MonitorSmartphone, PanelLeftClose, PanelLeftOpen, Minus, X, ChevronDown } from 'lucide-react'
 import { useShallow } from 'zustand/react/shallow'
 import { useInterviewStore, type AppConfig } from '@/stores/configStore'
+import { useKbStore } from '@/stores/kbStore'
 import { getAssistModelEntries, getAssistScreenshotModel, getWrittenExamModel, isConfiguredModel, missingWrittenExamModel } from '@/lib/assistModels'
 import { speechProvider } from '@/lib/speechProviders'
 import { useUiPrefsStore } from '@/stores/uiPrefsStore'
@@ -85,13 +86,15 @@ function useIsDesktopViewport(): boolean {
 export default function App() {
   useInterviewWS()
   // 精确订阅, 避免 store 任意字段变化(LLM token 流式 / toast 等)触发 App 重渲染
-  const { config, toggleSettings, openModelsDrawer } = useInterviewStore(
+  const { config, settingsOpen, toggleSettings, openModelsDrawer } = useInterviewStore(
     useShallow((s) => ({
       config: s.config,
+      settingsOpen: s.settingsOpen,
       toggleSettings: s.toggleSettings,
       openModelsDrawer: s.openModelsDrawer,
     })),
   )
+  const kbDrawerOpen = useKbStore((s) => s.drawerOpen)
   const sttLoaded = useInterviewStore((s) => s.sttLoaded)
   const sttLoading = useInterviewStore((s) => s.sttLoading)
   const isRecording = useInterviewStore((s) => s.isRecording)
@@ -364,7 +367,7 @@ export default function App() {
   return (
     <div className="h-screen flex flex-col bg-bg-primary overflow-hidden noise-bg">
       {/* Header — 强制单行不换行, 各按钮文字按宽度阶梯隐藏, 实在不够再让左区横向滚动 */}
-      <header className="app-drag-region header-gradient flex flex-row items-center justify-between gap-2 px-3 md:px-5 py-2.5 flex-shrink-0 min-w-0">
+      <header className={`${settingsOpen || kbDrawerOpen ? '' : 'app-drag-region '}header-gradient flex flex-row items-center justify-between gap-2 px-3 md:px-5 py-2.5 flex-shrink-0 min-w-0`}>
         <div className="flex items-center gap-2 md:gap-2.5 flex-shrink min-w-0 overflow-hidden">
           <div className="flex items-center gap-2">
             <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-accent-blue/20 to-accent-blue/5 flex items-center justify-center border border-accent-blue/10">

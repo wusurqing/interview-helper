@@ -1,5 +1,47 @@
 import { parseReviewScore } from '@/lib/reviewScore'
 
+export const ARCHIVE_SPEAKERS = [['interviewer', '面试官'], ['candidate', '候选人']] as const
+export type ArchiveSpeaker = typeof ARCHIVE_SPEAKERS[number][0]
+const AUDIO_STATES = ['ready', 'approximate', 'partial', 'missing', 'none'] as const
+type AudioState = typeof AUDIO_STATES[number]
+
+interface ArchiveAudioCoverage {
+  state: AudioState
+  duration_ms: number
+  reason?: string
+}
+
+export function archiveAudioIssue(state?: AudioState) {
+  if (state === 'partial') return '部分录音缺失'
+  if (state === 'missing') return '录音缺失'
+  return null
+}
+
+export interface ArchiveClip {
+  asset_id: string
+  offset: number
+  duration: number
+  sample_start?: number
+  sample_count?: number
+  capture_id?: string
+}
+
+export interface ArchiveDetails {
+  round_id: string
+  policy_version: string
+  transcription_timeouts?: ArchiveSpeaker[]
+  utterances: Array<{
+    id: string; speaker: string; text: string; started_mono: number; is_final: boolean; alignment: string
+    transcription_failed?: boolean
+  }>
+  generations: Array<{
+    id: string; status: string; answer: string; thinking: string; error?: string
+    started_at: number; finished_at?: number; first_token_at: number | null; first_token_ms: number | null; total_ms: number | null
+    model: { name?: string; model?: string; protocol?: string; endpoint?: string }
+    attempts: Array<{ attempt_id: string; call_id: string; status: string; request_at: string; finished_at: string; duration_ms: number; first_output_latency_ms?: number; reasoning_text: string; output_text: string; error?: string }>
+  }>
+}
+
 export interface ReviewSession {
   id: number
   status: 'recording' | 'recorded' | 'analyzing' | 'completed' | 'partial_capture' | 'analysis_failed'
@@ -34,6 +76,9 @@ export interface ReviewSession {
   domain_summary?: Record<string, unknown> | null
   created_at: number
   updated_at: number
+  archive_status?: string | null
+  archive_warning?: string | null
+  archive_version?: number
 }
 
 export interface ReviewTurn {
@@ -55,6 +100,13 @@ export interface ReviewTurn {
   scorecard?: Record<string, unknown> | null
   created_at: number
   updated_at: number
+  round_id?: string | null
+  archive_version?: number
+  candidate_status?: string | null
+  ai_status?: string | null
+  media?: { interviewer: ArchiveClip[]; candidate: ArchiveClip[] } | null
+  audio_status?: Record<ArchiveSpeaker, ArchiveAudioCoverage | null> | null
+  model_summary?: { name?: string; model?: string; first_token_ms?: number | null; total_ms?: number | null } | null
 }
 
 export interface ReviewSessionDetail extends ReviewSession {
@@ -149,6 +201,13 @@ function parseReviewApplication(value: unknown): ReviewSession['application'] {
 
 export function parseReviewTurn(raw: Record<string, unknown>): ReviewTurn {
   return {
+    round_id: raw.round_id == null ? null : String(raw.round_id),
+    archive_version: parseNonNegativeInteger(raw.archive_version),
+    candidate_status: raw.candidate_status == null ? null : String(raw.candidate_status),
+    ai_status: raw.ai_status == null ? null : String(raw.ai_status),
+    media: parseArchiveMedia(raw.media),
+    audio_status: parseAudioCoverage(raw.audio_status),
+    model_summary: raw.model_summary && typeof raw.model_summary === 'object' ? raw.model_summary as ReviewTurn['model_summary'] : null,
     id: parseNumber(raw.id),
     session_id: parseNumber(raw.session_id),
     qa_id: String(raw.qa_id ?? ''),
@@ -205,8 +264,36 @@ export function parseReviewSessionDetail(raw: Record<string, unknown>): ReviewSe
   const turns = Array.isArray(raw.turns) ? raw.turns.map((turn) => parseReviewTurn(asRecord(turn))) : []
   return {
     ...parseReviewSession(raw),
+    archive_status: raw.archive_status == null ? null : String(raw.archive_status),
+    archive_warning: raw.archive_warning == null ? null : String(raw.archive_warning),
+    archive_version: parseNonNegativeInteger(raw.archive_version),
     turns,
   }
+}
+
+function parseArchiveMedia(raw: unknown): ReviewTurn['media'] {
+  if (!raw || typeof raw !== 'object') return null
+  const source = raw as Record<string, unknown>
+  const clips = (value: unknown): ArchiveClip[] => Array.isArray(value) ? value.flatMap((item) => {
+    const clip = asRecord(item)
+    const duration = finiteNumber(clip.duration)
+    const offset = finiteNumber(clip.offset)
+    return typeof clip.asset_id === 'string' && /^[a-f0-9]{64}$/.test(clip.asset_id) && duration != null && duration > 0 && offset != null && offset >= 0
+      ? [{ asset_id: clip.asset_id, offset, duration }] : []
+  }) : []
+  return { interviewer: clips(source.interviewer), candidate: clips(source.candidate) }
+}
+
+function parseAudioCoverage(value: unknown): ReviewTurn['audio_status'] {
+  if (!value || typeof value !== 'object') return null
+  const raw = asRecord(value)
+  const coverage = (speaker: ArchiveSpeaker): ArchiveAudioCoverage | null => {
+    const item = asRecord(raw[speaker])
+    const state = item.state as AudioState
+    if (!AUDIO_STATES.includes(state)) return null
+    return { state, duration_ms: parseNonNegativeInteger(item.duration_ms), reason: typeof item.reason === 'string' ? item.reason : undefined }
+  }
+  return { interviewer: coverage('interviewer'), candidate: coverage('candidate') }
 }
 
 export function parseReviewSessionsResponse(raw: unknown): ReviewSessionsResponse {

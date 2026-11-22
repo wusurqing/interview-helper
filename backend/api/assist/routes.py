@@ -1,7 +1,7 @@
 """Interview assist HTTP routes."""
 
 import asyncio
-from pathlib import Path
+from pathlib import PureWindowsPath
 from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException
@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, StrictBool
 from core.config import get_config
 from core.logger import get_logger
 from core.session import get_session, snapshot_session
+from services import review_integration
 from services.audio import AudioBusyError
 from services.stt import STTError, stt_configuration_error
 from services.stt.mmpg import valid_single_mic_id
@@ -36,6 +37,8 @@ from .scheduler import EXAM_MODEL_UNAVAILABLE, task_is_written_exam
 router = APIRouter()
 _rlog = get_logger("assist.routes")
 _role_switches: dict[RoleSwitch, asyncio.Task[tuple[int, dict | None]]] = {}
+_stop_task: asyncio.Task | None = None
+_DEFAULT_STOP_INTERVIEW_LOOP = stop_interview_loop
 
 
 class ManualQuestion(BaseModel):
@@ -137,17 +140,52 @@ async def _api_start(body: dict):
 
 @router.post("/stop")
 async def api_stop():
+    await finish_interview()
+    return {"ok": True}
+
+
+async def finish_interview(reason="stopped"):
+    global _stop_task
+    loop = asyncio.get_running_loop()
+    if _stop_task is None or _stop_task.done() or _stop_task.get_loop() is not loop:
+        _stop_task = loop.create_task(_finish_interview(reason))
+    await asyncio.shield(_stop_task)
+
+
+async def _finish_interview(reason):
     async with mmpg.http_lifecycle_lock:
         mmpg.bump_lifecycle_epoch()
-        single_mic = get_session().single_mic
-        if single_mic is not None:
-            await mmpg.drain_single_mic_transports(single_mic, "stopped")
-        await asyncio.gather(
-            mmpg.manager.stop("stopped"),
-            candidate_mmpg.stop("stopped", drain=single_mic is None),
+        session = get_session()
+        is_active = bool(
+            session.is_recording
+            or session.archive
+            or mmpg.manager.active
+            or candidate_mmpg.manager.active
         )
-        await run_in_threadpool(stop_interview_loop)
-    return {"ok": True}
+        if is_active or reason == "shutdown":
+            try:
+                if is_active:
+                    if session.single_mic is not None:
+                        await mmpg.drain_single_mic_transports(session.single_mic, reason)
+                    else:
+                        await mmpg.drain_dual_input(reason)
+            finally:
+                try:
+                    await asyncio.gather(
+                        mmpg.manager.stop(reason),
+                        candidate_mmpg.stop(reason, drain=False),
+                        return_exceptions=(reason == "shutdown"),
+                    )
+                finally:
+                    import api.assist as assist_pkg
+
+                    stop_fn = (
+                        assist_pkg.stop_interview_loop
+                        if assist_pkg.stop_interview_loop is not _DEFAULT_STOP_INTERVIEW_LOOP
+                        else stop_interview_loop
+                    )
+                    await run_in_threadpool(stop_fn)
+        await run_in_threadpool(review_integration.wait_for_archive_saves)
 
 
 @router.post("/pause")
@@ -167,7 +205,14 @@ async def api_pause(body: dict | None = None):
             return {"ok": True}
         if is_streaming_interview() or mmpg.manager.active:
             mmpg.bump_lifecycle_epoch()
-            await asyncio.gather(mmpg.manager.stop("paused"), candidate_mmpg.stop("paused", drain=True))
+            try:
+                await mmpg.drain_dual_input(reason="paused")
+            finally:
+                try:
+                    await asyncio.gather(mmpg.manager.stop("paused"), candidate_mmpg.stop("paused"))
+                finally:
+                    if is_streaming_interview() and not get_session().is_paused:
+                        await run_in_threadpool(pause_interview)
             return {"ok": True}
         session = get_session()
         if not session.is_recording:
@@ -517,7 +562,7 @@ async def api_preflight_replay(body: dict):
             expected_phrase=expected_phrase,
         )
         if isinstance(result, dict) and "audio_path" in result:
-            result = {**result, "audio_path": Path(str(result["audio_path"])).name}
+            result = {**result, "audio_path": PureWindowsPath(str(result["audio_path"])).name}
         return result
     except AudioBusyError as e:
         raise HTTPException(409, str(e))
